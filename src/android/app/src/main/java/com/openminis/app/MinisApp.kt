@@ -25,6 +25,7 @@ import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.data.repository.WebAppShortcutRepository
 import com.openminis.app.data.repository.MCPRepository
 import com.openminis.app.data.repository.SkillRepository
+import com.openminis.app.knowledgebase.KnowledgeBaseRepository
 import com.openminis.app.notification.BackgroundTaskNotifier
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.network.NetworkMonitor
@@ -83,6 +84,8 @@ class MinisApp : Application(), ImageLoaderFactory {
     lateinit var skillRepository: SkillRepository
         private set
     lateinit var mcpRepository: MCPRepository
+        private set
+    lateinit var knowledgeBaseRepository: KnowledgeBaseRepository
         private set
     lateinit var memoryRepository: MemoryRepository
         private set
@@ -303,6 +306,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         envVarRepository = EnvVarRepository(this)
         skillRepository = SkillRepository(this)
         mcpRepository = MCPRepository(this)
+        knowledgeBaseRepository = KnowledgeBaseRepository(this)
         memoryRepository = MemoryRepository(java.io.File(filesDir, "minis-global/memory"))
         webAppShortcutRepository = WebAppShortcutRepository(database.webAppShortcutDao())
 

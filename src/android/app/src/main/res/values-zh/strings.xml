@@ -1259,6 +1259,8 @@
     <!-- [T-mcp-i18n-android] MCP Integrations UI -->
     <string name="settings_mcp">MCP 集成</string>
     <string name="settings_mcp_subtitle">连接 Model Context Protocol 服务器</string>
+    <string name="settings_knowledge_bases">Knowledge Bases</string>
+    <string name="settings_knowledge_bases_subtitle">Searchable document collections (on-device RAG)</string>
     <string name="mcp_title">MCP 集成</string>
     <string name="mcp_add">添加 MCP 服务器</string>
     <string name="mcp_edit">编辑 MCP 服务器</string>

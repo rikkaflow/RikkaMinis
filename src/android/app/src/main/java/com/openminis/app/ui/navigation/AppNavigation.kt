@@ -63,6 +63,8 @@ import com.openminis.app.ui.settings.MountDetailScreen
 import com.openminis.app.ui.settings.MountedFoldersScreen
 import com.openminis.app.ui.settings.SharedFolderDetailScreen
 import com.openminis.app.ui.settings.SharedFoldersScreen
+import com.openminis.app.ui.settings.KnowledgeBaseDetailScreen
+import com.openminis.app.ui.settings.KnowledgeBaseListScreen
 import com.openminis.app.ui.settings.SkillsManagementScreen
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.data.repository.MemoryRepository
@@ -129,6 +131,10 @@ object Routes {
     const val SKILL_DETAIL = "skill/{skillId}"
     const val SKILL_FILE = "skill_file/{skillId}/{relativePath}"
     const val MINIS_SKILLS_BROWSER = "minis_skills_browser"
+    // [RAG v1] Knowledge base management.
+    const val KNOWLEDGE_BASES = "knowledge_bases"
+    const val KNOWLEDGE_BASE_DETAIL = "knowledge_base/{kbId}"
+    fun knowledgeBaseDetail(kbId: String) = "knowledge_base/$kbId"
 
     fun skillDetail(skillId: String) = "skill/$skillId"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {
@@ -229,6 +235,7 @@ fun AppNavigation(
     skillRepository: SkillRepository? = null,
     mcpRepository: com.openminis.app.data.repository.MCPRepository? = null,
     memoryRepository: MemoryRepository? = null,
+    knowledgeBaseRepository: com.openminis.app.knowledgebase.KnowledgeBaseRepository? = null,
     navController: NavHostController = rememberNavController(),
     initialDeepLink: DeepLinkAction? = null,
 ) {
@@ -547,6 +554,7 @@ fun AppNavigation(
                 memoryRepository = memoryRepository,
                 skillRepository = skillRepository,
                 mcpRepository = mcpRepository,
+                knowledgeBaseRepository = knowledgeBaseRepository,
                 onBack = { navController.safePopBackStack() },
                 // [T-new-chat-menu-entry] Chat-menu "New Chat": same draft-id
                 // funnel as the session list / NewChat deep link — a fresh
@@ -606,6 +614,7 @@ fun AppNavigation(
                 onTerminalClick = { navController.safeNavigate(Routes.terminal()) },
                 onMemoryClick = { navController.safeNavigate(Routes.MEMORY) },
                 onMcpClick = { navController.safeNavigate(Routes.MCP) },
+                onKnowledgeBasesClick = { navController.safeNavigate(Routes.KNOWLEDGE_BASES) },
                 onSoulClick = { navController.safeNavigate(Routes.SOUL) },
                 onPermissionsClick = { navController.safeNavigate(Routes.PERMISSIONS) },
                 onUsageClick = { navController.safeNavigate(Routes.USAGE_STATS) },
@@ -1109,6 +1118,29 @@ fun AppNavigation(
                     },
                 )
             }
+        }
+
+        // [RAG v1] Knowledge base management screens.
+        composable(Routes.KNOWLEDGE_BASES) {
+            val app = LocalContext.current.applicationContext as com.openminis.app.MinisApp
+            KnowledgeBaseListScreen(
+                knowledgeBaseRepository = app.knowledgeBaseRepository,
+                onBack = { navController.safePopBackStack() },
+                onOpenKb = { kbId -> navController.safeNavigate(Routes.knowledgeBaseDetail(kbId)) },
+            )
+        }
+
+        composable(
+            Routes.KNOWLEDGE_BASE_DETAIL,
+            arguments = listOf(androidx.navigation.navArgument("kbId") { type = androidx.navigation.NavType.StringType }),
+        ) { backStackEntry ->
+            val kbId = backStackEntry.arguments?.getString("kbId") ?: return@composable
+            val app = LocalContext.current.applicationContext as com.openminis.app.MinisApp
+            KnowledgeBaseDetailScreen(
+                kbId = kbId,
+                knowledgeBaseRepository = app.knowledgeBaseRepository,
+                onBack = { navController.safePopBackStack() },
+            )
         }
 
         // [T-mcp-integration-android] MCP Integrations management screen.

@@ -131,6 +131,26 @@
     <!-- [T-mcp-integration-android] MCP Integrations settings entry + management screen -->
     <string name="settings_mcp">MCP Integrations</string>
     <string name="settings_mcp_subtitle">Connect Model Context Protocol servers</string>
+    <!-- [RAG v1] Knowledge Bases settings entry + screens -->
+    <string name="settings_knowledge_bases">Knowledge Bases</string>
+    <string name="settings_knowledge_bases_subtitle">Searchable document collections (on-device RAG)</string>
+    <string name="kb_title">Knowledge Bases</string>
+    <string name="kb_empty_title">No knowledge bases yet</string>
+    <string name="kb_empty_action">Create one to start indexing documents the agent can search.</string>
+    <string name="kb_create">Create Knowledge Base</string>
+    <string name="kb_new_name">New knowledge base name</string>
+    <string name="kb_new_description">Description (optional)</string>
+    <string name="kb_documents">Documents</string>
+    <string name="kb_add_document">Add Document</string>
+    <string name="kb_doc_title">Document title</string>
+    <string name="kb_doc_content">Document content</string>
+    <string name="kb_doc_source_path">Source path (optional)</string>
+    <string name="kb_delete_kb">Delete knowledge base</string>
+    <string name="kb_delete_kb_confirm">Delete this knowledge base and all its documents? This cannot be undone.</string>
+    <string name="kb_delete_doc">Delete document</string>
+    <string name="kb_delete_doc_confirm">Delete this document and its chunks?</string>
+    <string name="kb_chunks">chunks</string>
+    <string name="kb_embedding_bm25">BM25 (on-device, offline)</string>
     <string name="mcp_title">MCP Integrations</string>
     <string name="mcp_add">Add MCP Server</string>
     <string name="mcp_edit">Edit MCP Server</string>

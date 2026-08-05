@@ -31,6 +31,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderShared
 import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.MenuBook
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Settings
@@ -87,6 +88,9 @@ fun SettingsScreen(
     // OEM autostart guidance). Default no-op so older callers/tests
     // don't need to be retrofitted.
     onBackgroundClick: () -> Unit = {},
+    // [RAG v1] Knowledge Bases management (BM25 on-device retrieval).
+    // Default no-op for back-compat with callers wired before RAG v1.
+    onKnowledgeBasesClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
     Scaffold(
@@ -182,6 +186,14 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_mcp),
                     subtitle = stringResource(R.string.settings_mcp_subtitle),
                     onClick = onMcpClick,
+                )
+                // [RAG v1] Knowledge Bases — below MCP, above Env Vars.
+                SettingsItem(
+                    icon = Icons.Outlined.MenuBook,
+                    iconColor = Color(0xFFAF52DE),
+                    title = stringResource(R.string.settings_knowledge_bases),
+                    subtitle = stringResource(R.string.settings_knowledge_bases_subtitle),
+                    onClick = onKnowledgeBasesClick,
                 )
                 SettingsItem(
                     icon = Icons.Outlined.Terminal,

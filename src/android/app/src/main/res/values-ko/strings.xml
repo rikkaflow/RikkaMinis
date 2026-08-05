@@ -944,6 +944,8 @@
     <!-- [T-mcp-i18n-android] MCP Integrations UI -->
     <string name="settings_mcp">MCP 통합</string>
     <string name="settings_mcp_subtitle">Model Context Protocol 서버 연결</string>
+    <string name="settings_knowledge_bases">Knowledge Bases</string>
+    <string name="settings_knowledge_bases_subtitle">Searchable document collections (on-device RAG)</string>
     <string name="mcp_title">MCP 통합</string>
     <string name="mcp_add">MCP 서버 추가</string>
     <string name="mcp_edit">MCP 서버 편집</string>

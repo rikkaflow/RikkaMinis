@@ -54,6 +54,7 @@ internal object ChatMutationMethods {
                     memoryRepository = app.memoryRepository,
                     skillRepository = app.skillRepository,
                     mcpRepository = app.mcpRepository,
+                    knowledgeBaseRepository = app.knowledgeBaseRepository,
                 ),
             )[com.openminis.app.ui.chat.ChatViewModel::class.java].also { it.sendMessage(text) }
         }

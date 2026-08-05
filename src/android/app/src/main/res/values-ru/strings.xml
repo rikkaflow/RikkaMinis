@@ -1111,6 +1111,8 @@
     <!-- [T-mcp-i18n-android] MCP Integrations UI -->
     <string name="settings_mcp">Интеграции MCP</string>
     <string name="settings_mcp_subtitle">Подключение серверов Model Context Protocol</string>
+    <string name="settings_knowledge_bases">Knowledge Bases</string>
+    <string name="settings_knowledge_bases_subtitle">Searchable document collections (on-device RAG)</string>
     <string name="mcp_title">Интеграции MCP</string>
     <string name="mcp_add">Добавить сервер MCP</string>
     <string name="mcp_edit">Изменить сервер MCP</string>

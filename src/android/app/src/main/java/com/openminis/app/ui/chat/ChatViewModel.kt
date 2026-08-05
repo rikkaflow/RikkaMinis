@@ -90,6 +90,7 @@ class ChatViewModel(
     val memoryRepository: MemoryRepository? = null,
     val skillRepository: com.openminis.app.data.repository.SkillRepository? = null,
     val mcpRepository: com.openminis.app.data.repository.MCPRepository? = null,
+    val knowledgeBaseRepository: com.openminis.app.knowledgebase.KnowledgeBaseRepository? = null,
 ) : ViewModel() {
 
     companion object {
@@ -299,6 +300,7 @@ class ChatViewModel(
             memoryRepository: MemoryRepository?,
             skillRepository: com.openminis.app.data.repository.SkillRepository?,
             mcpRepository: com.openminis.app.data.repository.MCPRepository? = null,
+            knowledgeBaseRepository: com.openminis.app.knowledgebase.KnowledgeBaseRepository? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -310,6 +312,7 @@ class ChatViewModel(
                     memoryRepository = memoryRepository,
                     skillRepository = skillRepository,
                     mcpRepository = mcpRepository,
+                    knowledgeBaseRepository = knowledgeBaseRepository,
                 ) as T
             }
         }
@@ -7240,6 +7243,10 @@ class ChatViewModel(
             "browser_use" -> executeBrowserUseTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
+            "kb_list" -> executeKbListTool(argsJson)
+            "kb_retrieve" -> executeKbRetrieveTool(argsJson)
+            "kb_ingest" -> executeKbIngestTool(argsJson)
+            "kb_create" -> executeKbCreateTool(argsJson)
             else -> ToolExecutionResult("Unknown tool: $name", false)
         }
     }
@@ -7622,6 +7629,120 @@ class ChatViewModel(
             keywords = keywords,
         )
         return ToolExecutionResult(result.output, result.success, toolTitle = result.toolTitle)
+    }
+
+    // ─── Knowledge Base (RAG) tools ─────────────────────────────────────
+
+    /**
+     * RAG surface: kb_list / kb_retrieve / kb_ingest / kb_create.
+     * Backed by KnowledgeBaseRepository (BM25, offline). Returns JSON
+     * payloads the model can reason over.
+     */
+    private fun executeKbListTool(argsJson: String): ToolExecutionResult {
+        val repo = knowledgeBaseRepository
+            ?: return ToolExecutionResult("Error: Knowledge base not available", false)
+        val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title", "kb_list") }.getOrDefault("kb_list")
+        return try {
+            val kbs = kotlinx.coroutines.runBlocking { repo.getAllKnowledgeBasesList() }
+            if (kbs.isEmpty()) {
+                ToolExecutionResult(
+                    "No knowledge bases exist yet. Create one with kb_create, then add documents with kb_ingest.",
+                    true, toolTitle,
+                )
+            } else {
+                val sb = StringBuilder("Knowledge bases:\n")
+                for (kb in kbs) {
+                    sb.append("- id: ${kb.id}\n  name: ${kb.name}\n  description: ${kb.description}\n" +
+                        "  documents: ${kb.documentCount}, chunks: ${kb.chunkCount}\n")
+                }
+                ToolExecutionResult(sb.toString(), true, toolTitle)
+            }
+        } catch (e: Exception) {
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+        }
+    }
+
+    private fun executeKbRetrieveTool(argsJson: String): ToolExecutionResult {
+        val repo = knowledgeBaseRepository
+            ?: return ToolExecutionResult("Error: Knowledge base not available", false)
+        val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title", "kb_retrieve") }.getOrDefault("kb_retrieve")
+        return try {
+            val obj = JSONObject(argsJson)
+            val query = obj.optString("query", "").trim()
+            if (query.isBlank()) {
+                return ToolExecutionResult("Error: Missing required 'query' parameter", false, toolTitle)
+            }
+            val kbId = obj.optString("kb_id", "all")
+            val topK = obj.optInt("top_k", 8).coerceIn(1, 20)
+
+            val results = kotlinx.coroutines.runBlocking {
+                if (kbId == "all" || kbId.isBlank()) repo.retrieveAll(query, topK)
+                else repo.retrieve(kbId, query, topK)
+            }
+
+            if (results.isEmpty()) {
+                ToolExecutionResult(
+                    "No relevant chunks found for query \"$query\" in ${if (kbId == "all") "any knowledge base" else "kb $kbId"}. " +
+                        "The information may not be ingested yet — consider kb_ingest of the relevant document, " +
+                        "or rephrase with different keywords.",
+                    true, toolTitle,
+                )
+            } else {
+                val sb = StringBuilder("Retrieved ${results.size} chunk(s) for \"$query\":\n\n")
+                for ((i, r) in results.withIndex()) {
+                    val docTitle = r.document?.title ?: "unknown"
+                    val docId = r.document?.id ?: "?"
+                    sb.append("[${i + 1}] score=${"%.3f".format(r.score)} doc=\"$docTitle\" (id=$docId)\n")
+                    sb.append(r.chunk.content.take(2000))
+                    sb.append("\n\n")
+                }
+                ToolExecutionResult(sb.toString(), true, toolTitle)
+            }
+        } catch (e: Exception) {
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+        }
+    }
+
+    private fun executeKbIngestTool(argsJson: String): ToolExecutionResult {
+        val repo = knowledgeBaseRepository
+            ?: return ToolExecutionResult("Error: Knowledge base not available", false)
+        val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title", "kb_ingest") }.getOrDefault("kb_ingest")
+        return try {
+            val obj = JSONObject(argsJson)
+            val kbId = obj.optString("kb_id", "")
+            val title = obj.optString("title", "").trim()
+            val content = obj.optString("content", "")
+            val sourcePath = obj.optString("source_path", "")
+            if (kbId.isBlank()) return ToolExecutionResult("Error: Missing required 'kb_id' parameter", false, toolTitle)
+            if (title.isBlank()) return ToolExecutionResult("Error: Missing required 'title' parameter", false, toolTitle)
+            if (content.isBlank()) return ToolExecutionResult("Error: Missing required 'content' parameter", false, toolTitle)
+
+            val doc = kotlinx.coroutines.runBlocking {
+                repo.ingestText(kbId, title, content, sourcePath = sourcePath)
+            }
+            ToolExecutionResult(
+                "Ingested \"${doc.title}\" into kb $kbId: ${doc.chunkCount} chunk(s), checksum ${doc.checksum.take(8)}…",
+                true, toolTitle,
+            )
+        } catch (e: Exception) {
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+        }
+    }
+
+    private fun executeKbCreateTool(argsJson: String): ToolExecutionResult {
+        val repo = knowledgeBaseRepository
+            ?: return ToolExecutionResult("Error: Knowledge base not available", false)
+        val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title", "kb_create") }.getOrDefault("kb_create")
+        return try {
+            val obj = JSONObject(argsJson)
+            val name = obj.optString("name", "").trim()
+            val description = obj.optString("description", "").trim()
+            if (name.isBlank()) return ToolExecutionResult("Error: Missing required 'name' parameter", false, toolTitle)
+            val kb = kotlinx.coroutines.runBlocking { repo.createKnowledgeBase(name, description) }
+            ToolExecutionResult("Created knowledge base \"${kb.name}\" with id ${kb.id}", true, toolTitle)
+        } catch (e: Exception) {
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+        }
     }
 
     // ─── UI Helpers ──────────────────────────────────────────────────────

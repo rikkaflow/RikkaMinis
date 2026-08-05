@@ -59,6 +59,7 @@ internal object HeadlessChatRunner {
                 memoryRepository = app.memoryRepository,
                 skillRepository = app.skillRepository,
                 mcpRepository = app.mcpRepository,
+                knowledgeBaseRepository = app.knowledgeBaseRepository,
             ),
         )
         providers[sessionId] = provider
