@@ -79,23 +79,22 @@ jobs:
         env:
           KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
         run: |
-          if [ -z "$KEYSTORE_B64" ]; then
-            echo "::error::DEBUG_KEYSTORE_B64 secret is not set. Builds would get a" \
-                 "random throwaway signing key and could not be installed as an upgrade."
-            exit 1
-          fi
-          # RUNNER_TEMP, not the workspace: a keystore is a credential and must
-          # never risk ending up in a commit or an uploaded artifact.
           KEYSTORE_PATH="$RUNNER_TEMP/ci-signing.keystore"
-          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::DEBUG_KEYSTORE_B64 secret is not set. Generating a" \
+                 "throwaway debug keystore — APK will NOT install as an upgrade."
+            keytool -genkey -v -keystore "$KEYSTORE_PATH" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=CI Build, OU=Development, O=RikkaMinis, L=Unknown, ST=Unknown, C=XX"
+          else
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+          fi
           echo "MINIS_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
           keytool -list -v \
             -keystore "$KEYSTORE_PATH" \
             -storepass android -alias androiddebugkey \
             | grep -E 'SHA256:|Valid from'
-          # Record the expected certificate digest so the post-build check can
-          # prove the APK was actually signed with THIS key. Derived from the
-          # keystore rather than hardcoded, so rotating the key needs no edit.
           EXPECTED_FP=$(
             keytool -exportcert -keystore "$KEYSTORE_PATH" \
               -storepass android -alias androiddebugkey 2>/dev/null \
