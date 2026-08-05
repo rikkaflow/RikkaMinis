@@ -7647,7 +7647,7 @@ class ChatViewModel(
             if (kbs.isEmpty()) {
                 ToolExecutionResult(
                     "No knowledge bases exist yet. Create one with kb_create, then add documents with kb_ingest.",
-                    true, toolTitle,
+                    true, toolTitle = toolTitle,
                 )
             } else {
                 val sb = StringBuilder("Knowledge bases:\n")
@@ -7655,10 +7655,10 @@ class ChatViewModel(
                     sb.append("- id: ${kb.id}\n  name: ${kb.name}\n  description: ${kb.description}\n" +
                         "  documents: ${kb.documentCount}, chunks: ${kb.chunkCount}\n")
                 }
-                ToolExecutionResult(sb.toString(), true, toolTitle)
+                ToolExecutionResult(sb.toString(), true, toolTitle = toolTitle)
             }
         } catch (e: Exception) {
-            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 
@@ -7670,7 +7670,7 @@ class ChatViewModel(
             val obj = JSONObject(argsJson)
             val query = obj.optString("query", "").trim()
             if (query.isBlank()) {
-                return ToolExecutionResult("Error: Missing required 'query' parameter", false, toolTitle)
+                return ToolExecutionResult("Error: Missing required 'query' parameter", false, toolTitle = toolTitle)
             }
             val kbId = obj.optString("kb_id", "all")
             val topK = obj.optInt("top_k", 8).coerceIn(1, 20)
@@ -7685,7 +7685,7 @@ class ChatViewModel(
                     "No relevant chunks found for query \"$query\" in ${if (kbId == "all") "any knowledge base" else "kb $kbId"}. " +
                         "The information may not be ingested yet — consider kb_ingest of the relevant document, " +
                         "or rephrase with different keywords.",
-                    true, toolTitle,
+                    true, toolTitle = toolTitle,
                 )
             } else {
                 val sb = StringBuilder("Retrieved ${results.size} chunk(s) for \"$query\":\n\n")
@@ -7696,10 +7696,10 @@ class ChatViewModel(
                     sb.append(r.chunk.content.take(2000))
                     sb.append("\n\n")
                 }
-                ToolExecutionResult(sb.toString(), true, toolTitle)
+                ToolExecutionResult(sb.toString(), true, toolTitle = toolTitle)
             }
         } catch (e: Exception) {
-            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 
@@ -7713,19 +7713,19 @@ class ChatViewModel(
             val title = obj.optString("title", "").trim()
             val content = obj.optString("content", "")
             val sourcePath = obj.optString("source_path", "")
-            if (kbId.isBlank()) return ToolExecutionResult("Error: Missing required 'kb_id' parameter", false, toolTitle)
-            if (title.isBlank()) return ToolExecutionResult("Error: Missing required 'title' parameter", false, toolTitle)
-            if (content.isBlank()) return ToolExecutionResult("Error: Missing required 'content' parameter", false, toolTitle)
+            if (kbId.isBlank()) return ToolExecutionResult("Error: Missing required 'kb_id' parameter", false, toolTitle = toolTitle)
+            if (title.isBlank()) return ToolExecutionResult("Error: Missing required 'title' parameter", false, toolTitle = toolTitle)
+            if (content.isBlank()) return ToolExecutionResult("Error: Missing required 'content' parameter", false, toolTitle = toolTitle)
 
             val doc = kotlinx.coroutines.runBlocking {
                 repo.ingestText(kbId, title, content, sourcePath = sourcePath)
             }
             ToolExecutionResult(
                 "Ingested \"${doc.title}\" into kb $kbId: ${doc.chunkCount} chunk(s), checksum ${doc.checksum.take(8)}…",
-                true, toolTitle,
+                true, toolTitle = toolTitle,
             )
         } catch (e: Exception) {
-            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 
@@ -7737,11 +7737,11 @@ class ChatViewModel(
             val obj = JSONObject(argsJson)
             val name = obj.optString("name", "").trim()
             val description = obj.optString("description", "").trim()
-            if (name.isBlank()) return ToolExecutionResult("Error: Missing required 'name' parameter", false, toolTitle)
+            if (name.isBlank()) return ToolExecutionResult("Error: Missing required 'name' parameter", false, toolTitle = toolTitle)
             val kb = kotlinx.coroutines.runBlocking { repo.createKnowledgeBase(name, description) }
-            ToolExecutionResult("Created knowledge base \"${kb.name}\" with id ${kb.id}", true, toolTitle)
+            ToolExecutionResult("Created knowledge base \"${kb.name}\" with id ${kb.id}", true, toolTitle = toolTitle)
         } catch (e: Exception) {
-            ToolExecutionResult("Error: ${e.message}", false, toolTitle)
+            ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 

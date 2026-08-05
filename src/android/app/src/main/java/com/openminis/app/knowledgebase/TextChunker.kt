@@ -122,7 +122,7 @@ object TextChunker {
         for (c in text) {
             when {
                 c.code in 0x4E00..0x9FFF || c.code in 0x3000..0x303F || c.code in 0xFF00..0xFFEF -> cjkCount++
-                c.code in 0x20..0x7E || c.code == '\n' || c.code == '\t' -> asciiCount++
+                c.code in 0x20..0x7E || c == '\n' || c == '\t' -> asciiCount++
             }
         }
         return (cjkCount / 2) + (asciiCount / 4) + 1

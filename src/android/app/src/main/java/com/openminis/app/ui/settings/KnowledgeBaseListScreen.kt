@@ -115,17 +115,19 @@ fun KnowledgeBaseListScreen(
             title = { Text("New Knowledge Base") },
             text = {
                 Column {
+                    Text("Name", style = MaterialTheme.typography.labelMedium)
+                    Spacer(Modifier.size(6.dp))
                     DialogTextField(
                         value = newName,
                         onValueChange = { newName = it },
-                        label = "Name",
                         singleLine = true,
                     )
-                    Spacer(Modifier.size(8.dp))
+                    Spacer(Modifier.size(12.dp))
+                    Text("Description (optional)", style = MaterialTheme.typography.labelMedium)
+                    Spacer(Modifier.size(6.dp))
                     DialogTextField(
                         value = newDescription,
                         onValueChange = { newDescription = it },
-                        label = "Description (optional)",
                         singleLine = false,
                     )
                 }
