@@ -110,8 +110,11 @@ class MemoryFactsTest {
         )
         val hit = r.searchFacts(listOf("theme"))
         assertEquals(2, hit.size)
+        // OR semantics: "user" matches both user facts, "light" matches only
+        // one — so 2 results surface, with the fact matching BOTH tokens
+        // ("light theme") ranked above the one matching only "user".
         val hit2 = r.searchFacts(listOf("user", "light"))
-        assertEquals(1, hit2.size)
+        assertEquals(2, hit2.size)
         assertEquals("light theme", hit2[0].`object`)
         val miss = r.searchFacts(listOf("nonexistent"))
         assertTrue(miss.isEmpty())
@@ -188,6 +191,64 @@ class MemoryFactsTest {
         // Zero-regression contract: empty keywords = legacy recency order.
         assertEquals("new", top[0].subject)
         assertEquals("old", top[1].subject)
+    }
+
+    @Test
+    fun rankFactForQuery_partialHitBeatsNoHit() {
+        val f = fact("user", "prefers", "dark theme", 0.9, "2026-08-31T00:00:00")
+        // OR semantics: a fact matching ONE token ("dark") must surface even
+        // when the query has other non-matching tokens — the old AND logic
+        // returned 0 here and silently emptied injection.
+        val score = MemoryRepository.rankFactForQuery(f, listOf("dark", "kotlin"), 1.0)
+        assertTrue("partial hit must score > 0, got $score", score > 0.0)
+    }
+
+    @Test
+    fun rankFactForQuery_higherHitRatioRanksHigher() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("a", "p", "dark theme", 0.9, "2026-08-31T00:00:00"),
+                fact("b", "p", "dark kotlin", 0.9, "2026-08-31T00:00:00"),
+            )
+        )
+        // "dark" + "kotlin" — the fact matching BOTH must outrank the one
+        // matching only "dark".
+        val hit = r.searchFacts(listOf("dark", "kotlin"))
+        assertEquals(2, hit.size)
+        assertEquals("dark kotlin", hit[0].`object`)
+    }
+
+    @Test
+    fun searchFacts_filtersStopwords() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("user", "prefers", "dark theme", 0.9, "2026-08-31T00:00:00"),
+                fact("user", "prefers", "有立场 敢反驳", 0.9, "2026-08-31T00:00:00"),
+            )
+        )
+        // "的" is a stopword — it must not act as a keyword that matches both
+        // facts. A query of pure stopwords degrades to recency (both returned,
+        // newest first), but a mixed query must rank the real match first.
+        val hit = r.searchFacts(listOf("theme", "的"))
+        assertEquals(1, hit.size)
+        assertEquals("dark theme", hit[0].`object`)
+    }
+
+    @Test
+    fun searchFacts_pureStopwords_degradesToRecency() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("old", "fact", "one", 0.8, "2026-08-01T00:00:00"),
+                fact("new", "fact", "two", 0.8, "2026-08-31T00:00:00"),
+            )
+        )
+        // All tokens are stopwords → empty effective keyword set → recency.
+        val hit = r.searchFacts(listOf("的", "了", "the"))
+        assertEquals(2, hit.size)
+        assertEquals("new", hit[0].subject)
     }
 
     @Test

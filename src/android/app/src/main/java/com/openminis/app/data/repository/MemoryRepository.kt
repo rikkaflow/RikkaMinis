@@ -56,6 +56,33 @@ class MemoryRepository(private val memoryDir: File) {
         private const val MAX_FACTS_LOAD_LINES = 200
         // searchFacts result cap.
         private const val MAX_FACTS_SEARCH_RESULTS = 20
+        // [fix/facts-query-or-semantics] Function words that must not act as
+        // facts-query keywords. With OR semantics, a single common word like
+        // "的" or "the" matches nearly every fact and drowns out the real
+        // signal (a query like "Usage 页的费用显示有问题" would otherwise rank
+        // a fact containing just "有" at the top). Tokenized query tokens are
+        // filtered against this set before matching. English stopwords matter
+        // because mixed-language queries (e.g. "帮我查 Kotlin 编译错误")
+        // produce English tokens alongside Chinese ones via the segmenter.
+        private val FACTS_QUERY_STOPWORDS = setOf(
+            // English function words
+            "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on",
+            "for", "with", "at", "by", "from", "is", "are", "was", "were", "be",
+            "been", "it", "its", "this", "that", "these", "those", "i", "you",
+            "he", "she", "they", "we", "me", "my", "your", "his", "her", "their",
+            "do", "does", "did", "have", "has", "had", "can", "could", "will",
+            "would", "should", "what", "which", "who", "how", "why", "when",
+            "where", "not", "no", "yes", "please", "thanks",
+            // Chinese function words / fillers
+            "的", "了", "是", "我", "你", "他", "她", "它", "我们", "你们", "他们",
+            "帮", "帮我", "帮忙", "一下", "这个", "那个", "这些", "那些", "这", "那",
+            "就", "都", "也", "还", "又", "和", "与", "及", "或", "被", "让", "给",
+            "对", "从", "向", "为", "因为", "所以", "但", "但是", "然后", "接着",
+            "怎么", "怎么样", "怎样", "什么", "为什么", "哪个", "哪些", "哪里",
+            "有", "没", "没有", "不", "不是", "能", "可以", "要", "想", "会",
+            "把", "到", "在", "呢", "吗", "吧", "啊", "呀", "哦", "嗯", "的",
+            "查", "看看", "看", "说说", "说", "讲", "问", "请问", "知道", "告诉",
+        )
         // Soft ceiling that triggers a best-effort line-dropping compaction
         // (oldest lines first) instead of failing the append.
         private const val MAX_FACTS_FILE_LINES = 2000
@@ -126,13 +153,17 @@ class MemoryRepository(private val memoryDir: File) {
          * [feat/facts-query-relevance] Query-relevance score for a fact
          * against lowercase query [tokens].
          *
-         * No tokens → recency only (legacy order). With tokens:
-         *   score = keywordMatch × (1 + confidence) × recency
-         * so a relevant fact beats an irrelevant-but-recent one, but a
-         * relevant OLD fact still trails a relevant RECENT fact (recency is
-         * the tiebreaker, not the gate). Irrelevant facts (no token hit)
-         * score 0 and are dropped by [searchFacts] — they no longer occupy
-         * injection slots.
+         * No tokens → recency only (legacy order). With tokens, ANY hit is
+         * enough to keep the fact in the running (OR semantics) — requiring
+         * every token to match (AND) made multi-token query sentences (which
+         * is what a real typed message becomes after segmentation) yield zero
+         * hits every time, silently emptying the facts injection. The score is
+         *   score = (1 + confidence) × recency × hitRatio
+         * where hitRatio = matchedTokens / totalTokens. A fact matching more of
+         * the query ranks above one matching a single common word; relevant
+         * facts beat irrelevant-but-recent ones; among relevant facts, recency
+         * is the tiebreaker (not a gate). Irrelevant facts (zero token hits)
+         * score 0 and are dropped by [searchFacts].
          *
          * Pure function of (fact, tokens, recency) — JVM-testable in
          * isolation.
@@ -143,9 +174,11 @@ class MemoryRepository(private val memoryDir: File) {
             recency: Double,
         ): Double {
             if (tokens.isEmpty()) return recency
-            if (!fact.matchesKeywords(tokens)) return 0.0
+            val hits = fact.keywordHitCount(tokens)
+            if (hits == 0) return 0.0
             val conf = fact.confidence.takeIf { it in 0.0..1.0 } ?: 0.8
-            return (1.0 + conf) * recency
+            val hitRatio = hits.toDouble() / tokens.size.toDouble()
+            return (1.0 + conf) * recency * hitRatio
         }
     }
 
@@ -599,21 +632,28 @@ class MemoryRepository(private val memoryDir: File) {
     }
 
     /**
-     * Keyword search over facts. All keywords must match (case-insensitive,
-     * any of subject/predicate/object). Results are ranked by recency-decay
-     * weight of their created_at date (reusing [memoryRecencyWeight] /
-     * [dailyLogAgeDays]) — newest facts surface first. Facts whose date is
-     * empty/unparseable get weight 1.0 (no penalty).
+     * Keyword search over facts. Any keyword match (case-insensitive, any of
+     * subject/predicate/object) keeps a fact in the running — OR semantics, so
+     * a multi-token query sentence still surfaces facts matching only part of
+     * it. Chinese/English stopwords are filtered before matching, otherwise
+     * ubiquitous function words (的/了/我/是/the/a/…) would make every fact a
+     * false hit and drown out the real signal. Results are ranked by
+     * [rankFactForQuery] (keyword hit ratio × confidence × recency-decay of
+     * created_at); newest facts surface first among equally-relevant ones.
+     * Facts whose date is empty/unparseable get weight 1.0 (no penalty).
      */
     fun searchFacts(keywords: List<String>, limit: Int = 20): List<com.openminis.app.data.model.MemoryFact> {
         if (limit <= 0) return emptyList()
-        val kw = keywords.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        val kw = keywords
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .filterNot { it in FACTS_QUERY_STOPWORDS }
         val nowMs = System.currentTimeMillis()
         val all = loadFacts(MAX_FACTS_LOAD_LINES)
         // [feat/facts-query-relevance] Query-relevant ranking: when keywords
-        // are present, score by keyword hit × confidence × recency so facts
-        // relevant to the current user message surface first; no keywords →
-        // pure recency (unchanged legacy behavior, zero regression risk).
+        // are present, score by keyword hit ratio × confidence × recency so
+        // facts relevant to the current user message surface first; no
+        // keywords → pure recency (unchanged legacy behavior, zero regression).
         val ranked = all.asSequence()
             .mapNotNull { fact ->
                 val recency = memoryRecencyWeight(

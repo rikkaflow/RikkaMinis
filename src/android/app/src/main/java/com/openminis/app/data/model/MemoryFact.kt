@@ -37,16 +37,17 @@ data class MemoryFact(
 
     /** Concatenated lowercase searchable text: subject + predicate + object.
      *  Keyword matching in [MemoryRepository.searchFacts] runs against this
-     *  single field (a fact matches when every query token appears anywhere
-     *  across the triple). */
+     *  single field (a fact is relevant when any query token appears anywhere
+     *  across the triple — OR semantics, see [keywordHitCount]). */
     fun searchableText(): String =
         "$subject $predicate $`object`".lowercase()
 
-    /** True when every [tokens] (already lowercase) appears in the triple.
-     *  Pure and side-effect free so the query-relevance scoring is JVM-testable. */
-    fun matchesKeywords(tokens: List<String>): Boolean {
-        if (tokens.isEmpty()) return true
+    /** Number of [tokens] (already lowercase) that appear anywhere in the
+     *  triple. Pure and side-effect free so the query-relevance scoring is
+     *  JVM-testable. */
+    fun keywordHitCount(tokens: List<String>): Int {
+        if (tokens.isEmpty()) return 0
         val hay = searchableText()
-        return tokens.all { hay.contains(it) }
+        return tokens.count { hay.contains(it) }
     }
 }
