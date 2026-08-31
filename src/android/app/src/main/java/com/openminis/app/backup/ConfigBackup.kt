@@ -1357,8 +1357,9 @@ object ConfigBackup {
     /** [T-backup-streaming-export] Streaming variant of [writeSnapshot]:
      *  hands the caller a Writer over a fresh snapshot file, so a heavy
      *  document (~65M chars of chat) never materializes as one String in
-     *  the heap. Same naming / pruning contract as the String overload. */
-    fun writeSnapshotStreaming(
+     *  the heap. Same naming / pruning contract as the String overload.
+     *  Suspend because the caller streams [exportToWriter] through it. */
+    suspend fun writeSnapshotStreaming(
         dir: java.io.File,
         write: suspend (java.io.Writer) -> Unit,
     ): java.io.File {
