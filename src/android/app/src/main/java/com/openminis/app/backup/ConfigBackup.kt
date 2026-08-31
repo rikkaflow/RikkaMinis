@@ -204,6 +204,32 @@ object ConfigBackup {
         includeHiddenModels: Boolean,
         memoryFileNames: Set<String>?,
     ): ExportSections {
+        val registry = ConfigRegistry.get()
+
+        val fields = JSONObject()
+        var readFailures = 0
+        for (path in registry.allVisibleFieldPaths()) {
+            val field = registry.resolveField(path) ?: continue
+            if (field.scope !in BACKED_UP_SCOPES) continue
+            // READONLY fields would fail on the way back in, so there is no
+            // point carrying them. Feature-unavailable fields likewise refuse
+            // reads on this device.
+            if (field.access != ConfigAccess.READWRITE) continue
+            if (field.unavailableReason != null) continue
+            try {
+                val value = field.read().let { if (includeSecrets) it else it.redactingSecrets() }
+                // Store each value as its JSON *string* form and decode with
+                // ConfigValue.decode() on the way back in. ConfigValue's
+                // Any-tree conversion is private, and going through the
+                // documented jsonString()/decode() pair keeps the round-trip
+                // symmetric without reaching into its internals.
+                fields.put(path, value.jsonString())
+            } catch (t: Throwable) {
+                // A single unreadable field must not sink the whole backup.
+                readFailures++
+                Log.w(TAG, "export: skipped unreadable field $path: ${t.message}")
+            }
+        }
 
         val providers = JSONArray()
         for (instance in providerRepo.instances) {
@@ -1334,7 +1360,7 @@ object ConfigBackup {
      *  the heap. Same naming / pruning contract as the String overload. */
     fun writeSnapshotStreaming(
         dir: java.io.File,
-        write: (java.io.Writer) -> Unit,
+        write: suspend (java.io.Writer) -> Unit,
     ): java.io.File {
         dir.mkdirs()
         val file = java.io.File(dir, snapshotFileName())
