@@ -3,6 +3,9 @@ package com.openminis.app.tools
 import com.openminis.app.data.repository.MemoryRepository
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Tool definitions and execution for memory_write and memory_get.
@@ -141,6 +144,12 @@ object MemoryTools {
         val raw = obj.opt("facts")
         if (raw !is JSONArray) return emptyList()
         val out = mutableListOf<com.openminis.app.data.model.MemoryFact>()
+        // [fix] 之前 source/createdAt 写死为空 → fact 永远拿不到时间衰减权重
+        // （recency decay 依赖 created_at）。现在落盘当天日期（source 文件名）
+        // 与 ISO 时间戳，让衰减排序与同日去重真正生效。
+        val now = Date()
+        val source = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(now) + ".md"
+        val createdAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(now)
         for (i in 0 until raw.length()) {
             val el = raw.optJSONObject(i) ?: continue
             val subject = el.optString("subject", "").trim()
@@ -155,9 +164,9 @@ object MemoryTools {
                     predicate = predicate,
                     `object` = `object`,
                     confidence = confidence,
-                    source = "",
+                    source = source,
                     deviceId = "unknown",
-                    createdAt = "",
+                    createdAt = createdAt,
                 )
             )
         }

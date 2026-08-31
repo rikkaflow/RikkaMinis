@@ -503,8 +503,6 @@
     <string name="usage_detail_session_avg">会话均值</string>
     <string name="usage_detail_sessions">会话</string>
     <string name="usage_detail_active_days">活跃天数</string>
-    <string name="usage_label_est_cost">预估费用</string>
-    <string name="usage_detail_est_cost">预估费用</string>
     <string name="mirror_back">返回</string>
     <string name="mirror_current_section">当前</string>
     <string name="mirror_use_mirror_toggle">使用镜像</string>

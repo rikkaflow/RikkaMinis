@@ -1390,8 +1390,6 @@
     <string name="usage_detail_session_avg">會話均值</string>
     <string name="usage_detail_sessions">會話</string>
     <string name="usage_detail_active_days">活躍天數</string>
-    <string name="usage_label_est_cost">預估費用</string>
-    <string name="usage_detail_est_cost">預估費用</string>
     <string name="mirror_back">返回</string>
     <string name="mirror_current_section">當前</string>
     <string name="mirror_use_mirror_toggle">使用映象</string>

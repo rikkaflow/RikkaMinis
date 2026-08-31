@@ -1,6 +1,5 @@
 package com.openminis.app.data.usage
 
-import com.openminis.app.provider.CostCalculator
 import org.json.JSONObject
 
 
@@ -26,12 +25,6 @@ data class AggregatedModelStats(
     val cacheReadTokens: Long,
     val distinctDays: Set<String>,
     val distinctSessions: Set<String>,
-    // [T-cost-aggregate] Sum of estimated USD cost across rows. Rows carry
-    // "estimatedCostUsd" in their token_usage JSON (written at persist time);
-    // legacy rows without the key are back-computed from the CURRENT catalog
-    // price. Null = no row had a computable cost (unknown model) — display as
-    // "unknown", never $0.00.
-    val estimatedCostUsd: Double? = null,
 ) {
     val totalInput: Long get() = inputTokens + cacheReadTokens + cacheCreationTokens
 }
@@ -66,8 +59,6 @@ object UsageAggregator {
             var output = 0L
             var cacheCr = 0L
             var cacheRd = 0L
-            var costSum = 0.0
-            var costKnown = false
             val days = LinkedHashSet<String>()
             val sessions = LinkedHashSet<String>()
             for (row in modelRows) {
@@ -80,29 +71,6 @@ object UsageAggregator {
                 cacheRd += usage.optLong("cacheReadTokens", usage.optLong("cacheReadInputTokens", 0))
                 days.add(dayFormat(row.createdAtMs))
                 sessions.add(row.sessionId)
-                // [T-cost-aggregate] Prefer the persist-time estimate (price
-                // as of when the call happened); back-compute legacy rows.
-                val persistedCost = if (usage.has("estimatedCostUsd")) {
-                    usage.optDouble("estimatedCostUsd", Double.NaN).takeUnless { it.isNaN() }
-                } else null
-                if (persistedCost != null) {
-                    costSum += persistedCost
-                    costKnown = true
-                } else {
-                    val backComputed = CostCalculator.estimateCostUsd(
-                        modelId,
-                        com.openminis.app.data.model.LLMUsage(
-                            inputTokens = usage.optLong("inputTokens", 0).toInt(),
-                            outputTokens = usage.optLong("outputTokens", 0).toInt(),
-                            cacheCreationInputTokens = usage.optLong("cacheCreationTokens", usage.optLong("cacheCreationInputTokens", 0)).let { if (it == 0L) null else it.toInt() },
-                            cacheReadInputTokens = usage.optLong("cacheReadTokens", usage.optLong("cacheReadInputTokens", 0)).let { if (it == 0L) null else it.toInt() },
-                        ),
-                    )
-                    if (backComputed != null) {
-                        costSum += backComputed
-                        costKnown = true
-                    }
-                }
             }
             result[modelId] = AggregatedModelStats(
                 modelId = modelId,
@@ -112,7 +80,6 @@ object UsageAggregator {
                 cacheReadTokens = cacheRd,
                 distinctDays = days,
                 distinctSessions = sessions,
-                estimatedCostUsd = if (costKnown) costSum else null,
             )
         }
         return result

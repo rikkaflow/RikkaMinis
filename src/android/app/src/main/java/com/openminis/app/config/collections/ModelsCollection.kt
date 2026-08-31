@@ -46,8 +46,6 @@ class ModelsCollection(
             isCustom(forId),
             displayNameField(forId),
             maxOutputTokensField(forId),
-            inputPriceField(forId),
-            outputPriceField(forId),
             isHiddenField(forId),
             modalitiesField(forId),
             modalitiesOverrideField(forId),
@@ -208,53 +206,6 @@ class ModelsCollection(
                 val i = (v as? ConfigValue.Int)?.value ?: throw ConfigError.TypeMismatch("int")
                 mutate(id) { e ->
                     e.copy(overrides = e.overrides.copy(maxOutputTokens = if (i == 0) null else i))
-                }
-            },
-        )
-
-    /**
-     * [T-cost-override] User-supplied input price (USD per 1M tokens). For
-     * proxy/relay models (e.g. DeepSeek relay stations) the real price isn't
-     * in the public catalog — this is the only correct source. 0 clears the
-     * override and falls back to the built-in catalog.
-     */
-    private fun inputPriceField(id: String): ConfigField =
-        ClosureField(
-            path = "models.$id.inputPricePerMillion",
-            displayName = "Input price (USD / 1M tokens)",
-            description = "Override for proxy/custom models. 0 = use built-in catalog estimate.",
-            valueSchema = ConfigSchema.Double(min = 0.0, max = 1000.0),
-            risk = ConfigRisk.NORMAL,
-            revertable = true,
-            reader = {
-                val e = entry(id) ?: return@ClosureField ConfigValue.Null
-                ConfigValue.Double(e.overrides.inputPricePerMillion ?: 0.0)
-            },
-            writer = { v ->
-                val d = (v as? ConfigValue.Double)?.value ?: throw ConfigError.TypeMismatch("double")
-                mutate(id) { e ->
-                    e.copy(overrides = e.overrides.copy(inputPricePerMillion = if (d <= 0.0) null else d))
-                }
-            },
-        )
-
-    /** [T-cost-override] User-supplied output price (USD per 1M tokens). */
-    private fun outputPriceField(id: String): ConfigField =
-        ClosureField(
-            path = "models.$id.outputPricePerMillion",
-            displayName = "Output price (USD / 1M tokens)",
-            description = "Override for proxy/custom models. 0 = use built-in catalog estimate.",
-            valueSchema = ConfigSchema.Double(min = 0.0, max = 1000.0),
-            risk = ConfigRisk.NORMAL,
-            revertable = true,
-            reader = {
-                val e = entry(id) ?: return@ClosureField ConfigValue.Null
-                ConfigValue.Double(e.overrides.outputPricePerMillion ?: 0.0)
-            },
-            writer = { v ->
-                val d = (v as? ConfigValue.Double)?.value ?: throw ConfigError.TypeMismatch("double")
-                mutate(id) { e ->
-                    e.copy(overrides = e.overrides.copy(outputPricePerMillion = if (d <= 0.0) null else d))
                 }
             },
         )

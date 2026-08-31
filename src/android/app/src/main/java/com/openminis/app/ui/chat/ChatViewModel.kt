@@ -54,7 +54,6 @@ import com.openminis.app.R
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.data.repository.ProviderRepository
-import com.openminis.app.provider.CostCalculator
 import com.openminis.app.provider.ImageBudget
 import com.openminis.app.provider.LLMProvider
 import com.openminis.app.provider.ProviderFactory
@@ -1440,16 +1439,6 @@ class ChatViewModel(
             val model = currentModel ?: return ThinkingLevel.XHIGH
             return model.catalogMaxThinkingLevel
         }
-
-    /**
-     * [T-cost-override] Resolve the active [ModelEntry] for the current turn
-     * (via [activeEntryId] → provider config). Null when the model binding is
-     * group-resolved without a concrete entry, or the config hasn't loaded.
-     */
-    private fun activeModelEntry(): com.openminis.app.data.model.ModelEntry? {
-        val id = _activeEntryId.value ?: return null
-        return providerRepository.config.value.modelEntries.find { it.id == id }
-    }
 
     /**
      * [T-android-thinking-level-arch] Levels the chat composer picker should
@@ -7542,24 +7531,6 @@ class ChatViewModel(
                     }
                     is LLMStreamChunk.Usage -> {
                         lastUsage = chunk.usage
-                        // [T-cost-budget] Advisory cost accounting: consume the
-                        // estimated USD for this turn against the run budget.
-                        // maxEstimatedCostUsd is null in the observe phase →
-                        // Allowed, no-op bookkeeping (same pattern as tokens).
-                        runCatching {
-                            val entry = activeModelEntry()
-                            val turnCost = CostCalculator.estimateCostUsd(
-                                currentProvider?.model?.id.orEmpty(),
-                                chunk.usage,
-                                inputPricePerMillion = entry?.overrides?.inputPricePerMillion,
-                                outputPricePerMillion = entry?.overrides?.outputPricePerMillion,
-                            )
-                            if (turnCost != null) {
-                                t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD) {
-                                    it.consumeEstimatedCostUsd(turnCost)
-                                }
-                            }
-                        }
                         // Update context token count for next turn's dynamicMaxTokens()
                         // and publish to _lastTurnContextTokens so the ContextPolicy
                         // gate in [checkContextBeforeSend] can see the latest pressure
@@ -9363,8 +9334,7 @@ class ChatViewModel(
                             BudgetExhaustedReason.SHELL_COMMAND_LIMIT,
                             BudgetExhaustedReason.COMPACTION_CALL_LIMIT,
                             BudgetExhaustedReason.CONCURRENT_TOOLS_LIMIT,
-                            BudgetExhaustedReason.TOKEN_BUDGET_EXCEEDED,
-                            BudgetExhaustedReason.COST_BUDGET_EXCEEDED -> AgentTraceRecorder.REFUSE_BUDGET_EXHAUSTED
+                            BudgetExhaustedReason.TOKEN_BUDGET_EXCEEDED -> AgentTraceRecorder.REFUSE_BUDGET_EXHAUSTED
                             BudgetExhaustedReason.DEADLINE_EXPIRED -> AgentTraceRecorder.REFUSE_DEADLINE_REACHED
                         },
                     )
@@ -9381,10 +9351,6 @@ class ChatViewModel(
         AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> T7_OBSERVE_MAX_SHELL_COMMANDS - snap.shellCommandsUsed
         AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> T7_OBSERVE_MAX_COMPACTION_CALLS - snap.compactionCallsUsed
         AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> T7_OBSERVE_MAX_CONCURRENT_TOOLS - snap.concurrentToolsActive
-        // [T-cost-budget] int-trace API: report remaining in micro-USD (1e-6),
-        // null (disabled) → 0 — trace granularity, not a billing figure.
-        AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD ->
-            snap.estimatedCostUsdUsed?.let { (it * 1_000_000).toInt() } ?: 0
         else -> 0
     }
 
@@ -9395,8 +9361,6 @@ class ChatViewModel(
         AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> budget.maxShellCommands
         AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> budget.maxCompactionCalls
         AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> budget.maxConcurrentTools
-        AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD ->
-            budget.maxEstimatedCostUsd?.let { (it * 1_000_000).toInt() } ?: 0
         else -> 0
     }
 
@@ -10310,21 +10274,8 @@ class ChatViewModel(
         if (parts.isEmpty()) return null
         val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
         val tokenJson = usage?.let { u ->
-            // [T-cost-persist] Cost computed at persist time with the CURRENT
-            // price (user override first, else catalog) — one extra JSON key
-            // inside the existing token_usage column (no schema change; legacy
-            // readers ignore it, the aggregator back-computes rows that
-            // predate the key).
-            val entry = activeModelEntry()
-            val cost = CostCalculator.estimateCostUsd(
-                modelId ?: "",
-                u,
-                inputPricePerMillion = entry?.overrides?.inputPricePerMillion,
-                outputPricePerMillion = entry?.overrides?.outputPricePerMillion,
-            )
-            val sb = StringBuilder("""{"inputTokens":${u.inputTokens},"outputTokens":${u.outputTokens},"cacheCreationTokens":${u.cacheCreationInputTokens ?: 0},"cacheReadTokens":${u.cacheReadInputTokens ?: 0},"latestContextTokens":${u.latestContextTokens}""")
-            if (cost != null) sb.append(""","estimatedCostUsd":$cost""")
-            sb.append("}").toString()
+            StringBuilder("""{"inputTokens":${u.inputTokens},"outputTokens":${u.outputTokens},"cacheCreationTokens":${u.cacheCreationInputTokens ?: 0},"cacheReadTokens":${u.cacheReadInputTokens ?: 0},"latestContextTokens":${u.latestContextTokens}""")
+                .append("}").toString()
         }
         val entity = chatRepository.appendMessage(
             realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,

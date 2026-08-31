@@ -412,8 +412,6 @@
     <string name="usage_detail_session_avg">세션 평균</string>
     <string name="usage_detail_sessions">세션</string>
     <string name="usage_detail_active_days">활동 일수</string>
-    <string name="usage_label_est_cost">예상 비용</string>
-    <string name="usage_detail_est_cost">예상 비용</string>
     <string name="mirror_back">뒤로</string>
     <string name="mirror_current_section">현재</string>
     <string name="mirror_use_mirror_toggle">미러 사용</string>

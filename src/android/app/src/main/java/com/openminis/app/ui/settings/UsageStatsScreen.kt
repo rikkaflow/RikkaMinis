@@ -49,8 +49,6 @@ private data class ModelStats(
     var outputTokens: Long = 0,
     var cacheCreationTokens: Long = 0,
     var cacheReadTokens: Long = 0,
-    // [T-cost-ui] Estimated USD cost (null = unknown model, no catalog price).
-    val estimatedCostUsd: Double? = null,
     val distinctDays: MutableSet<String> = mutableSetOf(),
     val distinctSessions: MutableSet<String> = mutableSetOf(),
 ) {
@@ -67,10 +65,6 @@ private data class GrandTotal(
     val outputTokens: Long = 0,
     val cacheReadTokens: Long = 0,
     val cacheCreationTokens: Long = 0,
-    // [T-cost-ui] Sum across models whose cost is known; null when NO model
-    // had a computable cost. Partial knowledge (some models known) still
-    // shows the known sum — the estimate line says "est." anyway.
-    val estimatedCostUsd: Double? = null,
 ) {
     val cacheHitRate: Double?
         get() = if (totalInput <= 0 || cacheReadTokens <= 0) null
@@ -140,7 +134,6 @@ fun UsageStatsScreen(
                 outputTokens = stats.outputTokens,
                 cacheCreationTokens = stats.cacheCreationTokens,
                 cacheReadTokens = stats.cacheReadTokens,
-                estimatedCostUsd = stats.estimatedCostUsd,
                 distinctDays = stats.distinctDays.toMutableSet(),
                 distinctSessions = stats.distinctSessions.toMutableSet(),
             )
@@ -156,14 +149,11 @@ fun UsageStatsScreen(
         }
 
         val allStats = statsMap.values
-        // [T-cost-ui] Sum known costs; null only when every model is unknown.
-        val knownCosts = allStats.mapNotNull { it.estimatedCostUsd }
         grandTotal = GrandTotal(
             totalInput = allStats.sumOf { it.totalInput },
             outputTokens = allStats.sumOf { it.outputTokens },
             cacheReadTokens = allStats.sumOf { it.cacheReadTokens },
             cacheCreationTokens = allStats.sumOf { it.cacheCreationTokens },
-            estimatedCostUsd = knownCosts.takeIf { it.isNotEmpty() }?.sum(),
         )
 
         providerGroups = sortedGroups
@@ -215,11 +205,6 @@ fun UsageStatsScreen(
                 if (grandTotal.cacheReadTokens > 0) stringResource(R.string.usage_label_cache_read) to formatCount(grandTotal.cacheReadTokens) else null,
                 if (grandTotal.cacheCreationTokens > 0) stringResource(R.string.usage_label_cache_creation) to formatCount(grandTotal.cacheCreationTokens) else null,
                 grandTotal.cacheHitRate?.let { rate -> stringResource(R.string.usage_label_cache_hit_rate) to String.format("%.1f%%", rate) },
-                // [T-cost-ui] Estimated spend — shown only when at least one
-                // model's price is known (unknown ≠ free).
-                grandTotal.estimatedCostUsd?.let { cost ->
-                    stringResource(R.string.usage_label_est_cost) to formatCostUsd(cost)
-                },
             )
             stats.forEachIndexed { idx, (label, value) ->
                 SettingsValueRow(
@@ -298,10 +283,6 @@ private fun ExpandableModelRow(model: ModelStats, showDivider: Boolean) {
                 if (sessions > 0) {
                     DetailRow(stringResource(R.string.usage_detail_session_avg), formatCount((model.inputTokens + model.outputTokens) / sessions))
                 }
-                // [T-cost-ui] Per-model estimated cost (null = unknown price).
-                model.estimatedCostUsd?.let { cost ->
-                    DetailRow(stringResource(R.string.usage_detail_est_cost), formatCostUsd(cost))
-                }
                 DetailRow(stringResource(R.string.usage_detail_sessions), sessions.toString())
                 DetailRow(stringResource(R.string.usage_detail_active_days), days.toString())
             }
@@ -341,16 +322,4 @@ private fun formatCount(n: Long): String = when {
         else String.format("%.1fk", k)
     }
     else -> n.toString()
-}
-
-/**
- * [T-cost-ui] Human-friendly USD estimate: >= $1 → "$12.34"; >= $0.01 →
- * "$0.042" (3 decimals — per-call costs are sub-cent); smaller → 4 decimals
- * or scientific floor "$0.0000". Always prefixed with ~ to mark ESTIMATE.
- */
-private fun formatCostUsd(cost: Double): String = when {
-    cost >= 1.0 -> String.format("~$%.2f", cost)
-    cost >= 0.01 -> String.format("~$%.3f", cost)
-    cost > 0.0 -> String.format("~$%.4f", cost)
-    else -> "~$0.0000"
 }

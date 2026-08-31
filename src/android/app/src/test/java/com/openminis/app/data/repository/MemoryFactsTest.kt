@@ -222,6 +222,11 @@ class MemoryFactsTest {
         assertEquals(1, r.loadFacts().size)
         assertEquals("user", r.loadFacts()[0].subject)
         assertEquals(0.9, r.loadFacts()[0].confidence, 1e-9)
+        // [fix] source/created_at must be populated (non-empty) so the fact
+        // earns a recency-decay weight and participates in same-day dedup.
+        assertTrue("source must be a dated .md file", r.loadFacts()[0].source.endsWith(".md"))
+        assertTrue("created_at must be a non-empty timestamp", r.loadFacts()[0].createdAt.isNotEmpty())
+        assertEquals(r.loadFacts()[0].createdAt.substring(0, 10), r.loadFacts()[0].source.removeSuffix(".md"))
     }
 
     @Test

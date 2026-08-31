@@ -412,8 +412,6 @@
     <string name="usage_detail_session_avg">セッション平均</string>
     <string name="usage_detail_sessions">セッション</string>
     <string name="usage_detail_active_days">アクティブ日数</string>
-    <string name="usage_label_est_cost">推定コスト</string>
-    <string name="usage_detail_est_cost">推定コスト</string>
     <string name="mirror_back">戻る</string>
     <string name="mirror_current_section">現在</string>
     <string name="mirror_use_mirror_toggle">ミラーを使用</string>

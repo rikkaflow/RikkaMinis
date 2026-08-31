@@ -89,9 +89,6 @@ class AgentTraceRecorder(
         const val DIMENSION_COMPACTION_CALLS = "compaction_calls"
         const val DIMENSION_CONCURRENT_TOOLS = "concurrent_tools"
         const val DIMENSION_ESTIMATED_TOKENS = "estimated_tokens"
-        // [T-cost-budget] spend dimension (USD); consumed values are
-        // double-formatted by the caller (budgetConsume takes Double).
-        const val DIMENSION_ESTIMATED_COST_USD = "estimated_cost_usd"
 
         // budget refuse reason 枚举
         const val REFUSE_BUDGET_EXHAUSTED = "budget_exhausted"

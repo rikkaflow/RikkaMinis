@@ -264,12 +264,6 @@ data class ModelOverrides(
     // of older JSON (unlike adding an enum case) — old configs simply lack the
     // key and it defaults to null.
     val maxThinkingLevel: ThinkingLevel? = null,
-    // [T-cost-override] User-supplied price overrides (USD per 1M tokens) for
-    // proxy/custom models whose real price isn't in the public catalog (e.g.
-    // DeepSeek relay stations). Non-null wins over ModelPriceCatalog in
-    // CostCalculator. Optional field → older configs deserialize fine (null).
-    val inputPricePerMillion: Double? = null,
-    val outputPricePerMillion: Double? = null,
 ) {
     val isEmpty: Boolean
         get() = displayName == null
@@ -279,8 +273,6 @@ data class ModelOverrides(
             && inputModalities == null
             && outputModalities == null
             && maxThinkingLevel == null
-            && inputPricePerMillion == null
-            && outputPricePerMillion == null
 }
 
 @Serializable

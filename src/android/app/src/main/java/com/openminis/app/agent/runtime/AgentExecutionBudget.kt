@@ -32,11 +32,6 @@ class AgentExecutionBudget(
     val maxCompactionCalls: Int,
     val maxConcurrentTools: Int,
     val maxEstimatedTokens: Long?,
-    // [T-cost-budget] Optional spend cap in USD (LiteLLM spend-limit idea).
-    // null = cost budget disabled / prices unknown — same "don't fabricate"
-    // rule as maxEstimatedTokens: when null, consumeEstimatedCostUsd returns
-    // Allowed and the snapshot stays null.
-    val maxEstimatedCostUsd: Double? = null,
     private val monotonicClock: () -> Long = DEFAULT_MONOTONIC_CLOCK,
 ) {
 
@@ -53,9 +48,6 @@ class AgentExecutionBudget(
         require(maxEstimatedTokens == null || maxEstimatedTokens >= 0) {
             "maxEstimatedTokens must be null or >= 0, was $maxEstimatedTokens"
         }
-        require(maxEstimatedCostUsd == null || maxEstimatedCostUsd >= 0.0) {
-            "maxEstimatedCostUsd must be null or >= 0, was $maxEstimatedCostUsd"
-        }
     }
 
     private val lock = Any()
@@ -69,8 +61,6 @@ class AgentExecutionBudget(
     private var estimatedTokensUsed: Long? = if (maxEstimatedTokens != null) 0L else null
     // null = token 预算未启用 / 未知；非 null 时初始为 0L
     private var reservedChildTokens = 0L // 已预留给 child 但尚未消耗
-    // [T-cost-budget] 已花费的估算美元；null = 成本预算未启用。
-    private var estimatedCostUsdUsed: Double? = if (maxEstimatedCostUsd != null) 0.0 else null
 
     // ─── 计数消耗（不可回退） ───────────────────────────────────────────────
 
@@ -134,34 +124,6 @@ class AgentExecutionBudget(
                 return BudgetDecision.Denied(BudgetExhaustedReason.TOKEN_BUDGET_EXCEEDED)
             }
             estimatedTokensUsed = used + tokens
-            BudgetDecision.Allowed
-        }
-    }
-
-    /**
-     * [T-cost-budget] 消耗估算的美元成本（来自 CostCalculator × 已知 token 用量）。
-     * 语义与 [consumeEstimatedTokens] 完全对称：
-     *  - [maxEstimatedCostUsd] == null → Allowed 不记账（价格未知不得伪造拦截）。
-     *  - cost 为 NaN/负数 → IllegalArgumentException（调用方 bug，静默吞掉等于
-     *    预算失控）；+0.0 合法（免费模型/空用量）。
-     *  - 拒绝不改变任何状态（Denied 无副作用不变量）。
-     *
-     * 浮点边界：用 1e-9 的 epsilon 判"恰好到顶"——0.4+0.4+0.2 在 IEEE754 下
-     * 是 1.0000000000000002 量级的误差源，二进制浮点没有精确的 0.2，严格的
-     * `cost > cap - used` 会把"数学上恰好用完"误判为超限。1e-9 USD = 十亿分
-     * 之一美元，远低于任何真实计费粒度。
-     */
-    fun consumeEstimatedCostUsd(cost: Double): BudgetDecision {
-        require(!cost.isNaN() && cost >= 0.0) { "cost consumption must be a non-negative number, was $cost" }
-        return synchronized(lock) {
-            if (isExpiredLocked()) return BudgetDecision.Denied(BudgetExhaustedReason.DEADLINE_EXPIRED)
-            val cap = maxEstimatedCostUsd ?: return BudgetDecision.Allowed
-            val used = estimatedCostUsdUsed ?: 0.0
-            val remaining = cap - used
-            if (used >= cap || cost > remaining + COST_EPSILON_USD) {
-                return BudgetDecision.Denied(BudgetExhaustedReason.COST_BUDGET_EXCEEDED)
-            }
-            estimatedCostUsdUsed = used + cost
             BudgetDecision.Allowed
         }
     }
@@ -250,7 +212,6 @@ class AgentExecutionBudget(
             compactionCallsUsed = compactionCallsUsed,
             concurrentToolsActive = concurrentToolsActive,
             estimatedTokensUsed = estimatedTokensUsed,
-            estimatedCostUsdUsed = estimatedCostUsdUsed,
             reservedChildTokens = reservedChildTokens,
             isExpired = isExpiredLocked(),
         )
@@ -268,9 +229,6 @@ class AgentExecutionBudget(
             concurrentToolSlotsRemaining = maxOf(0, maxConcurrentTools - concurrentToolsActive),
             estimatedTokensRemaining = maxEstimatedTokens?.let { cap ->
                 maxOf(0L, cap - (estimatedTokensUsed ?: 0L) - reservedChildTokens)
-            },
-            estimatedCostUsdRemaining = maxEstimatedCostUsd?.let { cap ->
-                maxOf(0.0, cap - (estimatedCostUsdUsed ?: 0.0))
             },
             millisRemaining = if (now >= deadlineMonotonicMs) 0L else deadlineMonotonicMs - now,
             isExpired = now >= deadlineMonotonicMs,
@@ -294,9 +252,6 @@ class AgentExecutionBudget(
          * 生产接入（T7）可替换为 SystemClock.elapsedRealtime() 等单调源。
          */
         val DEFAULT_MONOTONIC_CLOCK: () -> Long = { System.nanoTime() / 1_000_000L }
-
-        /** [T-cost-budget] 浮点边界 epsilon（美元）：0.4+0.4+0.2 类的恰好到顶判定。 */
-        private const val COST_EPSILON_USD = 1e-9
     }
 }
 
@@ -316,7 +271,6 @@ enum class BudgetExhaustedReason {
     COMPACTION_CALL_LIMIT,
     CONCURRENT_TOOLS_LIMIT,
     TOKEN_BUDGET_EXCEEDED,
-    COST_BUDGET_EXCEEDED,
     DEADLINE_EXPIRED,
 }
 
@@ -329,8 +283,6 @@ data class BudgetSnapshot(
     val compactionCallsUsed: Int,
     val concurrentToolsActive: Int,
     val estimatedTokensUsed: Long?,
-    // [T-cost-budget] null = 成本预算未启用/价格未知；非 null 为已记账的估算累计。
-    val estimatedCostUsdUsed: Double? = null,
     val reservedChildTokens: Long,
     val isExpired: Boolean,
 )
@@ -344,8 +296,6 @@ data class RemainingBudget(
     val compactionCallsRemaining: Int,
     val concurrentToolSlotsRemaining: Int,
     val estimatedTokensRemaining: Long?,
-    // [T-cost-budget] null = 成本预算未启用。
-    val estimatedCostUsdRemaining: Double? = null,
     val millisRemaining: Long,
     val isExpired: Boolean,
 )

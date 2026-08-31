@@ -652,8 +652,6 @@
     <string name="usage_detail_session_avg">Среднее за сессию</string>
     <string name="usage_detail_sessions">Сессии</string>
     <string name="usage_detail_active_days">Активных дней</string>
-    <string name="usage_label_est_cost">Примерная стоимость</string>
-    <string name="usage_detail_est_cost">Примерн. стоимость</string>
     <string name="mirror_back">Назад</string>
     <string name="mirror_current_section">Текущее</string>
     <string name="mirror_use_mirror_toggle">Использовать зеркало</string>
