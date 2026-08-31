@@ -34,4 +34,19 @@ data class MemoryFact(
      *  recency weighting. Empty/unparseable → null (no penalty, weight 1.0). */
     fun createdDatePrefix(): String? =
         createdAt.takeIf { it.length >= 10 }?.take(10)
+
+    /** Concatenated lowercase searchable text: subject + predicate + object.
+     *  Keyword matching in [MemoryRepository.searchFacts] runs against this
+     *  single field (a fact matches when every query token appears anywhere
+     *  across the triple). */
+    fun searchableText(): String =
+        "$subject $predicate $`object`".lowercase()
+
+    /** True when every [tokens] (already lowercase) appears in the triple.
+     *  Pure and side-effect free so the query-relevance scoring is JVM-testable. */
+    fun matchesKeywords(tokens: List<String>): Boolean {
+        if (tokens.isEmpty()) return true
+        val hay = searchableText()
+        return tokens.all { hay.contains(it) }
+    }
 }

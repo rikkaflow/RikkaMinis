@@ -10620,12 +10620,17 @@ Environment variables:
         // to the memory feature.
         val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment() else null
         val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
-        // [feat/memory-facts] Inject the top-N most recent structured facts
-        // (recency-decay ranked) so retrieval surfaces durable facts before
-        // raw log text. v1 deliberately skips keyword extraction — we inject
-        // the globally highest-weight facts regardless of the current query.
+        // [feat/facts-query-relevance] Inject the top-N facts ranked by
+        // relevance to the current user message (keyword hit × confidence ×
+        // recency). A genuinely typed turn supplies the tokens; with no real
+        // user input (cold start / resume) it degrades to pure recency —
+        // the exact pre-feature behavior, so this is a strict improvement
+        // with zero regression on the no-signal path.
         val factsFragment = if (memoryOn) {
-            memoryRepository?.searchFacts(emptyList(), 15)
+            val tokens = extractQueryTokens(agentHistory) { text ->
+                com.openminis.app.shared.TextSegmenter.getInstance(context).segmentForSearch(text)
+            }
+            memoryRepository?.searchFacts(tokens, 15)
                 ?.let { memoryRepository.formatFactsForPrompt(it) }
                 ?.takeIf { it.isNotBlank() }
         } else {

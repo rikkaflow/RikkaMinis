@@ -142,6 +142,81 @@ class MemoryFactsTest {
 
     // ── recency-decay ordering ───────────────────────────────────────────
 
+    // ── [feat/facts-query-relevance] query-relevance ranking ─────────────
+
+    @Test
+    fun searchFacts_relevantFactBeatsIrrelevantRecent() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                // Irrelevant but recent: highest recency, must NOT win.
+                fact("user", "prefers", "dark theme", 0.9, "2026-08-31T00:00:00"),
+                // Relevant but older: keyword hit must surface it first.
+                fact("dev", "discipline", "kotlin 单测 用 kotlinc", 0.9, "2026-08-25T00:00:00"),
+            )
+        )
+        val hit = r.searchFacts(listOf("kotlin"))
+        assertEquals(1, hit.size)
+        assertEquals("dev", hit[0].subject)
+    }
+
+    @Test
+    fun searchFacts_relevantRecentBeatsRelevantOld() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("dev", "discipline", "kotlin 单测 用 kotlinc", 0.9, "2026-08-20T00:00:00"),
+                fact("dev", "discipline", "kotlin 编译 陷阱", 0.9, "2026-08-30T00:00:00"),
+            )
+        )
+        val hit = r.searchFacts(listOf("kotlin"))
+        assertEquals(2, hit.size)
+        // Both relevant; recency is the tiebreaker — newer first.
+        assertEquals("kotlin 编译 陷阱", hit[0].`object`)
+    }
+
+    @Test
+    fun searchFacts_noKeywords_stillPureRecency() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("old", "fact", "one", 0.8, "2026-08-01T00:00:00"),
+                fact("new", "fact", "two", 0.8, "2026-08-31T00:00:00"),
+            )
+        )
+        val top = r.searchFacts(emptyList(), 15)
+        // Zero-regression contract: empty keywords = legacy recency order.
+        assertEquals("new", top[0].subject)
+        assertEquals("old", top[1].subject)
+    }
+
+    @Test
+    fun rankFactForQuery_scoresHigherConfidenceFirst() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("dev", "discipline", "kotlin 单测", 0.5, "2026-08-30T00:00:00"),
+                fact("dev", "discipline", "kotlin 编译", 0.95, "2026-08-30T00:00:00"),
+            )
+        )
+        // Same recency (same day), both relevant — higher confidence wins.
+        val hit = r.searchFacts(listOf("kotlin"))
+        assertEquals("kotlin 编译", hit[0].`object`)
+    }
+
+    @Test
+    fun rankFactForQuery_emptyTokens_returnsRecency() {
+        val f = fact("user", "prefers", "dark theme", 0.9, "2026-08-31T00:00:00")
+        // Pure-function contract: no tokens → score == recency (1.0 for today).
+        assertEquals(1.0, MemoryRepository.rankFactForQuery(f, emptyList(), 1.0), 1e-9)
+    }
+
+    @Test
+    fun rankFactForQuery_irrelevantToken_returnsZero() {
+        val f = fact("user", "prefers", "dark theme", 0.9, "2026-08-31T00:00:00")
+        assertEquals(0.0, MemoryRepository.rankFactForQuery(f, listOf("kotlin"), 1.0), 1e-9)
+    }
+
     @Test
     fun searchFacts_recentBeatsOld_onSameKeyword() {
         val r = repo()

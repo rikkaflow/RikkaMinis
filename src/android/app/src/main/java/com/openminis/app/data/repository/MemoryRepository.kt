@@ -121,6 +121,32 @@ class MemoryRepository(private val memoryDir: File) {
                 null
             }
         }
+
+        /**
+         * [feat/facts-query-relevance] Query-relevance score for a fact
+         * against lowercase query [tokens].
+         *
+         * No tokens → recency only (legacy order). With tokens:
+         *   score = keywordMatch × (1 + confidence) × recency
+         * so a relevant fact beats an irrelevant-but-recent one, but a
+         * relevant OLD fact still trails a relevant RECENT fact (recency is
+         * the tiebreaker, not the gate). Irrelevant facts (no token hit)
+         * score 0 and are dropped by [searchFacts] — they no longer occupy
+         * injection slots.
+         *
+         * Pure function of (fact, tokens, recency) — JVM-testable in
+         * isolation.
+         */
+        internal fun rankFactForQuery(
+            fact: com.openminis.app.data.model.MemoryFact,
+            tokens: List<String>,
+            recency: Double,
+        ): Double {
+            if (tokens.isEmpty()) return recency
+            if (!fact.matchesKeywords(tokens)) return 0.0
+            val conf = fact.confidence.takeIf { it in 0.0..1.0 } ?: 0.8
+            return (1.0 + conf) * recency
+        }
     }
 
     init {
@@ -584,20 +610,21 @@ class MemoryRepository(private val memoryDir: File) {
         val kw = keywords.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
         val nowMs = System.currentTimeMillis()
         val all = loadFacts(MAX_FACTS_LOAD_LINES)
+        // [feat/facts-query-relevance] Query-relevant ranking: when keywords
+        // are present, score by keyword hit × confidence × recency so facts
+        // relevant to the current user message surface first; no keywords →
+        // pure recency (unchanged legacy behavior, zero regression risk).
         val ranked = all.asSequence()
-            .filter { fact ->
-                kw.isEmpty() || kw.all { k ->
-                    fact.subject.lowercase().contains(k) ||
-                        fact.predicate.lowercase().contains(k) ||
-                        fact.`object`.lowercase().contains(k)
-                }
-            }
-            .sortedByDescending { fact ->
-                memoryRecencyWeight(
+            .mapNotNull { fact ->
+                val recency = memoryRecencyWeight(
                     fact.createdDatePrefix()?.let { dailyLogAgeDays("$it.md", nowMs) }
                 )
+                val score = rankFactForQuery(fact, kw, recency)
+                if (kw.isNotEmpty() && score <= 0.0) null else fact to score
             }
+            .sortedByDescending { (_, score) -> score }
             .take(limit)
+            .map { (fact, _) -> fact }
             .toList()
         return ranked
     }
