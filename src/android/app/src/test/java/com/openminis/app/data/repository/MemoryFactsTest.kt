@@ -1,0 +1,326 @@
+package com.openminis.app.data.repository
+
+import com.openminis.app.data.model.MemoryFact
+import com.openminis.app.tools.MemoryTools
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+import java.util.UUID
+
+/**
+ * [feat/memory-facts] JVM tests for the structured-facts layer:
+ * MemoryRepository.appendFacts/loadFacts/searchFacts/formatFactsForPrompt +
+ * MemoryTools.executeMemoryWrite facts parsing + AgentToolDefinition
+ * array-type schema output.
+ */
+class MemoryFactsTest {
+
+    private val tempDir = File(System.getProperty("java.io.tmpdir"), "facts-${UUID.randomUUID().toString().take(8)}")
+    private val memoryDir = File(tempDir, "minis-global/memory")
+
+    @After
+    fun tearDown() {
+        tempDir.deleteRecursively()
+    }
+
+    private fun repo(): MemoryRepository = MemoryRepository(memoryDir)
+
+    private fun fact(
+        subject: String,
+        predicate: String,
+        `object`: String,
+        confidence: Double = 0.8,
+        createdAt: String = "2026-08-31T12:00:00",
+    ) = MemoryFact(subject, predicate, `object`, confidence, "2026-08-31.md", "device-A", createdAt)
+
+    // ── append / load round-trip ─────────────────────────────────────────
+
+    @Test
+    fun appendFacts_roundTrip_preservesFieldsAndSnakeCaseKeys() {
+        val r = repo()
+        val n = r.appendFacts(listOf(fact("user", "prefers", "dark theme", 0.9)))
+        assertEquals(1, n)
+
+        val lines = File(memoryDir, "facts.jsonl").readLines()
+        assertEquals(1, lines.size)
+        val obj = JSONObject(lines[0])
+        // snake_case keys on disk
+        assertEquals("device-A", obj.getString("device_id"))
+        assertEquals("2026-08-31T12:00:00", obj.getString("created_at"))
+        assertEquals(0.9, obj.getDouble("confidence"), 1e-9)
+
+        val loaded = r.loadFacts()
+        assertEquals(1, loaded.size)
+        assertEquals("user", loaded[0].subject)
+        assertEquals("prefers", loaded[0].predicate)
+        assertEquals("dark theme", loaded[0].`object`)
+        assertEquals(0.9, loaded[0].confidence, 1e-9)
+        assertEquals("device-A", loaded[0].deviceId)
+        assertEquals("2026-08-31T12:00:00", loaded[0].createdAt)
+        assertEquals("2026-08-31.md", loaded[0].source)
+    }
+
+    @Test
+    fun loadFacts_skipsMalformedLines() {
+        val r = repo()
+        r.appendFacts(listOf(fact("user", "prefers", "dark theme")))
+        val file = File(memoryDir, "facts.jsonl")
+        // Corrupt the middle line + append a truncated JSON line.
+        val lines = file.readLines().toMutableList()
+        lines.add("not json at all")
+        lines.add("{\"subject\": \"truncated\",")
+        file.writeText(lines.joinToString("\n") + "\n")
+
+        val loaded = r.loadFacts()
+        assertEquals(1, loaded.size)
+        assertEquals("user", loaded[0].subject)
+    }
+
+    @Test
+    fun loadFacts_respectsLimit() {
+        val r = repo()
+        r.appendFacts(
+            (1..5).map { i -> fact("user$i", "has", "property$i", createdAt = "2026-08-3${i}T00:00:00") }
+        )
+        assertEquals(2, r.loadFacts(2).size)
+        assertEquals(5, r.loadFacts(200).size)
+    }
+
+    @Test
+    fun loadFacts_missingFile_returnsEmpty() {
+        assertEquals(0, repo().loadFacts().size)
+    }
+
+    // ── search ───────────────────────────────────────────────────────────
+
+    @Test
+    fun searchFacts_keywordMultiHit_andZeroHit() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("user", "prefers", "dark theme", 0.9, "2026-08-30T10:00:00"),
+                fact("user", "prefers", "light theme", 0.7, "2026-08-30T11:00:00"),
+                fact("project", "uses", "kotlin", 0.9, "2026-08-30T12:00:00"),
+            )
+        )
+        val hit = r.searchFacts(listOf("theme"))
+        assertEquals(2, hit.size)
+        val hit2 = r.searchFacts(listOf("user", "light"))
+        assertEquals(1, hit2.size)
+        assertEquals("light theme", hit2[0].`object`)
+        val miss = r.searchFacts(listOf("nonexistent"))
+        assertTrue(miss.isEmpty())
+    }
+
+    @Test
+    fun searchFacts_caseInsensitive() {
+        val r = repo()
+        r.appendFacts(listOf(fact("User", "Prefers", "Dark Theme")))
+        val hit = r.searchFacts(listOf("dark"))
+        assertEquals(1, hit.size)
+    }
+
+    @Test
+    fun searchFacts_emptyKeywords_returnsTopByRecency() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("old", "fact", "one", 0.8, "2026-08-01T00:00:00"),
+                fact("new", "fact", "two", 0.8, "2026-08-31T00:00:00"),
+            )
+        )
+        val top = r.searchFacts(emptyList(), 15)
+        assertEquals(2, top.size)
+        // Recency decay: today's fact ranks above the 30-day-old one.
+        assertEquals("new", top[0].subject)
+    }
+
+    // ── recency-decay ordering ───────────────────────────────────────────
+
+    @Test
+    fun searchFacts_recentBeatsOld_onSameKeyword() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("user", "prefers", "theme X", 0.8, "2026-07-15T00:00:00"),
+                fact("user", "prefers", "theme Y", 0.8, "2026-08-30T00:00:00"),
+            )
+        )
+        val hit = r.searchFacts(listOf("theme"))
+        assertEquals(2, hit.size)
+        assertEquals("theme Y", hit[0].`object`)
+        assertEquals("theme X", hit[1].`object`)
+    }
+
+    @Test
+    fun searchFacts_unparseableDate_getsNoPenalty() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("a", "b", "dated", 0.8, "2026-08-01T00:00:00"),
+                fact("c", "d", "undated", 0.8, ""),
+            )
+        )
+        val hit = r.searchFacts(listOf("d"))
+        // Both facts match on predicate "d" — the undated one must not be
+        // pushed out by the decay ordering (it gets weight 1.0).
+        assertEquals(2, hit.size)
+    }
+
+    // ── dedup ────────────────────────────────────────────────────────────
+
+    @Test
+    fun appendFacts_sameDayTripleDedup() {
+        val r = repo()
+        val f = fact("user", "prefers", "dark theme", 0.9)
+        assertEquals(1, r.appendFacts(listOf(f)))
+        // Same triple, same day → skipped.
+        assertEquals(0, r.appendFacts(listOf(f)))
+        // Same triple, different confidence, same day → still skipped (triple key).
+        assertEquals(0, r.appendFacts(listOf(f.copy(confidence = 0.5))))
+        assertEquals(1, r.loadFacts().size)
+    }
+
+    @Test
+    fun appendFacts_crossDayDuplicateCoexists() {
+        val r = repo()
+        assertEquals(1, r.appendFacts(listOf(fact("user", "prefers", "dark", 0.8, "2026-08-01T00:00:00"))))
+        assertEquals(1, r.appendFacts(listOf(fact("user", "prefers", "dark", 0.9, "2026-08-31T00:00:00"))))
+        assertEquals(2, r.loadFacts().size)
+        // Newer declaration ranks first on search.
+        val hit = r.searchFacts(listOf("dark"))
+        assertEquals("2026-08-31T00:00:00", hit[0].createdAt)
+    }
+
+    // ── executeMemoryWrite integration ───────────────────────────────────
+
+    @Test
+    fun executeMemoryWrite_withFacts_appendsAndReports() {
+        val r = repo()
+        val factsArr = JSONArray().apply {
+            put(JSONObject().apply {
+                put("subject", "user")
+                put("predicate", "prefers")
+                put("object", "dark theme")
+                put("confidence", 0.9)
+            })
+        }
+        val input = JSONObject().apply {
+            put("tool_title", "memory_write")
+            put("content", "## note\nuser prefers dark theme")
+            put("facts", factsArr)
+        }.toString()
+
+        val result = MemoryTools.executeMemoryWrite(input, r)
+        assertTrue(result.success)
+        assertTrue("expected '(+1 facts)' in: ${result.output}", result.output.contains("(+1 facts)"))
+        assertEquals(1, r.loadFacts().size)
+        assertEquals("user", r.loadFacts()[0].subject)
+        assertEquals(0.9, r.loadFacts()[0].confidence, 1e-9)
+    }
+
+    @Test
+    fun executeMemoryWrite_malformedFacts_degradesToPlainWrite() {
+        val r = repo()
+        val input = JSONObject().apply {
+            put("tool_title", "memory_write")
+            put("content", "## note\nplain entry")
+            // facts as a string → must not fail the write
+            put("facts", "not-an-array")
+        }.toString()
+
+        val result = MemoryTools.executeMemoryWrite(input, r)
+        assertTrue("write should succeed: ${result.output}", result.success)
+        assertFalse("no (+N facts) suffix expected: ${result.output}", result.output.contains("(+"))
+        assertEquals(0, r.loadFacts().size)
+        // Daily log still written
+        val daily = File(memoryDir, "2026-08-31.md")
+        assertTrue(daily.exists())
+    }
+
+    @Test
+    fun executeMemoryWrite_noFacts_unchangedOutput() {
+        val r = repo()
+        val input = JSONObject().apply {
+            put("tool_title", "memory_write")
+            put("content", "## note\nplain")
+        }.toString()
+        val result = MemoryTools.executeMemoryWrite(input, r)
+        assertTrue(result.success)
+        assertFalse(result.output.contains("(+"))
+    }
+
+    // ── negative self-check: hostile facts.jsonl ─────────────────────────
+
+    @Test
+    fun hostileFile_neverThrows() {
+        val r = repo()
+        val file = File(memoryDir, "facts.jsonl")
+        file.writeText(
+            "{bad json\n" +
+                "{\"subject\":\"x\"}\n" +
+                "{\"created_at\":\"2099-01-01T00:00:00\",\"subject\":\"future\",\"predicate\":\"p\",\"object\":\"o\"}\n" +
+                "{\"subject\":\"\",\"predicate\":\"\",\"object\":\"\"}\n" +
+                "{\"subject\":\"ok\",\"predicate\":\"p\",\"object\":\"o\",\"confidence\":\"NaN\"}\n"
+        )
+        // loadFacts must not throw; malformed lines skipped; empty-triple skipped;
+        // NaN confidence clamped; future date parses without penalty.
+        val loaded = r.loadFacts()
+        assertTrue(loaded.isNotEmpty())
+        for (f in loaded) {
+            assertTrue(f.confidence in 0.0..1.0)
+        }
+        // searchFacts must not throw either, including on the future-dated line.
+        val hit = r.searchFacts(listOf("future"))
+        assertTrue(hit.isNotEmpty())
+        val any = r.searchFacts(emptyList())
+        assertTrue(any.isNotEmpty())
+        // blank-only triple must never be returned
+        assertTrue(loaded.none { it.subject.isEmpty() && it.predicate.isEmpty() && it.`object`.isEmpty() })
+    }
+
+    // ── AgentToolDefinition array-type schema (provider contract) ────────
+
+    @Test
+    fun agentToolDefinition_arrayType_schemaShape() {
+        // Mirror of AgentTools.memoryWriteDefinition()'s facts param — the
+        // full AgentTools.kt can't compile in the JVM sandbox (Android deps),
+        // so we assert the provider-facing JSON shape here; AgentTools.kt
+        // compilation is covered by the full CI build.
+        val factsParam = com.openminis.app.data.model.AgentToolParam(
+            type = "array",
+            description = "Optional array of structured facts. Each element: {\"subject\": string, \"predicate\": string, \"object\": string, \"confidence\": number 0-1}",
+        )
+        val def = com.openminis.app.data.model.AgentToolDefinition(
+            name = "memory_write",
+            description = "d",
+            parameters = mapOf(
+                "tool_title" to com.openminis.app.data.model.AgentToolParam("string", "t"),
+                "content" to com.openminis.app.data.model.AgentToolParam("string", "c"),
+                "facts" to factsParam,
+            ),
+            required = listOf("tool_title", "content"),
+            propertyOrdering = listOf("tool_title", "content", "facts"),
+        )
+
+        val anthropic = def.toAnthropicJson().getJSONObject("input_schema")
+        val props = anthropic.getJSONObject("properties")
+        assertEquals("array", props.getJSONObject("facts").getString("type"))
+        assertFalse(props.getJSONObject("facts").has("items"))
+        // facts not required
+        val required = anthropic.getJSONArray("required")
+        assertEquals(2, required.length())
+        assertFalse(required.toString().contains("facts"))
+
+        val openai = def.toOpenAIJson().getJSONObject("function").getJSONObject("parameters")
+        assertEquals("array", openai.getJSONObject("properties").getJSONObject("facts").getString("type"))
+
+        val gemini = def.toGeminiJson().getJSONObject("parameters")
+        assertEquals("ARRAY", gemini.getJSONObject("properties").getJSONObject("facts").getString("type"))
+    }
+}

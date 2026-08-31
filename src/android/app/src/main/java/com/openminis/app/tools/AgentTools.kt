@@ -120,9 +120,16 @@ object AgentTools {
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Save user preference for Python', 'Note today's project context'). Use the same language as the user."),
             "content" to AgentToolParam("string", "The memory content to write. Use concise Markdown with a short heading (## Topic) and context about what was done/learned."),
+            // [feat/memory-facts] Optional structured facts. AgentToolParam
+            // only supports type String + enumValues (no array/object schema),
+            // so we declare type "array" and describe the element structure in
+            // the description — providers pass the type through verbatim and
+            // accept "array" without an items schema. Zero infrastructure
+            // change (no public data class modification for one tool).
+            "facts" to AgentToolParam("array", "Optional array of structured facts distilled from this memory entry — stable user preferences, project conventions, key entities. Each element: {\"subject\": string, \"predicate\": string, \"object\": string, \"confidence\": number 0-1 (optional, default 0.8)}. Only include when the entry genuinely contains durable facts (not transient session context). Example: {\"subject\":\"user\",\"predicate\":\"prefers\",\"object\":\"dark theme\",\"confidence\":0.9}"),
         ),
         required = listOf("tool_title", "content"),
-        propertyOrdering = listOf("tool_title", "content"),
+        propertyOrdering = listOf("tool_title", "content", "facts"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5069-5078

@@ -57,7 +57,9 @@ object MemoryRollupTool {
             val outcome = runner.runOnce()
             val (message, success) = when (outcome) {
                 MemoryRollupRunner.Outcome.ROLLED_UP ->
-                    "Memory rollup completed: the largest eligible daily log was distilled into MEMORY-ROLLUP.md" to true
+                    "Memory rollup completed: the largest eligible daily log was distilled into MEMORY-ROLLUP.md. " +
+                        "Note: consider extracting structured facts from recently rolled-up entries via memory_write(facts=...) " +
+                        "for durable preferences/conventions." to true
                 MemoryRollupRunner.Outcome.SKIPPED_ALREADY ->
                     "Memory rollup skipped: the selected log was already distilled (idempotent)" to true
                 MemoryRollupRunner.Outcome.NO_LOG_YESTERDAY ->

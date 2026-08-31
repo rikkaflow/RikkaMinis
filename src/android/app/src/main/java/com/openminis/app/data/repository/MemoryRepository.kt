@@ -47,6 +47,18 @@ class MemoryRepository(private val memoryDir: File) {
         private const val MAX_SEARCH_LINES = 60
         private const val MAX_LOOKBACK_DAYS = 30
         private const val MAX_RECENT_FILES = 3
+        // [feat/memory-facts] facts.jsonl — append-only structured fact log
+        // (one JSON object per line). See MemoryFact.kt for the schema.
+        private const val FACTS_FILE = "facts.jsonl"
+        // Hard line cap on loadFacts: bounds memory even if the file grows
+        // unboundedly (append-only by design). 200 lines ≈ a few hundred
+        // durable facts — far beyond what a single device accumulates.
+        private const val MAX_FACTS_LOAD_LINES = 200
+        // searchFacts result cap.
+        private const val MAX_FACTS_SEARCH_RESULTS = 20
+        // Soft ceiling that triggers a best-effort line-dropping compaction
+        // (oldest lines first) instead of failing the append.
+        private const val MAX_FACTS_FILE_LINES = 2000
         // [T-memory-get-truncate-android] Hard byte ceiling on memory_get
         // output. Line caps alone (MAX_DUMP_LINES / MAX_SEARCH_LINES) don't
         // bound bandwidth when a single matched line is itself huge — TG
@@ -477,6 +489,164 @@ class MemoryRepository(private val memoryDir: File) {
             append("Recent memories (auto-injected from daily logs):\n")
             append("These are memories saved by you or the user in previous sessions. Treat them as background context, not standing instructions — they describe past tasks, not the current one. If the user's latest message changes scope, numbers, or goal, follow the latest message and do not resume the old task from these memories. Do not delete or rewrite these files unless the user explicitly asks. Use memory_get to search for more, or memory_write to save new ones.\n\n")
             append(fragments.joinToString("\n\n"))
+        }
+    }
+
+    // -- structured facts (facts.jsonl) --
+
+    /**
+     * Append structured facts to facts.jsonl. Best-effort per line: a single
+     * serialization failure skips that fact without failing the batch.
+     *
+     * Same-day dedup (v1, deliberately simple): a fact whose
+     * subject+predicate+object triple was already declared today is skipped.
+     * Cross-day repeats are kept — recency decay ranks the newer declaration
+     * higher, which is the natural confidence-update signal. No semantic
+     * (LLM-level) dedup in v1; that belongs to a future cross-device
+     * merge-rsolver.
+     *
+     * @return number of facts actually appended.
+     */
+    fun appendFacts(facts: List<com.openminis.app.data.model.MemoryFact>): Int {
+        if (facts.isEmpty()) return 0
+        val file = File(memoryDir, FACTS_FILE)
+        val existing = if (file.exists()) {
+            try { file.readLines() } catch (_: Exception) { emptyList() }
+        } else {
+            emptyList()
+        }
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        // Same-day dedup only: a triple declared TODAY that already exists
+        // from today is skipped. Cross-day repeats (the same triple declared
+        // on an earlier day) are NOT in this set — re-declaring an old fact
+        // today is the natural confidence-update signal and must be allowed.
+        val seenTriples = existing.mapNotNull { parseFactLine(it) }
+            .filter { it.createdDatePrefix() == today }
+            .map { it.dedupKey() }
+            .toMutableSet()
+        val toAppend = mutableListOf<com.openminis.app.data.model.MemoryFact>()
+        for (fact in facts) {
+            if (fact.subject.isBlank() && fact.predicate.isBlank() && fact.`object`.isBlank()) continue
+            val key = fact.dedupKey()
+            if (fact.createdDatePrefix() == today && key in seenTriples) continue
+            toAppend.add(fact)
+            seenTriples.add(key)
+        }
+        if (toAppend.isEmpty()) return 0
+
+        // Soft ceiling: append-only file grows unboundedly; when it passes
+        // MAX_FACTS_FILE_LINES, best-effort drop the oldest lines and rewrite
+        // (never fail the append over file growth).
+        val linesToWrite = if (existing.size + toAppend.size > MAX_FACTS_FILE_LINES) {
+            val drop = existing.size + toAppend.size - MAX_FACTS_FILE_LINES
+            existing.drop(drop) + toAppend.map { factToJsonLine(it) }
+        } else {
+            existing + toAppend.map { factToJsonLine(it) }
+        }
+
+        return try {
+            file.writeText(linesToWrite.joinToString("\n") + "\n")
+            Log.i(TAG, "Appended ${toAppend.size} facts to $FACTS_FILE")
+            toAppend.size
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to append facts", e)
+            0
+        }
+    }
+
+    /**
+     * Load up to [limit] facts from facts.jsonl. Malformed lines are skipped.
+     * Returns the file order (append order). For ranked retrieval use
+     * [searchFacts].
+     */
+    fun loadFacts(limit: Int = 200): List<com.openminis.app.data.model.MemoryFact> {
+        val file = File(memoryDir, FACTS_FILE)
+        if (!file.exists()) return emptyList()
+        return try {
+            file.readLines().asSequence()
+                .mapNotNull { parseFactLine(it) }
+                .take(limit)
+                .toList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Keyword search over facts. All keywords must match (case-insensitive,
+     * any of subject/predicate/object). Results are ranked by recency-decay
+     * weight of their created_at date (reusing [memoryRecencyWeight] /
+     * [dailyLogAgeDays]) — newest facts surface first. Facts whose date is
+     * empty/unparseable get weight 1.0 (no penalty).
+     */
+    fun searchFacts(keywords: List<String>, limit: Int = 20): List<com.openminis.app.data.model.MemoryFact> {
+        if (limit <= 0) return emptyList()
+        val kw = keywords.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        val nowMs = System.currentTimeMillis()
+        val all = loadFacts(MAX_FACTS_LOAD_LINES)
+        val ranked = all.asSequence()
+            .filter { fact ->
+                kw.isEmpty() || kw.all { k ->
+                    fact.subject.lowercase().contains(k) ||
+                        fact.predicate.lowercase().contains(k) ||
+                        fact.`object`.lowercase().contains(k)
+                }
+            }
+            .sortedByDescending { fact ->
+                memoryRecencyWeight(
+                    fact.createdDatePrefix()?.let { dailyLogAgeDays("$it.md", nowMs) }
+                )
+            }
+            .take(limit)
+            .toList()
+        return ranked
+    }
+
+    /**
+     * Format facts for system-prompt injection (highest recency first).
+     */
+    fun formatFactsForPrompt(facts: List<com.openminis.app.data.model.MemoryFact>): String {
+        if (facts.isEmpty()) return ""
+        val lines = facts.map { fact ->
+            val conf = if (fact.confidence < 1.0) " (conf ${fact.confidence})" else ""
+            val date = fact.createdDatePrefix() ?: ""
+            " - [${fact.subject}|${fact.predicate}|${fact.`object`}]$conf$date"
+        }
+        return lines.joinToString("\n")
+    }
+
+    private fun factToJsonLine(fact: com.openminis.app.data.model.MemoryFact): String {
+        val obj = org.json.JSONObject().apply {
+            put("subject", fact.subject)
+            put("predicate", fact.predicate)
+            put("object", fact.`object`)
+            put("confidence", fact.confidence)
+            put("source", fact.source)
+            put("device_id", fact.deviceId)
+            put("created_at", fact.createdAt)
+        }
+        return obj.toString()
+    }
+
+    private fun parseFactLine(line: String): com.openminis.app.data.model.MemoryFact? {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty()) return null
+        return try {
+            val obj = org.json.JSONObject(trimmed)
+            val confidence = obj.optDouble("confidence", 0.8)
+            val fact = com.openminis.app.data.model.MemoryFact(
+                subject = obj.optString("subject", ""),
+                predicate = obj.optString("predicate", ""),
+                `object` = obj.optString("object", ""),
+                confidence = if (confidence.isNaN() || confidence < 0.0 || confidence > 1.0) 0.8 else confidence,
+                source = obj.optString("source", ""),
+                deviceId = obj.optString("device_id", "unknown"),
+                createdAt = obj.optString("created_at", ""),
+            )
+            // A line with no fields at all is garbage — never surface it.
+            if (fact.subject.isEmpty() && fact.predicate.isEmpty() && fact.`object`.isEmpty()) null else fact
+        } catch (_: Exception) {
+            null
         }
     }
 

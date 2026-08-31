@@ -10532,6 +10532,7 @@ class ChatViewModel(
 
 Memory system (currently ENABLED):
 - memory_write writes to today's daily log (YYYY-MM-DD.md) — use it for session notes, key facts, project context, things learned, and action items.
+- memory_write accepts optional 'facts' for durable structured facts (preferences/conventions/entities); include them when the entry contains stable facts.
 - memory_rollup: Distill stable rules from the previous day's daily log into MEMORY-ROLLUP.md. Call this when daily logs are growing large — it surfaces reusable knowledge concisely. Idempotent; skips dates already rolled up.
 - GLOBAL.md (/var/minis/memory/GLOBAL.md) stores persistent preferences, settings, and general-purpose conventions. To read it, use file_read (NOT memory_get). To update it, use file_read first then file_edit. If GLOBAL.md does not exist yet, use file_write to create it directly.
 - IMPORTANT: Only write to GLOBAL.md when the user explicitly asks (e.g. 'remember this globally', 'save to global memory'). Before editing, deduplicate and clean up — avoid ambiguity, repetition, or daily-log-style entries. GLOBAL.md should contain only concise, reusable knowledge (preferences, settings, conventions), NOT session logs or transient context.
@@ -10668,6 +10669,17 @@ Environment variables:
         // to the memory feature.
         val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment() else null
         val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
+        // [feat/memory-facts] Inject the top-N most recent structured facts
+        // (recency-decay ranked) so retrieval surfaces durable facts before
+        // raw log text. v1 deliberately skips keyword extraction — we inject
+        // the globally highest-weight facts regardless of the current query.
+        val factsFragment = if (memoryOn) {
+            memoryRepository?.searchFacts(emptyList(), 15)
+                ?.let { memoryRepository.formatFactsForPrompt(it) }
+                ?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
         // [T6-rollup] Daily log size hint + MEMORY-ROLLUP.md injection.
         // When the largest daily log is large, suggest the agent run
         // memory_rollup to distill stable rules. MEMORY-ROLLUP.md (if it
@@ -10701,6 +10713,12 @@ Environment variables:
             if (dailyMemoryFragment != null) {
                 append("\n\n")
                 append(dailyMemoryFragment)
+            }
+            // [feat/memory-facts] Structured facts go right after the daily
+            // log fragment — facts are the distilled layer, logs the evidence.
+            if (factsFragment != null) {
+                append("\n\nStructured facts (auto-injected, highest recency first):\n")
+                append(factsFragment)
             }
             // [T6-rollup] Inject MEMORY-ROLLUP.md (distilled stable rules)
             // as a compact memory fragment, plus a size hint to trigger

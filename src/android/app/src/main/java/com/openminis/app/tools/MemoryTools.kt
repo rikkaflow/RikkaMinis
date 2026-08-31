@@ -114,11 +114,54 @@ object MemoryTools {
             } else {
                 val result = repository.writeMemory(content)
                 val success = result.startsWith("Memory saved")
-                ToolResult(result, success, toolTitle)
+                // [feat/memory-facts] Optional structured facts. Missing /
+                // empty / malformed → silently degrade to plain-text write;
+                // a bad facts payload must NEVER fail the whole memory_write.
+                val appended = try {
+                    val facts = parseFactsArg(obj)
+                    if (facts.isEmpty()) 0 else repository.appendFacts(facts)
+                } catch (_: Exception) {
+                    0
+                }
+                val output = if (appended > 0) "$result (+$appended facts)" else result
+                ToolResult(output, success, toolTitle)
             }
         } catch (e: Exception) {
             ToolResult("Error: ${e.message}", false)
         }
+    }
+
+    /**
+     * Parse the optional "facts" argument of a memory_write call. Lenient:
+     * non-array, malformed elements, or invalid field shapes are skipped, not
+     * fatal. Returns the facts that parsed cleanly (may be empty).
+     */
+    fun parseFactsArg(obj: JSONObject): List<com.openminis.app.data.model.MemoryFact> {
+        if (!obj.has("facts")) return emptyList()
+        val raw = obj.opt("facts")
+        if (raw !is JSONArray) return emptyList()
+        val out = mutableListOf<com.openminis.app.data.model.MemoryFact>()
+        for (i in 0 until raw.length()) {
+            val el = raw.optJSONObject(i) ?: continue
+            val subject = el.optString("subject", "").trim()
+            val predicate = el.optString("predicate", "").trim()
+            val `object` = el.optString("object", "").trim()
+            if (subject.isEmpty() && predicate.isEmpty() && `object`.isEmpty()) continue
+            var confidence = el.optDouble("confidence", 0.8)
+            if (confidence.isNaN() || confidence < 0.0 || confidence > 1.0) confidence = 0.8
+            out.add(
+                com.openminis.app.data.model.MemoryFact(
+                    subject = subject,
+                    predicate = predicate,
+                    `object` = `object`,
+                    confidence = confidence,
+                    source = "",
+                    deviceId = "unknown",
+                    createdAt = "",
+                )
+            )
+        }
+        return out
     }
 
     fun executeMemoryGet(inputJson: String, repository: MemoryRepository): ToolResult {
