@@ -647,6 +647,17 @@ class MemoryRepository(private val memoryDir: File) {
         val kw = keywords
             .map { it.trim().lowercase() }
             .filter { it.isNotEmpty() }
+            // [fix/facts-query-punct-filter] Drop pure-punctuation tokens
+            // (，。？！… etc.) that jieba's query mode emits as standalone
+            // words. With OR semantics a lone "，" matches any fact whose
+            // text contains a comma — every 中文 fact has one — so the
+            // punctuation token drowns out the real signal and can rank an
+            // unrelated fact at the top (observed live: "最新改动是否成立"
+            // ranked "user|prefers|中文交流…" #1 on the strength of its
+            // comma). Tokens containing at least one letter/digit are kept
+            // (kotlin, rikka-ci-bridge, huggingface — and Chinese hanzi are
+            // letters in Unicode terms, so 中文/编译 are unaffected).
+            .filter { token -> token.any { ch -> ch.isLetterOrDigit() } }
             .filterNot { it in FACTS_QUERY_STOPWORDS }
         val nowMs = System.currentTimeMillis()
         val all = loadFacts(MAX_FACTS_LOAD_LINES)

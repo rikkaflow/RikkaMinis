@@ -128,6 +128,35 @@ class MemoryFactsTest {
         assertEquals(1, hit.size)
     }
 
+    // [fix/facts-query-punct-filter] jieba query mode emits standalone
+    // punctuation tokens (，。？！…). Under OR semantics a lone "，" matches
+    // any fact whose searchable text contains a comma — which nearly every
+    // Chinese fact does — so punctuation must never count as a keyword.
+    @Test
+    fun searchFacts_purePunctuationTokensAreDropped() {
+        val r = repo()
+        r.appendFacts(
+            listOf(
+                fact("user", "prefers", "中文交流，代码保留英文", 0.95, "2026-08-31T00:00:00"),
+                fact("dev", "discipline", "kotlin 编译", 0.9, "2026-08-31T00:00:00"),
+            )
+        )
+        // Only punctuation tokens → no keywords left → falls back to pure
+        // recency ordering (same as empty-keyword behavior; all facts
+        // surface, ranked by date). The punctuation itself never matches.
+        val punctOnly = r.searchFacts(listOf("，", "。", "？"))
+        assertEquals(2, punctOnly.size)
+        // Mixed: punctuation is dropped, real token "kotlin" still matches.
+        val hit = r.searchFacts(listOf("，", "kotlin", "。"))
+        assertEquals(1, hit.size)
+        assertEquals("dev", hit[0].subject)
+        // Token containing letters alongside punctuation survives filtering
+        // and still matches (substring contains, punctuation ignored).
+        val hit2 = r.searchFacts(listOf("kotlin", "？"))
+        assertEquals(1, hit2.size)
+        assertEquals("dev", hit2[0].subject)
+    }
+
     @Test
     fun searchFacts_emptyKeywords_returnsTopByRecency() {
         val r = repo()
