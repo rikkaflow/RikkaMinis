@@ -4,6 +4,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -2922,6 +2923,11 @@ fun ChatScreen(
                 var lastColdPrewarmMs by remember(sessionId) { mutableStateOf(-1L) }
                 var coldOpenSummaryEmitted by remember(sessionId) { mutableStateOf(false) }
                 val screenMountAtMs = remember(sessionId) { System.currentTimeMillis() }
+                // [T-android-placed-storm-diag] Mutable (non-Compose) holder
+                // for the place-storm detector. Plain class instance — the
+                // counter updates must NOT recompose the surrounding scope on
+                // every onPlaced, so it is deliberately not a State.
+                val placeStorm = remember(sessionId) { PlaceStormState() }
                 // T-streaming-side-channel: messages-level changes (new
                 // message, retry, etc.) AND streamingById deltas both feed
                 // buildFlatChatItems, but we subscribe to streamingById
@@ -3631,6 +3637,46 @@ fun ChatScreen(
                                                 "lazyColumn.firstItem.placed",
                                                 "size=${it.size.width}x${it.size.height}",
                                             )
+                                            // [T-android-placed-storm-diag] Place-storm
+                                            // detector. The 2026-08-31 stall showed the
+                                            // newest item being placed ~620 times in
+                                            // 10s (once per frame, size unchanged) with
+                                            // no hang episode — the main thread was
+                                            // healthy but re-laying-out the same item
+                                            // in a loop, which the HangDetector cannot
+                                            // catch (its heartbeat stayed <3s). When
+                                            // that repeats, dump ONE main-thread stack
+                                            // so the driver (animation restart vs list
+                                            // reference churn vs scrollToItem re-fire)
+                                            // is visible in the log instead of guessed.
+                                            // Purely observational: no behavior change,
+                                            // one dump per session.
+                                            val storm = placeStorm
+                                            if (!storm.dumped) {
+                                                val now = SystemClock.uptimeMillis()
+                                                if (now - storm.lastPlacedMs <= 2_000L) {
+                                                    storm.count++
+                                                    storm.lastPlacedMs = now
+                                                    // ~60 places in 2s ≈ 30fps worth of
+                                                    // re-layout; a normal cold open is a
+                                                    // handful. Dump once, then stay quiet.
+                                                    if (storm.count >= 60) {
+                                                        storm.dumped = true
+                                                        val frames = Looper.getMainLooper().thread.stackTrace
+                                                            .take(20).joinToString(" <- ") {
+                                                                "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+                                                            }
+                                                        AppLogger.warning(
+                                                            "PlaceStorm",
+                                                            "[PlaceStorm] session=$sessionId count=${storm.count} " +
+                                                                "lastKey=${item.key} stack: $frames",
+                                                        )
+                                                    }
+                                                } else {
+                                                    storm.count = 1
+                                                    storm.lastPlacedMs = now
+                                                }
+                                            }
                                             // [T-android-jank-diag-logging]
                                             // One quotable line per session
                                             // open, after the first frame's
@@ -6386,4 +6432,16 @@ private fun ChatInputArea(
             )
         }
 
+}
+
+/**
+ * [T-android-placed-storm-diag] Mutable holder for the place-storm detector.
+ * A plain class (not a Compose State) on purpose: the counter mutates on every
+ * `firstItem.placed` callback and must never invalidate the surrounding
+ * composable scope. `remember(sessionId)` keeps one instance per session.
+ */
+private class PlaceStormState {
+    var count: Int = 0
+    var lastPlacedMs: Long = 0L
+    var dumped: Boolean = false
 }
