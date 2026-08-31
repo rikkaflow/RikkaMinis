@@ -412,6 +412,8 @@
     <string name="usage_detail_session_avg">Durchschnitt pro Sitzung</string>
     <string name="usage_detail_sessions">Sitzungen</string>
     <string name="usage_detail_active_days">Aktive Tage</string>
+    <string name="usage_label_est_cost">Geschätzte Kosten</string>
+    <string name="usage_detail_est_cost">Gesch. Kosten</string>
     <string name="mirror_back">Zurück</string>
     <string name="mirror_current_section">Aktuell</string>
     <string name="mirror_use_mirror_toggle">Mirror verwenden</string>

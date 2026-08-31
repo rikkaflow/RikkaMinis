@@ -35,6 +35,7 @@ import androidx.compose.material.icons.outlined.Extension
 import com.openminis.app.data.BPETokenizer
 import com.openminis.app.data.ContextOffload
 import com.openminis.app.data.ContextPolicy
+import com.openminis.app.conversation.CompactSummaryCache
 import com.openminis.app.conversation.ContextCompactor
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.data.FileMentionIndex
@@ -53,6 +54,7 @@ import com.openminis.app.R
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.data.repository.ProviderRepository
+import com.openminis.app.provider.CostCalculator
 import com.openminis.app.provider.ImageBudget
 import com.openminis.app.provider.LLMProvider
 import com.openminis.app.provider.ProviderFactory
@@ -2806,7 +2808,23 @@ class ChatViewModel(
             "Previous context summary:\n$previousSummary\n\n" +
                 "New conversation to merge:\n$transcript"
         }
-        return try {
+        // [T-compact-cache] Exact-match reuse: identical (model, prompt,
+        // previous summary, transcript) → same summary, skip the provider
+        // call entirely. Only at depth 0 — split halves are one-shot calls
+        // whose inputs never repeat within a run.
+        if (depth == 0) {
+            val cached = CompactSummaryCache.lookup(
+                modelId = currentProvider?.model?.id,
+                systemPrompt = compactSummarySystemPrompt,
+                previousSummary = previousSummary,
+                transcript = conversationText,
+            )
+            if (cached != null) {
+                AppLogger.info(TAG, "[Compact] cache hit — reusing summary (${cached.outputTokensEstimate} out-tokens est)")
+                return cached.summaryText
+            }
+        }
+        val summary = try {
             generateCompactSummary(conversationText)
         } catch (e: CancellationException) {
             throw e
@@ -2841,6 +2859,20 @@ class ChatViewModel(
             }
             generateCompactSummary(mergeInput)
         }
+        // [T-compact-cache] Persist for exact-match reuse. Split-path summaries
+        // are NOT stored (their inputs depend on error-driven halving and are
+        // unlikely to repeat).
+        if (depth == 0) {
+            CompactSummaryCache.store(
+                modelId = currentProvider?.model?.id,
+                systemPrompt = compactSummarySystemPrompt,
+                previousSummary = previousSummary,
+                transcript = conversationText,
+                summaryText = summary,
+                outputTokensEstimate = summary.length / 4,
+            )
+        }
+        return summary
     }
 
     /**
@@ -7500,6 +7532,21 @@ class ChatViewModel(
                     }
                     is LLMStreamChunk.Usage -> {
                         lastUsage = chunk.usage
+                        // [T-cost-budget] Advisory cost accounting: consume the
+                        // estimated USD for this turn against the run budget.
+                        // maxEstimatedCostUsd is null in the observe phase →
+                        // Allowed, no-op bookkeeping (same pattern as tokens).
+                        runCatching {
+                            val turnCost = CostCalculator.estimateCostUsd(
+                                currentProvider?.model?.id.orEmpty(),
+                                chunk.usage,
+                            )
+                            if (turnCost != null) {
+                                t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD) {
+                                    it.consumeEstimatedCostUsd(turnCost)
+                                }
+                            }
+                        }
                         // Update context token count for next turn's dynamicMaxTokens()
                         // and publish to _lastTurnContextTokens so the ContextPolicy
                         // gate in [checkContextBeforeSend] can see the latest pressure
@@ -9303,7 +9350,8 @@ class ChatViewModel(
                             BudgetExhaustedReason.SHELL_COMMAND_LIMIT,
                             BudgetExhaustedReason.COMPACTION_CALL_LIMIT,
                             BudgetExhaustedReason.CONCURRENT_TOOLS_LIMIT,
-                            BudgetExhaustedReason.TOKEN_BUDGET_EXCEEDED -> AgentTraceRecorder.REFUSE_BUDGET_EXHAUSTED
+                            BudgetExhaustedReason.TOKEN_BUDGET_EXCEEDED,
+                            BudgetExhaustedReason.COST_BUDGET_EXCEEDED -> AgentTraceRecorder.REFUSE_BUDGET_EXHAUSTED
                             BudgetExhaustedReason.DEADLINE_EXPIRED -> AgentTraceRecorder.REFUSE_DEADLINE_REACHED
                         },
                     )
@@ -9320,6 +9368,10 @@ class ChatViewModel(
         AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> T7_OBSERVE_MAX_SHELL_COMMANDS - snap.shellCommandsUsed
         AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> T7_OBSERVE_MAX_COMPACTION_CALLS - snap.compactionCallsUsed
         AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> T7_OBSERVE_MAX_CONCURRENT_TOOLS - snap.concurrentToolsActive
+        // [T-cost-budget] int-trace API: report remaining in micro-USD (1e-6),
+        // null (disabled) → 0 — trace granularity, not a billing figure.
+        AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD ->
+            snap.estimatedCostUsdUsed?.let { (it * 1_000_000).toInt() } ?: 0
         else -> 0
     }
 
@@ -9330,6 +9382,8 @@ class ChatViewModel(
         AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> budget.maxShellCommands
         AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> budget.maxCompactionCalls
         AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> budget.maxConcurrentTools
+        AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD ->
+            budget.maxEstimatedCostUsd?.let { (it * 1_000_000).toInt() } ?: 0
         else -> 0
     }
 
@@ -10242,8 +10296,15 @@ class ChatViewModel(
     ): String? {
         if (parts.isEmpty()) return null
         val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
-        val tokenJson = usage?.let {
-            """{"inputTokens":${it.inputTokens},"outputTokens":${it.outputTokens},"cacheCreationTokens":${it.cacheCreationInputTokens ?: 0},"cacheReadTokens":${it.cacheReadInputTokens ?: 0},"latestContextTokens":${it.latestContextTokens}}"""
+        val tokenJson = usage?.let { u ->
+            // [T-cost-persist] Cost computed at persist time with the CURRENT
+            // catalog price — one extra JSON key inside the existing
+            // token_usage column (no schema change; legacy readers ignore it,
+            // the aggregator back-computes rows that predate the key).
+            val cost = CostCalculator.estimateCostUsd(modelId ?: "", u)
+            val sb = StringBuilder("""{"inputTokens":${u.inputTokens},"outputTokens":${u.outputTokens},"cacheCreationTokens":${u.cacheCreationInputTokens ?: 0},"cacheReadTokens":${u.cacheReadInputTokens ?: 0},"latestContextTokens":${u.latestContextTokens}""")
+            if (cost != null) sb.append(""","estimatedCostUsd":$cost""")
+            sb.append("}").toString()
         }
         val entity = chatRepository.appendMessage(
             realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,

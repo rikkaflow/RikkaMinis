@@ -806,6 +806,8 @@
     <string name="usage_detail_session_avg">Per-Session Avg</string>
     <string name="usage_detail_sessions">Sessions</string>
     <string name="usage_detail_active_days">Active Days</string>
+    <string name="usage_label_est_cost">Estimated Cost</string>
+    <string name="usage_detail_est_cost">Est. Cost</string>
     <string name="mirror_back">Back</string>
     <string name="mirror_current_section">Current</string>
     <string name="mirror_use_mirror_toggle">Use Mirror</string>
