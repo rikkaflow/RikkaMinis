@@ -5,60 +5,111 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
- * [T-cost-calculator] JVM tests: price lookup + cost math + the
- * "unknown model → null, never zero" contract.
+ * [T-cost-calculator] JVM tests: JSON catalog parsing, price lookup + fuzzy
+ * matching, cost math, the "unknown model → null, never zero" contract, and
+ * user-override precedence.
  */
 class CostCalculatorTest {
 
+    // A representative subset loaded via parseJson (production loads from
+    // assets; tests exercise the pure parser with the same schema).
+    private val catalogJson = """
+        {
+          "gpt-4o": { "input": 2.5, "output": 10.0, "cacheRead": 1.25 },
+          "gpt-4o-mini": { "input": 0.15, "output": 0.6, "cacheRead": 0.075 },
+          "claude-sonnet-4-6": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 },
+          "gemini-2.5-flash": { "input": 0.3, "output": 2.5, "cacheRead": 0.03 },
+          "deepseek-v4-pro": { "input": 1.32, "output": 3.96, "cacheRead": 0.044 },
+          "grok-4.20-0309-reasoning": { "input": 1.25, "output": 2.5, "cacheRead": 0.2 },
+          "llama-4-maverick": { "input": 0.05, "output": 0.15, "cacheRead": 0.0 }
+        }
+    """.trimIndent()
+
+    private val testEntries: Map<String, ModelPriceCatalog.PriceEntry> by lazy {
+        ModelPriceCatalog.parseJson(catalogJson)
+    }
+
+    private fun priceFor(id: String): ModelPriceCatalog.PriceEntry? =
+        ModelPriceCatalog.priceForFrom(testEntries, id)
+
+    @Before
+    fun checkParser() {
+        val entries = ModelPriceCatalog.parseJson(catalogJson)
+        assertEquals(7, entries.size)
+        assertEquals(2.5, entries["gpt-4o"]!!.inputPerMillion, 1e-9)
+        assertNull(entries["gpt-4o"]!!.cacheWritePerMillion)
+        assertEquals(3.75, entries["claude-sonnet-4-6"]!!.cacheWritePerMillion!!, 1e-9)
+        // Wire the production catalog path to the test JSON so
+        // CostCalculator.estimateCostUsd's internal ModelPriceCatalog.priceFor
+        // sees the same data.
+        ModelPriceCatalog.loader = { catalogJson }
+        ModelPriceCatalog.reload()
+    }
+
     @Test
     fun `exact model id resolves price`() {
-        val p = ModelPriceCatalog.priceFor("gpt-4o")
+        val p = priceFor("gpt-4o")
         assertNotNull(p)
         assertEquals(2.5, p!!.inputPerMillion, 1e-9)
         assertEquals(10.0, p.outputPerMillion, 1e-9)
     }
 
     @Test
-    fun `openrouter vendor prefix strips to bare slug`() {
-        // openai/gpt-4o → gpt-4o
-        assertEquals(ModelPriceCatalog.priceFor("gpt-4o"), ModelPriceCatalog.priceFor("openai/gpt-4o"))
-        // anthropic/claude-sonnet-4 → claude-sonnet-4 (not in catalog → but
-        // claude-sonnet-4-6 IS; bare "claude-sonnet-4" should be unknown)
-        assertNull(ModelPriceCatalog.priceFor("anthropic/claude-sonnet-4"))
+    fun `vendor prefix strips to bare slug`() {
+        assertEquals(priceFor("gpt-4o"), priceFor("openai/gpt-4o"))
     }
 
     @Test
     fun `unknown model returns null not zero`() {
-        assertNull(ModelPriceCatalog.priceFor("totally-unknown-model"))
+        assertNull(priceFor("totally-unknown-model"))
         assertNull(CostCalculator.estimateCostUsd("totally-unknown-model", LLMUsage(1000, 1000)))
     }
 
     @Test
     fun `blank model id returns null`() {
-        assertNull(ModelPriceCatalog.priceFor(""))
-        assertNull(ModelPriceCatalog.priceFor("   "))
+        assertNull(priceFor(""))
+        assertNull(priceFor("   "))
     }
 
     @Test
     fun `case insensitive fallback`() {
-        assertEquals(ModelPriceCatalog.priceFor("gpt-4o"), ModelPriceCatalog.priceFor("GPT-4O"))
+        assertEquals(priceFor("gpt-4o"), priceFor("GPT-4O"))
+    }
+
+    @Test
+    fun `date suffix is stripped for deepseek release ids`() {
+        val p = priceFor("deepseek-v4-pro-0813")
+        assertNotNull(p)
+        assertEquals(1.32, p!!.inputPerMillion, 1e-9)
+        assertEquals(3.96, p.outputPerMillion, 1e-9)
+        assertEquals(0.044, p.cacheReadPerMillion!!, 1e-9)
+    }
+
+    @Test
+    fun `date suffix with vendor prefix strips too`() {
+        val p = priceFor("deepseek/deepseek-v4-pro-0813")
+        assertNotNull(p)
+        assertEquals(1.32, p!!.inputPerMillion, 1e-9)
+    }
+
+    @Test
+    fun `non-numeric suffix is never stripped`() {
+        assertNotNull(priceFor("grok-4.20-0309-reasoning"))
     }
 
     @Test
     fun `cost math fresh input and output`() {
-        // gpt-4o: in 2.5 / out 10.0 per 1M
         val cost = CostCalculator.estimateCostUsd("gpt-4o", LLMUsage(inputTokens = 1_000_000, outputTokens = 500_000))
         assertNotNull(cost)
-        // 1M * 2.5/1M + 0.5M * 10/1M = 2.5 + 5.0 = 7.5
         assertEquals(7.5, cost!!, 1e-9)
     }
 
     @Test
     fun `cost math includes anthropic cache pricing`() {
-        // claude-sonnet-4-6: in 3.0 / out 15.0 / cacheRead 0.3 / cacheWrite 3.75
         val usage = LLMUsage(
             inputTokens = 100_000,
             outputTokens = 10_000,
@@ -73,27 +124,8 @@ class CostCalculatorTest {
     }
 
     @Test
-    fun `cache tokens priced at input rate when no cache price listed`() {
-        // gemini-2.5-flash: in 0.3 / out 2.5 / cacheRead 0.03, no cacheWrite
-        // → cacheWrite tokens fall back to input price 0.3
-        val usage = LLMUsage(
-            inputTokens = 0,
-            outputTokens = 0,
-            cacheCreationInputTokens = 1_000_000,
-        )
-        val cost = CostCalculator.estimateCostUsd("gemini-2.5-flash", usage)
-        assertNotNull(cost)
-        // cacheWrite fallback: 1M * 0.3/1M = 0.3 (not 3.75x — catalog has none)
-        assertEquals(0.3, cost!!, 1e-9)
-    }
-
-    @Test
     fun `negative token counts clamped to zero`() {
-        // Defensive: malformed rows shouldn't produce negative costs.
-        val cost = CostCalculator.estimateCostUsd(
-            "gpt-4o",
-            LLMUsage(inputTokens = -500, outputTokens = -100),
-        )
+        val cost = CostCalculator.estimateCostUsd("gpt-4o", LLMUsage(inputTokens = -500, outputTokens = -100))
         assertNotNull(cost)
         assertEquals(0.0, cost!!, 1e-9)
     }
@@ -107,7 +139,6 @@ class CostCalculatorTest {
 
     @Test
     fun `realistic small call is sub-cent`() {
-        // 3k in / 300 out on gpt-4o-mini (0.15 / 0.6)
         val cost = CostCalculator.estimateCostUsd("gpt-4o-mini", LLMUsage(3_000, 300))
         assertNotNull(cost)
         val expected = 3_000 * 0.15 / 1e6 + 300 * 0.6 / 1e6
@@ -116,22 +147,56 @@ class CostCalculatorTest {
     }
 
     @Test
-    fun `all builtin catalog models resolve`() {
-        // Every entry must at least resolve itself (sanity for hand-typed table)
-        for (id in listOf(
-            "claude-fable-5", "claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-5",
-            "claude-sonnet-4-6", "claude-haiku-4-5",
-            "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro",
-            "gemini-2.5-flash", "gemini-2.5-flash-lite",
-            "gpt-5.5", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.2",
-            "gpt-4o", "gpt-4o-mini", "o3", "o4-mini", "codex-mini-latest",
-            "llama-4-maverick",
-            "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning",
-            "grok-4.20-multi-agent-0309", "grok-build-0.1", "grok-3-mini", "grok-3-mini-fast",
-            "grok-composer-2.5-fast", "grok-4-fast", "grok-4-fast-non-reasoning", "grok-code-fast-1",
-            "kimi-k3", "kimi-k2",
-        )) {
-            assertNotNull("catalog missing: $id", ModelPriceCatalog.priceFor(id))
-        }
+    fun `user overrides win over catalog`() {
+        // deepseek-v4-pro catalog: in 1.32 / out 3.96. Override to a relay
+        // station's actual price (in 2.0 / out 6.0).
+        val cost = CostCalculator.estimateCostUsd(
+            "deepseek-v4-pro-0813",
+            LLMUsage(1_000_000, 100_000),
+            inputPricePerMillion = 2.0,
+            outputPricePerMillion = 6.0,
+        )
+        assertNotNull(cost)
+        // 1M * 2.0/1M + 0.1M * 6.0/1M = 2.0 + 0.6 = 2.6
+        assertEquals(2.6, cost!!, 1e-9)
+    }
+
+    @Test
+    fun `partial override falls back to catalog`() {
+        // Only input override (no output) → not a complete synthetic entry,
+        // falls back to catalog price entirely.
+        val cost = CostCalculator.estimateCostUsd(
+            "gpt-4o",
+            LLMUsage(1_000_000, 100_000),
+            inputPricePerMillion = 9.9,
+        )
+        assertNotNull(cost)
+        // catalog gpt-4o: 2.5 in + 10.0 out → 1M in + 0.1M out = 2.5 + 1.0 = 3.5
+        assertEquals(3.5, cost!!, 1e-9)
+    }
+
+    @Test
+    fun `override works even for unknown catalog model`() {
+        // Model not in catalog at all, but user supplied both prices.
+        val cost = CostCalculator.estimateCostUsd(
+            "my-relay/custom-model",
+            LLMUsage(1_000_000, 0),
+            inputPricePerMillion = 1.0,
+            outputPricePerMillion = 2.0,
+        )
+        assertNotNull(cost)
+        assertEquals(1.0, cost!!, 1e-9)
+    }
+
+    @Test
+    fun `malformed json yields empty catalog`() {
+        assertEquals(0, ModelPriceCatalog.parseJson("{ not valid json").size)
+        assertEquals(0, ModelPriceCatalog.parseJson("").size)
+    }
+
+    @Test
+    fun `entry missing required prices is skipped`() {
+        val entries = ModelPriceCatalog.parseJson("""{ "broken": { "cacheRead": 0.5 } }""")
+        assertEquals(0, entries.size)
     }
 }

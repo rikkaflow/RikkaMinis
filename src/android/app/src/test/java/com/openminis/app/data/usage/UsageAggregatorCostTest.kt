@@ -3,6 +3,7 @@ package com.openminis.app.data.usage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Before
 import org.junit.Test
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -14,6 +15,19 @@ import java.util.TimeZone
  * preference, legacy-row back-computation, unknown-model null semantics.
  */
 class UsageAggregatorCostTest {
+
+    @Before
+    fun wireCatalog() {
+        // CostCalculator back-computation needs a catalog; inject the same
+        // representative subset used by CostCalculatorTest.
+        com.openminis.app.provider.ModelPriceCatalog.loader = {
+            """{
+              "gpt-4o": { "input": 2.5, "output": 10.0, "cacheRead": 1.25 },
+              "claude-sonnet-4-6": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 }
+            }""".trimIndent()
+        }
+        com.openminis.app.provider.ModelPriceCatalog.reload()
+    }
 
     private val utcDayFormat: (Long) -> String = { ms ->
         val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)

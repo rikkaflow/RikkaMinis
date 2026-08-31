@@ -1442,6 +1442,16 @@ class ChatViewModel(
         }
 
     /**
+     * [T-cost-override] Resolve the active [ModelEntry] for the current turn
+     * (via [activeEntryId] → provider config). Null when the model binding is
+     * group-resolved without a concrete entry, or the config hasn't loaded.
+     */
+    private fun activeModelEntry(): com.openminis.app.data.model.ModelEntry? {
+        val id = _activeEntryId.value ?: return null
+        return providerRepository.config.value.modelEntries.find { it.id == id }
+    }
+
+    /**
      * [T-android-thinking-level-arch] Levels the chat composer picker should
      * offer: everything up to the current model's ceiling, EXCLUDING OFF —
      * mirrors iOS availableThinkingLevels (`filter { $0 != .off && $0 <= max }`).
@@ -7537,9 +7547,12 @@ class ChatViewModel(
                         // maxEstimatedCostUsd is null in the observe phase →
                         // Allowed, no-op bookkeeping (same pattern as tokens).
                         runCatching {
+                            val entry = activeModelEntry()
                             val turnCost = CostCalculator.estimateCostUsd(
                                 currentProvider?.model?.id.orEmpty(),
                                 chunk.usage,
+                                inputPricePerMillion = entry?.overrides?.inputPricePerMillion,
+                                outputPricePerMillion = entry?.overrides?.outputPricePerMillion,
                             )
                             if (turnCost != null) {
                                 t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_ESTIMATED_COST_USD) {
@@ -10298,10 +10311,17 @@ class ChatViewModel(
         val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
         val tokenJson = usage?.let { u ->
             // [T-cost-persist] Cost computed at persist time with the CURRENT
-            // catalog price — one extra JSON key inside the existing
-            // token_usage column (no schema change; legacy readers ignore it,
-            // the aggregator back-computes rows that predate the key).
-            val cost = CostCalculator.estimateCostUsd(modelId ?: "", u)
+            // price (user override first, else catalog) — one extra JSON key
+            // inside the existing token_usage column (no schema change; legacy
+            // readers ignore it, the aggregator back-computes rows that
+            // predate the key).
+            val entry = activeModelEntry()
+            val cost = CostCalculator.estimateCostUsd(
+                modelId ?: "",
+                u,
+                inputPricePerMillion = entry?.overrides?.inputPricePerMillion,
+                outputPricePerMillion = entry?.overrides?.outputPricePerMillion,
+            )
             val sb = StringBuilder("""{"inputTokens":${u.inputTokens},"outputTokens":${u.outputTokens},"cacheCreationTokens":${u.cacheCreationInputTokens ?: 0},"cacheReadTokens":${u.cacheReadInputTokens ?: 0},"latestContextTokens":${u.latestContextTokens}""")
             if (cost != null) sb.append(""","estimatedCostUsd":$cost""")
             sb.append("}").toString()

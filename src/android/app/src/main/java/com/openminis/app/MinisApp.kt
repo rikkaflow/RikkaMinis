@@ -259,6 +259,13 @@ class MinisApp : Application(), ImageLoaderFactory {
         // never pass through a ViewModel.
         com.openminis.app.data.FastModePrefs.prime(this)
 
+        // [T-cost-catalog] Capture the app context so the model price catalog
+        // can read assets/model_prices.json lazily at first cost lookup.
+        com.openminis.app.provider.AssetJsonLoader.init(this)
+        com.openminis.app.provider.ModelPriceCatalog.loader = {
+            com.openminis.app.provider.AssetJsonLoader.read("model_prices.json")
+        }
+
         // [D-2] Warm the cross-session concurrency cap from prefs so the three
         // coordinated gates (SessionConcurrencyManager / ExecutionCoordinator /
         // NativeOffloadServer) read the user-configured value at first use.
