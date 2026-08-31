@@ -56,6 +56,59 @@ class MemoryRepository(private val memoryDir: File) {
         // back into the next LLM call. Counted as UTF-8 bytes (matches
         // what the provider sees over the wire).
         private const val MAX_OUTPUT_BYTES = 30 * 1024  // 30 KB
+
+        // [feat/memory-time-decay] Recency weight for keyword-search file
+        // ordering. getMemory() previously iterated files purely by name
+        // descending (newest first) and appended matches in that fixed order,
+        // so when several files matched, the line/byte budget could be eaten
+        // by an old file before a recent one was considered. The decay factor
+        // ranks matched files by exp(-lambda * ageDays): a file from today
+        // scores 1.0, a 30-day-old file scores ~0.30 with the default lambda
+        // (0.04). GLOBAL.md is undated and treated as "no decay" (weight 1.0 —
+        // user-maintained global preferences never age out). This reorders
+        // WHICH matched files get included first; the per-file line/byte
+        // truncation behavior is unchanged. Pure function of (ageDays) so the
+        // scoring is unit-testable without touching the search loop.
+        internal const val MEMORY_DECAY_LAMBDA = 0.04
+
+        /**
+         * Recency weight for a memory file, exp(-[MEMORY_DECAY_LAMBDA] * ageDays).
+         *
+         * @param ageDays age of the file in days (parsed from the
+         *   YYYY-MM-DD filename); negative (future/malformed) or null
+         *   (undated file such as GLOBAL.md) is clamped to "no decay" (1.0)
+         *   — never punish a malformed filename by hiding the file.
+         */
+        internal fun memoryRecencyWeight(ageDays: Long?): Double {
+            if (ageDays == null || ageDays <= 0L) return 1.0
+            return Math.exp(-MEMORY_DECAY_LAMBDA * ageDays)
+        }
+
+        /**
+         * Parse the age (in days) of a daily-log filename against [nowMs].
+         * Returns null for names that are not YYYY-MM-DD dates. Exposed
+         * internal for unit tests.
+         */
+        internal fun dailyLogAgeDays(fileName: String, nowMs: Long): Long? {
+            val regex = Regex("^(\\d{4})-(\\d{2})-(\\d{2})\\.md$")
+            val match = regex.find(fileName) ?: return null
+            val (y, m, d) = match.destructured
+            return try {
+                val cal = java.util.Calendar.getInstance(Locale.US)
+                cal.clear()
+                cal.isLenient = false
+                cal.set(y.toInt(), m.toInt() - 1, d.toInt())
+                val fileMs = cal.timeInMillis
+                val diff = nowMs - fileMs
+                // Floor toward negative infinity so "same day" = 0 only when
+                // now is truly past midnight of the log's date; a clock a few
+                // hours ahead (timezone skew) yields a small negative age that
+                // memoryRecencyWeight clamps to 1.0.
+                Math.floorDiv(diff, 86_400_000L)
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     init {
@@ -170,6 +223,24 @@ class MemoryRepository(private val memoryDir: File) {
             return "No memory files found."
         }
 
+        // [feat/memory-time-decay] Reorder matched files by recency before
+        // the budgeted search loop runs. Phase 1: this reordering only takes
+        // effect for keyword searches, where several files can match and the
+        // fixed name-descending order let an old file eat the line budget
+        // before a recent one was considered. The full-dump path
+        // (keywordList.isEmpty()) keeps the original name-descending order —
+        // a dump is a chronological preview, not a ranked result set, and
+        // reordering it would change the "recent days first" reading order.
+        // GLOBAL.md (undated) gets weight 1.0 via memoryRecencyWeight(null).
+        val nowMs = System.currentTimeMillis()
+        val orderedFiles = if (keywordList.isEmpty()) {
+            filesToSearch
+        } else {
+            filesToSearch.sortedByDescending { (label, _) ->
+                memoryRecencyWeight(dailyLogAgeDays(label, nowMs))
+            }
+        }
+
         val results = mutableListOf<String>()
         var totalLines = 0
         // [T-memory-get-truncate-android] UTF-8 byte tally — see
@@ -188,7 +259,7 @@ class MemoryRepository(private val memoryDir: File) {
         // to flood agent context.
         val lineCap = if (keywordList.isEmpty()) MAX_DUMP_LINES else MAX_SEARCH_LINES
 
-        for ((label, file) in filesToSearch) {
+        for ((label, file) in orderedFiles) {
             if (totalLines >= lineCap || byteCapHit) break
             val content = try { file.readText() } catch (_: Exception) { continue }
             if (content.isEmpty()) continue
