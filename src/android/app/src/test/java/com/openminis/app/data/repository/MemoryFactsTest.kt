@@ -30,13 +30,23 @@ class MemoryFactsTest {
 
     private fun repo(): MemoryRepository = MemoryRepository(memoryDir)
 
+    // [fix/test-date-flake] The default fixture date must track the RUNTIME
+    // "today": MemoryRepository.appendFacts dedups facts whose createdDatePrefix
+    // equals today, and MemoryTools.executeMemoryWrite writes today's daily log
+    // (yyyy-MM-dd.md). A hard-coded 2026-08-31 passed on 08-31 CI and turned red
+    // the next day — a time-bomb test, not a real regression (caught by the
+    // 2026-09-01 CI run on an unrelated branch). All other hard-coded dates in
+    // this file are pure historical fixtures compared only against themselves
+    // (round-trip equality), so they are left alone.
+    private val todayDate: String = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+
     private fun fact(
         subject: String,
         predicate: String,
         `object`: String,
         confidence: Double = 0.8,
-        createdAt: String = "2026-08-31T12:00:00",
-    ) = MemoryFact(subject, predicate, `object`, confidence, "2026-08-31.md", "device-A", createdAt)
+        createdAt: String = "${todayDate}T12:00:00",
+    ) = MemoryFact(subject, predicate, `object`, confidence, "$todayDate.md", "device-A", createdAt)
 
     // ── append / load round-trip ─────────────────────────────────────────
 
@@ -51,7 +61,7 @@ class MemoryFactsTest {
         val obj = JSONObject(lines[0])
         // snake_case keys on disk
         assertEquals("device-A", obj.getString("device_id"))
-        assertEquals("2026-08-31T12:00:00", obj.getString("created_at"))
+        assertEquals("${todayDate}T12:00:00", obj.getString("created_at"))
         assertEquals(0.9, obj.getDouble("confidence"), 1e-9)
 
         val loaded = r.loadFacts()
@@ -61,8 +71,8 @@ class MemoryFactsTest {
         assertEquals("dark theme", loaded[0].`object`)
         assertEquals(0.9, loaded[0].confidence, 1e-9)
         assertEquals("device-A", loaded[0].deviceId)
-        assertEquals("2026-08-31T12:00:00", loaded[0].createdAt)
-        assertEquals("2026-08-31.md", loaded[0].source)
+        assertEquals("${todayDate}T12:00:00", loaded[0].createdAt)
+        assertEquals("$todayDate.md", loaded[0].source)
     }
 
     @Test
@@ -409,7 +419,7 @@ class MemoryFactsTest {
         assertFalse("no (+N facts) suffix expected: ${result.output}", result.output.contains("(+"))
         assertEquals(0, r.loadFacts().size)
         // Daily log still written
-        val daily = File(memoryDir, "2026-08-31.md")
+        val daily = File(memoryDir, "$todayDate.md")
         assertTrue(daily.exists())
     }
 
