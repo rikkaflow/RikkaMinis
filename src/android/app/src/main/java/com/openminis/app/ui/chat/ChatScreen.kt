@@ -3632,49 +3632,84 @@ fun ChatScreen(
                                 .then(
                                     if (isNewestItem) {
                                         Modifier.onPlaced {
-                                            com.openminis.app.diagnostics.PerfLongCtx.step(
-                                                sessionId,
-                                                "lazyColumn.firstItem.placed",
-                                                "size=${it.size.width}x${it.size.height}",
-                                            )
                                             // [T-android-placed-storm-diag] Place-storm
-                                            // detector. The 2026-08-31 stall showed the
-                                            // newest item being placed ~620 times in
-                                            // 10s (once per frame, size unchanged) with
-                                            // no hang episode — the main thread was
-                                            // healthy but re-laying-out the same item
-                                            // in a loop, which the HangDetector cannot
-                                            // catch (its heartbeat stayed <3s). When
-                                            // that repeats, dump ONE main-thread stack
-                                            // so the driver (animation restart vs list
-                                            // reference churn vs scrollToItem re-fire)
-                                            // is visible in the log instead of guessed.
-                                            // Purely observational: no behavior change,
-                                            // one dump per session.
+                                            // detector v2 (2026-09-01 log forensics).
+                                            //
+                                            // The 2026-09-01 log (minis-2026-09-01__1_)
+                                            // showed the FIRST-GEN instrumentation was
+                                            // itself a frame-budget offender: 11,739
+                                            // `firstItem.placed` lines (one per frame,
+                                            // each a PerfLongCtx.step string-build +
+                                            // logcat IPC + synchronous PrintWriter file
+                                            // write ON THE MAIN THREAD) — ~16ms of
+                                            // per-frame logging work during every
+                                            // storm, and the 3MB log itself. v2 keeps
+                                            // the same detector semantics but:
+                                            //   1. Emits AT MOST one summary line per
+                                            //      second (count + last size), so idle
+                                            //      per-frame cost is a couple of
+                                            //      long-field reads — no string build,
+                                            //      no I/O — until a storm summary is
+                                            //      actually due.
+                                            //   2. Dumps up to 3 stacks per session
+                                            //      (was 1): the 2nd/3rd dumps land
+                                            //      mid-storm at different offsets, so
+                                            //      a driver that only engages later
+                                            //      (streaming, IME) still gets caught.
+                                            //   3. Each dump appends a LazyListState
+                                            //      snapshot (firstIdx/firstOff/
+                                            //      totalItems/isScrollInProgress) —
+                                            //      a scroll-position flutter loop is
+                                            //      the prime suspect for a layout-only,
+                                            //      no-recomposition 60fps storm, and
+                                            //      the snapshot makes it visible.
+                                            // Still purely observational: the mutable
+                                            // holder is not a Compose State, so the
+                                            // counter never invalidates composition.
                                             val storm = placeStorm
-                                            if (!storm.dumped) {
-                                                val now = SystemClock.uptimeMillis()
-                                                if (now - storm.lastPlacedMs <= 2_000L) {
-                                                    storm.count++
-                                                    storm.lastPlacedMs = now
-                                                    // ~60 places in 2s ≈ 30fps worth of
-                                                    // re-layout; a normal cold open is a
-                                                    // handful. Dump once, then stay quiet.
-                                                    if (storm.count >= 60) {
-                                                        storm.dumped = true
+                                            val now = SystemClock.uptimeMillis()
+                                            storm.count++
+                                            storm.lastSize = "${it.size.width}x${it.size.height}"
+                                            if (now - storm.lastEmitMs >= 1_000L) {
+                                                storm.lastEmitMs = now
+                                                com.openminis.app.diagnostics.PerfLongCtx.step(
+                                                    sessionId,
+                                                    "lazyColumn.firstItem.placed.summary",
+                                                    "placesInWindow=${storm.count} lastSize=${storm.lastSize}",
+                                                )
+                                                storm.count = 0
+                                            }
+                                            if (storm.dumps < 3) {
+                                                // Burst-window detector: places within
+                                                // 2s of each other accumulate; ~60 in
+                                                // the window ≈ 30fps of re-layout (a
+                                                // normal cold open is a handful).
+                                                if (now - storm.windowStartMs <= 2_000L) {
+                                                    if (storm.windowCount >= 60) {
+                                                        storm.dumps++
+                                                        storm.windowCount = 0
+                                                        storm.windowStartMs = now
+                                                        val info = listState.layoutInfo
                                                         val frames = Looper.getMainLooper().thread.stackTrace
-                                                            .take(20).joinToString(" <- ") {
+                                                            .take(25).joinToString(" <- ") {
                                                                 "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
                                                             }
                                                         AppLogger.warning(
                                                             "PlaceStorm",
-                                                            "[PlaceStorm] session=$sessionId count=${storm.count} " +
-                                                                "lastKey=${item.key} stack: $frames",
+                                                            "[PlaceStorm] session=$sessionId dump#${storm.dumps} " +
+                                                                "lastKey=${item.key} lastSize=${storm.lastSize} " +
+                                                                "firstIdx=${listState.firstVisibleItemIndex} " +
+                                                                "firstOff=${listState.firstVisibleItemScrollOffset} " +
+                                                                "totalItems=${info.totalItemsCount} " +
+                                                                "scrollInProgress=${listState.isScrollInProgress} " +
+                                                                "stack: $frames",
                                                         )
+                                                    } else {
+                                                        storm.windowCount++
                                                     }
                                                 } else {
-                                                    storm.count = 1
-                                                    storm.lastPlacedMs = now
+                                                    storm.windowCount = 1
+                                                    storm.windowStartMs = now
                                                 }
                                             }
                                             // [T-android-jank-diag-logging]
@@ -6439,9 +6474,22 @@ private fun ChatInputArea(
  * A plain class (not a Compose State) on purpose: the counter mutates on every
  * `firstItem.placed` callback and must never invalidate the surrounding
  * composable scope. `remember(sessionId)` keeps one instance per session.
+ *
+ * v2 fields:
+ *  - [count]/[lastEmitMs] throttle the per-second summary line (v1 logged
+ *    every frame — 11,739 lines in the 2026-09-01 log, each paying a string
+ *    build + logcat IPC + main-thread file write).
+ *  - [windowCount]/[windowStartMs] are the burst detector (≥60 places within
+ *    a 2s window → stack dump).
+ *  - [dumps] allows up to 3 dumps per session (v1's single dump fired at
+ *    storm onset only; later drivers never got caught).
+ *  - [lastSize] keeps the most recent onPlaced size for the dump line.
  */
 private class PlaceStormState {
     var count: Int = 0
-    var lastPlacedMs: Long = 0L
-    var dumped: Boolean = false
+    var lastEmitMs: Long = 0L
+    var lastSize: String = ""
+    var windowCount: Int = 0
+    var windowStartMs: Long = 0L
+    var dumps: Int = 0
 }
