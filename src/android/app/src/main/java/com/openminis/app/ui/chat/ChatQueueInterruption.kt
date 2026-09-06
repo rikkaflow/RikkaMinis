@@ -359,7 +359,14 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
             // active provider too, so the drain chain continues AFTER the
             // current entry (and, with the fixed entry-anchor, never
             // re-includes the active entry itself).
-            val drainedProvider = currentProvider ?: provider
+            val drainedProvider = run {
+                // [T-per-message-load-balance] Each queued prompt is its own
+                // new user turn — advance the loadBalance rotation before
+                // re-anchoring, so the drain serves queued messages across
+                // the group's members too.
+                rotateForNewTurn("drain")
+                currentProvider ?: provider
+            }
             val drainFallbacks = buildFallbackProviders(drainedProvider)
             // [P0-fallback-reentry] Log the drain anchor so the user can
             // verify a queued prompt continues on the ACTUAL active entry
@@ -427,7 +434,7 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
         }
         var provider: LLMProvider = initialProvider
 
-        val baseSystemPrompt = buildSystemPrompt()
+        val baseSystemPrompt = systemPromptForSession()
         val systemPrompt = baseSystemPrompt
 
         // T145: claim the streaming flag synchronously before launching
@@ -436,9 +443,16 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
         AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel _isStreaming=true (sync, sid=$activeSessionId)")
         _isStreaming.value = true
         streamEpoch++
+        // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
+        // finally can't flip _isStreaming off during the setup window.
+        streamingClaimEpoch = streamEpoch
         _canResume.value = false
         _error.value = null
 
+        // [T-stale-finally-vs-new-claim] Capture BEFORE launching so the
+        // finally gate compares against THIS takeover's claim even if the
+        // coroutine body starts late.
+        val launchEpoch = streamingClaimEpoch
         streamJob = launch(Dispatchers.IO) {
             AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel streamJob ENTER sid=$activeSessionId")
             try {
@@ -482,8 +496,9 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
             } catch (e: CancellationException) {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel streamJob CANCELLED waiting for slot")
             }
-            // [T-android-stale-streamjob-clears-isstreaming] guard.
-            if (streamJob === coroutineContext[Job]) {
+            // [T-android-stale-streamjob-clears-isstreaming] guard + epoch
+            // gate (see runRerunStreamTail).
+            if (streamJob === coroutineContext[Job] && launchEpoch == streamingClaimEpoch) {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel _isStreaming=false (about to set)")
                 _isStreaming.value = false
             } else {

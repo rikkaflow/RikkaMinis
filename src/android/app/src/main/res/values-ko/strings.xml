@@ -1067,6 +1067,8 @@
     <string name="error_tech_detail">기술 세부 정보</string>
     <string name="fallback_switched_to">%1$s(으)로 전환됨</string>
     <string name="error_output_truncated_repeated">모델이 출력 길이 제한에 반복적으로 도달했습니다. 모델 설정에서 컨텍스트 제한을 낮추거나 질문을 더 작은 부분으로 나누어 보세요.</string>
+        <string name="error_content_filtered">모델의 안전 필터가 이 응답을 차단했습니다. 표현을 바꾸거나 다른 모델로 전환해 보세요.</string>
+        <string name="error_stream_interrupted">모델과의 연결이 끊어져 응답을 완료하지 못했습니다. 다시 시도해 주세요.</string>
     <string name="error_empty_response_context_large">모델이 빈 응답을 반환했습니다. 대화 컨텍스트가 너무 클 수 있습니다 — 압축하거나 새 세션을 시작하세요.</string>
     <string name="error_empty_response_after_tool">도구 결과 이후 리마인더를 보냈는데도 모델이 응답을 반환하지 않았습니다. 과부하 상태일 수 있습니다 — 다시 시도하거나 모델을 변경하세요.</string>
     <string name="thinking_truncated_hint">%2$dK자 중 마지막 %1$dK자 표시 중</string>
@@ -1171,7 +1173,7 @@
     <!-- 英文兜底 (2026-08-08) -->
     <string name="model_group_name_saved">Name saved</string>
     <string name="model_group_routing_fallback_footer">Try models in order. If one fails, advance to the next.</string>
-    <string name="model_group_routing_loadbalance_footer">Distribute sessions across models in the group.</string>
+    <string name="model_group_routing_loadbalance_footer">새 메시지마다 그룹 내 다음 모델로 전환됩니다.</string>
     <string name="model_group_fallback_default_footer">Fall back on rate limits (429) and server errors (5xx) only.</string>
     <string name="model_group_fallback_always_footer">Advanced: fall back on any error, including network and auth failures. Prefer Default unless you know why you need this.</string>
     <string name="model_group_no_models">No models in this group.</string>

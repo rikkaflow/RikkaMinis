@@ -836,6 +836,8 @@
     <string name="error_tech_detail">技術詳情</string>
     <string name="fallback_switched_to">已切換至 %1$s</string>
     <string name="error_output_truncated_repeated">模型多次達到輸出長度上限而被截斷。請嘗試在模型設定中調低上下文限制，或將問題拆分為較小的部分。</string>
+        <string name="error_content_filtered">模型的安全過濾器攔截了這條回答。請嘗試換個說法，或切換其他模型。</string>
+        <string name="error_stream_interrupted">與模型的連線中斷，回答未能完成——請重試。</string>
     <string name="error_empty_response_context_large">模型回傳了空回應。對話上下文可能過大 —— 請嘗試壓縮上下文或開啟新工作階段。</string>
     <string name="error_empty_response_after_tool">在工具結果之後，即使經過提醒，模型仍未回傳任何回應。它可能已過載 —— 請重試或切換模型。</string>
     <string name="thinking_truncated_hint">顯示最後 %1$dK / 共 %2$dK 字元</string>
@@ -893,7 +895,7 @@
     <!-- 英文兜底 (2026-08-08) -->
     <string name="model_group_name_saved">Name saved</string>
     <string name="model_group_routing_fallback_footer">Try models in order. If one fails, advance to the next.</string>
-    <string name="model_group_routing_loadbalance_footer">Distribute sessions across models in the group.</string>
+    <string name="model_group_routing_loadbalance_footer">每則新訊息依次切換到群組內的下一個模型。</string>
     <string name="model_group_fallback_default_footer">Fall back on rate limits (429) and server errors (5xx) only.</string>
     <string name="model_group_fallback_always_footer">Advanced: fall back on any error, including network and auth failures. Prefer Default unless you know why you need this.</string>
     <string name="model_group_no_models">No models in this group.</string>

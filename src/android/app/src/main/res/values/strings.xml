@@ -998,7 +998,7 @@
     <string name="model_group_detail_unavailable">Unavailable</string>
     <string name="model_group_name_saved">Name saved</string>
     <string name="model_group_routing_fallback_footer">Try models in order. If one fails, advance to the next.</string>
-    <string name="model_group_routing_loadbalance_footer">Distribute sessions across models in the group.</string>
+    <string name="model_group_routing_loadbalance_footer">Each new message advances to the next model in the group.</string>
     <string name="model_group_fallback_default_footer">Fall back on rate limits (429) and server errors (5xx) only.</string>
     <string name="model_group_fallback_always_footer">Advanced: fall back on any error, including network and auth failures. Prefer Default unless you know why you need this.</string>
     <string name="model_group_no_models">No models in this group.</string>
@@ -1519,6 +1519,8 @@
     <!-- [T-error-no-permanent-scars] Lightweight note shown when a model-group fallback switches models mid-turn. -->
     <string name="fallback_switched_to">Switched to %1$s</string>
     <string name="error_output_truncated_repeated">The model hit the output length limit repeatedly. Try lowering the context limit in model settings, or ask the question in smaller parts.</string>
+        <string name="error_content_filtered">The model\'s safety filter blocked this response. Try rephrasing, or switch to another model.</string>
+        <string name="error_stream_interrupted">The connection to the model was interrupted. The response could not be completed — try again.</string>
     <string name="error_empty_response_context_large">The model returned an empty response. The conversation context may be too large — try compacting or starting a new session.</string>
     <string name="error_empty_response_after_tool">The model returned no response after a tool result, even after a reminder. It may be overloaded — please retry or switch models.</string>
     <!-- [T-thinking-render-perf-android] Inline windowed-tail hint + large-content viewer entry. -->

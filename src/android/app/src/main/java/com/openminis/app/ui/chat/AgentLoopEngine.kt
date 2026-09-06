@@ -52,6 +52,32 @@ import com.openminis.app.R
 /** Hard cap on agent-loop turns (moved from ChatViewModel companion, FE-5 route C). */
 internal const val MAX_AGENT_TURNS = 200
 
+/**
+ * [feat/hermes-tier1] Max text-continuation rounds per length-wall wall.
+ * A truncated (finish_reason="length") turn with visible text is continued
+ * at most this many times; past the cap the loop stops continuing, rolls
+ * the seam back to the last clean fold, and surfaces the truncation error.
+ * Mirrors Hermes turn_truncation's continuation ceiling of 4.
+ */
+internal const val MAX_LENGTH_WALL_TEXT_CONTINUES = 4
+
+/**
+ * [feat/hermes-tier1] Consecutive deterministic-empty completions (usage
+ * proves output_tokens == 0) after which the loop gives up instead of
+ * re-billing. Mirrors Hermes empty_response_guard's skip-retries-on-2-
+ * deterministic-empties (adapted: RikkaMinis keeps one reminder round for
+ * the tool-result case, so the streak limit is 2 here).
+ */
+internal const val DETERMINISTIC_EMPTY_LIMIT = 2
+
+/**
+ * [fix/eof-stub-continuation] Max continuation rounds for EOF-truncated
+ * streams (stream ended with NO finish_reason). The partial answer is KEPT
+ * and a network-stub reminder asks the model to continue; past this cap the
+ * loop gives up with a visible error instead of a silent mid-sentence stop.
+ */
+internal const val MAX_EOF_STUB_CONTINUES = 2
+
 /** Per-tool ring cap for ToolInputDelta snapshots (moved from ChatViewModel companion). */
 internal const val TOOL_INPUT_CHUNK_RING_MAX = 10
 
@@ -792,10 +818,30 @@ internal class AgentLoopEngine(
                         ((actual is com.openminis.app.sandbox.offload.ModelWorkerDiedException) ||
                             (actual is com.openminis.app.sandbox.offload.ModelStreamErrorException)) &&
                         (actual as? com.openminis.app.sandbox.offload.ModelExecutionStreamException)?.hadChunks == false
+                    // [fix/stream-error-silent-recovery] A mid-stream failure
+                    // (hadChunks=true) used to fall through to the fatal path:
+                    // the worker→client error line carried no type info, so the
+                    // engine couldn't tell a proxy blip from a fatal error and
+                    // surfaced "Stream error" + a manual retry button. The
+                    // worker now stamps a machine-readable kind on the error
+                    // line; classify() maps it. AUTO_RETRY is safe even with
+                    // partial output on screen — rollbackTurnBlocksTo (below)
+                    // rewinds the half-delivered text before the resend, so no
+                    // duplicate is possible. FALLBACK_NOW skips same-provider
+                    // retries (rate-limit / bad-key members can't self-heal).
+                    // Null kind (legacy worker) → FATAL, byte-identical to the
+                    // old behavior.
+                    val streamErrorAction =
+                        (actual as? com.openminis.app.sandbox.offload.ModelStreamErrorException)
+                            ?.let { ChatStreamErrorPolicy.classify(it.kind) }
+                    val streamErrorAutoRetry = streamErrorAction == ChatStreamErrorPolicy.Action.AUTO_RETRY
+                    val streamErrorFallbackNow =
+                        streamErrorAction == ChatStreamErrorPolicy.Action.FALLBACK_NOW
                     val isTransient = actual is com.openminis.app.data.model.LLMError.NetworkError ||
                         actual is com.openminis.app.data.model.LLMError.TransientError ||
                         is5xx ||
-                        workerDiedZeroChunk
+                        workerDiedZeroChunk ||
+                        streamErrorAutoRetry
                     // [T-fallback-retry-original] Restored original behavior: all members
                     // (including fallback chain members) get bounded retries on transient
                     // errors. This absorbs intermittent stream resets that the fallback
@@ -912,7 +958,17 @@ internal class AgentLoopEngine(
                     // group immediately — rate limits (429), bad/expired API keys
                     // (401) and provider errors (4xx/5xx, incl. per-provider 403
                     // quota). `always` additionally falls back on every error.
+                    // [fix/stream-error-silent-recovery] TYPED stream errors
+                    // mirror the LLMError semantics they were classified from:
+                    //  - rate_limited / invalid_key / provider kinds skip
+                    //    same-provider retries entirely (retrying a member
+                    //    that answered "you can't use me" is wasted latency);
+                    //  - network / transient kinds retry first, then fall
+                    //    back after exhaustion — exactly how a NetworkError
+                    //    flows through this catch block.
                     val shouldFallback =
+                        streamErrorFallbackNow ||
+                        streamErrorAutoRetry ||
                         (actual as? com.openminis.app.data.model.LLMError)?.isFallbackable == true ||
                         fallbackStrategy == com.openminis.app.data.model.FallbackStrategy.always
                     // T7-A: 观察 —— provider 尝试失败需 fallback（T5 ProviderAttemptFinished(FALLBACK_FAILURE)）
@@ -1183,7 +1239,165 @@ internal class AgentLoopEngine(
             } else {
                 loopState.accumulatedText += turnTextRaw
             }
-            loopState.lastTurnWasLengthWall = turnFinishReason == "length" && turnTextRaw.isNotEmpty()
+            // [fix/eof-stub-continuation] EOF-stub continuations behave like
+            // length-wall continuations for seam-dedup purposes: the next
+            // turn's head may repeat the truncated tail. The stub branch
+            // (below, finish-path) sets this flag when it injects the
+            // network-stub reminder; here it must NOT be cleared when the
+            // previous turn was an EOF stub (turnFinishReason is null on the
+            // next streamed turn, which would reset the flag before the seam
+            // merge could use it). Cleared only on a NORMAL finish (stop /
+            // end_turn / tool-call turn) — those are clean turn boundaries
+            // where head-overlap trimming would be wrong.
+            loopState.lastTurnWasLengthWall = when {
+                turnTextRaw.isEmpty() -> false
+                turnFinishReason == "length" -> true
+                turnFinishReason == null -> loopState.lastTurnWasLengthWall
+                else -> false // stop / end_turn / tool-call turns: clean boundary
+            }
+
+            // [fix/finish-reason-network-error] Field-observed (2026-09-06
+            // log, user-uploaded): a relay (agentrouter.org / glm-5.3) turned
+            // ITS OWN upstream failure into a normal SSE finish frame —
+            // finish_reason="network_error", zero content, clean [DONE]. No
+            // EOF, no error line, no exception: every existing guard (EOF
+            // stub, stream-error kind) is keyed on the ABNORMAL paths, so
+            // this pseudo-finish sailed through as "no tool calls → break"
+            // and the user saw the reply die mid-answer with NO banner and
+            // NO retry. Treat error-shaped finishes as transient stream
+            // failures:
+            //  - with visible partial content → same recovery as an
+            //    EOF-truncated stream (network-stub continuation, bounded);
+            //  - with no content → one-shot retry (drop the empty turn),
+            //    then the normal empty-turn hint path takes over.
+            if (toolCalls.isEmpty() && ContentFilterFinishPolicy.isErrorShapedFinish(turnFinishReason)) {
+                if (turnTextRaw.isNotEmpty()) {
+                    if (loopState.eofStubContinues < MAX_EOF_STUB_CONTINUES) {
+                        loopState.eofStubContinues++
+                        AppLogger.warning(
+                            TAG_STREAM,
+                            "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) with ${turnTextRaw.length} chars — network-stub continuation ${loopState.eofStubContinues}/$MAX_EOF_STUB_CONTINUES",
+                        )
+                        val stubReminder = eofStubReminder(turnText.takeLast(80))
+                        host.agentHistory.add(
+                            LLMMessage(
+                                role = LLMMessage.Role.USER,
+                                content = stubReminder,
+                                contentParts = listOf(AgentContentPart.Text(stubReminder)),
+                            )
+                        )
+                        loopState.lastTurnWasLengthWall = true
+                        continue
+                    }
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) stub ceiling hit — giving up with visible error",
+                    )
+                    withContext(Dispatchers.Main) {
+                        host.setInlineError(host.string(R.string.error_stream_interrupted))
+                    }
+                    // fall through to normal persist + exit (partial kept)
+                } else {
+                    // Empty + error-shaped: the relay failed BEFORE emitting
+                    // anything. One-shot retry (fresh turn re-reads history),
+                    // then the empty-turn hint path reports it visibly.
+                    if (!loopState.didRetryTruncatedTurn) {
+                        loopState.didRetryTruncatedTurn = true
+                        AppLogger.warning(
+                            TAG_STREAM,
+                            "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) with no content — one-shot retry",
+                        )
+                        continue
+                    }
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) empty after retry — surfacing error",
+                    )
+                    withContext(Dispatchers.Main) {
+                        host.setInlineError(host.string(R.string.error_stream_interrupted))
+                    }
+                    loopState.loopExitedNormally = true
+                    break
+                }
+            }
+
+            // [feat/content-filter-fallback] A content-filter / safety-block
+            // finish (content_filter, Gemini SAFETY/RECITATION/…, Anthropic
+            // refusal) is a DETERMINISTIC member-level refusal: this member
+            // will answer the same way on every retry. Instead of falling
+            // through to the blank-bubble path below, consume the fallback
+            // chain immediately — a different member may have a different
+            // safety posture and answer fine. Guard rails:
+            //  - only when there is no usable output (a content_filter WITH
+            //    partial text is a finished answer for our purposes — the
+            //    model said what it was allowed to say);
+            //  - the empty assistant turn added above is dropped before
+            //    continuing (mirrors the empty-after-toolresult retry path);
+            //  - the loopExitedNormally flow below is skipped entirely via
+            //    `continue`.
+            if (toolCalls.isEmpty() && turnTextRaw.isEmpty() &&
+                ContentFilterFinishPolicy.isBlockedFinish(turnFinishReason)
+            ) {
+                // [feat/content-filter-fallback] A content-filter / safety-
+                // block finish with NO usable output is a DETERMINISTIC
+                // member-level refusal: this member will answer the same way
+                // on every retry. Consume the fallback chain immediately — a
+                // different member may have a different safety posture and
+                // answer fine. (A content_filter WITH partial text falls
+                // through: the model said what it was allowed to say, which
+                // is a finished answer.)
+                val next = loopState.remainingFallbacks.removeFirstOrNull()
+                if (next != null) {
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn finish=$turnFinishReason (content filter / safety block) on ${loopState.currentProvider.model.displayName} — falling back to ${next.provider.model.displayName}",
+                    )
+                    loopState.fallbackReasons.add("⚠️ ${loopState.currentProvider.model.displayName}: $turnFinishReason")
+                    val failedProvider = loopState.currentProvider
+                    loopState.currentProvider = next.provider
+                    host.setCurrentProvider(next.provider)
+                    host.noteModelNames(modelName = next.provider.model.displayName, providerName = null, entryId = null)
+                    // Same entry-precision rule as the error-path fallback:
+                    // resolve the group ENTRY by id, not by modelId (a group
+                    // can hold several entries for the same modelId behind
+                    // different instances).
+                    host.activeConfigModelEntries.find { it.id == next.entryId }?.let { newEntry ->
+                        host.setActiveEntryId(newEntry.id)
+                        host.updateCurrentModel(newEntry.model)
+                        val newLabel = host.providerInstanceLabel(newEntry.providerInstanceId)
+                        if (newLabel != null) {
+                            host.setProviderName(newLabel.ifEmpty { newEntry.model.provider })
+                        }
+                    }
+                    if (next.provider.model.id != failedProvider.model.id) host.bumpFallbackTrigger()
+                    host.emitFallbackToast(
+                        host.string(R.string.fallback_switched_to, next.provider.model.displayName)
+                    )
+                    // NOTE: no rollback of allToolBlocks needed here — the
+                    // blocked turn produced no text and no tool blocks
+                    // (guard requires turnTextRaw.isEmpty()); nothing was
+                    // streamed to the screen. Reset the per-attempt retry
+                    // budget so the fallback member gets its own full
+                    // transient-retry allowance.
+                    retryAttempt = 0
+                    // skip the rest of this turn's post-processing (history
+                    // add / persist) — `continue` targets the OUTER for(turn)
+                    // loop, same as the length-wall and EOF-stub branches.
+                    continue
+                }
+                // Fallback chain exhausted or absent (single-model) — surface
+                // a human-readable error instead of the silent blank bubble
+                // this path produced before.
+                AppLogger.warning(
+                    TAG_STREAM,
+                    "runAgentLoop turn=$turn finish=$turnFinishReason (content filter / safety block) — no fallback available, surfacing error",
+                )
+                withContext(Dispatchers.Main) {
+                    host.setInlineError(host.string(R.string.error_content_filtered))
+                }
+                loopState.loopExitedNormally = true
+                break
+            }
 
             // Build assistant contentParts for history
             val assistantParts = mutableListOf<AgentContentPart>()
@@ -1196,6 +1410,16 @@ internal class AgentLoopEngine(
 
             // Map toolUseId -> input JSON string for persistence (accumulated across turns)
             toolCalls.forEach { (id, _, args) -> loopState.allToolInputs[id] = args.toString() }
+            // [feat/hermes-tier1] A tool-call turn clears the length-wall
+            // continuation budget AND the deterministic-empty streak: the
+            // model recovered and is doing new work, so future walls get a
+            // fresh allowance (mirrors Hermes resetting per-wall retry state).
+            loopState.lengthWallContinues = 0
+            loopState.deterministicEmptyStreak = 0
+            // [fix/eof-stub-continuation] A tool-call turn is proof the model
+            // produced new work after any EOF — reset the stub-continuation
+            // budget so long tool-heavy runs keep full allowance.
+            loopState.eofStubContinues = 0
             val toolInputMap = loopState.allToolInputs
             // Prefer the opaque blob from LLMStreamChunk.ReasoningContent when the
             // provider emitted one — that path preserves empty strings (DeepSeek V4
@@ -1248,6 +1472,35 @@ internal class AgentLoopEngine(
                         // a node that burned its whole budget just pays for the
                         // same wall again".
                         loopState.lengthWallEmptyHits++
+                        // [feat/hermes-tier1] Deterministic-empty fast-exit:
+                        // when the usage block PROVES zero output tokens
+                        // (outputTokens==0) on consecutive empty length-walls,
+                        // the provider is deterministically returning nothing —
+                        // retrying re-bills the full input for a provably
+                        // identical result (Hermes empty_response_guard port).
+                        // Whitespace-only output or a missing usage block keeps
+                        // the legacy 3-hit budget (fail-open).
+                        val usageForEmptyCheck = lastUsage
+                        val usageProvesEmpty = usageForEmptyCheck != null &&
+                            usageForEmptyCheck.outputTokens == 0
+                        if (usageProvesEmpty) {
+                            loopState.deterministicEmptyStreak++
+                            if (loopState.deterministicEmptyStreak >= DETERMINISTIC_EMPTY_LIMIT) {
+                                AppLogger.warning(
+                                    TAG_STREAM,
+                                    "runAgentLoop turn=$turn finish=length empty ×$loopState.deterministicEmptyStreak with usage.outputTokens==0 — deterministic empty, skipping remaining retries",
+                                )
+                                withContext(Dispatchers.Main) {
+                                    host.setInlineError(host.string(R.string.error_output_truncated_repeated))
+                                }
+                                // Fall through to the normal break path (persist + exit).
+                                // Do NOT `break` here directly: it would skip
+                                // `loopState.loopExitedNormally = true` and misclassify as a
+                                // MAX_AGENT_TURNS runaway.
+                            }
+                        } else {
+                            loopState.deterministicEmptyStreak = 0
+                        }
                         if (loopState.lengthWallEmptyHits < 3) {
                             // T9: log the wasted empty-length iteration
                             traceObserver.agentTraceRecorder.turnEnd(
@@ -1277,19 +1530,50 @@ internal class AgentLoopEngine(
                         // MAX_AGENT_TURNS runaway.
                     } else {
                         // Truncated mid-answer: continue so the model finishes.
+                        // [feat/hermes-tier1] Repetition guard FIRST (Hermes
+                        // turn_truncation order: abort BEFORE continuing): if
+                        // the visible output is dominated by a degenerate
+                        // repetition loop, continuing only stitches more
+                        // repeated text into the reply. Also enforce the
+                        // continuation ceiling — a model that re-truncates on
+                        // every attempt burns billed calls without bound.
                         loopState.lengthWallEmptyHits = 0
-                        // T9: log the truncated turn before continuing
-                        traceObserver.agentTraceRecorder.turnEnd(
-                            turn = turn,
-                            tokensIn = lastUsage?.inputTokens,
-                            tokensOut = lastUsage?.outputTokens,
-                            finishReason = turnFinishReason,
-                            durationMs = System.currentTimeMillis() - turnStartMs,
-                        )
-                        AppLogger.warning(
-                            TAG_STREAM,
-                            "runAgentLoop turn=$turn finish=length — truncated (${turnText.length} chars), continuing loop to let the model finish",
-                        )
+                        loopState.deterministicEmptyStreak = 0
+                        if (isRepetitionDominated(turnText)) {
+                            AppLogger.warning(
+                                TAG_STREAM,
+                                "runAgentLoop turn=$turn finish=length but output is repetition-dominated (${turnText.length} chars) — aborting instead of continuing the degenerate response",
+                            )
+                            withContext(Dispatchers.Main) {
+                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
+                            }
+                            // Fall through to the normal break path (persist +
+                            // exit). NOT `loopExitedNormally` (this is an
+                            // abort), but also NOT a runaway misclassification:
+                            // see the deterministic-empty branch above for the
+                            // same pattern.
+                        } else if (loopState.lengthWallContinues >= MAX_LENGTH_WALL_TEXT_CONTINUES) {
+                            AppLogger.warning(
+                                TAG_STREAM,
+                                "runAgentLoop turn=$turn finish=length — continuation ceiling $MAX_LENGTH_WALL_TEXT_CONTINUES reached, giving up (accumulated ${loopState.accumulatedText.length} chars)",
+                            )
+                            withContext(Dispatchers.Main) {
+                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
+                            }
+                        } else {
+                            loopState.lengthWallContinues++
+                            // T9: log the truncated turn before continuing
+                            traceObserver.agentTraceRecorder.turnEnd(
+                                turn = turn,
+                                tokensIn = lastUsage?.inputTokens,
+                                tokensOut = lastUsage?.outputTokens,
+                                finishReason = turnFinishReason,
+                                durationMs = System.currentTimeMillis() - turnStartMs,
+                            )
+                            AppLogger.warning(
+                                TAG_STREAM,
+                                "runAgentLoop turn=$turn finish=length — truncated (${turnText.length} chars), continuing loop to let the model finish (${loopState.lengthWallContinues}/$MAX_LENGTH_WALL_TEXT_CONTINUES)",
+                            )
                         // [T-length-wall-prefill] When the provider accepts
                         // an assistant-final prefill, the truncated assistant
                         // text is ALREADY the last message in host.agentHistory
@@ -1346,8 +1630,41 @@ internal class AgentLoopEngine(
                             )
                         )
                         continue
+                        } // [feat/hermes-tier1] else — continuation budget branch
                     }
                 }
+                // [feat/verification-stop] Turn-end verification guard
+                // (Hermes verification_stop port, Tier-2 #3). The model is
+                // about to finish its reply. If this run edited CODE files
+                // and the newest passing verification evidence predates the
+                // last edit, inject ONE bounded follow-up nudge instead of
+                // letting the turn close unverified — the nudge tells the
+                // model to run the relevant check, read failures, repair,
+                // and summarize what actually passed. Policy-only: nothing
+                // runs a check here (VerificationStopPolicy owns the shape
+                // classification; the engine only tracks edit/verify order).
+                val verifyNudge = VerificationStopPolicy.buildNudge(
+                    changedPaths = loopState.changedCodePaths.toList(),
+                    attempts = loopState.verifyNudgeAttempts,
+                    lastEvidenceDetail = loopState.lastVerificationDetail,
+                )
+                if (verifyNudge != null) {
+                    loopState.verifyNudgeAttempts++
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn finish=$turnFinishReason but unverified code edits " +
+                            "(${loopState.changedCodePaths.size} path(s)) — injecting verify nudge " +
+                            "${loopState.verifyNudgeAttempts}/${VerificationStopPolicy.MAX_VERIFY_NUDGES}",
+                    )
+                    val nudgeMsg = LLMMessage(
+                        role = LLMMessage.Role.USER,
+                        content = verifyNudge,
+                        contentParts = listOf(AgentContentPart.Text(verifyNudge)),
+                    )
+                    host.agentHistory.add(nudgeMsg)
+                    continue
+                }
+
                 AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn no tool calls → break (finishReason=$turnFinishReason)")
                 withContext(Dispatchers.Main) {
                     host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)
@@ -1434,23 +1751,78 @@ internal class AgentLoopEngine(
                 // [T-truncated-stream-retry] The provider signalled the model
                 // turn ended WITHOUT a server finish_reason (EOF / connection
                 // drop mid-stream). The user may have seen a partial answer
-                // (or a blank bubble) that never got a proper end — silently
-                // accepting it loses the tail of the reply. Retry ONCE with the
-                // accumulated context re-appended, mirroring the empty-turn
-                // one-shot guard: it can never loop, and a second truncation
-                // falls through to the normal break below (the user keeps the
-                // partial content + an inline hint is surfaced by the caller).
-                if (turnTruncated && !loopState.didRetryTruncatedTurn) {
+                // (or a blank bubble) that never got a proper end.
+                //
+                // [fix/eof-stub-continuation] Hermes network-stub pattern
+                // (agent/conversation_loop.py): KEEP the partial text as the
+                // model's own last turn — it is already in agentHistory and
+                // accumulatedText, and it is perfectly good content — then
+                // append a synthetic user-role reminder anchoring the exact
+                // cut point and continue. The legacy behavior DELETED the
+                // partial turn and regenerated from scratch (wasting every
+                // streamed token; the regeneration frequently re-emitted a
+                // different opening — screen-level duplication), and a SECOND
+                // EOF broke silently: mid-sentence stop, no hint, user had to
+                // type "继续" by hand. Now: continue in-loop up to
+                // MAX_EOF_STUB_CONTINUES, then give up with a VISIBLE error.
+                // The stacking guard drops a stale stub reminder so consecutive
+                // EOFs do not pile up reminder turns (same pattern as the
+                // length-wall reminder below).
+                if (turnTruncated && hasVisibleContent) {
+                    if (loopState.eofStubContinues < MAX_EOF_STUB_CONTINUES) {
+                        loopState.eofStubContinues++
+                        AppLogger.warning(
+                            TAG_STREAM,
+                            "runAgentLoop turn=$turn EOF-truncated stream (${turnText.length} chars kept, mid-sentence=${looksLikeMidSentenceCut(turnText)}) — network-stub continuation ${loopState.eofStubContinues}/$MAX_EOF_STUB_CONTINUES",
+                        )
+                        // Drop any stale stub reminder from a previous EOF so
+                        // reminders never stack (guard mirrors length-wall).
+                        val prevTail = host.agentHistory.lastOrNull()
+                        val tailIsEofStubReminder = prevTail != null &&
+                            prevTail.role == LLMMessage.Role.USER &&
+                            prevTail.contentParts.size == 1 &&
+                            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
+                                ?.contains("cut off by a network error") == true
+                        if (tailIsEofStubReminder) {
+                            host.agentHistory.removeAt(host.agentHistory.size - 1)
+                        }
+                        val stubReminder = eofStubReminder(turnText.takeLast(80))
+                        host.agentHistory.add(
+                            LLMMessage(
+                                role = LLMMessage.Role.USER,
+                                content = stubReminder,
+                                contentParts = listOf(AgentContentPart.Text(stubReminder)),
+                            )
+                        )
+                        // Reset the seam-dedup marker: the NEXT turn is a
+                        // continuation of THIS truncation, exactly like a
+                        // length-wall continuation (head-overlap trim applies).
+                        // lastTurnWasLengthWall was already set by the shared
+                        // seam logic above only for finish_reason=="length";
+                        // EOF truncation needs the same treatment.
+                        loopState.lastTurnWasLengthWall = true
+                        continue
+                    }
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn EOF-truncated ×$loopState.eofStubContinues (ceiling $MAX_EOF_STUB_CONTINUES) — giving up with visible error",
+                    )
+                    withContext(Dispatchers.Main) {
+                        host.setInlineError(host.string(R.string.error_output_truncated_repeated))
+                    }
+                    // Fall through to the normal break path (persist + exit)
+                    // so the partial answer the user already saw is persisted.
+                } else if (turnTruncated && !loopState.didRetryTruncatedTurn) {
+                    // EOF with NO visible content (blank/whitespace stream):
+                    // there is nothing worth keeping, so the legacy one-shot
+                    // retry (drop the empty assistant turn, regenerate) is
+                    // still the right move. didRetryTruncatedTurn keeps its
+                    // original one-shot semantics on this path.
                     loopState.didRetryTruncatedTurn = true
                     AppLogger.warning(
                         TAG_STREAM,
-                        "truncated turn detected (no finish_reason) — retrying one round (turn=$turn) hasVisibleContent=$hasVisibleContent"
+                        "runAgentLoop turn=$turn EOF-truncated stream with no visible content — one-shot retry (drop empty turn)",
                     )
-                    // Drop this turn's just-appended assistant role from
-                    // host.agentHistory so the retry continuations cleanly. The
-                    // partial text is NOT persisted as the final assistant
-                    // message — the retry either completes it or the second
-                    // truncation leaves the in-progress bubble intact.
                     host.agentHistory.removeAt(host.agentHistory.size - 1)
                     continue
                 }
@@ -1776,6 +2148,39 @@ internal class AgentLoopEngine(
                     "${result.output}\n\n${postRecord.message}"
                 } else {
                     result.output
+                }
+
+                // [feat/verification-stop] edit/verify bookkeeping. Edit side:
+                // a SUCCESSFUL file_write/file_edit on a code path marks the
+                // run's evidence stale (bumps lastEditSeq). Verify side: a
+                // verification-shaped shell command records its outcome and,
+                // when it PASSED, bumps lastVerifySeq — the turn-end guard
+                // compares the two stamps. Non-code paths (prose/config) are
+                // filtered by the policy so a SKILL.md edit never demands a
+                // verification script.
+                when {
+                    result.success && (name == "file_write" || name == "file_edit") -> {
+                        VerificationStopPolicy.changedPathFromArgs(name, p.argsStr)?.let { path ->
+                            if (!VerificationStopPolicy.isNonCodePath(path)) {
+                                loopState.changedCodePaths.add(path)
+                                loopState.lastEditSeq++
+                            }
+                        }
+                    }
+                    name == "shell_execute" -> {
+                        val cmd = try { JSONObject(p.argsStr).optString("command", "") } catch (_: Exception) { "" }
+                        val kind = VerificationStopPolicy.verificationKind(cmd)
+                        if (kind != null) {
+                            val outcome = when {
+                                result.success -> "PASSED"
+                                result.timedOut -> "TIMED OUT"
+                                else -> "FAILED"
+                            }
+                            loopState.lastVerificationDetail = "${cmd.take(120)} → $outcome"
+                            if (result.success) loopState.lastVerifySeq++
+                            AppLogger.info(TAG_STREAM, "[verification-stop] evidence: kind=$kind outcome=$outcome cmd=${cmd.take(80)}")
+                        }
+                    }
                 }
 
                 val blockIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }

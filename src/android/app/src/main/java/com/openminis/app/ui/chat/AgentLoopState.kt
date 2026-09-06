@@ -127,12 +127,45 @@ internal class AgentLoopState(
     var didRetryTruncatedTurn: Boolean = false
 
     /**
+     * [fix/eof-stub-continuation] EOF-truncated-stream continuation count.
+     * Replaces the one-shot [didRetryTruncatedTurn] semantics: instead of
+     * deleting the partial answer and regenerating (waste + re-emission) or
+     * breaking silently on the second EOF, the engine keeps the partial
+     * text as the model's own last turn and appends a network-stub reminder
+     * (Hermes conversation_loop network-stub pattern). Capped at
+     * [MAX_EOF_STUB_CONTINUES] per run; the counter resets on tool-call
+     * turns (model produced new work) so long tool-heavy runs keep full
+     * allowance.
+     */
+    var eofStubContinues: Int = 0
+
+    /**
      * [T-length-wall-continue] Consecutive finish_reason="length" turns that
      * produced NO visible content and NO tool calls. First hit: continue the
      * loop. 3+ empty walls in a row: drop the per-turn max_tokens cap and
      * retry, then give up with a visible error.
      */
     var lengthWallEmptyHits: Int = 0
+
+    /**
+     * [feat/hermes-tier1] Text-continuation attempts for the CURRENT
+     * length-wall wall (finish_reason="length" with visible text). Hermes
+     * caps text continuation at 4 nudges then aborts with a typed result —
+     * without a cap a model that re-truncates on every continuation attempt
+     * burns unbounded billed calls. Reset on a successful tool-call turn
+     * (the wall was cleared) and on a clean finish.
+     */
+    var lengthWallContinues: Int = 0
+
+    /**
+     * [feat/hermes-tier1] Consecutive empty completions whose usage proves
+     * zero output tokens (deterministic empty, Hermes empty_response_guard
+     * port). After [REPETITION_DETERMINISTIC_EMPTY_LIMIT] consecutive
+     * deterministic empties the loop stops retrying the same provider and
+     * surfaces the empty-turn hint — retrying a provider that PROVABLY
+     * produced zero tokens just re-bills full input for nothing.
+     */
+    var deterministicEmptyStreak: Int = 0
 
     /**
      * [T-length-wall-seam-dedup] True when the PREVIOUS turn ended with
@@ -142,4 +175,30 @@ internal class AgentLoopState(
      * point. Normal turn boundaries must NOT go through seam-dedup.
      */
     var lastTurnWasLengthWall: Boolean = false
+
+    // ── [feat/verification-stop] edit/verify evidence tracking ────────────
+
+    /**
+     * Code file paths changed by successful file_write / file_edit calls in
+     * this run (deduped). Feeds VerificationStopPolicy.buildNudge at the
+     * turn-end guard.
+     */
+    val changedCodePaths: MutableSet<String> = linkedSetOf()
+
+    /**
+     * Human-readable detail of the newest verification-shaped shell result
+     * (command + outcome), or null when none ran yet this run.
+     */
+    var lastVerificationDetail: String? = null
+
+    /**
+     * Monotonic sequence stamps: an edit and a verification only satisfy the
+     * guard when the verification's stamp is NEWER than every edit's stamp.
+     */
+    var lastEditSeq: Long = 0
+    var lastVerifySeq: Long = 0
+
+    /** How many verify nudges have been injected this run (bounded by
+     *  VerificationStopPolicy.MAX_VERIFY_NUDGES). */
+    var verifyNudgeAttempts: Int = 0
 }

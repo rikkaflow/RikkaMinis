@@ -1075,6 +1075,8 @@
     <string name="error_tech_detail">技術詳細</string>
     <string name="fallback_switched_to">%1$s に切り替えました</string>
     <string name="error_output_truncated_repeated">モデルが出力長の上限に繰り返し達しました。モデル設定でコンテキスト制限を下げるか、質問をより小さな部分に分けてください。</string>
+        <string name="error_content_filtered">モデルの安全フィルターによりこの応答がブロックされました。表現を変えるか、別のモデルに切り替えてください。</string>
+        <string name="error_stream_interrupted">モデルとの接続が中断され、応答を完了できませんでした。もう一度お試しください。</string>
     <string name="error_empty_response_context_large">モデルが空の応答を返しました。会話のコンテキストが大きすぎる可能性があります — 圧縮するか、新しいセッションを開始してください。</string>
     <string name="error_empty_response_after_tool">ツールの結果の後、リマインダーを送っても、モデルは応答を返しませんでした。過負荷の可能性があります — もう一度試すか、モデルを切り替えてください。</string>
     <string name="thinking_truncated_hint">%2$dK 文字のうち末尾 %1$dK 文字を表示中</string>
@@ -1179,7 +1181,7 @@
     <!-- 英文兜底 (2026-08-08) -->
     <string name="model_group_name_saved">Name saved</string>
     <string name="model_group_routing_fallback_footer">Try models in order. If one fails, advance to the next.</string>
-    <string name="model_group_routing_loadbalance_footer">Distribute sessions across models in the group.</string>
+    <string name="model_group_routing_loadbalance_footer">新しいメッセージごとに、グループ内の次のモデルへ切り替わります。</string>
     <string name="model_group_fallback_default_footer">Fall back on rate limits (429) and server errors (5xx) only.</string>
     <string name="model_group_fallback_always_footer">Advanced: fall back on any error, including network and auth failures. Prefer Default unless you know why you need this.</string>
     <string name="model_group_no_models">No models in this group.</string>
