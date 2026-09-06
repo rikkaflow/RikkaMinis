@@ -259,6 +259,11 @@ class MinisApp : Application(), ImageLoaderFactory {
         // never pass through a ViewModel.
         com.openminis.app.data.FastModePrefs.prime(this)
 
+        // [T-provider-key-roulette] Warm the LRU multi-key rotation state so
+        // the first provider build of the process rotates against the
+        // cold-start file hint instead of always picking key #1.
+        com.openminis.app.data.KeyRoulette.init(cacheDir)
+
         // [D-2] Warm the cross-session concurrency cap from prefs so the three
         // coordinated gates (SessionConcurrencyManager / ExecutionCoordinator /
         // NativeOffloadServer) read the user-configured value at first use.
@@ -493,7 +498,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         // (writes a 17-byte exit-0 stub at /usr/local/bin/minis-sessions-cli
         // so PATH lookup succeeds; PRoot intercepts the execve before
         // the stub runs and routes to this handler).
-        NativeOffloadServer.register("minis-sessions-cli", SessionsOffloadHandler(chatRepository))
+        NativeOffloadServer.register("minis-sessions-cli", SessionsOffloadHandler(chatRepository, this))
         // T322: android-shizuku-cli — privileged Android control via Shizuku.
         // The handler short-circuits with a typed error envelope when the
         // user hasn't installed / started / authorized Shizuku, so we

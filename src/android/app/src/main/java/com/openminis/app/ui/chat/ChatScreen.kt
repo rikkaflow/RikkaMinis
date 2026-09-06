@@ -1440,24 +1440,36 @@ fun ChatScreen(
         }
     }
 
-    // [fix/scroll-follow-simplify] RikkaHub-style simple explicit follow.
-    // Item granularity is message-level under AGGREGATE_MESSAGE_ITEMS, so the
-    // fragment-churn the old guard stack fought is gone. Streaming auto-follow
-    // = the exact rikkahub ChatList contract: `isAtBottom() && streaming` →
-    // requestScrollToItem at the bottom sentinel, driven directly off the
-    // rendered viewport (no state machine, no defensive guard).
+    // [fix/stream-follow-detached-deadlock] Gate contract, rewritten:
     //   - isStreaming: the user is getting something — follow the growing tail.
     //   - listState.isScrollInProgress: never fight a live gesture / fling.
-    //   - isAtBottom (isBottomSentinelVisible): only nudge when the sentinel
-    //     is already on screen — a history reader is never yanked.
-    // When the sentinel is in view, forward-layout anchoring already holds the
-    // bottom and requestScrollToItem(sentinel) is a harmless no-op scrolling to
-    // the current position, so the effect simply keeps a bottom-anchored viewer
-    // pinned as the tail grows. Explicit user intents (Send / FabDown /
-    // Resume / Retry / InitialOpen) keep flowing through the follow reducer +
-    // consumer above, which still scroll when the sentinel has scrolled out.
-    // The old data-collector StreamRowsChanged dispatch (which neither ran
-    // under AGGREGATE_MESSAGE_ITEMS nor is needed with this effect) was removed.
+    //   - followState.isFollowing: the USER's OWN verdict from drag-end
+    //     (raw list position, ChatScreen drag-stop handler) — FOLLOWING means
+    //     "the user wants the tail", DETACHED means "a history reader must
+    //     never be yanked". This REPLACES the old isBottomSentinelVisible gate:
+    //   - shouldRequestFollowScroll (canScrollForward): the clamp
+    //     guard from [fix/place-storm-follow-clamp-loop] — when the viewport
+    //     is flush against the bottom (canScrollForward == false) a
+    //     requestScrollToItem is UNREACHABLE (LazyListMeasure clamps it back,
+    //     visibleItemsInfo re-emits, the loop re-requests: the 60Hz measure
+    //     storm of minis-2026-09-01__2_.log). Skip; request once when the
+    //     clamp was released (new content grew the list).
+    //
+    // WHY the sentinel gate had to go (log forensics minis-2026-09-01__5_.log,
+    // 65b8a749 build, follow broken the whole streaming turn): with a forward
+    // layout anchored at firstVisibleItem, a pinned bottom viewport's rows
+    // GROW IN HEIGHT as tokens stream in — the anchor index never changes,
+    // so the growth pushes the 5dp bottom sentinel OUT of the viewport. The
+    // old contract then permanently read atBottom == false and the effect
+    // went silent for the rest of the turn: the viewport froze, every new
+    // token rendered off-screen, and the user had to drag / tap the FAB to
+    // catch up (21s placed-report gap at 19:26:54→19:27:15 with zero touches
+    // = the streaming row entirely off-viewport). Before 91498d74 the effect
+    // "worked" only because the clamp storm re-clamped the viewport to the
+    // bottom on every frame — the follow behaviour WAS the storm. The
+    // storm fix removed the follower; this restores it on the state-machine
+    // rail: FOLLOWING (drag-end verdict) + clamp released → one request per
+    // growth, clamped → silence. Frequency = content growth, never 60Hz.
     if (SIMPLE_FOLLOW) {
         val bottomScrollTarget: (Int) -> Int? = { total -> safeBottomScrollIndex(total) }
         LaunchedEffect(listState, isStreaming) {
@@ -1465,10 +1477,10 @@ fun ChatScreen(
                 .collect { vis ->
                     if (listState.isScrollInProgress) return@collect
                     if (!isStreaming) return@collect
+                    if (isUserDragging) return@collect
+                    if (!followState.isFollowing) return@collect
                     val total = listState.layoutInfo.totalItemsCount
                     if (total == 0) return@collect
-                    val atBottom = isBottomSentinelVisible(listState.layoutInfo)
-                    if (!atBottom) return@collect
                     // [fix/place-storm-follow-clamp-loop] Clamp guard: the
                     // sentinel being visible + content flush against the
                     // bottom (canScrollForward == false) means any
@@ -2932,6 +2944,19 @@ fun ChatScreen(
                 // prewarm when (if) it has finished by then, else -1.
                 var lastColdPrewarmMs by remember(sessionId) { mutableStateOf(-1L) }
                 var coldOpenSummaryEmitted by remember(sessionId) { mutableStateOf(false) }
+                // [place-storm-residual-2nd-source] Same-size placed-event
+                // throttle: during IME/insets animations and user drags over
+                // a taller-than-viewport item, onPlaced re-fires every frame
+                // (60Hz) with an IDENTICAL size — each one emitting a full
+                // PerfLongCtx line (log I/O + native-heap read) that itself
+                // costs frames. 2026-09-01 log: 608 placed lines in 17s, 91%
+                // during a plain drag of the 7723px newest row. Only report
+                // a placed event when the size CHANGED (or >2s since the
+                // last report, so a genuinely re-placed identical-size row
+                // still surfaces eventually). Milestone cadence is preserved
+                // because every real content growth changes the size.
+                var lastPlacedReportKey by remember(sessionId) { mutableStateOf<String?>(null) }
+                var lastPlacedReportAtMs by remember(sessionId) { mutableStateOf(0L) }
                 val screenMountAtMs = remember(sessionId) { System.currentTimeMillis() }
                 // [T-android-placed-storm-diag] Mutable (non-Compose) holder
                 // for the place-storm detector. Plain class instance — the
@@ -3642,85 +3667,22 @@ fun ChatScreen(
                                 .then(
                                     if (isNewestItem) {
                                         Modifier.onPlaced {
-                                            // [T-android-placed-storm-diag] Place-storm
-                                            // detector v2 (2026-09-01 log forensics).
-                                            //
-                                            // The 2026-09-01 log (minis-2026-09-01__1_)
-                                            // showed the FIRST-GEN instrumentation was
-                                            // itself a frame-budget offender: 11,739
-                                            // `firstItem.placed` lines (one per frame,
-                                            // each a PerfLongCtx.step string-build +
-                                            // logcat IPC + synchronous PrintWriter file
-                                            // write ON THE MAIN THREAD) — ~16ms of
-                                            // per-frame logging work during every
-                                            // storm, and the 3MB log itself. v2 keeps
-                                            // the same detector semantics but:
-                                            //   1. Emits AT MOST one summary line per
-                                            //      second (count + last size), so idle
-                                            //      per-frame cost is a couple of
-                                            //      long-field reads — no string build,
-                                            //      no I/O — until a storm summary is
-                                            //      actually due.
-                                            //   2. Dumps up to 3 stacks per session
-                                            //      (was 1): the 2nd/3rd dumps land
-                                            //      mid-storm at different offsets, so
-                                            //      a driver that only engages later
-                                            //      (streaming, IME) still gets caught.
-                                            //   3. Each dump appends a LazyListState
-                                            //      snapshot (firstIdx/firstOff/
-                                            //      totalItems/isScrollInProgress) —
-                                            //      a scroll-position flutter loop is
-                                            //      the prime suspect for a layout-only,
-                                            //      no-recomposition 60fps storm, and
-                                            //      the snapshot makes it visible.
-                                            // Still purely observational: the mutable
-                                            // holder is not a Compose State, so the
-                                            // counter never invalidates composition.
-                                            val storm = placeStorm
-                                            val now = SystemClock.uptimeMillis()
-                                            storm.count++
-                                            storm.lastSize = "${it.size.width}x${it.size.height}"
-                                            if (now - storm.lastEmitMs >= 1_000L) {
-                                                storm.lastEmitMs = now
+                                            val nowMs = System.currentTimeMillis()
+                                            val sizeKey = "${it.size.width}x${it.size.height}"
+                                            if (shouldReportPlaced(
+                                                    lastPlacedReportKey,
+                                                    lastPlacedReportAtMs,
+                                                    sizeKey,
+                                                    nowMs,
+                                                )
+                                            ) {
+                                                lastPlacedReportKey = sizeKey
+                                                lastPlacedReportAtMs = nowMs
                                                 com.openminis.app.diagnostics.PerfLongCtx.step(
                                                     sessionId,
-                                                    "lazyColumn.firstItem.placed.summary",
-                                                    "placesInWindow=${storm.count} lastSize=${storm.lastSize}",
+                                                    "lazyColumn.firstItem.placed",
+                                                    "size=$sizeKey",
                                                 )
-                                                storm.count = 0
-                                            }
-                                            if (storm.dumps < 3) {
-                                                // Burst-window detector: places within
-                                                // 2s of each other accumulate; ~60 in
-                                                // the window ≈ 30fps of re-layout (a
-                                                // normal cold open is a handful).
-                                                if (now - storm.windowStartMs <= 2_000L) {
-                                                    if (storm.windowCount >= 60) {
-                                                        storm.dumps++
-                                                        storm.windowCount = 0
-                                                        storm.windowStartMs = now
-                                                        val info = listState.layoutInfo
-                                                        val frames = Looper.getMainLooper().thread.stackTrace
-                                                            .take(25).joinToString(" <- ") {
-                                                                "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
-                                                            }
-                                                        AppLogger.warning(
-                                                            "PlaceStorm",
-                                                            "[PlaceStorm] session=$sessionId dump#${storm.dumps} " +
-                                                                "lastKey=${item.key} lastSize=${storm.lastSize} " +
-                                                                "firstIdx=${listState.firstVisibleItemIndex} " +
-                                                                "firstOff=${listState.firstVisibleItemScrollOffset} " +
-                                                                "totalItems=${info.totalItemsCount} " +
-                                                                "scrollInProgress=${listState.isScrollInProgress} " +
-                                                                "stack: $frames",
-                                                        )
-                                                    } else {
-                                                        storm.windowCount++
-                                                    }
-                                                } else {
-                                                    storm.windowCount = 1
-                                                    storm.windowStartMs = now
-                                                }
                                             }
                                             // [T-android-jank-diag-logging]
                                             // One quotable line per session

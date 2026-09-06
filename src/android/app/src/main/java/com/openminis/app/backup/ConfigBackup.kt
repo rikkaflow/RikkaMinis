@@ -465,6 +465,7 @@ object ConfigBackup {
                 if (readFailures > 0) put("readFailures", readFailures)
             }.toString()
             val skeletonChars = skeletonJson.length
+
             val cutoff = System.currentTimeMillis() - chatWindowDays * 24L * 3600 * 1000
             val sessions = runCatching {
                 chatRepo.dao.sessionsUpdatedSince(cutoff)
@@ -514,6 +515,7 @@ object ConfigBackup {
             )
             for (s in packed.sessions) chatSessions.put(s)
             for (m in packed.messages) chatMessages.put(m)
+
             if (packed.sessionsDropped > 0 || packed.messagesDropped > 0) {
                 chatTruncated = JSONObject().apply {
                     put("sessionsDropped", packed.sessionsDropped)
@@ -675,11 +677,14 @@ object ConfigBackup {
     }
 
     /**
-     * Provider credential keys, mirroring [ConfigValue.SECRET_KEYS] plus the
-     * Gemini-only OAuth side-channel strings that are equally sensitive.
+     * Provider credential keys, mirroring [ConfigValue.SECRET_KEYS]. The
+     * Gemini-only `oauthEmail`/`oauthGcpProject` keys were historically listed
+     * here, but they have no producer anywhere in the codebase (grep finds
+     * zero writers) — the real OAuth credential is `oauthToken`. Removed so
+     * the secret-strip list reflects what can actually appear in a payload.
      */
     private val SECRET_PROVIDER_KEYS = listOf(
-        "apiKey", "oauthToken", "manualOAuthToken", "oauthEmail", "oauthGcpProject",
+        "apiKey", "oauthToken", "manualOAuthToken",
     )
 
     /** Thrown for payloads that aren't ours, or are from a future major format. */

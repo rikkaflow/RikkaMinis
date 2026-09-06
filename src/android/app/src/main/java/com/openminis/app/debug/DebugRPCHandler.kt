@@ -379,7 +379,11 @@ class DebugRPCHandler(private val context: Context) {
 
         val fileSize = hostFile.length()
         val offset = params.optLong("offset", 0)
-        val limit = params.optInt("limit", 524_288)
+        // [fix/audit-s7l2] clamp limit like handleLogsRead/maxDepth/scale —
+        // previously a token-authenticated client could pass Int.MAX_VALUE and
+        // trigger a huge readNBytes allocation. Cap at 4 MiB (read() may still
+        // return fewer bytes than requested when the file is smaller).
+        val limit = params.optInt("limit", 524_288).coerceIn(1, 4 * 1024 * 1024)
         val forceBase64 = params.optBoolean("base64", false)
 
         val bytes = hostFile.inputStream().use { stream ->
@@ -1108,7 +1112,7 @@ class DebugRPCHandler(private val context: Context) {
 
         AppLogger.info("DebugRPC", "debug.sessions.exec argv=${argvTail.joinToString(" ")}")
         val app = context.applicationContext as com.openminis.app.MinisApp
-        val handler = com.openminis.app.sandbox.offload.SessionsOffloadHandler(app.chatRepository)
+        val handler = com.openminis.app.sandbox.offload.SessionsOffloadHandler(app.chatRepository, context)
         val request = com.openminis.app.sandbox.NativeOffloadRequest(
             pid = -1,
             argv = listOf("minis-sessions-cli") + argvTail,

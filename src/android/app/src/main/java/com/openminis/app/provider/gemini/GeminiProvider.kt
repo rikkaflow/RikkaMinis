@@ -76,23 +76,25 @@ class GeminiProvider(
             .applyUserAgentOverride(null)
             .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string() ?: ""
+        // [fix/audit-s4m1] response closed via .use{} on all paths.
+        client.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string() ?: ""
 
-        if (!response.isSuccessful) {
-            throw mapHttpError(
-                response.code,
-                responseBody,
-                parseRetryAfterMs(response.headers["Retry-After"], System.currentTimeMillis()),
-            )
+            if (!response.isSuccessful) {
+                throw mapHttpError(
+                    response.code,
+                    responseBody,
+                    parseRetryAfterMs(response.headers["Retry-After"], System.currentTimeMillis()),
+                )
+            }
+
+            val json = JSONObject(responseBody)
+            val text = extractText(json)
+            val finishReason = extractFinishReason(json)
+            val usage = extractUsage(json)
+            val mediaAttachments = extractInlineMedia(json)
+            LLMResponse(text, finishReason ?: "end_turn", usage, mediaAttachments)
         }
-
-        val json = JSONObject(responseBody)
-        val text = extractText(json)
-        val finishReason = extractFinishReason(json)
-        val usage = extractUsage(json)
-        val mediaAttachments = extractInlineMedia(json)
-        LLMResponse(text, finishReason ?: "end_turn", usage, mediaAttachments)
     }
 
     override fun streamMessageClamped(
@@ -170,9 +172,29 @@ class GeminiProvider(
                 // Extract function calls from streaming response
                 val functionCalls = extractFunctionCalls(json)
                 for ((fcName, fcArgs) in functionCalls) {
+                    // [audit-s4l2] id is client-minted: Gemini's streamGenerateContent
+                    // gives functionCall NO server-side id (unlike OpenAI's
+                    // tool_call_id). We use nanoTime because the SSE is INCREMENTAL
+                    // (extractTextAndThinking appends deltas without dedupe, and text
+                    // visibly never duplicates) — each functionCall's full args
+                    // arrive once in a single chunk, so a fresh id per occurrence is
+                    // safe and unique. NOTE: if a future Gemini stream mode ever
+                    // switches to cumulative candidate snapshots, this must become a
+                    // stable name-indexed id so the engine's per-turn dedupe
+                    // (dedupeToolStartId) can collapse repeats.
                     val toolId = "gemini_${System.nanoTime()}"
                     send(LLMStreamChunk.ToolUseStart(toolId, fcName))
                     send(LLMStreamChunk.ToolCallComplete(toolId, fcName, fcArgs))
+                }
+
+                // [fix/audit-s4m4] The request side sets responseModalities
+                // (buildThinkingLevelConfig/Gemini image+audio generation),
+                // so the model may stream inlineData parts back. The
+                // non-streaming path extracts them via extractInlineMedia
+                // (:94) — the SSE loop previously only read text/thinking
+                // parts, silently dropping media bytes on streaming turns.
+                extractInlineMedia(json).forEach { media ->
+                    send(LLMStreamChunk.MediaAttachment(media))
                 }
 
                 extractUsage(json)?.let { usage ->
@@ -347,67 +369,28 @@ class GeminiProvider(
      * - Gemini 2.5 Pro: uses thinkingBudget (128-16384)
      * - Gemini 2.5 Flash: uses thinkingBudget (0-8192)
      * - Gemini 2.5 Flash Lite: no thinking support
+     *
+     * [T-thinking-rules-phase2] The per-family rules live in
+     * ThinkingRuleResolver.geminiThinkingConfig so every vendor's thinking contract
+     * is described in ONE place. This delegation also absorbed the two upstream
+     * guards Android was missing:
+     *   • [T-gemini37-minimal-400] Gemini 3.7+ Flash rejects `thinkingLevel:"minimal"`
+     *     with a hard 400 at OFF — falls back to "low".
+     *   • [T-gemini-tts-thinking-400] -tts/-image/-embedding/-vision models reject ANY
+     *     thinking parameter — config is omitted entirely (OpenMinis#226).
      */
     private fun buildThinkingConfig(level: ThinkingLevel): JSONObject? {
-        val modelId = model.id
-        val isGemini3 = modelId.contains("gemini-3")
-        val is25Pro = modelId.contains("gemini-2.5-pro")
-        val is25Flash = modelId.contains("gemini-2.5-flash") && !modelId.contains("lite")
-        val is25FlashLite = modelId.contains("gemini-2.5-flash-lite")
-
-        if (is25FlashLite) return null  // No thinking support
-
-        return when {
-            isGemini3 -> {
-                JSONObject().apply {
-                    if (level == ThinkingLevel.OFF) {
-                        // 3.x Pro can't fully disable; use "minimal" for Flash, "low" for Pro
-                        put("thinkingLevel", if (modelId.contains("flash")) "minimal" else "low")
-                    } else {
-                        put("thinkingLevel", when (level) {
-                            ThinkingLevel.LOW -> "low"
-                            ThinkingLevel.MEDIUM -> "medium"
-                            ThinkingLevel.HIGH, ThinkingLevel.XHIGH -> "high"
-                            else -> "low"
-                        })
-                        put("includeThoughts", true)
-                    }
-                }
-            }
-            is25Pro -> {
-                JSONObject().apply {
-                    put("thinkingBudget", when (level) {
-                        ThinkingLevel.OFF -> 128      // minimum
-                        ThinkingLevel.LOW -> 2048
-                        ThinkingLevel.MEDIUM -> 8192
-                        ThinkingLevel.HIGH -> 16384
-                        // [T-android-thinking-level-arch] Gemini 2.5 Pro caps at
-                        // 32768; XHIGH and above all take the ceiling.
-                        ThinkingLevel.XHIGH,
-                        ThinkingLevel.MAX,
-                        ThinkingLevel.ULTRA -> 32768
-                    })
-                    if (level.isEnabled) put("includeThoughts", true)
-                }
-            }
-            is25Flash -> {
-                JSONObject().apply {
-                    put("thinkingBudget", when (level) {
-                        ThinkingLevel.OFF -> 0
-                        ThinkingLevel.LOW -> 1024
-                        ThinkingLevel.MEDIUM -> 4096
-                        ThinkingLevel.HIGH -> 8192
-                        // [T-android-thinking-level-arch] Gemini 2.5 Flash caps at
-                        // 16384; XHIGH and above all take the ceiling.
-                        ThinkingLevel.XHIGH,
-                        ThinkingLevel.MAX,
-                        ThinkingLevel.ULTRA -> 16384
-                    })
-                    if (level.isEnabled) put("includeThoughts", true)
-                }
-            }
-            else -> null
-        }
+        // [T-thinking-auto-level] AUTO = let the vendor decide: omit the whole
+        // thinkingConfig object so the model's own default applies.
+        if (level == ThinkingLevel.AUTO) return null
+        val cfg = com.openminis.app.provider.thinking.ThinkingRuleResolver
+            .geminiThinkingConfig(model.id, level)
+        com.openminis.app.logging.AppLogger.info(
+            "Thinking",
+            "[resolve] provider=gemini model=${model.id} level=${level.name} " +
+                "keys=[${cfg?.keys()?.asSequence()?.sorted()?.joinToString(",") ?: ""}]",
+        )
+        return cfg
     }
 
     /** Extract text from all non-thought parts. */

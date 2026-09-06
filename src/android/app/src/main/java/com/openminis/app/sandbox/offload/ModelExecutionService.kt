@@ -151,6 +151,15 @@ class ModelExecutionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        // [T-provider-key-roulette] The worker builds providers through
+        // ProviderFactory, whose create() now rotates multi-key strings. Warm the
+        // LRU state from the main process's persisted file so rotation continues
+        // across the process boundary instead of restarting from key #1.
+        com.openminis.app.data.KeyRoulette.init(cacheDir)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val requestDir = intent?.getStringExtra(EXTRA_REQUEST_DIR)
             ?: run { stopSelf(startId); return START_NOT_STICKY }
@@ -615,6 +624,13 @@ class ModelExecutionService : Service() {
                     com.openminis.app.data.model.LLMMessage.Role.USER
                 },
                 content = obj.optString("content", ""),
+                // [fix/audit-s3m1] Non-streaming executeRun now parses
+                // contentParts exactly like the streaming path (:870) — the
+                // dispatcher serializes contentParts (buildRequestJson :95),
+                // and previously tool results / images carried as parts were
+                // silently dropped here, so non-streaming turns (title
+                // generation / compaction / QuickTest) saw text only.
+                contentParts = parseContentParts(obj),
                 audioParts = jsonObjList(obj.optJSONArray("audio_parts")).mapNotNull { a ->
                     val b64 = a.optString("data", "")
                     if (b64.isEmpty()) null
@@ -751,6 +767,12 @@ class ModelExecutionService : Service() {
                     maxTokens = maxTokens,
                     temperature = temperature,
                     imageParts = imageParts,
+                    // [fix/audit-s3m1] tools now parsed and forwarded, matching
+                    // the streaming path (:1001) — the dispatcher serializes
+                    // tools (buildRequestJson :140) but this call site dropped
+                    // them, so non-streaming function-calling turns ran with
+                    // an empty tool surface.
+                    tools = parseToolsJson(req.optJSONArray("tools")),
                 )
             }
         } catch (e: Throwable) {
@@ -894,7 +916,20 @@ class ModelExecutionService : Service() {
                 )
             }
             val tools = parseToolsJson(req.optJSONArray("tools"))
-            val thinkingLevel = safeEnum(getString(req, "thinking_level"), com.openminis.app.data.model.ThinkingLevel.OFF)
+            // [T-thinking-off-omitted-key] thinking_level is deliberately OMITTED
+            // from the request JSON when OFF (ModelExecutionDispatcher: "don't
+            // serialize defaults"). optString returns "" for a missing key, and
+            // the strict safeEnum (T-model-exec-strict-enum) treats "" as an
+            // UNKNOWN value and throws — so a thinking-OFF turn never reached
+            // HTTP and died as "unknown t0 value: " with 3 retries + failover
+            // all failing the same way. The key ABSENT means OFF, exactly what
+            // the default parameter expresses. A present-but-unparseable value
+            // (newer enum case from a main-process-only build) still throws —
+            // that strict contract is unchanged.
+            val thinkingLevel = req.optString("thinking_level", "").let {
+                if (it.isEmpty()) com.openminis.app.data.model.ThinkingLevel.OFF
+                else safeEnum(it, com.openminis.app.data.model.ThinkingLevel.OFF)
+            }
 
             // ── API key: read from EncryptedSharedPreferences (same uid) ──
             // [T-stale-apikey-worker-cache] Same guard as executeRun: if the
@@ -978,6 +1013,13 @@ class ModelExecutionService : Service() {
                             systemPrompt = systemPrompt,
                             maxTokens = maxTokens,
                             temperature = temperature,
+                            // [fix/audit-s2h1] Non-streaming executeRun (:753) passes
+                            // imageParts but this streaming call site omitted it —
+                            // the dispatcher serializes image_parts (buildRequestJson),
+                            // the worker parsed them (:886) and then dropped them,
+                            // so streaming turns with user images silently lost the
+                            // images and the model only saw the text.
+                            imageParts = imageParts,
                             tools = tools,
                             thinkingLevel = thinkingLevel,
                         ).collect { chunk ->
@@ -1356,21 +1398,48 @@ class ModelExecutionService : Service() {
     ) {
         val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
         catch (_: Exception) { null } ?: return
-        val ip = obj.optJSONObject("image_passthrough") ?: return
-        val body = ip.optJSONObject("extra_body")
-        if (body != null) {
-            val bodyMap = linkedMapOf<String, Any?>()
-            for (key in body.keys()) { bodyMap[key] = body.get(key) }
-            openAI.imageExtraBody = bodyMap
+        // [fix/audit-s3m2] This reader used to expect an `image_passthrough`
+        // envelope that NO caller ever wrote (dead dialect — grep found this
+        // line as the only reference to the key in the whole repo). The
+        // in-process ModelUseOffloadHandler.parseImagePassthrough uses a
+        // different dialect: implicit top-level keys (not in the reserved
+        // set) + explicit extra_body / extra_headers / endpoint_path. Parse
+        // the SAME dialect here so passthrough extras survive the worker
+        // path too (e.g. Seedream image-to-image `image` body field),
+        // instead of being silently dropped.
+        val body = LinkedHashMap<String, Any?>()
+        for (key in obj.keys()) {
+            if (key in IMAGE_PASSTHROUGH_RESERVED_KEYS) continue
+            body[key] = obj.opt(key)
         }
-        ip.optString("path", "").ifEmpty { null }?.let { openAI.imagePathOverride = it }
-        val hdrs = ip.optJSONObject("extra_headers")
-        if (hdrs != null) {
-            val hdrsMap = linkedMapOf<String, String>()
-            for (key in hdrs.keys()) { hdrsMap[key] = hdrs.optString(key, "") }
-            openAI.imageExtraHeaders = hdrsMap
+        obj.optJSONObject("extra_body")?.let { eb ->
+            for (key in eb.keys()) body[key] = eb.opt(key)
+        }
+        if (body.isNotEmpty()) openAI.imageExtraBody = body
+        val headers = LinkedHashMap<String, String>()
+        obj.optJSONObject("extra_headers")?.let { eh ->
+            for (key in eh.keys()) {
+                val v = eh.opt(key)
+                if (v is String) headers[key] = v
+            }
+        }
+        if (headers.isNotEmpty()) openAI.imageExtraHeaders = headers
+        obj.optString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }?.let {
+            openAI.imagePathOverride = it
         }
     }
+
+    /**
+     * Keys consumed by the image-gen schema itself (parseImageGenConfig) or
+     * the chat schema — mirrors ModelUseOffloadHandler.imageReservedKeys.
+     * Any OTHER top-level key in inputJson folds into the passthrough body.
+     */
+    private val IMAGE_PASSTHROUGH_RESERVED_KEYS: Set<String> = setOf(
+        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
+        "size", "image_size", "quality", "generation_config", "endpoint",
+        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
+        "stream", "temperature", "max_tokens",
+    )
 }
 
 /**

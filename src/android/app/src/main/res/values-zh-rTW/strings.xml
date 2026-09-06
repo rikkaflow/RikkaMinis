@@ -605,6 +605,7 @@
     <string name="thinking_level_max">極高</string>
     <string name="thinking_level_xhigh">超高</string>
     <string name="thinking_level_ultra">至高</string>
+    <string name="thinking_level_auto">自動</string>
     <string name="thinking_level_sheet_title">思考強度</string>
     <string name="model_picker_title">選擇模型</string>
     <string name="model_picker_done">完成</string>
@@ -1136,6 +1137,8 @@
     <string name="settings_max_concurrent_subtitle">上限：%1$d · 執行中：%2$d · 排隊中：%3$d</string>
     <string name="settings_max_concurrent_dialog_title">最大併發會話數</string>
     <string name="settings_max_concurrent_restart_hint">下次啟動應用時生效。</string>
+    <string name="settings_subagent_dispatch">子代理派發</string>
+    <string name="settings_subagent_dispatch_subtitle">允許將任務派發到其他會話</string>
     <string name="settings_section_storage">儲存</string>
     <string name="settings_storage_subtitle">管理 Alpine Linux rootfs 並瀏覽檔案</string>
     <string name="settings_section_permissions">權限</string>
@@ -1446,6 +1449,7 @@
     <string name="model_group_detail_thinking_xhigh">超高</string>
     <string name="model_group_detail_thinking_max">最高</string>
     <string name="model_group_detail_thinking_ultra">至高</string>
+    <string name="model_group_detail_thinking_auto">自動</string>
     <string name="model_group_detail_limit_context_window">限制上下文視窗</string>
     <string name="model_group_detail_max_context">最大上下文</string>
     <string name="model_group_detail_unlimited">不限</string>
@@ -1557,4 +1561,40 @@
     <!-- Fix: minis:// 連結失效/檔案已清理時的提示，以及本地化的外部 scheme 攔截文案。 -->
     <string name="chat_link_file_missing">此檔案已不可用。</string>
     <string name="webpreview_blocked_scheme">已攔截指向外部應用的連結。</string>
+    <string name="thinking_rules_section">思考規則</string>
+    <string name="thinking_rules_footer">規則從上到下求值。第一條符合模型的規則決定傳送哪些思考參數。預設規則為內建，無法刪除——在其上方新增規則即可覆寫。</string>
+    <string name="thinking_rules_official_protocol_notice">此提供者使用官方協定，其思考參數由 Minis 維護。自訂規則僅適用於 Chat Completions API 上的 OpenAI 相容提供者。</string>
+    <string name="thinking_rules_default_rules_count">預設規則（%1$d）</string>
+    <string name="thinking_rules_add_rule">新增規則</string>
+    <string name="thinking_rules_move_up">上移</string>
+    <string name="thinking_rules_move_down">下移</string>
+    <string name="thinking_rules_new_rule">新增規則</string>
+    <string name="thinking_rules_edit_rule">編輯規則</string>
+    <string name="thinking_rules_rule_name">規則名稱</string>
+    <string name="thinking_rules_all_models">所有模型</string>
+    <string name="thinking_rules_model_pattern">模型比對模式（例如 deepseek-v4*）</string>
+    <string name="thinking_rules_glob_hint">"*" 比對任意字元。比對忽略大小寫，且 "." 與 "-" 視為同一字元。</string>
+    <string name="thinking_rules_what_to_send">傳送內容</string>
+    <string name="thinking_rules_send_off_value">關閉思考時也傳送一個值</string>
+    <string name="thinking_rules_off_value">關閉值（例如 none、minimal）</string>
+    <string name="thinking_rules_field_path">欄位路徑</string>
+    <string name="thinking_rules_dotted_path">點分路徑</string>
+    <string name="thinking_rules_value_at_high">High 檔的值</string>
+    <string name="thinking_rules_request_preview">請求預覽</string>
+    <string name="thinking_fmt_omit_title">不傳送任何欄位</string>
+    <string name="thinking_fmt_omit_desc">完全不傳送思考欄位。用於會拒絕未知鍵的端點。</string>
+    <string name="thinking_fmt_effort_title">reasoning_effort（根層級）</string>
+    <string name="thinking_fmt_effort_desc">根層級 reasoning_effort 字串，OpenAI Chat Completions 的標準形式。</string>
+    <string name="thinking_fmt_effort_nested_title">reasoning.effort（巢狀）</string>
+    <string name="thinking_fmt_effort_nested_desc">巢狀的 reasoning:{effort}——Responses / OpenRouter 的形式。</string>
+    <string name="thinking_fmt_bool_title">布林開關</string>
+    <string name="thinking_fmt_bool_desc">根層級欄位路徑上的純布林開關（無檔位）。</string>
+    <string name="thinking_fmt_extrabody_title">extra_body 開關</string>
+    <string name="thinking_fmt_extrabody_desc">巢狀於 extra_body 下的布林值，例如 extra_body.thinking.enabled。</string>
+    <string name="thinking_fmt_deepseek_title">thinking + reasoning_effort</string>
+    <string name="thinking_fmt_deepseek_desc">DeepSeek V4 形式：thinking 開關與 reasoning_effort 作為根層級並列欄位。</string>
+    <string name="thinking_fmt_qwen_title">enable_thinking + budget</string>
+    <string name="thinking_fmt_qwen_desc">Qwen/DashScope：enable_thinking 加一個不超過最大 token 的 thinking_budget。</string>
+    <string name="thinking_fmt_custom_title">自訂欄位路徑</string>
+    <string name="thinking_fmt_custom_desc">逃生艙：點分路徑加 High 檔的值，用於上述未涵蓋的端點。</string>
 </resources>

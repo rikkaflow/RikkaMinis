@@ -19,6 +19,8 @@ import com.openminis.app.provider.safeOptString
 import com.openminis.app.provider.sanitizeToolPairing
 import com.openminis.app.provider.clampOutboundMaxTokens
 import com.openminis.app.provider.clampOutboundTemperature
+import com.openminis.app.provider.thinking.ThinkingResolveContext
+import com.openminis.app.provider.thinking.ThinkingRuleResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
@@ -268,6 +270,15 @@ class OpenAIProvider constructor(
     override val name = "OpenAI"
     override var instanceContext: com.openminis.app.data.model.ProviderInstance? = null
 
+    /**
+     * [T-android-thinking-rules-phase2] Owning provider-instance id, set by
+     * ProviderFactory after construction (mirrors how instanceContext is a
+     * post-construction var). Lets the thinking resolver look up this instance's
+     * user-authored custom rules from ThinkingRuleResolver's cache. Null → no custom
+     * rules (built-in-only behaviour, identical to the pre-port chain).
+     */
+    var thinkingRuleInstanceId: String? = null
+
     companion object {
         /**
          * [T-android-stale-conn-retry-hang] Streaming time-to-first-byte
@@ -291,6 +302,41 @@ class OpenAIProvider constructor(
          */
         private const val STREAM_FIRST_DATA_TIMEOUT_MS =
             com.openminis.app.sandbox.offload.FirstChunkTimeoutPolicy.GENERATION_TIMEOUT_SEC * 1000L
+
+        /**
+         * [T-relay-host-adaptation] SiliconFlow (api.siliconflow.cn) model
+         * allowlist: only these exact model ids accept an `enable_thinking`
+         * toggle. Absorbed from RikkaHub's ChatCompletionsAPI host table —
+         * sending the field to any other id on this relay is silently ignored
+         * (or rejected). Kept as a Set for O(1) membership on the hot path.
+         */
+        private val SILICONFLOW_THINKING_MODELS = setOf(
+            "Pro/moonshotai/Kimi-K2.5",
+            "Pro/zai-org/GLM-5",
+            "Pro/zai-org/GLM-5.1",
+            "Pro/zai-org/GLM-4.7",
+            "deepseek-ai/DeepSeek-V3.2",
+            "Pro/deepseek-ai/DeepSeek-V3.2",
+            "Qwen/Qwen3.5-397B-A17B",
+            "Qwen/Qwen3.5-122B-A10B",
+            "Qwen/Qwen3.5-35B-A3B",
+            "Qwen/Qwen3.5-27B",
+            "Qwen/Qwen3.5-9B",
+            "Qwen/Qwen3.5-4B",
+            "zai-org/GLM-4.6",
+            "Qwen/Qwen3-8B",
+            "Qwen/Qwen3-14B",
+            "Qwen/Qwen3-32B",
+            "Qwen/Qwen3-30B-A3B",
+            "tencent/Hunyuan-A13B-Instruct",
+            "zai-org/GLM-4.5V",
+            "deepseek-ai/DeepSeek-V3.1-Terminus",
+            "Pro/deepseek-ai/DeepSeek-V3.1-Terminus",
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "Pro/deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V4-Pro",
+            "Pro/deepseek-ai/DeepSeek-V4-Pro",
+        )
     }
 
     // MARK: - Image passthrough [T-android-model-use-image-passthrough GH#62]
@@ -512,12 +558,19 @@ class OpenAIProvider constructor(
      *     `minimal`); the vendor-native `thinking:{}` shape is not honored.
      *   • Azure OpenAI ([isAzure]) — reasoning is `reasoning_effort` for every
      *     model surfaced through the deployment.
+     *   • Venice (`api.venice.ai`) — same unified surface; additionally its
+     *     ChatCompletionRequest is `additionalProperties:false`, so an unknown
+     *     ROOT key (e.g. `thinking:{}`) is a hard 400 before model dispatch
+     *     (OpenMinis#86 / 84f5c9e1). Added so the unified-gateway rule claims
+     *     Venice-hosted third-party ids before the vendor patterns do.
      *
      * Gated tightly so official direct endpoints (DeepSeek/GLM/Kimi native,
      * which DO want their own thinking shape) are never mis-routed.
      */
     private val usesUnifiedReasoningEffort: Boolean =
-        isAzure || basePath.lowercase().let { it.contains("volces") || it.contains("ark.") }
+        isAzure || basePath.lowercase().let {
+            it.contains("volces") || it.contains("ark.") || it.contains("api.venice.ai")
+        }
 
     /**
      * [T-deepseek-v4-official-only] Whether this instance is the official
@@ -534,6 +587,23 @@ class OpenAIProvider constructor(
      */
     private val isOfficialDeepSeek: Boolean =
         basePath.lowercase().contains("api.deepseek.com")
+
+    /**
+     * [T-mistral-omit-everything] Endpoint is Mistral's own API. The request rejects
+     * `reasoning` (422 extra_forbidden) and AssistantMessage is a closed schema that
+     * rejects `reasoning_content` — so the thinking key must be OMITTED entirely, not
+     * just turned off. Absorbed from upstream (GH OpenMinis#87 / 4592ca9b).
+     */
+    private val isMistral: Boolean =
+        basePath.lowercase().contains("mistral.ai")
+
+    /**
+     * [OpenMinis#163] Endpoint is xAI's own API (api.x.ai), not a relay that merely
+     * serves grok-named models. Scopes the empty-tier skip to the vendor where the
+     * 400 was actually observed (grok-build-0.1 rejects `reasoning_effort`).
+     */
+    private val isXAI: Boolean =
+        basePath.lowercase().contains("api.x.ai")
 
     /**
      * [T-length-wall-prefill] Whether this OpenAI-compatible endpoint accepts
@@ -1170,6 +1240,30 @@ class OpenAIProvider constructor(
                                 }
                                 send(LLMStreamChunk.ThinkingDelta(rc))
                             }
+
+                            // [T-relay-host-adaptation] Mistral reasoning dialect:
+                            // reasoning arrives inside `delta.content[]` as
+                            // {"type":"thinking","thinking":[{"type":"text","text":"…"}]}
+                            // (NOT reasoning_content/reasoning). Absorbed from
+                            // RikkaHub's ChatCompletionsStreamDecoder.
+                            d.optJSONArray("content")?.let { contentArr ->
+                                for (ci in 0 until contentArr.length()) {
+                                    val contentItem = contentArr.optJSONObject(ci) ?: continue
+                                    if (contentItem.optString("type", "") != "thinking") continue
+                                    val thinkingArr = contentItem.optJSONArray("thinking") ?: continue
+                                    for (ti in 0 until thinkingArr.length()) {
+                                        val thinkingItem = thinkingArr.optJSONObject(ti) ?: continue
+                                        val thinkingText = thinkingItem.safeOptString("text", "")
+                                        if (thinkingText.isNotEmpty()) {
+                                            reasoningAccum.append(thinkingText)
+                                            if (!sawReasoningDelta) {
+                                                sawReasoningDelta = true
+                                            }
+                                            send(LLMStreamChunk.ThinkingDelta(thinkingText))
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // Text content (with think-tag extraction — enabled for
@@ -1655,18 +1749,38 @@ class OpenAIProvider constructor(
         }
         body.put("stream", stream)
 
-        if (temperature != null) {
+        // [T-relay-host-adaptation] Some reasoning families reject an explicit
+        // `temperature` (400) or silently ignore it. Absorbed from RikkaHub's
+        // isModelAllowTemperature: o-series (o1/o3/o4), gpt-5.x, and Kimi
+        // K2.5/K2.6/K3 are self-reasoning — omit temperature for them.
+        if (temperature != null && isModelAllowTemperature(model.id)) {
             body.put("temperature", clampOutboundTemperature(temperature))
         }
 
-        if (stream && !isOpenRouter) {
+        // [T-relay-host-adaptation] Mistral does NOT support stream_options
+        // (mirrors RikkaHub — it 400s on include_usage); OpenRouter uses its own
+        // usage fields. Only emit include_usage on hosts that accept it.
+        val host = basePath.toHttpUrlOrNull()?.host ?: ""
+        if (stream && !isOpenRouter && host != "api.mistral.ai") {
             body.put("stream_options", JSONObject().put("include_usage", true))
         }
 
         // Provider-specific thinking params. We always call this — some
         // models (e.g. DeepSeek V4) reason by default and need an explicit
         // `disabled` signal when the user toggles thinking off.
-        injectThinkingParams(body, thinkingLevel, maxTokens)
+        //
+        // [T-android-mistral-reasoning-422] …EXCEPT on Mistral, which rejects
+        // the thinking request parameters outright with
+        // `422 extra_forbidden body.reasoning`. Mirrors iOS
+        // OpenAIAgentProvider.swift's `if !provider.isMistral` gate around this
+        // same call (4592ca9b / GH OpenMinis#87). Until now [isMistral] only
+        // suppressed the stream_options include_usage field — the
+        // request-parameter half of that fix was never ported, so an enabled
+        // thinking level still put `reasoning_effort` on the wire to
+        // api.mistral.ai.
+        if (!isMistral) {
+            injectThinkingParams(body, thinkingLevel, maxTokens)
+        }
 
         // Tools
         if (tools.isNotEmpty()) {
@@ -1692,10 +1806,26 @@ class OpenAIProvider constructor(
         //   - the model isn't explicitly known to reject reasoning.
         // Prevents 400s from Kimi / DeepSeek / GLM / QwQ that reject
         // multi-turn history missing reasoning_content once thinking is on.
+        //
+        // [T-android-mistral-reasoning-422] Mistral rejects `reasoning_content`
+        // on assistant messages entirely (closed schema → HTTP 422
+        // extra_forbidden), so suppress BOTH the captured echo and the ""
+        // placeholder for that endpoint (absorbed upstream 0839f019). This
+        // cannot be driven by capability metadata: MiMo/DeepSeek require the
+        // field's PRESENCE while Mistral forbids it, and neither advertises
+        // supportsReasoning — opposite requirements on the same generic path.
         val modelAlwaysReasons = model.supportsReasoning == true
         val modelMayReason = model.supportsReasoning ?: true
-        val includeReasoning = (thinkingLevel.isEnabled || modelAlwaysReasons) && modelMayReason
+        val forbidReasoningField = isMistral
+        val includeReasoning =
+            (thinkingLevel.isEnabled || modelAlwaysReasons) && modelMayReason && !forbidReasoningField
         val echoReasoning = includeReasoning
+        // [T-thinking-auto-level] AUTO does not assert "thinking is on": captured
+        // reasoning is still echoed (round-tripping real history, required by
+        // DeepSeek/MiMo multi-turn), but the EMPTY placeholder is suppressed —
+        // an empty reasoning_content is a field-presence signal that thinking
+        // should be on, which AUTO deliberately does not claim.
+        //
         // T-mimo-reasoning-echo-34671: Mimo V2.5 returns 400 Param Incorrect on
         // multi-turn tool-call history when any prior assistant turn (especially
         // a tool_calls-bearing one) omits `reasoning_content`. Mimo's docs say
@@ -1705,7 +1835,7 @@ class OpenAIProvider constructor(
         // echo gate (includeReasoning) is true. OpenAI o-series ignores
         // unknown message-level `reasoning_content` so this stays harmless
         // there; non-reasoning models gate this off via includeReasoning=false.
-        val placeholderAllowed = includeReasoning
+        val placeholderAllowed = includeReasoning && thinkingLevel != ThinkingLevel.AUTO
 
         val lastUserIndex = sanitizedMessages.indexOfLast { it.role == LLMMessage.Role.USER }
         for ((index, msg) in sanitizedMessages.withIndex()) {
@@ -1937,8 +2067,9 @@ class OpenAIProvider constructor(
      * keys overwrite; `model` is force-restored last.
      */
     private fun mergeChatExtraBody(body: JSONObject) {
-        if (chatExtraBody.isEmpty()) return
-        for ((k, v) in chatExtraBody) body.put(k, v ?: JSONObject.NULL)
+        if (chatExtraBody.isNotEmpty()) {
+            for ((k, v) in chatExtraBody) body.put(k, v ?: JSONObject.NULL)
+        }
         body.put("model", model.id)
     }
 
@@ -2113,214 +2244,134 @@ class OpenAIProvider constructor(
         return if (effort == "xhigh" && (lid.contains("mimo") || lid.contains("agnes"))) "high" else effort
     }
 
+    /**
+     * [T-relay-host-adaptation] Whether this model accepts an explicit
+     * `temperature` field. Absorbed from RikkaHub's isModelAllowTemperature —
+     * o-series (o1/o3/o4-*) and gpt-5.x self-reason and reject/ignore
+     * temperature; Kimi K2.5/K2.6/K3 are Moonshot-restricted (their endpoint
+     * 400s on temperature). Everything else keeps the historical clamp.
+     */
+    private fun isModelAllowTemperature(modelId: String): Boolean {
+        val lid = modelId.lowercase()
+        if (lid.startsWith("o") && lid.length >= 2 && lid[1].isDigit()) return false
+        if (lid.startsWith("gpt-5")) return false
+        if (lid.startsWith("kimi-k2.5") || lid.startsWith("kimi-k2.6") ||
+            lid.startsWith("kimi-k3") || lid == "k3"
+        ) {
+            return false
+        }
+        return true
+    }
+
     private fun injectThinkingParams(body: JSONObject, level: ThinkingLevel, maxTokens: Int) {
         // [T-android-thinking-level-arch] `level` is already clamped to the model
         // ceiling by LLMProvider.streamMessage/sendMessage — do NOT re-clamp.
         val lid = model.id.lowercase()
+        val host = basePath.toHttpUrlOrNull()?.host ?: ""
 
-        if (isOpenRouter) {
-            if (!level.isEnabled) return
-            val effort = clampEffortForModel(when (level) {
-                ThinkingLevel.LOW -> "low"
-                ThinkingLevel.MEDIUM -> "medium"
-                ThinkingLevel.HIGH -> "high"
-                ThinkingLevel.XHIGH -> "xhigh"
-                // [T-android-thinking-level-arch] MAX → "max". ULTRA is a
-                // client-side "Max + orchestration" concept, never a valid
-                // server effort — clamp it to "max" on the wire (mirrors iOS
-                // reasoningEffort case .max, .ultra: "max").
-                ThinkingLevel.MAX, ThinkingLevel.ULTRA -> "max"
-                ThinkingLevel.OFF -> return
-            })
-            body.put("reasoning", JSONObject().put("effort", effort))
-            return
-        }
-
-        // DeepSeek V4 — explicit thinking toggle required (mirrors iOS
-        // OpenAIAgentProvider.injectThinkingParams). High/xhigh map to
-        // "max", everything else lands on "high".
-        // [T-unified-reasoning-effort] On Volcengine Ark / Azure, deepseek-v4
-        // is controlled by the platform's uniform `reasoning_effort` field, NOT
-        // the vendor-native `thinking:{}` object — sending the latter leaves
-        // thinking uncontrolled. Skip this branch there and fall through to the
-        // generic reasoning_effort path below (mirrors iOS ba055121).
-        // [T-deepseek-v4-official-only] Only the OFFICIAL api.deepseek.com
-        // backend understands the vendor-native `thinking:{}` object (deepseek-v4
-        // family). Third-party OpenAI-compatible relays re-hosting deepseek-v4
-        // (e.g. tokenrhythm.studio) reject `thinking.reasoning_effort` with
-        // UNKNOWN_FIELD and control thinking via the standard top-level
-        // `reasoning_effort` instead. So:
-        //   • official basePath → `thinking:{type:enabled, reasoning_effort}` (native, unchanged)
-        //   • any other basePath → top-level `reasoning_effort` (standard OpenAI-compat)
-        // In both cases OFF must go through the explicit `thinking:{type:disabled}`
-        // object: deepseek-v4 thinks BY DEFAULT, and omitting the toggle on a
-        // reasoning-capable turn would silently leave thinking ON.
-        if (lid.contains("deepseek-v4") && !usesUnifiedReasoningEffort) {
-            val effort = when (level) {
-                // [T-android-thinking-level-arch] DeepSeek V4 tops out at
-                // "max"; every high-and-above tier collapses onto it.
-                ThinkingLevel.HIGH, ThinkingLevel.XHIGH,
-                ThinkingLevel.MAX, ThinkingLevel.ULTRA -> "max"
-                else -> "high"
-            }
-            if (level.isEnabled) {
-                if (isOfficialDeepSeek) {
-                    // Official backend: vendor-native thinking object.
-                    body.put("thinking", JSONObject().apply {
-                        put("type", "enabled")
-                        put("reasoning_effort", effort)
-                    })
-                    com.openminis.app.logging.AppLogger.info(
-                        "OpenAIProvider",
-                        "DeepSeek V4 thinking enabled (level=${level.name} → effort=$effort) on $lid (official deepseek.com)"
-                    )
-                } else {
-                    // Third-party OpenAI-compatible relay: standard top-level
-                    // reasoning_effort is the accepted control surface.
-                    body.put("reasoning_effort", effort)
-                    com.openminis.app.logging.AppLogger.info(
-                        "OpenAIProvider",
-                        "DeepSeek V4 thinking enabled via standard reasoning_effort (level=${level.name} → effort=$effort) on $lid via $basePath"
-                    )
+        // [T-relay-host-adaptation] Host-precise adaptation table, absorbed from
+        // RikkaHub's ChatCompletionsAPI `when(host)` switch. A relay is
+        // identified by its baseUrl HOST, not by the model id — the same model
+        // id (e.g. qwen3.8-max) means different wire dialects on DashScope vs
+        // SiliconFlow vs Volcengine Ark vs a private relay. The model-id
+        // `lid.contains()` branches below remain as the FALLBACK for unknown
+        // hosts (vendor-native direct endpoints), but every known relay host is
+        // resolved here first so switching relays no longer lands on the wrong
+        // (or a 400-rejected) thinking field.
+        when (host) {
+            "api.siliconflow.cn" -> {
+                // SiliconFlow: enable_thinking is honored only by an allowlist.
+                if (model.id in SILICONFLOW_THINKING_MODELS) {
+                    body.put("enable_thinking", level.isEnabled)
                 }
-            } else {
-                // OFF is explicit everywhere: deepseek-v4 defaults to thinking ON
-                // and omitting the toggle would leave it running.
-                body.put("thinking", JSONObject().put("type", "disabled"))
-                com.openminis.app.logging.AppLogger.info(
-                    "OpenAIProvider",
-                    "DeepSeek V4 thinking disabled on $lid"
-                )
-            }
-            return
-        }
-
-        // [T-thinking-off-explicit] Thinking OFF on a reasoning-capable model:
-        // send the ALLOWLISTED explicit off tier instead of omitting the field —
-        // omission lets the vendor default kick in (Ark defaults to thinking ON).
-        // Vendors outside the allowlist keep the historical omission. MiMo/Agnes
-        // are exempt as defense in depth: their backends validate
-        // reasoning_effort against a STRICT low/medium/high enum and reject the
-        // whole request on "none"/"minimal" (mirrors iOS ff60c818 + c5efeb1e).
-        if (!level.isEnabled) {
-            // [T-qwen-thinking-off-omission] Qwen/DashScope models think BY
-            // DEFAULT (Bailian/DashScope "provider" default), so thinking OFF
-            // must emit an explicit `enable_thinking: false` — omission lets the
-            // vendor default kick in and the model silently enters its reasoning
-            // phase, which stalls the visible stream (the reported "using a
-            // model and it suddenly freezes" bug). Verified live against
-            // tokenrhythm.studio qwen3.8-max (Bailian): without the field the
-            // response carries `reasoning_content` + `reasoning_tokens`; with
-            // `enable_thinking: false` it streams text immediately. Note the
-            // qwen branch historically `return`ed here with NO field at all —
-            // the offEffort allowlist below is for reasoning_effort vendors
-            // only, so qwen must be handled BEFORE the allowlist gate.
-            if (lid.contains("qwen") || isDashScope) {
-                body.put("enable_thinking", false)
-                com.openminis.app.logging.AppLogger.info(
-                    "OpenAIProvider",
-                    "Qwen/DashScope thinking disabled via enable_thinking:false on $lid (base=$basePath)"
-                )
                 return
             }
-            val offEffort = explicitOffEffort() ?: return
-            if (lid.contains("mimo") || lid.contains("agnes")) return
-            when {
-                lid.startsWith("o") || lid.startsWith("gpt-5") ->
-                    body.put("reasoning_effort", offEffort)
-                lid.contains("deepseek") || lid.contains("glm") ||
-                    lid.contains("kimi") || lid.contains("minimax") -> {
-                    // Native self-reasoning families: only the unified-effort
-                    // gateways (Ark/Azure) understand an off tier for them.
-                    if (usesUnifiedReasoningEffort) body.put("reasoning_effort", offEffort)
-                }
-                model.supportsReasoning != false ->
-                    body.put("reasoning_effort", offEffort)
-            }
-            return
-        }
 
-        // [T-android-xhigh-effort-clamp] Clamp once here so BOTH the o-series/
-        // gpt-5 branch and the generic reasoning_effort fallback below emit a
-        // backend-accepted value for MiMo/Agnes (xhigh → high).
-        val effortStr = clampEffortForModel(when (level) {
-            ThinkingLevel.LOW -> "low"
-            ThinkingLevel.MEDIUM -> "medium"
-            ThinkingLevel.HIGH -> "high"
-            ThinkingLevel.XHIGH -> "xhigh"
-            // [T-android-thinking-level-arch] MAX → "max"; ULTRA also → "max"
-            // (ultra is client-side only, never a valid server effort).
-            ThinkingLevel.MAX, ThinkingLevel.ULTRA -> "max"
-            ThinkingLevel.OFF -> return
-        })
-
-        when {
-            lid.startsWith("o") || lid.startsWith("gpt-5") -> {
-                body.put("reasoning_effort", effortStr)
-            }
-            lid.contains("qwen") || isDashScope -> {
-                var budget = when (level) {
-                    ThinkingLevel.LOW -> 4096
-                    ThinkingLevel.MEDIUM -> 16384
-                    ThinkingLevel.HIGH -> 32768
-                    ThinkingLevel.XHIGH -> 65536
-                    // [T-android-thinking-level-arch] Budget mode is "higher is
-                    // better, capped to maxTokens" — MAX/ULTRA reuse the ceiling.
-                    ThinkingLevel.MAX -> 65536
-                    ThinkingLevel.ULTRA -> 65536
-                    ThinkingLevel.OFF -> 0
-                }
-                // [T-android-qwen3-thinking-budget-max-tokens-constraint] (issue #35, #641)
-                // DashScope/Bailian enforces a STRICT `thinking_budget <
-                // max_completion_tokens` and 400s otherwise — equal values are
-                // rejected too ("[16384] must be greater than [16384]"). Our
-                // budget ladder is independent of maxTokens, so xhigh=65536 vs a
-                // 64000 max, or medium=16384 vs a 16384 max, both violate it.
-                // Clamp strictly below max_completion_tokens (== maxTokens) with a
-                // margin for the answer after thinking. The margin and ceiling are
-                // computed relative to maxTokens (which varies per qwen model —
-                // 64000, 16384, …), never a hardcoded threshold, and the ceiling
-                // is forced to at least maxTokens-1 so a tiny maxTokens can't leave
-                // the budget >= max. maxTokens<=0 means "not provided" (e.g. the
-                // title-gen reference) — skip the clamp then. Mirrors iOS #640.
-                if (budget > 0 && maxTokens > 0) {
-                    val margin = maxOf(2048, maxTokens / 8)
-                    // Stay strictly below max; never let the ceiling collapse to
-                    // <=0 when maxTokens is small — fall back to maxTokens-1.
-                    val ceiling = maxOf(1, minOf(maxTokens - margin, maxTokens - 1))
-                    if (budget >= ceiling) {
-                        budget = ceiling
-                    }
-                }
-                body.put("enable_thinking", true)
-                if (budget > 0) body.put("thinking_budget", budget)
-                body.put("extra_body", JSONObject().apply {
-                    put("enable_thinking", true)
-                    if (budget > 0) put("thinking_budget", budget)
+            "api.moonshot.cn" -> {
+                body.put("thinking", JSONObject().apply {
+                    put("type", if (level.isEnabled) "enabled" else "disabled")
+                    // K2.6: thinking.keep defaults to null (drop history thinking);
+                    // must be "all" for retention-style thinking when enabled.
+                    if (level.isEnabled && lid.contains("k2.6")) put("keep", "all")
                 })
+                return
             }
-            // DeepSeek, GLM, Kimi, MiniMax — no params needed, model always reasons.
-            // [T-unified-reasoning-effort] EXCEPTION: on Volcengine Ark / Azure
-            // these families are re-hosted behind a uniform OpenAI surface that
-            // controls thinking ONLY via `reasoning_effort` — omitting it there
-            // means the gateway applies its own default and the user's level is
-            // ignored. Fall through to the generic reasoning_effort branch below
-            // in that case; keep the native skip for direct vendor endpoints.
-            (lid.contains("deepseek") || lid.contains("glm") ||
-                lid.contains("kimi") || lid.contains("minimax")) &&
-                !usesUnifiedReasoningEffort -> {}
-            // [T-reasoning-effort-fallback] Generic fallback for OpenAI-compatible
-            // third-party reasoning models whose IDs match none of the branches
-            // above (e.g. Volcano/Ark "seed" models): inject the standard Chat
-            // Completions `reasoning_effort` field (mirrors iOS
-            // OpenAIAgentProvider.injectThinkingParams). Tri-state
-            // supportsReasoning: only a hard `false` blocks injection — null
-            // (unknown) lets the user enable thinking in the UI, so the request
-            // must honor that here too. OFF already returned via effortStr above.
-            model.supportsReasoning != false -> {
-                body.put("reasoning_effort", effortStr)
+
+            "api.xiaomimimo.com", "token-plan-cn.xiaomimimo.com" -> {
+                body.put("thinking", JSONObject().apply {
+                    put("type", if (level.isEnabled) "enabled" else "disabled")
+                })
+                return
+            }
+
+            "chat.intern-ai.org.cn" -> {
+                body.put("thinking_mode", level.isEnabled)
+                return
+            }
+
+            "open.bigmodel.cn" -> {
+                body.put("thinking", JSONObject().apply {
+                    put("type", if (level.isEnabled) "enabled" else "disabled")
+                })
+                return
+            }
+
+            "aiping.cn" -> {
+                body.put("enable_thinking", level.isEnabled)
+                return
             }
         }
+
+        // [T-android-thinking-rules-phase2] Everything below the host table is now
+        // delegated to ThinkingRuleResolver — a declarative, first-match-wins rule
+        // registry (built-in vendor rules + user-authored custom rules) that replaced
+        // the old if-return chain. The resolver reproduces the pre-refactor wire shapes
+        // branch for branch (OpenRouter nested reasoning, qwen dual-send vs relay
+        // root-only, deepseek-v4 official sibling vs relay top-level, unified-gateway
+        // reasoning_effort, self-reasoning family skip, generic fallback) and adds the
+        // user-editable escape hatch (ThinkingWireFormat.CustomPath). The `when(host)`
+        // table above stays OUTSIDE the registry: it encodes host-exact relay dialects
+        // measured live (RikkaHub absorption) that a model-pattern scope cannot express,
+        // and every known relay host short-circuits before the resolver runs.
+        val ctx = ThinkingResolveContext(
+            modelId = model.id,
+            instanceId = thinkingRuleInstanceId,
+            supportsReasoning = model.supportsReasoning,
+            declaredEffortValues = model.reasoningEffortValues,
+            declaresNoEffortTiers = model.declaresNoEffortTiers == true,
+            level = level,
+            maxTokens = maxTokens,
+            isOpenRouter = isOpenRouter,
+            usesUnifiedReasoningEffort = usesUnifiedReasoningEffort,
+            isMistral = isMistral,
+            isDashScope = isDashScope,
+            isXAI = isXAI,
+            isOfficialDeepSeek = isOfficialDeepSeek,
+            offEffort = explicitOffEffort(),
+        )
+        val trace = ThinkingRuleResolver.apply(body, ctx)
+        // [T-thinking-rules-observability] Which rule actually won must be inspectable,
+        // or a rule layer just replaces one hidden variable with a more complicated one.
+        // [T-thinking-resolve-in-log] The INPUT side of the decision is logged first
+        // (mirrors iOS `[resolve.in]`): when a relay 400s, the full decision input must
+        // be reconstructable from logs alone — endpoint predicates, declared tiers, and
+        // the off-tier in play — not just the winner. Otherwise a wrong rule fires for
+        // reasons invisible after the fact.
+        com.openminis.app.logging.AppLogger.info(
+            "Thinking",
+            "[resolve.in] model=${model.id} level=${level.name} " +
+                "openrouter=$isOpenRouter unified=$usesUnifiedReasoningEffort " +
+                "mistral=$isMistral dashscope=$isDashScope xai=$isXAI " +
+                "officialDeepSeek=$isOfficialDeepSeek " +
+                "supportsReasoning=${model.supportsReasoning} " +
+                "declared=${model.reasoningEffortValues?.joinToString("|") ?: "null"} " +
+                "declaresNoEffort=${model.declaresNoEffortTiers == true} " +
+                "offEffort=${explicitOffEffort() ?: "null"} maxTokens=$maxTokens",
+        )
+        com.openminis.app.logging.AppLogger.info(
+            "Thinking",
+            "[resolve] model=${model.id} level=${level.name} ${trace.logLine}",
+        )
     }
 
     /**
@@ -2457,10 +2508,23 @@ class OpenAIProvider constructor(
         // guard it here as well — only xhigh for those two families is affected.
         // [T-android-thinking-level-arch] `thinkingLevel` is already clamped by
         // LLMProvider.streamMessage/sendMessage before reaching here.
+        // [T-thinking-auto-level] AUTO maps to null effort; the effort branch
+        // below skips, and the OFF branch is gated by !isEnabled (AUTO is
+        // enabled), so AUTO emits NO reasoning object — vendor default applies.
         val effort = if (thinkingLevel.isEnabled) {
             mapThinkingLevelToResponsesEffort(thinkingLevel)?.let { clampEffortForModel(it) }
         } else null
         when {
+            // [T-android-mistral-reasoning-422] Mistral rejects the reasoning
+            // request parameter outright (`422 extra_forbidden body.reasoning`,
+            // GH OpenMinis#87). The Chat-Completions gate covers only
+            // injectThinkingParams; this builder is a SECOND, independent
+            // injection site that a Mistral instance with useResponsesAPI
+            // enabled would reach ungated. For Mistral the answer to "should
+            // any thinking field be sent" is NEVER, on every request path —
+            // so suppress the whole block. Must stay FIRST so it wins over the
+            // branches below (absorbed upstream, same fix).
+            isMistral -> {}
             effort != null -> body.put(
                 "reasoning",
                 JSONObject().put("effort", effort).put("summary", "auto"),
@@ -2755,6 +2819,9 @@ class OpenAIProvider constructor(
      */
     private fun mapThinkingLevelToResponsesEffort(level: ThinkingLevel): String? = when (level) {
         ThinkingLevel.OFF -> null
+        // [T-thinking-auto-level] no effort opinion — caller omits the reasoning
+        // object entirely (see buildResponsesAPIBody's effort handling).
+        ThinkingLevel.AUTO -> null
         ThinkingLevel.LOW -> "low"
         ThinkingLevel.MEDIUM -> "medium"
         ThinkingLevel.HIGH -> "high"

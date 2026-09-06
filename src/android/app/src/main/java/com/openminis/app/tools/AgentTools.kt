@@ -20,6 +20,19 @@ object AgentTools {
         // attempt those calls. Mirrors the iOS gate at
         // AIChatViewModel.makeAgentTools(memoryEnabled:).
         memoryEnabled: Boolean = true,
+        // [T-subagent-toggle] When the sub-agent / cross-session dispatch
+        // switch is OFF (default), drop spawn_agent from the schema entirely
+        // so the model can't attempt it — mirrors the memory toggle pattern.
+        // When ON, expose it; the sub-agent's own tool set is filtered inside
+        // SubagentSkill.buildFilteredTools (spawn_agent itself is FORBIDDEN
+        // there, so recursion via nested spawn_agent is impossible).
+        // [fix/diff-audit-0904-F4] Note: this anti-recursion filter covers the
+        // spawn_agent tool path only. A headless session created via
+        // `minis-sessions-cli send` (also gated by this switch) reads the same
+        // toggle and CAN expose spawn_agent to its model — i.e. one nesting
+        // level through the send path is reachable by design; only deeper
+        // recursion (sub-agent spawning sub-agents) is blocked.
+        subagentEnabled: Boolean = false,
     ): List<AgentToolDefinition> = buildList {
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
@@ -29,11 +42,10 @@ object AgentTools {
             add(ReadImageTool.definition())
         }
         add(browserUseDefinition())
-        // [T7-subagent] spawn_agent: skill = independent sub-agent instance.
-        // Always exposed — the sub-agent's own tool set is filtered inside
-        // SubagentSkill.buildFilteredTools (spawn_agent itself is FORBIDDEN
-        // there, so recursion is structurally impossible).
-        add(SubagentSkill.definition())
+        if (subagentEnabled) {
+            // [T7-subagent] spawn_agent: skill = independent sub-agent instance.
+            add(SubagentSkill.definition())
+        }
         if (memoryEnabled) {
             add(memoryWriteDefinition())
             add(memoryGetDefinition())

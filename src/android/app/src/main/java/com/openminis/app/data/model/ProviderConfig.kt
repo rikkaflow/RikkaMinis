@@ -40,7 +40,22 @@ enum class ThinkingLevel {
     // Kotlinx Serialization encodes enums by NAME string ("OFF"/"LOW"/...),
     // not declaration-order ordinal, so appending does not corrupt already-
     // persisted data. GPT-5.6 sol/terra reach ULTRA, luna reaches MAX.
-    OFF, LOW, MEDIUM, HIGH, XHIGH, MAX, ULTRA;
+    OFF, LOW, MEDIUM, HIGH, XHIGH, MAX, ULTRA,
+
+    /**
+     * [T-thinking-auto-level] "Let the vendor decide" — RikkaHub's AUTO(-1).
+     * Appended last so no existing rank/ordinal shifts. Semantics:
+     *  • Enabled (isEnabled == true), but expresses NO effort opinion.
+     *  • OpenAI-family emitters (chat/completions + Responses) omit ALL
+     *    thinking control fields for AUTO; Anthropic sends only the bare
+     *    `thinking:{type:"adaptive"}` switch for adaptive-generation models
+     *    (vendor picks the budget); Gemini omits thinkingConfig entirely.
+     *    Mirrors RikkaHub's AUTO branch.
+     *  • NOT subject to the model ceiling clamp (rank is an artifact of the
+     *    append rule, not an intensity), and NOT offered as a per-model
+     *    selection — the picker shows it as the "default" choice only.
+     */
+    AUTO;
 
     val isEnabled: Boolean get() = this != OFF
 
@@ -53,6 +68,7 @@ enum class ThinkingLevel {
             XHIGH -> "XHigh"   // was "Max"; the label now belongs to the new MAX case
             MAX -> "Max"
             ULTRA -> "Ultra"
+            AUTO -> "Auto"
         }
 
     /** Intensity ordinal used for intersection / clamp comparisons —
@@ -240,6 +256,26 @@ data class ProviderInstance(
      */
     val supportsAzureMode: Boolean
         get() = providerType == ProviderType.openAI && credentialType == ProviderCredential.apiKey
+
+    /**
+     * [T-android-thinking-rules-phase2] Whether the custom thinking-rules editor
+     * is surfaced for this instance. Only the OpenAI-compatible request path
+     * consults [com.openminis.app.provider.thinking.ThinkingRuleResolver]:
+     *   • anthropic/gemini build their thinking shape in their own emitters —
+     *     user rules would be silently ignored, so show a notice, not an editor;
+     *   • the Responses API and Codex OAuth both bypass the Chat-Completions
+     *     body where rules apply — same notice treatment.
+     * Mirrors iOS `supportsCustomThinkingRules`.
+     */
+    val supportsCustomThinkingRules: Boolean
+        get() = when (providerType) {
+            ProviderType.anthropic, ProviderType.gemini -> false
+            else -> {
+                val codexOAuth = credentialType == ProviderCredential.oauth &&
+                    customBaseURL.isNullOrBlank()
+                !useResponsesAPI && !codexOAuth
+            }
+        }
 }
 
 @Serializable

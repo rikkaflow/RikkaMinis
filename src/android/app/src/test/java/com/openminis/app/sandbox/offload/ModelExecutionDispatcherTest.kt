@@ -179,6 +179,43 @@ class ModelExecutionDispatcherTest {
     }
 
     @Test
+    fun `custom knobs are serialized`() {
+        // [T-provider-extra-headers/body] Removed feature — the dispatcher no
+        // longer serializes custom_headers / custom_body_fields, so a fresh
+        // request JSON must NOT contain either key.
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = emptyList(),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = emptyList(),
+            inputJson = "",
+            outputExt = null,
+        ))
+        assertFalse(json.has("custom_headers"))
+        assertFalse(json.has("custom_body_fields"))
+    }
+
+    @Test
+    fun `empty custom knobs omit the keys`() {
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = emptyList(),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = emptyList(),
+            inputJson = "",
+            outputExt = null,
+        ))
+        assertFalse(json.has("custom_headers"))
+        assertFalse(json.has("custom_body_fields"))
+    }
+
+    @Test
     fun `nullables are omitted not null`() {
         val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
             instance = sampleInstance().copy(customBaseURL = null, customUserAgent = null),

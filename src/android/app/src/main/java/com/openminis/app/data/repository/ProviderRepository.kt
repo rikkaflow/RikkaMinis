@@ -7,6 +7,7 @@ import com.openminis.app.data.db.ProviderConfigDao
 import com.openminis.app.data.db.ProviderConfigMetaKeys
 import com.openminis.app.data.db.ProviderConfigSnapshot
 import com.openminis.app.data.db.ProviderDatabase
+import com.openminis.app.data.db.ProviderThinkingRuleEntity
 import com.openminis.app.data.db.compositeEntryKey
 import com.openminis.app.data.db.toProviderConfig
 import com.openminis.app.data.db.toSnapshot
@@ -29,6 +30,9 @@ import com.openminis.app.data.model.hasVoiceModality
 import com.openminis.app.data.model.isVoiceTemplateSeedShape
 import com.openminis.app.data.model.withInferredVoiceModality
 import com.openminis.app.provider.registerModelListProviders
+import com.openminis.app.provider.thinking.ThinkingRule
+import com.openminis.app.provider.thinking.ThinkingRuleCoding
+import com.openminis.app.provider.thinking.ThinkingRuleResolver
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,19 +41,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
-
-// Modality bit layout — must match src/ios/Providers/LLMTypes.swift
-// ModelModality OptionSet rawValue exactly. Used by export/import to
-// transmit modality info as a single Int that iOS can decode.
-private const val MODALITY_BIT_TEXT_IN = 1 shl 0
-private const val MODALITY_BIT_TEXT_OUT = 1 shl 1
-private const val MODALITY_BIT_IMG_IN = 1 shl 2
-private const val MODALITY_BIT_PDF_IN = 1 shl 3
-private const val MODALITY_BIT_AUD_IN = 1 shl 4
-private const val MODALITY_BIT_VID_IN = 1 shl 5
-private const val MODALITY_BIT_IMG_OUT = 1 shl 6
-private const val MODALITY_BIT_AUD_OUT = 1 shl 7
-private const val MODALITY_BIT_VID_OUT = 1 shl 8
 
 class ProviderRepository(private val context: Context) {
 
@@ -419,22 +410,6 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
-     * Stable hash of the JSON mirror string, used as the in-DB synced-state
-     * marker. SHA-256 hex so collisions are negligible. Returns null only
-     * if [str] is null (caller normalizes).
-     */
-    private fun hashJsonMirror(str: String): String {
-        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(str.toByteArray())
-        return buildString(digest.size * 2) {
-            for (b in digest) {
-                val v = b.toInt() and 0xFF
-                append(Character.forDigit(v shr 4, 16))
-                append(Character.forDigit(v and 0xF, 16))
-            }
-        }
-    }
-
-    /**
      * Atomically persist [config] to (DB) + (legacy JSON mirror), with
      * the meta.json_sync_hash kept in lockstep with the mirror we just
      * wrote. Returns the canonicalized config (entry uuids rewritten to
@@ -515,6 +490,9 @@ class ProviderRepository(private val context: Context) {
             _config.value = loadConfig()
             _configLoaded.value = true
         }
+        // [T-android-thinking-rules-phase2] Warm the resolver's custom-rule cache
+        // once config is available, so the (sync) request builder can read user rules.
+        loadAllThinkingRulesIntoCache()
         if (!configLoadComplete.isCompleted) configLoadComplete.complete(Unit)
     }
 
@@ -793,6 +771,12 @@ class ProviderRepository(private val context: Context) {
 
         saveConfig(config)
         deleteApiKey(instanceId)
+        // [T-android-thinking-rules-phase2] The instance is gone — drop its custom
+        // rules from Room and the resolver cache (they can never fire again).
+        runCatching {
+            runBlocking { providerDao.deleteThinkingRulesForInstance(instanceId) }
+            ThinkingRuleResolver.setCustomRules(instanceId, emptyList())
+        }
     }
 
     /**
@@ -820,6 +804,119 @@ class ProviderRepository(private val context: Context) {
 
     fun instance(id: String): ProviderInstance? =
         _config.value.instances.find { it.id == id }
+
+    // ── [T-android-thinking-rules-phase2] Custom thinking rules ──
+
+    /** Load one instance's custom rules from Room, in stored order. */
+    fun thinkingRules(instanceId: String): List<ThinkingRule> = runBlocking {
+        runCatching { providerDao.loadThinkingRules(instanceId).map { ThinkingRuleCoding.toRule(it) } }
+            .getOrDefault(emptyList())
+    }
+
+    /** The persisted ids for one instance's custom rules, parallel to [thinkingRules]. */
+    fun thinkingRuleIds(instanceId: String): List<String> = runBlocking {
+        runCatching { providerDao.loadThinkingRules(instanceId).map { it.id } }.getOrDefault(emptyList())
+    }
+
+    /** First model id served by [instanceId], for the resolution-trace sample. Null if none. */
+    fun firstModelId(instanceId: String): String? {
+        ensureConfigLoaded()
+        return _config.value.modelEntries.firstOrNull { it.providerInstanceId == instanceId }?.baseModel?.id
+    }
+
+    /** Warm the resolver cache with every instance's custom rules (called on config load). */
+    fun loadAllThinkingRulesIntoCache() {
+        runCatching {
+            val rows = runBlocking { providerDao.loadAllThinkingRules() }
+            val byInstance = rows.groupBy { it.providerInstanceId }
+                .mapValues { (_, rs) -> rs.sortedBy { it.sortOrder }.map { ThinkingRuleCoding.toRule(it) } }
+            ThinkingRuleResolver.setAllCustomRules(byInstance)
+        }
+    }
+
+    private fun republishThinkingCache(instanceId: String) {
+        ThinkingRuleResolver.setCustomRules(instanceId, thinkingRules(instanceId))
+    }
+
+    /**
+     * Insert or update a custom rule. [id] null ⇒ new rule minted at the TOP of the
+     * list (position 0) — a rule overriding a built-in is useless below it; existing
+     * rules shift down. A non-null [id] updates in place, preserving position.
+     * Returns the rule id.
+     */
+    fun saveThinkingRule(instanceId: String, rule: ThinkingRule, id: String? = null): String = runBlocking {
+        val existing = providerDao.loadThinkingRules(instanceId).toMutableList()
+        val ruleId = id ?: java.util.UUID.randomUUID().toString()
+        val idx = existing.indexOfFirst { it.id == ruleId }
+        if (idx >= 0) {
+            // Update in place at its current sort_order.
+            existing[idx] = ThinkingRuleCoding.toEntity(rule, ruleId, instanceId, existing[idx].sortOrder)
+        } else {
+            // New rule at the top; everything else shifts down.
+            existing.add(0, ThinkingRuleCoding.toEntity(rule, ruleId, instanceId, 0))
+        }
+        val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }
+        providerDao.replaceThinkingRules(instanceId, renumbered)
+        republishThinkingCache(instanceId)
+        ruleId
+    }
+
+    fun deleteThinkingRule(instanceId: String, id: String) = runBlocking {
+        providerDao.deleteThinkingRule(id)
+        // Renumber survivors so sort_order stays dense.
+        val survivors = providerDao.loadThinkingRules(instanceId)
+            .sortedBy { it.sortOrder }
+            .mapIndexed { i, e -> e.copy(sortOrder = i) }
+        providerDao.replaceThinkingRules(instanceId, survivors)
+        republishThinkingCache(instanceId)
+    }
+
+    /** Reorder an instance's custom rules to match [orderedIds] (a permutation). */
+    fun reorderThinkingRules(instanceId: String, orderedIds: List<String>) = runBlocking {
+        val byId = providerDao.loadThinkingRules(instanceId).associateBy { it.id }
+        val reordered = orderedIds.mapNotNull { byId[it] }
+            .mapIndexed { i, e -> e.copy(sortOrder = i) }
+        // Keep any id the caller omitted (defensive against a partial list) appended.
+        val omitted = byId.values.filter { it.id !in orderedIds }.map { it }
+        providerDao.replaceThinkingRules(instanceId, reordered + omitted)
+        republishThinkingCache(instanceId)
+    }
+
+    /**
+     * Built-in rules relevant to THIS instance, for the Provider-detail UI. Mirrors iOS
+     * builtInRulesForDisplay: resolve the vendor context from the instance's base URL,
+     * then keep every AllModels-scoped rule (endpoint/provider-type defaults) plus any
+     * ModelPattern rule the provider actually serves a matching model for. An empty
+     * catalog keeps everything (list must not be mysteriously empty before first fetch).
+     */
+    fun builtInThinkingRulesForDisplay(instanceId: String): List<ThinkingRule> {
+        ensureConfigLoaded()
+        val config = _config.value
+        val inst = config.instances.find { it.id == instanceId } ?: return emptyList()
+        val base = (inst.effectiveBaseURL ?: "").lowercase()
+        val ctx = com.openminis.app.provider.thinking.ThinkingResolveContext(
+            modelId = "",
+            supportsReasoning = null,
+            declaredEffortValues = null,
+            level = ThinkingLevel.OFF,
+            maxTokens = 0,
+            isOpenRouter = base.contains("openrouter.ai"),
+            usesUnifiedReasoningEffort = base.contains("volces") || base.contains("ark.") || base.contains("venice.ai"),
+            isMistral = base.contains("mistral.ai"),
+            isDashScope = base.contains("dashscope"),
+            isXAI = base.contains("api.x.ai"),
+            isOfficialDeepSeek = base.contains("api.deepseek.com"),
+            offEffort = null,
+        )
+        val modelIds = config.modelEntries.filter { it.providerInstanceId == instanceId }.map { it.model.id }
+        return ThinkingRuleResolver.builtInRules(ctx).filter { rule ->
+            when (rule.scope) {
+                is ThinkingRule.Scope.AllModels -> true
+                is ThinkingRule.Scope.ModelPattern ->
+                    modelIds.isEmpty() || modelIds.any { rule.scope.matches(it) }
+            }
+        }
+    }
 
     fun enabledInstances(providerType: ProviderType): List<ProviderInstance> =
         _config.value.instances.filter { it.providerType == providerType && it.isEnabled }
@@ -1203,30 +1300,30 @@ class ProviderRepository(private val context: Context) {
     // added items in the picker, mirrors iOS appendIfNeeded behaviour.
 
     /** Append [entryId] to the agent-loop direct-pin list if not already there. */
-    fun addAgentLoopEntry(entryId: String) {
+    fun addAgentLoopEntry(entryId: String) = synchronized(configLock) {
         val cur = _config.value.agentLoopModelEntryIds.toList()
-        if (entryId in cur) return
+        if (entryId in cur) return@synchronized
         setAgentLoopEntryIds(cur + entryId)
     }
 
     /** Remove [entryId] from the agent-loop direct-pin list. No-op if absent. */
-    fun removeAgentLoopEntry(entryId: String) {
+    fun removeAgentLoopEntry(entryId: String) = synchronized(configLock) {
         val cur = _config.value.agentLoopModelEntryIds.toList()
-        if (entryId !in cur) return
+        if (entryId !in cur) return@synchronized
         setAgentLoopEntryIds(cur.filterNot { it == entryId })
     }
 
     /** Append [groupId] to the agent-loop group-pin list if not already there. */
-    fun addAgentLoopGroup(groupId: String) {
+    fun addAgentLoopGroup(groupId: String) = synchronized(configLock) {
         val cur = _config.value.agentLoopGroupIds.toList()
-        if (groupId in cur) return
+        if (groupId in cur) return@synchronized
         setAgentLoopGroupIds(cur + groupId)
     }
 
     /** Remove [groupId] from the agent-loop group-pin list. No-op if absent. */
-    fun removeAgentLoopGroup(groupId: String) {
+    fun removeAgentLoopGroup(groupId: String) = synchronized(configLock) {
         val cur = _config.value.agentLoopGroupIds.toList()
-        if (groupId !in cur) return
+        if (groupId !in cur) return@synchronized
         setAgentLoopGroupIds(cur.filterNot { it == groupId })
     }
 
@@ -1863,16 +1960,6 @@ class ProviderRepository(private val context: Context) {
         }
     }
 
-    private fun isSameCalendarDay(aMs: Long, bMs: Long): Boolean {
-        val cal = java.util.Calendar.getInstance()
-        cal.timeInMillis = aMs
-        val aYear = cal.get(java.util.Calendar.YEAR)
-        val aDay = cal.get(java.util.Calendar.DAY_OF_YEAR)
-        cal.timeInMillis = bMs
-        return aYear == cal.get(java.util.Calendar.YEAR)
-            && aDay == cal.get(java.util.Calendar.DAY_OF_YEAR)
-    }
-
     // API Key management
     fun saveApiKey(instanceId: String, key: String) {
         encryptedPrefs.edit().putString("apikey_$instanceId", key).commit()
@@ -2297,91 +2384,6 @@ class ProviderRepository(private val context: Context) {
             if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
         }
         return existing.id to entryMap
-    }
-
-    // -- Modality interop with iOS ----------------------------------------
-    //
-    // iOS encodes ModelModality as a single Int bitfield (OptionSet rawValue);
-    // Android carries inputModalities / outputModalities as bare string lists
-    // ("text" / "image" / "pdf" / "audio" / "video"). The export/import path
-    // writes both encodings so the wire format is portable in either
-    // direction without losing fidelity:
-    //   - Android → Android: the native string lists round-trip exactly.
-    //   - Android → iOS:    iOS reads `modalityOverride` Int and ignores
-    //                       the unknown list keys (forward-compatible).
-    //   - iOS → Android:    Android prefers the native list keys when
-    //                       present (Android-original export); otherwise
-    //                       decodes `modalityOverride` Int back into lists.
-    //
-    // Bit layout constants live at file scope above the class (Kotlin
-    // forbids a second companion object, and ProviderRepository already
-    // has one).
-
-    private fun modalityBitfieldFromLists(
-        inputs: List<String>?,
-        outputs: List<String>?,
-    ): Int {
-        var bits = 0
-        inputs?.forEach { raw ->
-            when (raw.lowercase()) {
-                "text" -> bits = bits or MODALITY_BIT_TEXT_IN
-                "image" -> bits = bits or MODALITY_BIT_IMG_IN
-                "pdf" -> bits = bits or MODALITY_BIT_PDF_IN
-                "audio" -> bits = bits or MODALITY_BIT_AUD_IN
-                "video" -> bits = bits or MODALITY_BIT_VID_IN
-            }
-        }
-        outputs?.forEach { raw ->
-            when (raw.lowercase()) {
-                "text" -> bits = bits or MODALITY_BIT_TEXT_OUT
-                "image" -> bits = bits or MODALITY_BIT_IMG_OUT
-                "audio" -> bits = bits or MODALITY_BIT_AUD_OUT
-                "video" -> bits = bits or MODALITY_BIT_VID_OUT
-            }
-        }
-        return bits
-    }
-
-    private fun modalityListsFromBitfield(bits: Int): Pair<List<String>?, List<String>?> {
-        if (bits == 0) return null to null
-        val inputs = buildList {
-            if (bits and MODALITY_BIT_TEXT_IN != 0) add("text")
-            if (bits and MODALITY_BIT_IMG_IN != 0) add("image")
-            if (bits and MODALITY_BIT_PDF_IN != 0) add("pdf")
-            if (bits and MODALITY_BIT_AUD_IN != 0) add("audio")
-            if (bits and MODALITY_BIT_VID_IN != 0) add("video")
-        }
-        val outputs = buildList {
-            if (bits and MODALITY_BIT_TEXT_OUT != 0) add("text")
-            if (bits and MODALITY_BIT_IMG_OUT != 0) add("image")
-            if (bits and MODALITY_BIT_AUD_OUT != 0) add("audio")
-            if (bits and MODALITY_BIT_VID_OUT != 0) add("video")
-        }
-        return inputs.ifEmpty { null } to outputs.ifEmpty { null }
-    }
-
-    /**
-     * Read modality info from a JSON object. Returns (inputs, outputs):
-     *   - native `inputModalities` / `outputModalities` list keys take
-     *     precedence (Android-original export — lossless).
-     *   - if neither list is present, decode iOS's `modalityOverride`
-     *     bitfield as the fallback.
-     *   - if neither shape is present, returns null pair (caller treats
-     *     as "no modality info" → baseModel defaults apply).
-     */
-    private fun readModalitiesWithBitfieldFallback(
-        obj: JSONObject,
-    ): Pair<List<String>?, List<String>?> {
-        val nativeIn = obj.optJSONArray("inputModalities")?.let { arr ->
-            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotEmpty() } }.takeIf { it.isNotEmpty() }
-        }
-        val nativeOut = obj.optJSONArray("outputModalities")?.let { arr ->
-            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotEmpty() } }.takeIf { it.isNotEmpty() }
-        }
-        if (nativeIn != null || nativeOut != null) return nativeIn to nativeOut
-        if (!obj.has("modalityOverride")) return null to null
-        val bits = obj.optInt("modalityOverride", 0)
-        return modalityListsFromBitfield(bits)
     }
 }
 
