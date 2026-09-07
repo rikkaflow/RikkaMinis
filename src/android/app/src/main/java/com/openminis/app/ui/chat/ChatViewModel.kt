@@ -938,6 +938,43 @@ class ChatViewModel(
     private val _autoRetryCountdown = MutableStateFlow(0)
     val autoRetryCountdown: StateFlow<Int> = _autoRetryCountdown.asStateFlow()
 
+    // [render-churn-1] Second-scale tool progress (shell delay countdown),
+    // keyed by tool block id. This is the tool-pill-only side channel —
+    // intentionally separate from message content: per-second writes to
+    // message content invalidate the WHOLE message item (1Hz re-compose +
+    // re-layout of the full block — the 09-07 render-churn incident). The
+    // pill subscribes via LocalToolProgressById inside the running branch,
+    // so completed blocks never read this flow. Mirror of the retry
+    // countdown pattern above (AgentLoopHost.setAutoRetryCountdown).
+    private val _toolProgressById = MutableStateFlow<Map<String, String>>(emptyMap())
+    val toolProgressById: StateFlow<Map<String, String>> = _toolProgressById.asStateFlow()
+
+    /** Publish/clear a tool block's progress text. Empty text removes the entry. */
+    internal fun publishToolProgress(toolId: String, text: String) {
+        _toolProgressById.value = if (text.isEmpty()) {
+            _toolProgressById.value - toolId
+        } else {
+            _toolProgressById.value + (toolId to text)
+        }
+    }
+
+    // [render-churn-3] Chat-screen visibility (app foreground), driven by
+    // ProcessLifecycleOwner ON_STOP/ON_RESUME in ChatScreen. When false,
+    // UI-only state publication (streaming deltas) is suppressed — the
+    // engine keeps persisting content, but nothing recomposes in the
+    // background (the 09-07 incident ran the 1Hz ticker 3 minutes in
+    // background = pure waste). ON_RESUME flushes the freshest suppressed
+    // delta once. Defaults true (the screen is visible at creation).
+    private val _uiVisible = MutableStateFlow(true)
+    val uiVisible: StateFlow<Boolean> = _uiVisible.asStateFlow()
+
+    /** [render-churn-3] Set screen visibility; a transition back to visible flushes suppressed deltas. */
+    internal fun setUiVisible(visible: Boolean) {
+        if (_uiVisible.value == visible) return
+        _uiVisible.value = visible
+        if (visible) flushPendingStreamingOnResume()
+    }
+
     // [T-android-stale-streamjob-clears-isstreaming] @Volatile so cross-coroutine
     // reads (the orphaned previous streamJob's tail block running on a different
     // dispatcher) see the latest assignment. Without it, an old job's

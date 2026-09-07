@@ -83,11 +83,22 @@ internal fun linuxPathToMinisURL(path: String): String? {
 internal suspend fun executeBrowserUseTool(
     argsJson: String,
     tabPool: BrowserTabPool,
+    /** [fix/browser-trio-audit] Owning chat session — injected (never parsed
+     *  from the model's JSON) so file_upload resolves per-session
+     *  /var/minis/... paths via resolveSessionHostPath (T178 pattern).
+     *  Caution: never write a slash immediately followed by two glob stars
+     *  inside a Kotlin block comment — Kotlin comments nest, that sequence
+     *  opens a nested level the single trailing close marker cannot shut
+     *  (it broke kspReleaseKotlin on the first CI run of this change). */
+    sessionId: String? = null,
     artifactWriter: (filename: String, data: ByteArray) -> String?,
     resizeJpeg: (ByteArray, Int) -> ByteArray?,
 ): ToolExecutionResult {
-    val input = BrowserActionInput.parse(argsJson)
+    val parsed = BrowserActionInput.parse(argsJson)
         ?: return ToolExecutionResult("Error: Invalid browser_use input", false)
+    // copy(sessionId = null) is a no-op when sessionId is absent — callers
+    // without a session (rare) keep the global-resolver behavior.
+    val input = parsed.copy(sessionId = sessionId)
 
     return try {
         val result = tabPool.execute(input)
