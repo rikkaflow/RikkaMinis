@@ -195,13 +195,41 @@ internal class ChatAgentTraceObserver(
         }
     }
 
-    internal fun t7Remaining(dimension: String, snap: BudgetSnapshot): Int = when (dimension) {
-        AgentTraceRecorder.DIMENSION_TURNS -> snap.turnsUsed.let { T7_OBSERVE_MAX_TURNS - it }
-        AgentTraceRecorder.DIMENSION_PROVIDER_ATTEMPTS -> T7_OBSERVE_MAX_PROVIDER_ATTEMPTS - snap.providerAttemptsUsed
-        AgentTraceRecorder.DIMENSION_TOOL_CALLS -> T7_OBSERVE_MAX_TOOL_CALLS - snap.toolCallsUsed
-        AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> T7_OBSERVE_MAX_SHELL_COMMANDS - snap.shellCommandsUsed
-        AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> T7_OBSERVE_MAX_COMPACTION_CALLS - snap.compactionCallsUsed
-        AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> T7_OBSERVE_MAX_CONCURRENT_TOOLS - snap.concurrentToolsActive
+    internal fun t7Remaining(dimension: String, snap: BudgetSnapshot): Int =
+        t7RemainingOf(dimension, snap, activeRunBudget)
+
+    /**
+     * [fix/runtime-limits-audit] Remaining is derived from THIS run's budget
+     * (the same object the consumption came from), NOT a live prefs re-read.
+     * The engine snapshots limits at runAgentLoop entry; a mid-run settings
+     * change must not make remaining jump or go negative on subsequent
+     * trace events (the run keeps the budget it started with — same
+     * rationale as the banner numbers).
+     */
+    private fun t7RemainingOf(dimension: String, snap: BudgetSnapshot, budget: AgentExecutionBudget?): Int {
+        val total = budget?.let { t7Total(dimension, it) }
+            // No budget (JVM test path / pre-prime) → fall back to the live
+            // prefs value, which reads as the defaults in that context.
+            ?: t7TotalOf(dimension)
+        return when (dimension) {
+            AgentTraceRecorder.DIMENSION_TURNS -> total - snap.turnsUsed
+            AgentTraceRecorder.DIMENSION_PROVIDER_ATTEMPTS -> total - snap.providerAttemptsUsed
+            AgentTraceRecorder.DIMENSION_TOOL_CALLS -> total - snap.toolCallsUsed
+            AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> total - snap.shellCommandsUsed
+            AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> total - snap.compactionCallsUsed
+            AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> total - snap.concurrentToolsActive
+            else -> 0
+        }
+    }
+
+    /** [feat/runtime-limits-panel] Live prefs limit — fallback only (no active budget). */
+    private fun t7TotalOf(dimension: String): Int = when (dimension) {
+        AgentTraceRecorder.DIMENSION_TURNS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxTurns()
+        AgentTraceRecorder.DIMENSION_PROVIDER_ATTEMPTS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxProviderAttempts()
+        AgentTraceRecorder.DIMENSION_TOOL_CALLS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxToolCalls()
+        AgentTraceRecorder.DIMENSION_SHELL_COMMANDS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxShellCommands()
+        AgentTraceRecorder.DIMENSION_COMPACTION_CALLS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxCompactionCalls()
+        AgentTraceRecorder.DIMENSION_CONCURRENT_TOOLS -> com.openminis.app.data.AgentRuntimeLimitsPrefs.maxConcurrentTools()
         else -> 0
     }
 
@@ -393,8 +421,18 @@ internal class ChatAgentTraceObserver(
         // ── T7-A: 观察预算默认上限（advisory 观察用，不阻断任何行为）──
         // 这些数字只用于 trace 记录当前消耗进度（budget_consume/refuse 事件），
         // 不改变生产行为；T7-C 接入 enforced 模式前由 T4-B/T10 依据真实基线校准。
+        // [fix/budget-stop-silent-exit] provider attempts 64→128：真实长任务基线
+        // （2026-09-07 field log：28 分钟 agent 会话烧满 64 次，任务仍在中途）
+        // 证明 64 在 enforced 语义下会截断合法长任务。128 = 2× 观测到的真实峰值。
+        // [fix/budget-stop-banner] 用户实测 128 也会撞墙（超长 agent 会话）——
+        // 但 Resume 语义保证无损续跑，撞墙从"静默死"变成"分节"。预算不追着极端
+        // 长任务无限抬（防失控循环烧 token），横幅数字引用本常量（Banner mirror）。
+        // [feat/runtime-limits-panel] 这些常量降级为 DEFAULT：运行时真值来自
+        // AgentRuntimeLimitsPrefs（Settings → Agent Runtime → Runtime Limits），
+        // 引擎在 runAgentLoop 入口构造 AgentExecutionBudget 时读取；未 prime 的
+        // JVM 测试路径仍命中这些默认值（prime 未跑时 prefs 读数即默认）。
         internal const val T7_OBSERVE_MAX_TURNS = 200
-        internal const val T7_OBSERVE_MAX_PROVIDER_ATTEMPTS = 64
+        internal const val T7_OBSERVE_MAX_PROVIDER_ATTEMPTS = 128
         internal const val T7_OBSERVE_MAX_TOOL_CALLS = 128
         internal const val T7_OBSERVE_MAX_SHELL_COMMANDS = 128
         internal const val T7_OBSERVE_MAX_COMPACTION_CALLS = 8

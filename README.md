@@ -233,6 +233,8 @@ token 只用于这些显式请求的鉴权。
 | **工作区** | 把工作组织到独立上下文中，通过 `minis://workspace/` 访问。工作区、附件、offload 与浏览器目录是**每会话私有**的（`minis-sessions/<sid>/`）；跨会话共享的只有 `shared/`、`memory/`、`skills/`、`mcp-servers/` 与挂载目录。 |
 | **原生卸载（offload）** | 繁重或平台特定的工作交给原生代码而非沙箱处理。 |
 
+**→ [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — 系统全貌与复杂度边界（哪些是继承的、哪些是本 fork 自写的）。
+
 **→ [OpenMinis/MinisSkills](https://github.com/OpenMinis/MinisSkills)** — 现成技能。
 为 Claude、Codex、OpenClaw 或 Hermes Agent 构建的技能通常可以直接在 Minis 中运行。
 
@@ -345,6 +347,10 @@ ANSI/CSI/OSC 解析与 TUI 渲染引擎。
 **Android 端侧 AI 智能体参考** — 以下项目为 RikkaMinis 的 agent 运行时、
 自动化与系统集成能力提供了设计参考（借鉴思路，非代码复制）：
 
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — harness 纪律型
+  agent 参考：repetition_guard（重复中止）、empty_response_guard（确定性空快出）、
+  continuation ceiling、session 级 system prompt 冻结、verification_stop 验证
+  门控、预算护栏可见化。落地清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §12
 - **[OmniBot](https://github.com/omnimind-ai/OmniBot)** — 工具并发、回合折叠、
   自动压缩、记忆 rollup、子代理系统
 - **[肉包 Roubao](https://github.com/Turbo1123/roubao)** — 宏脚本、执行追踪

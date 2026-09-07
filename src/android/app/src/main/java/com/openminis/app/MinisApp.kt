@@ -237,6 +237,15 @@ class MinisApp : Application(), ImageLoaderFactory {
         if (isModelServiceProcess()) {
             Log.i("MinisApp", "skipping app init in :modelservice process")
             com.openminis.app.data.FastModePrefs.prime(this)
+            // [fix/runtime-limits-audit] The worker process is exactly where
+            // the runtime-limits knobs execute: executionSlots is sized from
+            // liveProviderSlots() at companion init, admission reads
+            // liveQueueAdmission(), and OpenAIProvider's companion times out
+            // via decideGenerationTimeoutSec(). Without priming here, every
+            // worker read falls back to defaults — user-tuned slots/walls
+            // would silently ignore on ALL offloaded runs (chat streaming,
+            // title-gen, compaction all go through this process).
+            com.openminis.app.data.AgentRuntimeLimitsPrefs.prime(this)
             return
         }
 
@@ -250,6 +259,10 @@ class MinisApp : Application(), ImageLoaderFactory {
         if (isToolServiceProcess()) {
             Log.i("MinisApp", "skipping app init in :toolservice process")
             com.openminis.app.data.FastModePrefs.prime(this)
+            // [fix/runtime-limits-audit] Same rationale as :modelservice —
+            // if/when this process wakes up, its runtime knobs must read the
+            // persisted values, not defaults.
+            com.openminis.app.data.AgentRuntimeLimitsPrefs.prime(this)
             return
         }
 
@@ -269,6 +282,12 @@ class MinisApp : Application(), ImageLoaderFactory {
         // NativeOffloadServer) read the user-configured value at first use.
         // Runs before ExecutionCoordinator.init / NativeOffloadServer.start.
         com.openminis.app.data.ConcurrencyPrefs.prime(this)
+
+        // [feat/runtime-limits-panel] Warm the user-tunable agent runtime
+        // limits (agent-loop budget / stream recovery / worker timeouts /
+        // slot policy). Context-free readers (engine loop, worker service,
+        // providers) must see the persisted values before first use.
+        com.openminis.app.data.AgentRuntimeLimitsPrefs.prime(this)
 
         // T283: install NDK signal handler for native crashes (SIGSEGV/
         // SIGABRT/SIGBUS/SIGFPE/SIGILL/SIGSYS). Writes a one-shot text

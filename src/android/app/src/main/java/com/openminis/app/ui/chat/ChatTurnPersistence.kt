@@ -85,11 +85,33 @@ internal suspend fun ChatViewModel.persistToolResultMessage(parts: List<AgentCon
     return entity.id
 }
 
+/**
+ * [fix/budget-stop-banner → feat/runtime-limits-panel] The provider-attempt
+ * budget shown in the budget-stop banner. The first ship hardcoded "64"
+ * while the budget had already been raised to 128 (user hit the wall and
+ * saw a stale number); the fix pointed the banner at the real constant. The
+ * panel now makes the limit user-tunable, so the banner reads the LIVE value
+ * via [providerAttemptLimitNow] — this val remains only as the documented
+ * default (== T7_OBSERVE_MAX_PROVIDER_ATTEMPTS == 128) and for any code
+ * that wants the shipped default explicitly.
+ */
+internal val PROVIDER_ATTEMPT_LIMIT_FOR_BANNER: Int =
+    ChatAgentTraceObserver.T7_OBSERVE_MAX_PROVIDER_ATTEMPTS
+
+/**
+ * [feat/runtime-limits-panel] The REAL provider-attempt limit in force right
+ * now (prefs-backed, user-tunable). The budget-stop banner uses this so the
+ * number can never drift from the enforced limit, whatever the user set.
+ */
+internal fun providerAttemptLimitNow(): Int =
+    com.openminis.app.data.AgentRuntimeLimitsPrefs.maxProviderAttempts()
 
 internal fun ChatViewModel.finalizeAtTurnLimit(
     assistantId: String,
     text: String,
     blocks: List<AssistantBlock>,
+    /** [fix/runtime-limits-audit] This run's actual turn ceiling (snapshot at run entry) — banner quotes it, not a live re-read. */
+    maxTurnsThisRun: Int = com.openminis.app.data.AgentRuntimeLimitsPrefs.maxTurns(),
 ) {
     updateAssistantMessage(
         assistantId, text, false, blocks,
@@ -111,12 +133,63 @@ internal fun ChatViewModel.finalizeAtTurnLimit(
         _streamingById.value = _streamingById.value - assistantId
     }
     setInlineError(
-        "Stopped after $MAX_AGENT_TURNS agent turns to prevent runaway " +
+        // [fix/runtime-limits-audit] The banner must quote THIS run's budget,
+        // not a live re-read: the engine snapshots limits at runAgentLoop
+        // entry, so a mid-run setting change would otherwise make the banner
+        // disagree with the budget that actually stopped the run (the exact
+        // "64 vs 128" drift bug this banner was built to prevent).
+        "Stopped after $maxTurnsThisRun agent turns to prevent runaway " +
         "tool use. The model kept calling tools without finishing — tap " +
         "Resume to continue from here, or send a new message to start over.",
 )
     _canResume.value = true
 }
+
+/**
+ * [fix/budget-stop-silent-exit] Budget-stop finalization — same teardown
+ * shape as [finalizeAtTurnLimit] with a budget-specific banner. The run was
+ * interrupted mid-work by an execution budget (provider attempts / turns /
+ * deadline), NOT by the model finishing: without this, the loop exited with
+ * only a logcat WARN and the UI silently dropped the streaming state — the
+ * field-reported "reply just stops" (2026-09-07 log: provider_attempt_limit
+ * after 64 attempts, 3 empty turns burned in 4ms, zero user-visible signal).
+ */
+internal fun ChatViewModel.finalizeBudgetStop(
+    assistantId: String,
+    text: String,
+    blocks: List<AssistantBlock>,
+    reason: String,
+    /** [fix/runtime-limits-audit] This run's budget limits (snapshot at run entry) — banners quote them, not live re-reads. */
+    maxProviderAttemptsThisRun: Int = providerAttemptLimitNow(),
+    maxTurnsThisRun: Int = com.openminis.app.data.AgentRuntimeLimitsPrefs.maxTurns(),
+) {
+    updateAssistantMessage(
+        assistantId, text, false, blocks,
+        isAwaitingModelResponse = false,
+    )
+    clearStreamFlushState(assistantId)
+    if (_streamingById.value.containsKey(assistantId)) {
+        _streamingById.value = _streamingById.value - assistantId
+    }
+    val detail = when (reason) {
+        "provider_attempt_limit" ->
+            // [fix/runtime-limits-audit] Quote the run's snapshot limit (passed
+            // from the engine), not a live re-read — mid-run settings changes
+            // must not make the banner lie about which budget fired.
+            "the run reached its provider-call limit ($maxProviderAttemptsThisRun calls)"
+        "turn_limit" ->
+            "the run reached its turn limit ($maxTurnsThisRun turns)"
+        "deadline_reached" ->
+            "the run reached its time limit"
+        else -> "an execution budget was exhausted ($reason)"
+    }
+    setInlineError(
+        "Run paused: $detail. Your work so far is kept — tap Resume to " +
+        "continue with a fresh budget, or send a new message to start over.",
+    )
+    _canResume.value = true
+}
+
 
 
 /** Retry the last agent turn (triggered by inline error Retry button).
@@ -280,6 +353,11 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
                 SessionActivityTracker.markStreamError(activeSessionId)
             } finally {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "$label streamJob FINALLY enter")
+                // [audit-0907 B2] Reset queue-position state — same
+                // rationale as the send path's finally: whatever the
+                // worker reported while queued must not leak into the
+                // next run's typing indicator.
+                resetQueueWaitingAhead()
                 // [T-android-overlay-reply-status-34599] Surface
                 // the assistant's most recent reply text to the
                 // overlay BEFORE setInactive so the post-completion
