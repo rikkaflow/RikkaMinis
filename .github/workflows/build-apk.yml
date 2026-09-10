@@ -234,7 +234,13 @@ jobs:
           VC=$((220000000 + GITHUB_RUN_NUMBER))
           echo "MINIS_VERSION_CODE=$VC" >> "$GITHUB_ENV"
           echo "MINIS_VERSION_NAME_SUFFIX=+$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
-          echo "versionCode=$VC  versionNameSuffix=+$GITHUB_RUN_NUMBER"
+          # [dual-appid] Alt-account (lab) builds ship the experimental identity
+          # so they install CO-EXISTING with the stable main-account app
+          # (applicationId com.rikkaminis.app.lab) instead of overwriting it.
+          # This is the only delta this fork carries; everything else tracks
+          # logicflow-GYW/RikkaMinis main verbatim.
+          echo "MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab" >> "$GITHUB_ENV"
+          echo "versionCode=$VC  versionNameSuffix=+$GITHUB_RUN_NUMBER  appId=com.rikkaminis.app.lab"
 
       # JVM unit tests — the full suite. The test backlog that used to force a
       # scoped filter here is cleared:
