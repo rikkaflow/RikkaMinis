@@ -49,19 +49,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.MountedFoldersStore
-import com.rikkaminis.app.ui.components.SectionTextField
 import kotlinx.coroutines.launch
 import com.rikkaminis.app.ui.components.MinisTextButton
 import com.rikkaminis.app.ui.theme.ChatColors
 
 /**
  * Detail/edit screen for a single mounted folder. Mirrors iOS
- * MountDetailView (external case only). Allows renaming, toggling
- * the user soft-lock on writes, opening the in-app file browser
- * (placeholder toast for T219-2), and unmounting with confirmation.
+ * MountDetailView (external case only). Shows where the mount points,
+ * toggles the user soft-lock on writes, opens the in-app file browser
+ * (placeholder toast for T219-2), and unmounts with confirmation.
  *
- * Save is enabled only when there are pending changes AND the new
- * name is valid.
+ * Renaming is deliberately not offered: a mount's name *is* its path
+ * identity (`/var/minis/mounts/<name>`), so a rename silently
+ * invalidates every path already written into sessions and scripts,
+ * and the UI cannot report that. To change the name, unmount and
+ * mount the same host folder again.
+ *
+ * Save is enabled only while the write toggle differs from the stored
+ * value.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,16 +86,10 @@ fun MountDetailScreen(
         return
     }
 
-    var nameText by remember(entry.id) { mutableStateOf(entry.name) }
     var allowWrite by remember(entry.id) { mutableStateOf(entry.userAllowWrite) }
     var showUnmountConfirm by remember { mutableStateOf(false) }
 
-    val nameTrimmed = nameText.trim()
-    val nameChanged = nameTrimmed != entry.name
-    val nameValid = isValidMountName(nameText)
-    val allowWriteChanged = allowWrite != entry.userAllowWrite
-    val hasChanges = nameChanged || allowWriteChanged
-    val canSave = hasChanges && (!nameChanged || nameValid)
+    val canSave = allowWrite != entry.userAllowWrite
 
     Scaffold(
         topBar = {
@@ -106,8 +105,7 @@ fun MountDetailScreen(
                         enabled = canSave,
                         onClick = {
                             scope.launch {
-                                if (nameChanged) store.rename(entry.id, nameTrimmed)
-                                if (allowWriteChanged) store.setUserAllowWrite(entry.id, allowWrite)
+                                store.setUserAllowWrite(entry.id, allowWrite)
                                 onBack()
                             }
                         },
@@ -127,35 +125,6 @@ fun MountDetailScreen(
         ) {
             Spacer(Modifier.height(16.dp))
             HeaderCard(entry = entry)
-
-            Spacer(Modifier.height(20.dp))
-            Text(
-                text = stringResource(R.string.mount_add_name_label),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(6.dp))
-            SectionTextField(
-                value = nameText,
-                onValueChange = { nameText = it },
-                singleLine = true,
-                isError = nameChanged && !nameValid,
-            )
-            if (nameChanged && !nameValid) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = stringResource(R.string.mount_detail_name_invalid),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            } else {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = stringResource(R.string.mount_add_name_hint),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
 
             Spacer(Modifier.height(20.dp))
             Surface(
