@@ -39,6 +39,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   sync:
@@ -51,8 +52,10 @@ jobs:
           fetch-depth: 0
 
       - name: Merge upstream main with the dual-appid delta re-applied
+        id: merge
         run: |
           set -eu
+          echo "pushed=false" >> "$GITHUB_OUTPUT"
           git config user.name  "rikkaflow-sync"
           git config user.email "rikkaflow-sync@users.noreply.github.com"
           git fetch --no-tags https://github.com/logicflow-GYW/RikkaMinis.git main
@@ -89,4 +92,19 @@ jobs:
             || { echo "::error::version echo line lost the appId annotation"; exit 1; }
 
           git push origin HEAD:main
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
           echo "pushed $(git rev-parse --short HEAD)"
+
+      - name: Trigger the build for the synced commit
+        if: steps.merge.outputs.pushed == 'true'
+        # A push made with the default GITHUB_TOKEN does NOT trigger other
+        # workflows (anti-recursion rule), so a sync alone would leave this line
+        # with no fresh APK — the exact opposite of what it is for. Dispatch it
+        # explicitly. workflow_dispatch IS allowed from GITHUB_TOKEN (it and
+        # repository_dispatch are the documented exceptions), hence actions:write.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh workflow run build-apk.yml --ref main
+          echo "dispatched build-apk.yml on main"
