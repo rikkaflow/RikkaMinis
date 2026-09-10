@@ -629,7 +629,21 @@ object ConfigBackup {
                     if (sections.readFailures > 0) w.write(sections.readFailures.toString())
                     else w.write("null")
                 }
-                else -> w.write(skeletonJson.opt(key)?.toString() ?: "null")
+                else -> {
+                    // [fix-stream-quoting] org.json's Object.toString() on a
+                    // String value returns the RAW string — the streaming frame
+                    // then emits {"format":openminis.config.backup,...} with no
+                    // quotes. org.json's own lenient parser accepts it (so the
+                    // in-app round trip and the JVM tests stay green), but every
+                    // strict parser (python json, jq, kotlinx-serialization)
+                    // rejects the document — a backup file that only this app
+                    // can read is a corrupt backup. String values must go
+                    // through JSONObject.quote(); numbers/booleans/objects
+                    // already toString() to valid JSON literals.
+                    val v = skeletonJson.opt(key)
+                    if (v is String) w.write(JSONObject.quote(v))
+                    else w.write(v?.toString() ?: "null")
+                }
             }
         }
         writer.flush()
