@@ -1,0 +1,92 @@
+name: Sync this fork with upstream main
+
+# WHY THIS EXISTS
+# ---------------
+# This repository is the ALT (lab) line of RikkaMinis. It has two jobs:
+#   1. Ship an APK that installs SIDE BY SIDE with the stable build on the same
+#      device — applicationId com.rikkaminis.app.lab, own data dir, own
+#      sub-process names, own launcher label.
+#   2. Stay a working copy of the tree, so when the main account's tree is in
+#      flux — a bad merge, a half-ported feature — a build that boots is always
+#      one dispatch away.
+# Job 2 only holds if this line stays CURRENT with upstream main.
+#
+# GitHub's "Sync fork" button cannot do that: it only fast-forwards, and this
+# branch carries its own commit (the dual-appid delta below), so the button
+# refuses. This workflow does the merge instead:
+#
+#     lines of this branch = upstream main (logicflow-GYW/RikkaMinis) + delta
+#
+# DELTA HANDLING
+# --------------
+# The delta is a pure insertion into .github/workflows/build-apk.yml — a file
+# upstream owns and keeps editing, so a merge can conflict there. On conflict
+# we take upstream's version of that file and re-apply the delta by script
+# (rerun-safe, anchored on the version echo line). Any conflict OUTSIDE that
+# file aborts the job instead of guessing: a silent bad merge would make this
+# branch a worse rescue line than a stale one.
+#
+# Runs nightly, and on demand from the Actions tab.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this fork's main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main with the dual-appid delta re-applied
+        run: |
+          set -eu
+          git config user.name  "rikkaflow-sync"
+          git config user.email "rikkaflow-sync@users.noreply.github.com"
+          git fetch --no-tags https://github.com/logicflow-GYW/RikkaMinis.git main
+          UP=$(git rev-parse FETCH_HEAD)
+          echo "upstream main = $UP"
+
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "already current with upstream — nothing to do"
+            exit 0
+          fi
+          echo "behind upstream by $(git rev-list --count HEAD..$UP) commit(s)"
+
+          if git merge --no-edit "$UP"; then
+            echo "clean merge — delta untouched"
+          else
+            CONFLICTED=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            echo "conflicted paths: $CONFLICTED"
+            if [ "$(echo $CONFLICTED)" != ".github/workflows/build-apk.yml" ]; then
+              echo "::error::conflict outside the delta file — resolve by hand"
+              git merge --abort
+              exit 1
+            fi
+            echo "taking upstream's build-apk.yml and re-applying the delta"
+            git checkout "$UP" -- .github/workflows/build-apk.yml
+            python3 scripts/alt/apply_dual_appid_delta.py
+            git add .github/workflows/build-apk.yml
+            git commit --no-edit
+          fi
+
+          # The delta must be present in the merged tree, whichever path we took.
+          grep -q 'MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab' .github/workflows/build-apk.yml \
+            || { echo "::error::dual-appid delta missing after merge"; exit 1; }
+          grep -q 'appId=com.rikkaminis.app.lab' .github/workflows/build-apk.yml \
+            || { echo "::error::version echo line lost the appId annotation"; exit 1; }
+
+          git push origin HEAD:main
+          echo "pushed $(git rev-parse --short HEAD)"
