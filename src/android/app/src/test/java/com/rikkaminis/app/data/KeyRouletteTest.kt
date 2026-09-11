@@ -15,6 +15,18 @@ class KeyRouletteTest {
     }
 
     @Test
+    fun `duplicated or padded keys collapse to one cleaned token`() {
+        // T-provider-key-roulette: previously "k1, k1" was handed back raw and
+        // would have been sent as a Bearer value ("k1, k1") → auth failure.
+        assertEquals("k1", KeyRoulette.next("k1, k1", "p-dup"))
+        assertEquals("q", KeyRoulette.next("q, q  q", "p-dup2"))
+        // Stray whitespace around a single key is stripped.
+        assertEquals("sk-1", KeyRoulette.next(" sk-1 ", "p-pad"))
+        // Blank input still falls through verbatim (upper layers own the error).
+        assertEquals("   ", KeyRoulette.next("   ", "p-blank"))
+    }
+
+    @Test
     fun `multi key rotates round robin`() {
         val keys = "k1, k2, k3"
         val seen = mutableSetOf<String>()
@@ -56,6 +68,33 @@ class KeyRouletteTest {
         val second = KeyRoulette.next(keys, "p-persist")
         assertTrue(first != second)
         dir.deleteRecursively()
+    }
+
+    @Test
+    fun `candidates splits deduplicates and cleans`() {
+        assertEquals(listOf("k1", "k2", "k3"), KeyRoulette.candidates(" k1 , k2  k3 "))
+        assertEquals(listOf("k1"), KeyRoulette.candidates("k1, k1"))
+        assertTrue(KeyRoulette.candidates("   ").isEmpty())
+    }
+
+    @Test
+    fun `consecutive draws from one key string are distinct until exhausted`() {
+        // The model-list probe loop leans on this: N draws from the same
+        // multi-key string must walk all N keys before repeating any —
+        // otherwise a dead key would be retried while a live one stays untried.
+        val draws = List(3) { KeyRoulette.next("k1 k2 k3", "p-distinct") }
+        assertEquals(listOf("k1", "k2", "k3"), draws)
+    }
+
+    @Test
+    fun `candidates is draw free and does not disturb the rotation`() {
+        // VoiceProviderFactory.supports() classifies on a cleaned candidate
+        // while merely listing options; that lookup must not consume a draw,
+        // or browsing the UI would re-order which key the next request picks.
+        val keys = "a b"
+        assertEquals("a", KeyRoulette.next(keys, "p-nodraw")) // a used → b is now LRU
+        KeyRoulette.candidates(keys)
+        assertEquals("b", KeyRoulette.next(keys, "p-nodraw")) // still b
     }
 
     @Test

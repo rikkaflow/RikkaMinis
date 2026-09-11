@@ -9,6 +9,19 @@ import java.util.concurrent.ConcurrentHashMap
  * contains MULTIPLE keys separated by whitespace/commas, each new provider
  * build picks the least-recently-used key; single keys are returned verbatim.
  *
+ * ## Choke-point rule (read this before calling it)
+ * Rotation belongs at the single entry each *subsystem* funnels through, never
+ * at individual call sites — a stored key reaches the network through more
+ * doors than just the chat provider:
+ *  - chat / agent / offload worker → `ProviderFactory.create`
+ *  - model-list fetch (`/v1/models`) → `ModelListProviderRegistry.fetchModels`
+ *  - voice (ASR/TTS) → `VoiceProviderFactory.make`
+ *  - debug connectivity probe → `ProviderMutationMethods` models probe
+ * The 2026-09 history is the reason this list is spelled out: rotation was
+ * "unified" in ProviderFactory, which fixed chat only, and every non-chat door
+ * kept sending `Bearer k1, k2, k3` → 401 (model refresh silently kept the old
+ * list, voice tests failed). Add the door to this list when you add one.
+ *
  * - LRU state persists to `key_roulette.json` under the app cache dir. There
  *   is no time-based expiry: the persisted slice is rebuilt from the
  *   provider's *current* key list on every draw, so a key removed from the
@@ -63,12 +76,25 @@ object KeyRoulette {
     }
 
     /**
+     * Cleaned, de-duplicated key list for [keys] — the rotation candidates.
+     * A single key yields a one-element list; blank input yields none.
+     */
+    fun candidates(keys: String): List<String> = split(keys)
+
+    /**
      * Pick the next key for [providerId] from a possibly multi-key [keys]
-     * string. Single-key input returns as-is (no state touched).
+     * string. A key string that splits into a single cleaned token (one key,
+     * duplicated tokens like "k1, k1", or stray whitespace) is returned as
+     * that cleaned token; fully blank input falls through verbatim. No state
+     * is touched on these paths.
      */
     fun next(keys: String, providerId: String = ""): String {
         val list = split(keys)
-        if (list.size <= 1) return keys
+        // [T-provider-key-roulette] A list that collapses to one token must
+        // hand back the CLEANED token, not the raw input — sending "k1, k1"
+        // as a Bearer value would fail auth. Empty list (blank input) is left
+        // verbatim for the caller to handle.
+        if (list.size <= 1) return list.firstOrNull() ?: keys
         synchronized(lock) {
             // [T-provider-key-roulette] Monotonic draw counter is the true LRU
             // key — wall-clock ms collides when draws land in the same
