@@ -11,6 +11,7 @@ import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.sanitizeToolPairing
+import com.rikkaminis.app.provider.anthropicUsageAccounting
 import com.rikkaminis.app.data.model.LLMResponse
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
@@ -18,6 +19,7 @@ import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.applyUserAgentOverride
+import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
@@ -968,17 +970,22 @@ class AnthropicProvider(
     }
 
     private fun parseUsage(json: JSONObject): LLMUsage {
-        val totalInput = json.optInt("input_tokens", 0)
         val cacheRead = json.optInt("cache_read_input_tokens").takeIf { it > 0 }
         val cacheCreate = json.optInt("cache_creation_input_tokens").takeIf { it > 0 }
-        val cacheTotal = (cacheRead ?: 0) + (cacheCreate ?: 0)
-        val freshInput = (totalInput - cacheTotal).coerceAtLeast(0)
+        // Anthropic input_tokens is fresh-only (cache metered separately), so
+        // fresh input = input_tokens as-is and context = input + cache. See
+        // anthropicUsageAccounting for the verified semantics.
+        val (freshInput, contextTokens) = anthropicUsageAccounting(
+            inputTokens = json.optInt("input_tokens", 0),
+            cacheReadInputTokens = cacheRead,
+            cacheCreationInputTokens = cacheCreate,
+        )
         return LLMUsage(
             inputTokens = freshInput,
             outputTokens = json.optInt("output_tokens", 0),
             cacheCreationInputTokens = cacheCreate,
             cacheReadInputTokens = cacheRead,
-            latestContextTokens = totalInput,
+            latestContextTokens = contextTokens,
         )
     }
 
@@ -987,13 +994,13 @@ class AnthropicProvider(
         if (statusCode == 429) return LLMError.RateLimited(retryAfterMs = retryAfterMs)
 
         val message = try {
-            val json = JSONObject(body)
-            val error = json.optJSONObject("error")
-            val errorType = error?.safeOptString("type", "") ?: "error"
-            val errorMessage = error?.safeOptString("message", "") ?: body
-            "[$errorType] $errorMessage"
+            val errorType = JSONObject(body).optJSONObject("error")
+                ?.safeOptString("type", "")
+                ?.takeIf { it.isNotBlank() }
+                ?: "error"
+            "[$errorType] ${extractHttpErrorMessage(body)}"
         } catch (_: Exception) {
-            "HTTP $statusCode: ${body.take(500)}"
+            "[error] ${body.take(500)}"
         }
 
         val transientCodes = setOf(500, 502, 503, 504, 529)

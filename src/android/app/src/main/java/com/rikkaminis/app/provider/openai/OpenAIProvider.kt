@@ -16,6 +16,7 @@ import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderBoundary
 import com.rikkaminis.app.sandbox.offload.FirstChunkTimeoutPolicy
 import com.rikkaminis.app.provider.applyUserAgentOverride
+import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.provider.sanitizeToolPairing
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
@@ -107,11 +108,24 @@ class OpenAIProvider constructor(
         /**
          * [T-android-stale-conn-retry-hang] Streaming time-to-first-byte
          * budget: response HEADERS must arrive within this window. Does NOT
-         * bound the SSE body — a flowing stream stays unlimited. This is a REAL
-         * dead-upstream signal: a wedged tunnel never reaches headers at all,
-         * so 30s here is safe (headers arrive fast even for slow generations).
+         * bound the SSE body — a flowing stream stays unlimited. This is the
+         * dead-upstream signal: a wedged tunnel never reaches headers at all.
+         *
+         * [fix/ttfb-thinktag-composer] 2026-09-11: raised 30s → 90s. The 30s
+         * carried the assumption "headers arrive fast even for slow
+         * generations" — measured false for queueing relays/gateways: direct
+         * probing of a relay (api.senseaudio.cn) found 4/8 requests sitting
+         * 42.9–59.3s BEFORE headers (all latency in the upstream queue, not
+         * the body). Killing those at 30s turned ordinary relay queueing into
+         * a forced retry loop (retry → re-queue → killed again), which users
+         * experience as the provider "failing mid-answer". 90s covers the
+         * observed distribution with ~1.5× margin. Trade-off: a genuinely
+         * wedged tunnel now surfaces here 60s later; NetworkMonitor's pool
+         * eviction on network transitions and the retry ladder remain the
+         * first-line recovery, so the dead-tunnel case stays bounded and
+         * self-healing.
          */
-        private const val STREAM_TTFB_TIMEOUT_MS = 30_000L
+        private const val STREAM_TTFB_TIMEOUT_MS = 90_000L
 
         /**
          * First-data-row watchdog budget. A response whose headers arrived but
@@ -1225,6 +1239,18 @@ class OpenAIProvider constructor(
                     "OpenAIProvider",
                     "[T321] usage final: $lastUsageJson"
                 )
+                // [T321-reasoning-consistency] Upstream billed reasoning tokens
+                // but the stream carried no reasoning content: the thinking was
+                // either pasted into `content` (relay translation gap) or
+                // dropped. Classifying this used to require grepping logcat and
+                // comparing two log lines by hand; this makes it ONE line.
+                val billedMissing = ReasoningConsistency.missingReasoningContent(lastUsageJson, reasoningLen)
+                if (billedMissing > 0) {
+                    com.rikkaminis.app.logging.AppLogger.warning(
+                        "OpenAIProvider",
+                        "[T321] inconsistency: upstream billed $billedMissing reasoning tokens but the stream carried 0 reasoning content — thinking may be mixed into content or dropped by the relay",
+                    )
+                }
             }
 
             // T321: stream ended — final tally + warning if we never saw a
@@ -2772,14 +2798,7 @@ class OpenAIProvider constructor(
         if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
         if (statusCode == 429) return LLMError.RateLimited(retryAfterMs = retryAfterMs)
 
-        val message = try {
-            val json = JSONObject(body)
-            val error = json.optJSONObject("error")
-            val errorMessage = error?.safeOptString("message", "") ?: body
-            "[$statusCode] $errorMessage"
-        } catch (_: Exception) {
-            "HTTP $statusCode: ${body.take(500)}"
-        }
+        val message = "[$statusCode] ${extractHttpErrorMessage(body)}"
 
         val transientCodes = setOf(500, 502, 503, 504, 529)
         if (statusCode in transientCodes) {
