@@ -56,7 +56,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -1168,14 +1167,6 @@ fun ChatScreen(
     // visible jitter and yank the reader). Tracked by the DragInteraction
     // collector below. Declared BEFORE the consumer effect so it is in scope.
     var isUserDragging by remember { mutableStateOf(false) }
-    // [fix/history-open-catchup-guard] Bounded post-open catch-up state. The
-    // flatten collector arms it (armEpoch++) right after the INITIAL_OPEN
-    // snap; the catch-up effect below consumes it. Any real drag or Resume
-    // sets userEngaged=true, which revokes it for the rest of this open.
-    var openCatchUpArmEpoch by remember(sessionId) { mutableStateOf(0) }
-    var openCatchUpRolls by remember(sessionId) { mutableStateOf(0) }
-    var openCatchUpUserEngaged by remember(sessionId) { mutableStateOf(false) }
-    var openCatchUpArmedAtMs by remember(sessionId) { mutableStateOf(0L) }
     // [bottom-fix] Timestamp of the last drag-stop. Kept for the follow
     // disengage decision below (which still reads the raw list position).
     var lastDragStopMs by remember { mutableStateOf(0L) }
@@ -1284,9 +1275,6 @@ fun ChatScreen(
             when (interaction) {
                 is androidx.compose.foundation.interaction.DragInteraction.Start -> {
                     isUserDragging = true
-                    // [fix/history-open-catchup-guard] A real drag revokes the
-                    // post-open catch-up for the rest of this open.
-                    openCatchUpUserEngaged = true
                     // [forward-stable] A real pointer drag begins — drop any
                     // in-flight bottom request so nothing scrolls mid-gesture.
                     // This also maintains DETACHED/FOLLOWING for the explicit
@@ -1326,44 +1314,6 @@ fun ChatScreen(
                 else -> Unit
             }
         }
-    }
-    // [fix/history-open-catchup-guard] Bounded post-open catch-up. The
-    // INITIAL_OPEN snap lands against the newest row's FIRST layout; its
-    // second composition can still grow that row (measured +20%..+95% within
-    // 9-150ms) and re-release the clamp with nobody correcting — the open
-    // then rests "one screen short". This effect lives for a short window
-    // after each open and snaps back to the bottom whenever the clamp is
-    // released — until the user engages or the budget runs out. Driven by the
-    // same authoritative canScrollForward signal as the streaming follow
-    // gate; never fires mid-gesture / mid-scroll.
-    LaunchedEffect(listState, openCatchUpArmEpoch) {
-        if (openCatchUpArmEpoch == 0) return@LaunchedEffect
-        val armedAtMs = openCatchUpArmedAtMs
-        withTimeoutOrNull(OPEN_CATCHUP_WINDOW_MS) {
-            snapshotFlow { listState.canScrollForward }
-                .distinctUntilChanged()
-                .collect { canFwd ->
-                    val shouldRoll = shouldCatchUpAfterOpen(
-                        armed = true,
-                        userEngaged = openCatchUpUserEngaged,
-                        canScrollForward = canFwd,
-                        isScrollInProgress = listState.isScrollInProgress,
-                        rollsUsed = openCatchUpRolls,
-                        maxRolls = OPEN_CATCHUP_MAX_ROLLS,
-                    )
-                    if (!shouldRoll) return@collect
-                    openCatchUpRolls += 1
-                    AppLogger.debug(
-                        "ScrollSrc",
-                        "open-catchup roll #${openCatchUpRolls} dt=${SystemClock.elapsedRealtime() - armedAtMs}ms firstIdx=${listState.firstVisibleItemIndex} firstOff=${listState.firstVisibleItemScrollOffset}",
-                    )
-                    tracedScrollToItem("OPEN-CATCHUP", 1_000_000, 0)
-                }
-        }
-        AppLogger.debug(
-            "ScrollSrc",
-            "open-catchup done rolls=$openCatchUpRolls dt=${SystemClock.elapsedRealtime() - armedAtMs}ms",
-        )
     }
     // T169 / T170: an IME show/hide animates the LazyColumn's content area,
     // which can briefly register as a synthetic drag-stop and flip
@@ -3089,20 +3039,6 @@ fun ChatScreen(
                                         // overflow its sliding-window arithmetic.
                                         AppLogger.debug("ScrollSrc", "scroll-bottom reason=INITIAL_OPEN(first-rows) rows=${nextItems.size}")
                                         listState.scrollToItem(index = 1_000_000, scrollOffset = 0)
-                                        // [fix/history-open-catchup-guard] Arm the
-                                        // bounded open catch-up: the newest row can
-                                        // still grow AFTER this snap (second
-                                        // composition — measured up to +12.6k px
-                                        // within ~150ms), re-releasing the clamp
-                                        // with no correction. Quiet opens only: an
-                                        // open while a stream is active is owned by
-                                        // the streaming follow path.
-                                        if (stream.isEmpty()) {
-                                            openCatchUpRolls = 0
-                                            openCatchUpUserEngaged = false
-                                            openCatchUpArmedAtMs = SystemClock.elapsedRealtime()
-                                            openCatchUpArmEpoch += 1
-                                        }
                                     }
                                     followState = consumeBottomRequest(followState)
                                 }
@@ -4076,9 +4012,6 @@ fun ChatScreen(
                                 // [forward-stable] One pending bottom request;
                                 // the "Minis is thinking" indicator mounts via
                                 // the next StreamRowsChanged revision.
-                                // [fix/history-open-catchup-guard] Resume is a
-                                // user intent — revoke the open catch-up too.
-                                openCatchUpUserEngaged = true
                                 followState = followReducer(followState, FollowEvent.Resume)
                             })
                         }
@@ -4914,13 +4847,6 @@ internal const val AGGREGATE_MESSAGE_ITEMS: Boolean = true
 // FLIPPED TO TRUE — the SIMPLE_FOLLOW effect is now the streaming auto-follow
 // driver (see docs/scroll-follow-simplification.md).
 internal const val SIMPLE_FOLLOW: Boolean = true
-
-// [fix/history-open-catchup-guard] Bounded correction window & roll cap for
-// the post-INITIAL_OPEN catch-up. Device data (2026-09-13): the newest row's
-// second composition lands within 9-150ms of the first place; 1.2s is a
-// generous slow-device bound, 3 rolls a pathology guard.
-private const val OPEN_CATCHUP_WINDOW_MS = 1_200L
-private const val OPEN_CATCHUP_MAX_ROLLS = 3
 
 // [refactor/split-chatscreen] ChatInputArea composable moved verbatim to
 // ChatInputArea.kt (private -> internal; signature unchanged).
