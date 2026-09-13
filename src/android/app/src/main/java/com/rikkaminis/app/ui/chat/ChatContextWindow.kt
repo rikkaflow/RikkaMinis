@@ -94,11 +94,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
     force: Boolean = false,
 ) {
     val sid = activeSessionId
-    // [T-adaptive-compact-reserve] Same shifted policy the compact decision
-    // uses, so offload always fires strictly before the compact line it is
-    // meant to feed (a compact that summarises un-offloaded tool output is both
-    // expensive and lossy — see effectiveContextPolicy's KDoc).
-    val policy = effectiveContextPolicy(contextWindow)
+    val policy = ContextPolicy.forContextWindow(contextWindow)
 
     if (!force && policy.offloadThreshold == 0) {
     // Small-window tier: offload disabled — UI surfaces "exhausted"
