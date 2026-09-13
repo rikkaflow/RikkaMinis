@@ -276,6 +276,120 @@ internal object ConfigBuiltins {
             prefs = limits, key = L.KEY_QUEUE_ADMISSION,
             defaultValue = L.QUEUE_ADMISSION_DEFAULT, minValue = L.QUEUE_ADMISSION_MIN, maxValue = L.QUEUE_ADMISSION_MAX,
         ))
+        // ── [feat/chat-tuning-panel-b] Group 5: context & memory budget ──
+        r.register(PrefsIntField(
+            path = "runtime.autoCompactMinTailTokens",
+            displayName = "Auto-compact tail-token floor",
+            description = "Auto-compaction never cuts below this many tail tokens — the newest conversation stays verbatim. Higher = more context kept per compaction, larger requests. Default 8000.",
+            prefs = limits, key = L.KEY_AUTO_COMPACT_MIN_TAIL_TOKENS,
+            defaultValue = L.COMPACT_TAIL_TOKENS_DEFAULT, minValue = L.COMPACT_TAIL_TOKENS_MIN, maxValue = L.COMPACT_TAIL_TOKENS_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.autoCompactMinIntervalMin",
+            displayName = "Auto-compact minimum interval (min)",
+            description = "Minimum minutes between auto-compactions of the same conversation. Default 5.",
+            prefs = limits, key = L.KEY_AUTO_COMPACT_MIN_INTERVAL_MIN,
+            defaultValue = L.COMPACT_INTERVAL_DEFAULT_MIN, minValue = L.COMPACT_INTERVAL_MIN_MIN, maxValue = L.COMPACT_INTERVAL_MAX_MIN,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.memoryInjectLines",
+            displayName = "Memory: daily-log injection lines",
+            description = "Max daily-log lines injected into the system prompt. Default 200.",
+            prefs = limits, key = L.KEY_MEMORY_INJECT_LINES,
+            defaultValue = L.MEMORY_INJECT_LINES_DEFAULT, minValue = L.MEMORY_INJECT_LINES_MIN, maxValue = L.MEMORY_INJECT_LINES_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.memoryRollupInjectKb",
+            displayName = "Memory: rollup injection ceiling (KB)",
+            description = "Byte ceiling for MEMORY-ROLLUP.md content injected into the system prompt; older rules are truncated from the head. Default 12.",
+            prefs = limits, key = L.KEY_MEMORY_ROLLUP_INJECT_KB,
+            defaultValue = L.MEMORY_ROLLUP_KB_DEFAULT, minValue = L.MEMORY_ROLLUP_KB_MIN, maxValue = L.MEMORY_ROLLUP_KB_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.memorySearchLines",
+            displayName = "Memory: search result lines",
+            description = "Max lines a keyword memory search returns. Default 60.",
+            prefs = limits, key = L.KEY_MEMORY_SEARCH_LINES,
+            defaultValue = L.MEMORY_SEARCH_LINES_DEFAULT, minValue = L.MEMORY_SEARCH_LINES_MIN, maxValue = L.MEMORY_SEARCH_LINES_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.memoryLookbackDays",
+            displayName = "Memory: search lookback (days)",
+            description = "How many days back recent daily logs are walked for the context injection; memory search itself reads all logs. Default 30.",
+            prefs = limits, key = L.KEY_MEMORY_LOOKBACK_DAYS,
+            defaultValue = L.MEMORY_LOOKBACK_DAYS_DEFAULT, minValue = L.MEMORY_LOOKBACK_DAYS_MIN, maxValue = L.MEMORY_LOOKBACK_DAYS_MAX,
+        ))
+        // ── [feat/chat-tuning-panel-b] Group 6: media & tool budgets ──────
+        r.register(PrefsIntField(
+            path = "runtime.imageMaxPerImageMb",
+            displayName = "Images: per-image ceiling (MB)",
+            description = "Single-image byte ceiling before re-encode kicks in. Default 5.",
+            prefs = limits, key = L.KEY_IMAGE_MAX_PER_IMAGE_MB,
+            defaultValue = L.IMAGE_PER_IMAGE_MB_DEFAULT, minValue = L.IMAGE_PER_IMAGE_MB_MIN, maxValue = L.IMAGE_PER_IMAGE_MB_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.imageMaxTotalMb",
+            displayName = "Images: per-message total (MB)",
+            description = "Cumulative inline-image bytes allowed per user message; the tail is dropped past this. Default 25.",
+            prefs = limits, key = L.KEY_IMAGE_MAX_TOTAL_MB,
+            defaultValue = L.IMAGE_TOTAL_MB_DEFAULT, minValue = L.IMAGE_TOTAL_MB_MIN, maxValue = L.IMAGE_TOTAL_MB_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.imageMaxRequestMb",
+            displayName = "Images: per-request ceiling (MB)",
+            description = "Whole-request image byte ceiling across history; oldest images are elided past this. Default 25.",
+            prefs = limits, key = L.KEY_IMAGE_MAX_REQUEST_MB,
+            defaultValue = L.IMAGE_REQUEST_MB_DEFAULT, minValue = L.IMAGE_REQUEST_MB_MIN, maxValue = L.IMAGE_REQUEST_MB_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.imageMaxEdgePx",
+            displayName = "Images: re-encode max edge (px)",
+            description = "Longest edge images are downscaled to before encoding. Default 2000.",
+            prefs = limits, key = L.KEY_IMAGE_MAX_EDGE_PX,
+            defaultValue = L.IMAGE_EDGE_DEFAULT, minValue = L.IMAGE_EDGE_MIN, maxValue = L.IMAGE_EDGE_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.imageJpegQuality",
+            displayName = "Images: JPEG quality",
+            description = "JPEG re-encode quality (0-100). Default 80.",
+            prefs = limits, key = L.KEY_IMAGE_JPEG_QUALITY,
+            defaultValue = L.IMAGE_QUALITY_DEFAULT, minValue = L.IMAGE_QUALITY_MIN, maxValue = L.IMAGE_QUALITY_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.browserNavTimeoutSec",
+            displayName = "Browser: page-load timeout (s)",
+            description = "How long a browser navigation may run before it fails. Default 30.",
+            prefs = limits, key = L.KEY_BROWSER_NAV_TIMEOUT_SEC,
+            defaultValue = L.BROWSER_NAV_TIMEOUT_DEFAULT_SEC, minValue = L.BROWSER_NAV_TIMEOUT_MIN_SEC, maxValue = L.BROWSER_NAV_TIMEOUT_MAX_SEC,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.browserDomStableSec",
+            displayName = "Browser: DOM-stable wait default (s)",
+            description = "Default wait for the page DOM to settle before reading it, when a call does not pass its own timeout. Default 5.",
+            prefs = limits, key = L.KEY_BROWSER_DOM_STABLE_SEC,
+            defaultValue = L.BROWSER_DOM_STABLE_DEFAULT_SEC, minValue = L.BROWSER_DOM_STABLE_MIN_SEC, maxValue = L.BROWSER_DOM_STABLE_MAX_SEC,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.browserScreenshotQuality",
+            displayName = "Browser: screenshot quality",
+            description = "JPEG quality for browser screenshots (0-100). Default 80.",
+            prefs = limits, key = L.KEY_BROWSER_SCREENSHOT_QUALITY,
+            defaultValue = L.BROWSER_SCREENSHOT_Q_DEFAULT, minValue = L.BROWSER_SCREENSHOT_Q_MIN, maxValue = L.BROWSER_SCREENSHOT_Q_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.shellOutputKb",
+            displayName = "Shell: output capture ceiling (KB)",
+            description = "Max shell output kept per command; the rest is truncated with a marker. Default 128.",
+            prefs = limits, key = L.KEY_SHELL_OUTPUT_KB,
+            defaultValue = L.SHELL_OUTPUT_KB_DEFAULT, minValue = L.SHELL_OUTPUT_KB_MIN, maxValue = L.SHELL_OUTPUT_KB_MAX,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.shellTimeoutSec",
+            displayName = "Shell: default command timeout (s)",
+            description = "Default timeout for shell commands that don't pass their own; explicit per-call values keep their own (max 900 s). Default 900.",
+            prefs = limits, key = L.KEY_SHELL_TIMEOUT_SEC,
+            defaultValue = L.SHELL_TIMEOUT_DEFAULT_SEC, minValue = L.SHELL_TIMEOUT_MIN_SEC, maxValue = L.SHELL_TIMEOUT_MAX_SEC,
+        ))
     }
 
     // -- Master switch surface (read-only via the registry; UI toggles it) --
@@ -733,6 +847,107 @@ internal object ConfigBuiltins {
                 prefs = appearancePrefs,
                 key = "composer.modelPickerButton.visible",
                 defaultValue = true,
+            )
+        )
+
+        // ── [feat/chat-tuning-panel] Chat Tuning knobs ─────────────────────
+        // Previously hard-coded literals in ChatScreen / StreamingMarkdownText
+        // / ChatInputArea. Defaults equal those literals, so an untouched
+        // install behaves byte-identically. Registered here so `minis-config`
+        // can read/write them and ConfigBackup carries them; the in-app
+        // Chat Tuning panel reads/writes the same prefs file.
+        val chatTuningPrefs = context.getSharedPreferences(
+            com.rikkaminis.app.data.ChatTuningPrefs.PREFS, Context.MODE_PRIVATE
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.scrollNearBottomDp",
+                displayName = "Chat: bottom-stick threshold (dp)",
+                description = "How close to the bottom still counts as \"at the bottom\" — governs " +
+                    "auto-follow stickiness and when the jump-to-bottom button appears. Default 32.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_SCROLL_NEAR_BOTTOM_DP,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.SCROLL_NEAR_BOTTOM_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.SCROLL_NEAR_BOTTOM_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.SCROLL_NEAR_BOTTOM_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.prewarmRowLimit",
+                displayName = "Chat: pre-render rows on open",
+                description = "How many newest long messages are block-parsed off-main when a chat " +
+                    "opens, so the first frame renders from cache. Higher = smoother cold open, " +
+                    "more CPU/memory. Default 16.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_PREWARM_ROW_LIMIT,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.PREWARM_ROW_LIMIT_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.PREWARM_ROW_LIMIT_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.PREWARM_ROW_LIMIT_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.codePreviewLines",
+                displayName = "Chat: code-block fold threshold (lines)",
+                description = "Code blocks taller than this many lines start folded with an " +
+                    "\"Expand N lines\" button. Default 20.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_CODE_PREVIEW_LINES,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.CODE_PREVIEW_LINES_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.CODE_PREVIEW_LINES_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.CODE_PREVIEW_LINES_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.tablePreviewRows",
+                displayName = "Chat: table fold threshold (rows)",
+                description = "Tables taller than this many rows start folded. Default 10.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_TABLE_PREVIEW_ROWS,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.TABLE_PREVIEW_ROWS_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.TABLE_PREVIEW_ROWS_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.TABLE_PREVIEW_ROWS_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.markdownLineHeightSp",
+                displayName = "Chat: Markdown line height (sp)",
+                description = "Line spacing for message bodies, in sp at the default font scale " +
+                    "(still follows the message font-size setting). Default 24.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_MARKDOWN_LINE_HEIGHT_SP,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.inputMaxLines",
+                displayName = "Chat: composer max lines",
+                description = "The input box grows up to this many lines before it scrolls " +
+                    "internally. Default 6.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_INPUT_MAX_LINES,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.INPUT_MAX_LINES_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.INPUT_MAX_LINES_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.INPUT_MAX_LINES_MAX,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "chat.sendSwipeThresholdDp",
+                displayName = "Chat: swipe-up-to-send distance (dp)",
+                description = "How far you must swipe up inside the input to arm the send gesture. " +
+                    "Default 120.",
+                prefs = chatTuningPrefs,
+                key = com.rikkaminis.app.data.ChatTuningPrefs.KEY_SEND_SWIPE_THRESHOLD_DP,
+                defaultValue = com.rikkaminis.app.data.ChatTuningPrefs.SEND_SWIPE_THRESHOLD_DEFAULT,
+                minValue = com.rikkaminis.app.data.ChatTuningPrefs.SEND_SWIPE_THRESHOLD_MIN,
+                maxValue = com.rikkaminis.app.data.ChatTuningPrefs.SEND_SWIPE_THRESHOLD_MAX,
             )
         )
     }
