@@ -454,6 +454,15 @@ internal class AgentLoopEngine(
                     // [host.compactSummary] is prepended as a `<context-summary>`
                     // user message. Falls through to the raw host.agentHistory when
                     // no compact has happened, so the common path stays zero-copy.
+                    // [stream-timing 2026-09-14] Consumer-side latency marks. The
+                    // model call runs off-process (:modelservice) and its logcat
+                    // never reaches the tailer, so these two lines are the only
+                    // end-to-end timing the on-device log can carry. Cost: 2
+                    // lines per turn (~0.1% of log volume).
+                    val streamT0Ms = SystemClock.elapsedRealtime()
+                    var streamStartedMs = -1L
+                    var streamFirstContentMs = -1L
+                    var streamChunkCount = 0
                     host.streamChatTurnOffloaded(
                         provider = loopState.currentProvider,
                         messages = host.applyRequestImageBudget(host.effectiveAgentHistory()),
@@ -464,6 +473,20 @@ internal class AgentLoopEngine(
                         tools = host.agentTools,
                         thinkingLevel = if (host.currentModelSupportsReasoning) host.thinkingLevel else ThinkingLevel.OFF,
                     ).collect { chunk ->
+                // [stream-timing 2026-09-14] one-shot marks: Started (server
+                // accepted the request) and the first user-visible content chunk.
+                if (streamStartedMs < 0 && chunk is LLMStreamChunk.Started) {
+                    streamStartedMs = SystemClock.elapsedRealtime() - streamT0Ms
+                }
+                if (streamFirstContentMs < 0 && (
+                        chunk is LLMStreamChunk.Text ||
+                        chunk is LLMStreamChunk.ThinkingDelta ||
+                        chunk is LLMStreamChunk.ReasoningContent ||
+                        chunk is LLMStreamChunk.ToolUseStart)) {
+                    streamFirstContentMs = SystemClock.elapsedRealtime() - streamT0Ms
+                    AppLogger.info(TAG_STREAM, "stream first-content after=${streamFirstContentMs}ms started=${streamStartedMs}ms")
+                }
+                streamChunkCount++
                 when (chunk) {
                     is LLMStreamChunk.ThinkingDelta -> {
                         turnThinking.append(chunk.text)
@@ -657,7 +680,15 @@ internal class AgentLoopEngine(
                         // renamed id so the per-tool ring + block lookup match
                         // the block that ToolUseStart created.
                         val toolInputId = dedupeToolInputId(chunk.id)
-                        android.util.Log.d("ToolChain[VM]", "[turn=$turn] ToolInputDelta id=$toolInputId len=${chunk.accumulated.length}")
+                        // [log-diet 2026-09-14] This per-delta line ran at ~85k
+                        // lines/day (~60% of the on-device log by line count,
+                        // ~half its bytes) while carrying almost no post-hoc
+                        // signal — release summaries live in ToolCallComplete
+                        // (`len=`) and the consumer-side stream timing lines.
+                        // Debug builds keep the raw trace.
+                        if (com.rikkaminis.app.BuildConfig.DEBUG) {
+                            android.util.Log.d("ToolChain[VM]", "[turn=$turn] ToolInputDelta id=$toolInputId len=${chunk.accumulated.length}")
+                        }
                         // Maintain a per-tool ring of the most recent `accumulated`
                         // snapshots so the preflight validator below can dump them
                         // when an empty/invalid call is detected. Cheap (single
@@ -718,7 +749,11 @@ internal class AgentLoopEngine(
                         // the downstream tool-result join all key on the
                         // same value (matches the rename applied at start).
                         val toolCompleteId = dedupeToolCompleteId(chunk.id)
-                        android.util.Log.d("ToolChain[VM]", "[turn=$turn] ToolCallComplete id=$toolCompleteId name=${chunk.name} args=${chunk.args.toString().take(300)}")
+                        // [log-diet 2026-09-14] `len=` preserves the full-size
+                        // signal that the now-debug-gated per-delta trace used
+                        // to carry.
+                        val argsJson = chunk.args.toString()
+                        android.util.Log.d("ToolChain[VM]", "[turn=$turn] ToolCallComplete id=$toolCompleteId name=${chunk.name} args=${argsJson.take(300)} len=${argsJson.length}")
                         toolCalls.add(Triple(toolCompleteId, chunk.name, chunk.args))
                         val idx = loopState.allToolBlocks.indexOfFirst { it.id == toolCompleteId }
                         if (idx >= 0) {
@@ -739,6 +774,15 @@ internal class AgentLoopEngine(
                     }
                     is LLMStreamChunk.Usage -> {
                         lastUsage = chunk.usage
+                        // [T-adaptive-compact-reserve] Snapshot BEFORE the update:
+                        // the difference between two consecutive Usage readings is
+                        // exactly one turn's growth (this turn's answer + its tool
+                        // results), which is what the auto-compact reserve must be
+                        // sized against. A `prev` of 0 means this is the run's
+                        // first reading (loopState starts empty), and the delta
+                        // would be the whole context — not a growth step — so it
+                        // is deliberately not reported.
+                        val prevContextTokens = loopState.lastContextTokens
                         // Update context token count for next turn's host.dynamicMaxTokens()
                         // and publish to _lastTurnContextTokens so the ContextPolicy
                         // gate in [host.checkContextBeforeSend] can see the latest pressure
@@ -756,6 +800,9 @@ internal class AgentLoopEngine(
                         }
                         if (loopState.lastContextTokens > 0) {
                             host.setLastTurnContextTokens(loopState.lastContextTokens)
+                            if (prevContextTokens > 0 && loopState.lastContextTokens > prevContextTokens) {
+                                host.recordContextGrowth(loopState.lastContextTokens - prevContextTokens)
+                            }
                         }
                     }
                     is LLMStreamChunk.ReasoningContent -> {
@@ -791,6 +838,10 @@ internal class AgentLoopEngine(
                     }
                 }
                     }  // end collect
+                    // [stream-timing 2026-09-14] Summary for the consumer-visible
+                    // stream: `dur` = request → last chunk, `firstContent` = the
+                    // user-visible latency (first Text / Thinking / ToolStart).
+                    AppLogger.info(TAG_STREAM, "stream done dur=${SystemClock.elapsedRealtime() - streamT0Ms}ms chunks=$streamChunkCount started=${streamStartedMs}ms firstContent=${streamFirstContentMs}ms")
                     // T94 fix 2: flush any text that landed in the throttle
                     // window after the last UI tick. The retry-rollback /
                     // turn-finalize paths below assume _messages reflects all
@@ -2119,6 +2170,56 @@ internal class AgentLoopEngine(
                     continue
                 }
                 sameTurnFingerprints[dedupeFingerprint] = id
+                // [T-truncated-tool-call-guard] A turn that hit the output
+                // ceiling (finish_reason=length / max_tokens) may have been cut
+                // off WHILE this call's arguments were still streaming. Until
+                // this guard the dispatch path never consulted turnFinishReason
+                // — it is read only inside the `toolCalls.isEmpty()` branch
+                // above — so a prefix payload reached the executor. And
+                // ToolJsonRepair's truncation strategy makes that sharper, not
+                // safer: it deliberately CLOSES a cut-off JSON object, turning
+                // `{"path": "/data/local/tmp/fo` into a syntactically valid,
+                // semantically wrong argument. Refusing costs one re-planned
+                // turn; executing costs an unknown side effect. Same shape as
+                // the dedupe / loop-detector refusals below so that tool_use
+                // and tool_result stay paired for the next request.
+                //
+                // Place it BEFORE ToolJsonRepair: refusing on the raw payload
+                // means the refusal can never depend on a repaired one.
+                //
+                // Accepted residual risk: this branch does NOT charge the
+                // length-wall continuation budget (that counter is only
+                // advanced on the `toolCalls.isEmpty()` side), so a model that
+                // re-issues a call on every ceiling hit is bounded only by
+                // maxTurnsThisRun. Buying that with a new shared counter is not
+                // worth the extra state: the refusal message tells the model to
+                // re-issue with FULL arguments, and executing a prefix argument
+                // is strictly worse than spending turns.
+                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason)
+                if (truncatedRefusal != null) {
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn truncated tool call REFUSED name=$name id=$id finish=$turnFinishReason",
+                    )
+                    val truncatedIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }
+                    if (truncatedIdx >= 0) {
+                        loopState.allToolBlocks[truncatedIdx] = loopState.allToolBlocks[truncatedIdx].copy(
+                            toolStatus = ToolBlockStatus.FAILED,
+                            content = truncatedRefusal,
+                            durationMs = 0,
+                        )
+                        withContext(Dispatchers.Main) {
+                            host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                        }
+                    }
+                    resultParts.add(AgentContentPart.ToolResult(
+                        id = id,
+                        name = name,
+                        content = truncatedRefusal,
+                        isError = true,
+                    ))
+                    continue
+                }
                 // [T-android-overlay-tool-title] Pull tool_title uniformly
                 // from args for ALL tools — without this browser_use's
                 // tool_title never reached the overlay (only shell_execute

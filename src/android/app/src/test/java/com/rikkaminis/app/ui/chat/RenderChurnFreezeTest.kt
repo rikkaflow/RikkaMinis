@@ -5,6 +5,8 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.rikkaminis.app.ui.chat.legacy.StableChatRowLedger
+import com.rikkaminis.app.ui.chat.legacy.buildFlatChatItems
 
 /**
  * [render-churn-2] Frozen-completion contract tests for the chat render
@@ -17,7 +19,7 @@ import org.junit.Test
  * These tests pin the three invariants that fix it:
  *  1. sameBlockRefs: a re-created list of UNCHANGED block instances is
  *     "the same view" — no content walk.
- *  2. AssistantToolRunGroup / AssistantToolUse / AssistantMarkdownBlock
+ *  2. AssistantToolRunGroup / AssistantMarkdownBlock
  *     equals: reference-based for block payloads, so completed blocks
  *     stay frozen; live (copy()'d) blocks still register as changed.
  *  3. StableChatRowLedger: identical-content reconciles keep the published
@@ -117,24 +119,6 @@ class RenderChurnFreezeTest {
         assertFalse(a == b)
     }
 
-    // ───────────────────── AssistantToolUse.equals ─────────────────────
-
-    @Test
-    fun toolUseEqualsIgnoresListRebuildWithSameInstances() {
-        val t1 = toolBlock("t1", "result", ToolBlockStatus.SUCCESS)
-        val a = FlatChatItem.AssistantToolUse("m1", t1, listOf(t1))
-        val b = FlatChatItem.AssistantToolUse("m1", t1, listOf(t1))
-        assertTrue(a == b)
-        assertTrue(a.hashCode() == b.hashCode())
-    }
-
-    @Test
-    fun toolUseEqualsFalseWhenBlockCopied() {
-        val t1 = toolBlock("t1", "old", ToolBlockStatus.RUNNING)
-        val a = FlatChatItem.AssistantToolUse("m1", t1, listOf(t1))
-        val b = FlatChatItem.AssistantToolUse("m1", t1.copy(content = "new"), listOf(t1))
-        assertFalse(a == b)
-    }
 
     // ────────────────── AssistantMarkdownBlock.equals ──────────────────
 

@@ -31,6 +31,8 @@ import com.rikkaminis.app.data.BPETokenizer
 import com.rikkaminis.app.data.ContextOffload
 import com.rikkaminis.app.data.ContextPolicy
 import com.rikkaminis.app.conversation.ContextCompactor
+import com.rikkaminis.app.conversation.ContextGrowthTracker
+import com.rikkaminis.app.diagnostics.SessionIdAliases
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.data.db.CompactMarkerEntity
@@ -71,6 +73,7 @@ import com.rikkaminis.app.tools.ToolFailureHook
 import com.rikkaminis.app.offload.OffloadPermissionManager
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.service.SessionConcurrencyManager
+import com.rikkaminis.app.util.Utf16Sanitizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -916,6 +919,16 @@ class ChatViewModel(
     val lastTurnContextTokens: StateFlow<Int> = _lastTurnContextTokens.asStateFlow()
 
     /**
+     * [T-adaptive-compact-reserve] Per-turn context growth measured from
+     * consecutive API usage readings, fed by the agent loop
+     * ([AgentLoopHost.recordContextGrowth]). Sizes the reserve that shifts the
+     * auto-compact trigger earlier — see [effectiveContextPolicy] and
+     * [ContextGrowthTracker]. Empty (zero reserve) until the first measured
+     * turn, so cold-start behaviour is unchanged.
+     */
+    internal val contextGrowthTracker = ContextGrowthTracker()
+
+    /**
      * Latest compact summary for the current session, loaded from the DB on
      * [loadSession] and re-populated after [compactAll] finishes. When non-null,
      * [effectiveAgentHistory] prepends it as a `<context-summary>` user message
@@ -1207,6 +1220,14 @@ class ChatViewModel(
         override fun setCanResume(value: Boolean) { _canResume.value = value }
         override fun bumpFallbackTrigger() { _fallbackTrigger.value++ }
         override fun setLastTurnContextTokens(tokens: Int) { _lastTurnContextTokens.value = tokens }
+        override fun recordContextGrowth(deltaTokens: Int) {
+            contextGrowthTracker.sample(deltaTokens.toLong())
+            AppLogger.info(
+                TAG,
+                "[ContextGrowth] +$deltaTokens tokens/turn → estimate=${contextGrowthTracker.perTurnEstimate} " +
+                    "samples=${contextGrowthTracker.samples} reserve=${contextGrowthTracker.reserveTokens(effectiveContextWindowTokens() ?: 0)}",
+            )
+        }
         override fun setEnhancedCache(enabled: Boolean) { _enhancedCacheEnabled.value = enabled }
         override fun updateCurrentModel(model: com.rikkaminis.app.data.model.LLMModel) {
             currentModel = model
@@ -2963,7 +2984,21 @@ class ChatViewModel(
     // AgentLoopHost.kt (the engine returns/consumes it); the VM keeps its own
     // alias-free references. The old private nested data class is gone.
 
-    fun sendMessage(text: String) {
+    fun sendMessage(rawText: String) {
+        // [backlog #1 / fix/utf16-lone-surrogate] User input is one of the two
+        // text boundaries into the app (the other is the provider stream): a
+        // clipboard paste can carry an unpaired UTF-16 surrogate, which later
+        // trips strict encoders far away from the source. Sanitize on the way
+        // in and use that value for every downstream path, queue included.
+        val text = Utf16Sanitizer.sanitize(rawText)
+        // [mem-spike-diag] 用户发送是三条高开销路径的起点：会话加载 ->
+        // 上下文构建（phase:build-request）-> 流式渲染。这里只标起点，让日志
+        // 能把「发消息之后」的内存曲线按会话对齐（2026-09-13 16:54 那次尖峰
+        // 全程没有 cmd 记录，就是缺了起点标记才只能靠时间猜）。
+        com.rikkaminis.app.diagnostics.MemorySpikeRecorder.onEvent(
+            "ui:send",
+            "session=${SessionIdAliases.resolve(sessionId)} chars=${text.length} attachments=${_attachments.value.size} streaming=${_isStreaming.value}",
+        )
         val trimmed = text.trim()
         // While streaming, enqueue instead of silently dropping (iOS: send vs enqueuePrompt).
         if (_isStreaming.value) {

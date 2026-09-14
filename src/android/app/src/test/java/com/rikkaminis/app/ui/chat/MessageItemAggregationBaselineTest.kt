@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
 import org.junit.Test
+import com.rikkaminis.app.ui.chat.legacy.buildFlatChatItems
 
 /**
  * JVM regression baseline for the CURRENT "message-level flattening" behavior,
@@ -29,8 +30,8 @@ import org.junit.Test
  * single [FlatChatItem.AssistantToolRunGroup] (`[T-android-tool-run-collapse]`).
  * N tool_use blocks therefore produce exactly ONE toolrun row, not N. These
  * tests assert the TRUE current behaviour (the "before"), so C/D can measure
- * the real delta. The per-tool [FlatChatItem.AssistantToolUse] is no longer
- * emitted by the builder at all.
+ * the real delta. The per-tool row class that used to carry a single tool_use
+ * was removed entirely (2026-09-13 dead-row cleanup).
  */
 class MessageItemAggregationBaselineTest {
 

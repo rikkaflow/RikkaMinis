@@ -11,6 +11,8 @@ import com.rikkaminis.app.agent.runtime.RetryOutcome
 import com.rikkaminis.app.agent.runtime.RetryPolicy
 import com.rikkaminis.app.agent.runtime.RetrySafety
 import com.rikkaminis.app.data.repository.EnvVarRepository
+import com.rikkaminis.app.diagnostics.MemorySpikeRecorder
+import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.sandbox.offload.ChatStreamOffloadHandler
 import com.rikkaminis.app.sandbox.offload.ModelExecutionMailbox
 import com.rikkaminis.app.service.MemoryPressureGate
@@ -260,21 +262,37 @@ object ExecutionCoordinator {
         /** `(line, isPartial)` — see PersistentShell.CommandCallback.lineCallback. */
         lineCallback: ((String, Boolean) -> Unit)? = null
     ): CommandResult {
-        // [native-rss-tool-guard] Process-RSS hard gate BEFORE any shell work.
+        // [native-rss-tool-guard] Process-memory hard gate BEFORE any shell work.
         // Debug.getNativeHeapAllocatedSize() is blind to mmap/thread-stack/mapped
         // tmpfile growth — the exact shape of the 2026-08-19 crash (RSS 5.8–6.0GB
-        // while the native-heap-only tiers stayed below their cliffs). Read real
-        // VmRSS: if it is already CRITICAL, reclaim once, then re-check; if still
-        // critical, reject the command with a retryable, structured error instead
-        // of letting one more heavy command push the process over the edge.
-        val rssBeforeMB = MemoryPressureGate.rssReader()
-        if (MemoryPressureGate.levelFor(rssBeforeMB) == MemoryPressureLevel.CRITICAL) {
+        // while the native-heap-only tiers stayed below their cliffs).
+        // [fix/memory-anon-metric] Metric is RssAnon, not VmRSS: on this device
+        // file-backed pages sit at a constant ~147MB of a ~265MB healthy RSS
+        // (measured 2026-09-13), so VmRSS spent 61% of its signal on reclaimable
+        // cache. anon is both the thing that grows and the thing the gate exists
+        // to protect (thread stacks / anon mmap). See MemoryPressureGate.
+        // [fix/memory-anon-metric] 一次采样供多处使用：准入判定用 anon（主指标），
+        // 命令级 ΔRSS 归因仍用 rss（探针的 ΔRSS 口径是 rss——两个口径不能混用，
+        // 混了算出来的 Δ 是假的）。
+        val metricsBefore = MemoryPressureGate.metricsReader()
+        val anonBeforeMB = metricsBefore.anonMb
+        val rssBeforeKb = metricsBefore.rssMb * 1024L
+        // [mem-spike-diag] 命令级内存归因旁路：记录命令上下文 + 起始 RSS，由
+        // MemorySpikeRecorder 在命令结束时写出 ΔRSS —— 直接回答「哪条命令吃掉
+        // 多少内存」。与准入逻辑完全无关，任何失败静默。
+        val spikeCmdClass = classifyCommand(command)
+        MemorySpikeRecorder.onCommandStart(sessionId, spikeCmdClass.name, command)
+        if (MemoryPressureGate.levelFor(anonBeforeMB) == MemoryPressureLevel.CRITICAL) {
             MemoryPressureGate.reclaimAndWait(waitMs = 2_000L)
-            val rssAfterMB = MemoryPressureGate.rssReader()
-            if (MemoryPressureGate.shouldRejectAfterReclaim(rssAfterMB)) {
-                Log.w(TAG, "[$sessionId] Process RSS ${rssAfterMB}MB still critical after reclaim — rejecting command (rssBefore=${rssBeforeMB}MB)")
+            val anonAfterMB = MemoryPressureGate.anonMb()
+            if (MemoryPressureGate.shouldRejectAfterReclaim(anonAfterMB)) {
+                Log.w(TAG, "[$sessionId] Process anon ${anonAfterMB}MB still critical after reclaim — rejecting command (anonBefore=${anonBeforeMB}MB, rss=${MemoryPressureGate.rssMb()}MB)")
+                MemorySpikeRecorder.onEvent(
+                    "reject-anon",
+                    "session=$sessionId anonAfter=${anonAfterMB}MB anonBefore=${anonBeforeMB}MB rss=${MemoryPressureGate.rssMb()}MB :: ${MemorySpikeRecorder.previewOf(command, 60)}"
+                )
                 return CommandResult(
-                    "[System busy: process memory is critically high (${rssAfterMB}MB). " +
+                    "[System busy: process memory is critically high (anon ${anonAfterMB}MB). " +
                         "Please wait for the system to settle and retry.]",
                     -1, 0, true,
                 )
@@ -301,6 +319,10 @@ object ExecutionCoordinator {
         val preExecReject = preExecRejectionMessage(preExecPhase, cmdClass, preExecNativeMB, memAvailableMB)
         if (preExecReject != null) {
             Log.w(TAG, "[$sessionId] Phase $preExecPhase: rejecting $cmdClass command (native ${preExecNativeMB}MB, memAvail ${memAvailableMB}MB)")
+            MemorySpikeRecorder.onEvent(
+                "reject-tier",
+                "session=$sessionId phase=$preExecPhase class=$cmdClass native=${preExecNativeMB}MB memAvail=${memAvailableMB}MB"
+            )
             postRecycleMemoryRecovery()
             return CommandResult(preExecReject, -1, 0, true)
         }
@@ -451,9 +473,15 @@ object ExecutionCoordinator {
                 sessionDidTerminate(sessionId)
             }
 
+            // [mem-spike-diag] 命令结束归因：ΔRSS + PRoot 子进程聚合，落盘
+            // memspike-<date>.log。诊断旁路，不影响返回值。
+            MemorySpikeRecorder.onCommandEnd(durationMs, rssBeforeKb)
             CommandResult(output = output, exitCode = result.exitCode, durationMs = durationMs, truncated = outputTruncated)
         }
     } finally {
+        // [mem-spike-diag] 兜底配对：异常 / 提前 return 的路径也把命令上下文收尾，
+        // 避免 ΔRSS 归因丢行（幂等，成功路径已收尾时为 no-op）。
+        MemorySpikeRecorder.onCommandEndIfPending(rssBeforeKb = rssBeforeKb)
         // [P2-global-concurrency] Release the global concurrency slot.
         // This runs after the per-session mutex is released (the mutex is
         // inside the try block), so the next session waiting on the
@@ -539,6 +567,14 @@ object ExecutionCoordinator {
                     )
                     sessionDidTerminate(sessionId)
                     lastShell = null
+                } else if (result.exitCode == STALL_EXIT_CODE) {
+                    // [fix/memory-hardening-stall] The stall guard hard-killed
+                    // the shell at the process level. Drop the dead shell from
+                    // the registry right away instead of leaving a zombie entry
+                    // to be discovered by the next getOrCreateShell.
+                    Log.w(TAG, "[$sessionId] Command stalled and was killed — recycling shell")
+                    sessionDidTerminate(sessionId)
+                    lastShell = null
                 } else if (shellDied && attempt >= MAX_AUTO_RETRIES) {
                     lastShell = null // shell is dead and we're out of retries
                 }
@@ -598,7 +634,7 @@ object ExecutionCoordinator {
             val shell = PersistentShell(appContext, sessionId, bindMounts)
             shells[sessionId] = shell
             shell.ensureStarted()
-            Log.i(TAG, "[$sessionId] Shell created with ${bindMounts.size} bind mounts")
+            AppLogger.info(TAG, "[$sessionId] Shell created with ${bindMounts.size} bind mounts")
             shell
         }
     }
@@ -985,6 +1021,11 @@ internal fun internalShouldRetryCommand(
     // Keep in sync with ExecutionCoordinator.MAX_AUTO_RETRIES (defaults to 2).
     maxRetries: Int = 2,
 ): Boolean {
+    // [fix/memory-hardening-stall] A stall-killed command already burned its
+    // whole no-progress window; retrying the SAME command would hang again for
+    // the same reason. Hand the error to the agent instead and let it change
+    // approach (see STALL_EXIT_CODE).
+    if (exitCode == STALL_EXIT_CODE) return false
     val shellDied = exitCode == -1 || exitCode == 124 || !shellAlive
     return shellDied && attempt < maxRetries
 }

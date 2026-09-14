@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.Toast
+import com.rikkaminis.app.diagnostics.SessionIdAliases
 import java.io.File
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
@@ -56,6 +57,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -151,6 +153,8 @@ import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisMenuDivider
 import com.rikkaminis.app.data.ChatTuningPrefs
 import com.rikkaminis.app.ui.settings.rememberChatTuning
+import com.rikkaminis.app.ui.chat.legacy.StableChatRowLedger
+import com.rikkaminis.app.ui.chat.legacy.buildFlatChatItems
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -411,7 +415,7 @@ fun ChatScreen(
             ?: return@LaunchedEffect
         com.rikkaminis.app.logging.AppLogger.info(
             "ChatScreen",
-            "[Share] injecting ${pending.items.size} item(s) into chat session=$sessionId",
+            "[Share] injecting ${pending.items.size} item(s) into chat session=${SessionIdAliases.resolve(sessionId)}",
         )
         val sharedDir = com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
         for (item in pending.items) {
@@ -474,12 +478,13 @@ fun ChatScreen(
         // and any subsequent hang record. Removable by grepping out
         // `[T-HANG-DIAG]` from this file.
         println(
-            "[T-HANG-DIAG] ChatScreen MOUNT session=$sessionId hangCount=" +
+            "[T-HANG-DIAG] ChatScreen MOUNT session=${SessionIdAliases.resolve(sessionId)} hangCount=" +
                 com.rikkaminis.app.diagnostics.HangDetector.currentHangCount(tHangDiagAppContext),
         )
         com.rikkaminis.app.diagnostics.PerfLongCtx.step(sessionId, "chatScreen.mount")
+        com.rikkaminis.app.diagnostics.MemorySpikeRecorder.onEvent("ui:mount", "session=${SessionIdAliases.resolve(sessionId)}")
         onDispose {
-            println("[T-HANG-DIAG] ChatScreen UNMOUNT session=$sessionId")
+            println("[T-HANG-DIAG] ChatScreen UNMOUNT session=${SessionIdAliases.resolve(sessionId)}")
             // [audit-0909 T2-H1] compare-and-clear instead of setActiveSession(null):
             // a Chat→Chat navigation mounts the new ChatScreen (which sets the
             // new session) BEFORE this outgoing screen is disposed, so the old
@@ -517,7 +522,7 @@ fun ChatScreen(
         val transfer = ChatViewModelStore.consumePendingTransfer() ?: return@LaunchedEffect
         com.rikkaminis.app.logging.AppLogger.info(
             "ChatScreen",
-            "[MoveTo] draining transfer into session=$sessionId text=${transfer.inputText.length}ch attachments=${transfer.attachments.size}",
+            "[MoveTo] draining transfer into session=${SessionIdAliases.resolve(sessionId)} text=${transfer.inputText.length}ch attachments=${transfer.attachments.size}",
         )
         // Clear any stale unsent attachments on the target session before
         // injecting (mirrors iOS injectPendingTransferIfNeeded).
@@ -1167,6 +1172,14 @@ fun ChatScreen(
     // visible jitter and yank the reader). Tracked by the DragInteraction
     // collector below. Declared BEFORE the consumer effect so it is in scope.
     var isUserDragging by remember { mutableStateOf(false) }
+    // [fix/history-open-catchup-guard] Bounded post-open catch-up state. The
+    // flatten collector arms it (armEpoch++) right after the INITIAL_OPEN
+    // snap; the catch-up effect below consumes it. Any real drag or Resume
+    // sets userEngaged=true, which revokes it for the rest of this open.
+    var openCatchUpArmEpoch by remember(sessionId) { mutableStateOf(0) }
+    var openCatchUpRolls by remember(sessionId) { mutableStateOf(0) }
+    var openCatchUpUserEngaged by remember(sessionId) { mutableStateOf(false) }
+    var openCatchUpArmedAtMs by remember(sessionId) { mutableStateOf(0L) }
     // [bottom-fix] Timestamp of the last drag-stop. Kept for the follow
     // disengage decision below (which still reads the raw list position).
     var lastDragStopMs by remember { mutableStateOf(0L) }
@@ -1275,6 +1288,9 @@ fun ChatScreen(
             when (interaction) {
                 is androidx.compose.foundation.interaction.DragInteraction.Start -> {
                     isUserDragging = true
+                    // [fix/history-open-catchup-guard] A real drag revokes the
+                    // post-open catch-up for the rest of this open.
+                    openCatchUpUserEngaged = true
                     // [forward-stable] A real pointer drag begins — drop any
                     // in-flight bottom request so nothing scrolls mid-gesture.
                     // This also maintains DETACHED/FOLLOWING for the explicit
@@ -1314,6 +1330,44 @@ fun ChatScreen(
                 else -> Unit
             }
         }
+    }
+    // [fix/history-open-catchup-guard] Bounded post-open catch-up. The
+    // INITIAL_OPEN snap lands against the newest row's FIRST layout; its
+    // second composition can still grow that row (measured +20%..+95% within
+    // 9-150ms) and re-release the clamp with nobody correcting — the open
+    // then rests "one screen short". This effect lives for a short window
+    // after each open and snaps back to the bottom whenever the clamp is
+    // released — until the user engages or the budget runs out. Driven by the
+    // same authoritative canScrollForward signal as the streaming follow
+    // gate; never fires mid-gesture / mid-scroll.
+    LaunchedEffect(listState, openCatchUpArmEpoch) {
+        if (openCatchUpArmEpoch == 0) return@LaunchedEffect
+        val armedAtMs = openCatchUpArmedAtMs
+        withTimeoutOrNull(OPEN_CATCHUP_WINDOW_MS) {
+            snapshotFlow { listState.canScrollForward }
+                .distinctUntilChanged()
+                .collect { canFwd ->
+                    val shouldRoll = shouldCatchUpAfterOpen(
+                        armed = true,
+                        userEngaged = openCatchUpUserEngaged,
+                        canScrollForward = canFwd,
+                        isScrollInProgress = listState.isScrollInProgress,
+                        rollsUsed = openCatchUpRolls,
+                        maxRolls = OPEN_CATCHUP_MAX_ROLLS,
+                    )
+                    if (!shouldRoll) return@collect
+                    openCatchUpRolls += 1
+                    AppLogger.debug(
+                        "ScrollSrc",
+                        "open-catchup roll #${openCatchUpRolls} dt=${SystemClock.elapsedRealtime() - armedAtMs}ms firstIdx=${listState.firstVisibleItemIndex} firstOff=${listState.firstVisibleItemScrollOffset}",
+                    )
+                    tracedScrollToItem("OPEN-CATCHUP", 1_000_000, 0)
+                }
+        }
+        AppLogger.debug(
+            "ScrollSrc",
+            "open-catchup done rolls=$openCatchUpRolls dt=${SystemClock.elapsedRealtime() - armedAtMs}ms",
+        )
     }
     // T169 / T170: an IME show/hide animates the LazyColumn's content area,
     // which can briefly register as a synthetic drag-stop and flip
@@ -1838,6 +1892,16 @@ fun ChatScreen(
                     draftSnapshot?.let { com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, it.id) }
                 },
                 onSessionClick = { id ->
+                    // [diag/reentry-latency-anchor] Start the user-perceived
+                    // clock at the TAP, before the drawer-close coroutine, so
+                    // every later step on this session reports sinceClickMs =
+                    // what the user actually waited. Only for a real switch:
+                    // anchoring on a same-session tap (the drawer just closes)
+                    // would leave a dangling anchor that pollutes that
+                    // session's later steps with a meaningless sinceClickMs.
+                    if (id != sessionId) {
+                        com.rikkaminis.app.diagnostics.PerfLongCtx.click(id)
+                    }
                     if (id == sessionId) {
                         // Current session: just close the drawer, no navigation.
                         historyDrawerScope.launch { historyDrawerState.close() }
@@ -3005,11 +3069,41 @@ fun ChatScreen(
                                 // pair to diff against.
                                 val prevMsgs = aggregateReuse.messages
                                 val prevItems = aggregateReuse.items
-                                val nextItems = if (prevMsgs == null || prevMsgs.isEmpty() ||
+                                val aggregateColdBuild = prevMsgs == null || prevMsgs.isEmpty() ||
                                     prevItems == null || prevItems.isEmpty()
-                                ) {
+                                val nextItems = if (aggregateColdBuild) {
                                     withContext(Dispatchers.Default) {
-                                        buildAggregateChatItems(merged)
+                                        val rows = buildAggregateChatItems(merged)
+                                        // [fix/open-row-first-frame-final] Block-parse
+                                        // + cache the NEWEST row's markdown HERE — same
+                                        // off-main job, still BEFORE the publish below —
+                                        // so the INITIAL_OPEN snap (fired immediately
+                                        // after the publish, before the first layout of
+                                        // these rows) resolves against that row's FINAL
+                                        // height instead of a zero-height first layout
+                                        // that grows a frame later. Without this the
+                                        // opening lands "one screen short" and the
+                                        // catch-up correction is a visible multi-thousand
+                                        // px jump (2026-09-13 device forensics).
+                                        //
+                                        // Same job (not a second dispatch) so the parse
+                                        // cannot queue behind the pool work that the
+                                        // cold open just produced; block splitting is a
+                                        // line scan, the inline prewarm stays async.
+                                        if (stream.isEmpty()) {
+                                            val newest = newestRowMarkdownSources(rows)
+                                            if (newest.isNotEmpty()) {
+                                                val tWarmNs = System.nanoTime()
+                                                prewarmMarkdownBlockCaches(newest)
+                                                com.rikkaminis.app.diagnostics.PerfLongCtx.step(
+                                                    sessionId,
+                                                    "coldOpen.newestRowWarm",
+                                                    "srcs=${newest.size} chars=${newest.sumOf { it.length }} " +
+                                                        "warmMs=${(System.nanoTime() - tWarmNs) / 1_000_000}",
+                                                )
+                                            }
+                                        }
+                                        rows
                                     }
                                 } else {
                                     buildAggregateChatItemsIncremental(prevItems, prevMsgs, merged)
@@ -3017,6 +3111,59 @@ fun ChatScreen(
                                 flatItems = nextItems
                                 aggregateReuse.messages = merged
                                 aggregateReuse.items = nextItems
+                                // [diag/streamperf-revive] The ledger-path
+                                // StreamPerfMonitor.tick further down is unreachable
+                                // while AGGREGATE_MESSAGE_ITEMS is on (this branch
+                                // returns first), so every emitted [StreamPerf]
+                                // summary read ticks=0 — the incremental flatten was
+                                // never measured on the live path. Tick here with the
+                                // same shape so the two paths stay comparable.
+                                com.rikkaminis.app.diagnostics.StreamPerfMonitor.tick(
+                                    flattenNanos = System.nanoTime() - tickStartNs,
+                                    frozenReused = !aggregateColdBuild,
+                                    frozenRows = if (aggregateColdBuild) 0 else (prevItems?.size ?: 0),
+                                    liveRows = nextItems.size,
+                                )
+                                // [T-android-coldload-offmain-parse] Parallel viewport
+                                // prewarm: inline-warm the newest (viewport-candidate)
+                                // markdown fragments off-main so the first frame's rows
+                                // compose as cache HITs. Deliberately launched in
+                                // PARALLEL with the publish (the block half of the work
+                                // for the newest row is already done above) — blocking
+                                // the publish on the inline pass would add its latency
+                                // to time-to-first-frame.
+                                //
+                                // [fix/open-row-first-frame-final] Aggregate-aware source
+                                // selection: the old `(item as? AssistantMarkdownBlock)`
+                                // cast matched NOTHING once AGGREGATE_MESSAGE_ITEMS flipped
+                                // (rows are AssistantMessageItem now), so this pass never
+                                // ran a single parse — see ChatColdOpenPrewarm.kt.
+                                if (stream.isEmpty() && nextItems.isNotEmpty()) {
+                                    // [feat/chat-tuning-panel] Read prefs directly
+                                    // instead of the snapshot state: this collect
+                                    // lambda captured its closure long before, so a
+                                    // knob change must be picked up as a FRESH read
+                                    // on the next cold build, not a stale capture.
+                                    val prewarmSources = collectColdOpenPrewarmSources(
+                                        rowsNewestFirst = nextItems.asReversed(),
+                                        maxSources = ChatTuningPrefs.prewarmRowLimit(context),
+                                        charBudget = COLD_OPEN_PREWARM_CHAR_BUDGET,
+                                    )
+                                    if (prewarmSources.isNotEmpty()) {
+                                        launch(Dispatchers.Default) {
+                                            val tPrewarmNs = System.nanoTime()
+                                            prewarmMarkdown(prewarmSources)
+                                            val prewarmMs = (System.nanoTime() - tPrewarmNs) / 1_000_000
+                                            lastColdPrewarmMs = prewarmMs
+                                            com.rikkaminis.app.diagnostics.PerfLongCtx.step(
+                                                sessionId,
+                                                "coldPrewarm.done",
+                                                "srcs=${prewarmSources.size} " +
+                                                    "chars=${prewarmSources.sumOf { it.length }} prewarmMs=$prewarmMs",
+                                            )
+                                        }
+                                    }
+                                }
                                 if (!initialBottomScrollFired) {
                                     initialBottomScrollFired = true
                                     if (nextItems.isNotEmpty() &&
@@ -3039,18 +3186,33 @@ fun ChatScreen(
                                         // overflow its sliding-window arithmetic.
                                         AppLogger.debug("ScrollSrc", "scroll-bottom reason=INITIAL_OPEN(first-rows) rows=${nextItems.size}")
                                         listState.scrollToItem(index = 1_000_000, scrollOffset = 0)
+                                        // [fix/history-open-catchup-guard] Arm the
+                                        // bounded open catch-up: the newest row can
+                                        // still grow AFTER this snap (second
+                                        // composition — measured up to +12.6k px
+                                        // within ~150ms), re-releasing the clamp
+                                        // with no correction. Quiet opens only: an
+                                        // open while a stream is active is owned by
+                                        // the streaming follow path.
+                                        if (stream.isEmpty()) {
+                                            openCatchUpRolls = 0
+                                            openCatchUpUserEngaged = false
+                                            openCatchUpArmedAtMs = SystemClock.elapsedRealtime()
+                                            openCatchUpArmEpoch += 1
+                                        }
                                     }
                                     followState = consumeBottomRequest(followState)
                                 }
                                 return@collect
                             }
                             if (flatItems.isEmpty()) {
-                                val tBuildStart = System.nanoTime()
-                                com.rikkaminis.app.diagnostics.PerfLongCtx.step(
-                                    sessionId,
-                                    "buildFlatChatItems.start",
-                                    "msgCount=${msgs.size}",
-                                )
+                                // [T-android-liveness-census] This fallback
+                                // branch has NOT been entered since the
+                                // aggregate pipeline landed — 0 hits across
+                                // the whole 09-13/09-14 window while its
+                                // sibling prewarm site in the aggregate branch
+                                // logged 67 times. (Was three PerfLongCtx
+                                // breadcrumbs: start/firstBuild/highRowCount.)
                                 val rows = withContext(Dispatchers.Default) {
                                     // [T-android-flatitems-sublist-cme] Pass a
                                     // SNAPSHOT COPY (msgs.take), not a subList —
@@ -3060,8 +3222,16 @@ fun ChatScreen(
                                     // backing list changed mid-build.
                                     buildFlatChatItems(merged, sessionId)
                                 }
-                                val buildMs = (System.nanoTime() - tBuildStart) / 1_000_000
                                 rowLedger.seed(rows, merged.size)
+                                // [T-android-liveness-census] Recorded after
+                                // the build so maxRows carries the real ROW
+                                // count (it replaces the >3000-row alarm, not
+                                // a message count); the census reports this
+                                // branch whether or not it stays silent.
+                                com.rikkaminis.app.diagnostics.Liveness.record(
+                                    com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.ROW_COLD_BUILD,
+                                    rows = rows.size,
+                                )
                                 // [T-android-coldload-offmain-parse] Parallel
                                 // viewport prewarm: block-parse + inline-warm
                                 // the newest (viewport-candidate) markdown
@@ -3076,41 +3246,25 @@ fun ChatScreen(
                                     // lambda captured its closure long before, so a
                                     // knob change must be picked up as a FRESH read
                                     // on the next cold build, not a stale capture.
-                                    val prewarmRowLimit = ChatTuningPrefs.prewarmRowLimit(context)
-                                    val prewarmCharBudget = 96_000
-                                    val raws = mutableListOf<String>()
-                                    var charSum = 0
-                                    for (item in rows.asReversed()) {
-                                        if (raws.size >= prewarmRowLimit || charSum >= prewarmCharBudget) break
-                                        val raw = (item as? FlatChatItem.AssistantMarkdownBlock)?.rawText ?: continue
-                                        raws.add(raw)
-                                        charSum += raw.length
-                                    }
-                                    if (raws.isNotEmpty()) {
+                                    val prewarmSources = collectColdOpenPrewarmSources(
+                                        rowsNewestFirst = rows.asReversed(),
+                                        maxSources = ChatTuningPrefs.prewarmRowLimit(context),
+                                        charBudget = COLD_OPEN_PREWARM_CHAR_BUDGET,
+                                    )
+                                    if (prewarmSources.isNotEmpty()) {
                                         launch(Dispatchers.Default) {
                                             val tPrewarmNs = System.nanoTime()
-                                            prewarmMarkdown(raws)
+                                            prewarmMarkdown(prewarmSources)
                                             val prewarmMs = (System.nanoTime() - tPrewarmNs) / 1_000_000
                                             lastColdPrewarmMs = prewarmMs
                                             com.rikkaminis.app.diagnostics.PerfLongCtx.step(
                                                 sessionId,
                                                 "coldPrewarm.done",
-                                                "rows=${raws.size} chars=$charSum prewarmMs=$prewarmMs",
+                                                "srcs=${prewarmSources.size} " +
+                                                    "chars=${prewarmSources.sumOf { it.length }} prewarmMs=$prewarmMs",
                                             )
                                         }
                                     }
-                                }
-                                com.rikkaminis.app.diagnostics.PerfLongCtx.step(
-                                    sessionId,
-                                    "buildFlatChatItems.firstBuild",
-                                    "msgCount=${msgs.size} rowCount=${rows.size} buildMs=$buildMs",
-                                )
-                                if (rows.size > 3000) {
-                                    com.rikkaminis.app.diagnostics.PerfLongCtx.step(
-                                        sessionId,
-                                        "buildFlatChatItems.highRowCount",
-                                        "rowCount=${rows.size} threshold=3000 msgCount=${msgs.size}",
-                                    )
                                 }
                             } else {
                                 // Incremental reconcile, or a full re-seed when
@@ -3141,6 +3295,13 @@ fun ChatScreen(
                                         }
                                         val buildMs = (System.nanoTime() - tRebuildStart) / 1_000_000
                                         rowLedger.seed(rows, merged.size)
+                                        // [T-android-liveness-census] After the
+                                        // rebuild: pass the rebuilt ROW count,
+                                        // not the merged message count.
+                                        com.rikkaminis.app.diagnostics.Liveness.record(
+                                            com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.ROW_RESEED,
+                                            rows = rows.size,
+                                        )
                                         com.rikkaminis.app.diagnostics.PerfLongCtx.step(
                                             sessionId,
                                             "buildFlatChatItems.ledgerReseed",
@@ -3151,7 +3312,18 @@ fun ChatScreen(
                                 }
                                 lastMergedFingerprint = lightFingerprint(merged)
                             }
-                            flatItems = rowLedger.snapshot()
+                            // [T-android-liveness-census] One record per
+                            // legacy tick on the universal publish point — the
+                            // first wiring sat inside the turn-end block, which
+                            // under-counted (one per turn, not per tick) and
+                            // measured the converge path instead of the live
+                            // ledger path this branch is named for.
+                            val publishedRows = rowLedger.snapshot()
+                            com.rikkaminis.app.diagnostics.Liveness.record(
+                                com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.ROW_LEDGER,
+                                rows = publishedRows.size,
+                            )
+                            flatItems = publishedRows
                             // [fix/scroll-follow-simplify] Removed the
                             // prevRowKeys append-only prefix telemetry and the
                             // followReducer(StreamRowsChanged) dispatch. Under
@@ -3281,7 +3453,7 @@ fun ChatScreen(
                         // at its default anchor rather than guessing.
                         AppLogger.debug(
                             "ChatFocus",
-                            "focus target not found session=$sessionId target=$target rows=${flatItems.size}",
+                            "focus target not found session=${SessionIdAliases.resolve(sessionId)} target=$target rows=${flatItems.size}",
                         )
                         pendingFocusId = null
                         return@LaunchedEffect
@@ -3382,10 +3554,10 @@ fun ChatScreen(
                 var listRootCoords by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
                 // [Perf][LongCtx] T-android-long-ctx-reentry-perf:
                 // fires once per session when the LazyColumn first reports
-                // a layout. Combined with `buildFlatChatItems.firstBuild`
-                // (above) and `lazyColumn.firstItem.placed` (below) this
-                // tells us whether the bottleneck is row-list build,
-                // initial list measure, or per-row composition.
+                // a layout. Combined with `RenderCensus ROW_COLD_BUILD`
+                // (the row-list build branch) and `lazyColumn.firstItem.placed`
+                // (below) this tells us whether the bottleneck is row-list
+                // build, initial list measure, or per-row composition.
                 val perfFirstLayoutFired = remember(sessionId) { java.util.concurrent.atomic.AtomicBoolean(false) }
                 // [bottom-trigger] Gesture edge-trigger REMOVED — it proved
                 // unreliable on device. Follow is engaged only by explicit
@@ -3554,7 +3726,6 @@ fun ChatScreen(
                         val tHangDiagLen = remember(item.key) {
                             when (item) {
                                 is FlatChatItem.UserBubble -> item.message.content.length
-                                is FlatChatItem.AssistantText -> item.messageMarkdown.length
                                 else -> 0
                             }
                         }
@@ -3624,11 +3795,23 @@ fun ChatScreen(
                                             // newest row has laid out.
                                             if (!coldOpenSummaryEmitted) {
                                                 coldOpenSummaryEmitted = true
+                                                // [diag/reentry-latency-anchor] Close the
+                                                // reentry timeline here: this is the first
+                                                // frame whose newest row has laid out, i.e.
+                                                // the moment the user stops waiting. The
+                                                // step carries the real tap→content latency
+                                                // in sinceClickMs, and end() reclaims the
+                                                // per-session maps so a long-lived process
+                                                // cannot keep one entry per opened session.
+                                                com.rikkaminis.app.diagnostics.PerfLongCtx.end(
+                                                    sessionId,
+                                                    "reentry.settled",
+                                                )
                                                 val totalChars = messages.sumOf { m -> m.content.length }
                                                 val maxChars = messages.maxOfOrNull { m -> m.content.length } ?: 0
                                                 AppLogger.info(
                                                     "JankDiag",
-                                                    "[JankDiag] coldOpen summary session=$sessionId msgs=${messages.size} rows=${flatItems.size} " +
+                                                    "[JankDiag] coldOpen summary session=${SessionIdAliases.resolve(sessionId)} msgs=${messages.size} rows=${flatItems.size} " +
                                                         "totalChars=$totalChars maxChars=$maxChars prewarmMs=$lastColdPrewarmMs " +
                                                         "sinceMountMs=${System.currentTimeMillis() - screenMountAtMs} " +
                                                         "hangCount=${com.rikkaminis.app.diagnostics.HangDetector.currentHangCount(context)}",
@@ -3642,7 +3825,7 @@ fun ChatScreen(
                                                         val s = com.rikkaminis.app.diagnostics.ContentDiag.summarize(m.content)
                                                         AppLogger.info(
                                                             "Perf",
-                                                            "[Perf][ContentDiag] session=$sessionId msgIdx=$idx role=${m.role} " +
+                                                            "[Perf][ContentDiag] session=${SessionIdAliases.resolve(sessionId)} msgIdx=$idx role=${m.role} " +
                                                                 "streaming=${m.isStreaming} ${s.asLogFields()}",
                                                         )
                                                     }
@@ -3726,32 +3909,6 @@ fun ChatScreen(
                             )
                             } // close UserBubble SideEffect + UserMessageBubble block
                             is FlatChatItem.AssistantHeader -> AssistantHeader()
-                            is FlatChatItem.AssistantText -> BoundsTrackedBlock(
-                                messageId = item.messageId,
-                                slotKey = "text:${item.block.id}",
-                                markdown = item.messageMarkdown,
-                            ) {
-                                // T-android-gc-storm-issue17: collapse oversized frozen
-                                // assistant text before feeding the markdown parser, which
-                                // is the GC-storm hotspot for legacy sessions.
-                                LargeContentGuard(
-                                    content = item.block.content,
-                                    isStreaming = item.isStreaming,
-                                    stableKey = "text:${item.messageId}:${item.block.id}",
-                                ) {
-                                    SideEffect {
-                                        selectionController.rememberMessageMarkdown(item.messageId, item.messageMarkdown)
-                                    }
-                                    StreamingMarkdownText(
-                                        content = item.block.content,
-                                        isStreaming = item.isStreaming,
-                                        shardId = TextShardId(
-                                            messageId = item.messageId,
-                                            shardId = "text:${item.block.id}",
-                                        ),
-                                    )
-                                }
-                            }
                             is FlatChatItem.AssistantMarkdownBlock -> BoundsTrackedBlock(
                                 messageId = item.messageId,
                                 slotKey = "mdblock:${item.parentBlockId}:${item.blockIndex}",
@@ -3832,50 +3989,6 @@ fun ChatScreen(
                                         android.widget.Toast.LENGTH_SHORT,
                                     ).show()
                                 }) else null,
-                            )
-                            is FlatChatItem.AssistantToolUse -> ToolCallPill(
-                                block = item.block,
-                                allToolBlocks = item.allToolBlocks,
-                                onRetry = if (item.isLastCancelled && !isStreaming && !canResume) ({ safeMutate { viewModel.retryLast() } }) else null,
-                                // T14: route per-card stop to the global
-                                // cancelStream(). The button only renders
-                                // when the block is RUNNING/STREAMING — see
-                                // ToolCallPill `isRunning && onStop != null`
-                                // — so passing it unconditionally is safe.
-                                onStop = { viewModel.cancelStream() },
-                                onOpenTerminalWithCommand = onOpenTerminalWithCommand,
-                                // T261: route detail open through ViewModel so
-                                // the sheet is hoisted out of LazyColumn item
-                                // scope (otherwise the sheet snaps shut when
-                                // the pill scrolls off-screen and Compose
-                                // disposes the item).
-                                onOpenDetail = { viewModel.openToolDetail(it) },
-                                // [T-android-rerun-from-tool-block-position]
-                                // Re-run cuts at THIS tool_use block: keep the
-                                // blocks before it in the same turn, drop it +
-                                // everything after, then regenerate. The block
-                                // id (== tool_use id for a tool_use block) is
-                                // the stable anchor. Gated off while streaming
-                                // (mutating an in-flight turn corrupts agent
-                                // state, same rule as Retry on the user bubble).
-                                // safeMutate tears down the selection toolbar
-                                // before the truncation reshuffles the list.
-                                onRerunFromHere = if (!isStreaming) ({
-                                    coroutineScope.launch {
-                                        tracedScrollToItem("RERUN-FROM-TOOL", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
-                                    }
-                                    safeMutate { viewModel.rerunFromToolBlock(item.messageId, item.block.id) }
-                                }) else null,
-                                onCopyDetails = {
-                                    val text = formatToolDetailsForClipboard(item.block)
-                                    val cb = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                    cb.setPrimaryClip(android.content.ClipData.newPlainText("tool", text))
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        context.getString(R.string.tool_longpress_copied_toast),
-                                        android.widget.Toast.LENGTH_SHORT,
-                                    ).show()
-                                },
                             )
                             is FlatChatItem.AssistantInfo -> FallbackInfoBlock(
                                 block = item.block,
@@ -4012,6 +4125,9 @@ fun ChatScreen(
                                 // [forward-stable] One pending bottom request;
                                 // the "Minis is thinking" indicator mounts via
                                 // the next StreamRowsChanged revision.
+                                // [fix/history-open-catchup-guard] Resume is a
+                                // user intent — revoke the open catch-up too.
+                                openCatchUpUserEngaged = true
                                 followState = followReducer(followState, FollowEvent.Resume)
                             })
                         }
@@ -4517,6 +4633,14 @@ fun ChatScreen(
             messages = messages,
             onSelect = { messageId ->
                 showInputHistorySheet = false
+                // [backlog #5 / fix/open-catchup-history-jump] Jumping to a prior
+                // input is user engagement, exactly like a drag or Resume. Without
+                // this the bounded open catch-up (armed by INITIAL_OPEN for
+                // OPEN_CATCHUP_WINDOW_MS) only recognised drag/Resume, so a jump
+                // made inside that window left the guard "unengaged" and the
+                // FOCUS-MESSAGE scroll was then yanked back to the bottom by the
+                // catch-up pass. Narrow race, but the fix is one line.
+                openCatchUpUserEngaged = true
                 pendingFocusId = messageId
             },
             onDismiss = { showInputHistorySheet = false },
@@ -4847,6 +4971,22 @@ internal const val AGGREGATE_MESSAGE_ITEMS: Boolean = true
 // FLIPPED TO TRUE — the SIMPLE_FOLLOW effect is now the streaming auto-follow
 // driver (see docs/scroll-follow-simplification.md).
 internal const val SIMPLE_FOLLOW: Boolean = true
+
+// [fix/history-open-catchup-guard] Bounded correction window & roll cap for
+// the post-INITIAL_OPEN catch-up. Device data (2026-09-13): the newest row's
+// second composition lands within 9-150ms of the first place, but the same
+// forensics caught a 3.06s outlier (the row's text blocks published only after
+// the opening burst released the default dispatcher) — 1.2s left that open
+// resting "one screen short" with nobody correcting.
+//
+// [fix/open-row-first-frame-final] The row's markdown is now warm before the
+// publish, so the expected number of rolls is ZERO. This stays as the safety
+// net for the height sources that are still asynchronous (math/webview,
+// image decode, deferred sub-composition); 2.5s covers those without keeping
+// the window open so long that a correction lands after the user has started
+// reading. The user revokes it for the rest of the open with any touch.
+private const val OPEN_CATCHUP_WINDOW_MS = 2_500L
+private const val OPEN_CATCHUP_MAX_ROLLS = 4
 
 // [refactor/split-chatscreen] ChatInputArea composable moved verbatim to
 // ChatInputArea.kt (private -> internal; signature unchanged).

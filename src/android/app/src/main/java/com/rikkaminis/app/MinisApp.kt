@@ -268,6 +268,50 @@ class MinisApp : Application(), ImageLoaderFactory {
             Log.w("MinisApp", "NativeCrashHandler install failed: ${t.message}")
         }
 
+        // [mem-spike-diag] 内存尖峰记录器。NativeCrashHandler 只记「崩的那一刻」，
+        // 本记录器补上「一路上怎么涨的」：秒级采样 VmRSS / RssAnon / native heap /
+        // Java heap / **PRoot 子进程聚合 RSS**（区分「涨在 app 自己」还是「涨在
+        // tracer 子进程」），并在每条 shell 命令起止处写 ΔRSS（直接回答「哪条命令
+        // 吃掉多少内存」）。存在理由：MemoryPressureGate 在 RSS ≥ 800MB 时拒绝一切
+        // 工具调用 —— 飙升的那一刻恰好是取证能力归零的时刻，所以必须让进程自己
+        // 落盘。平时（RSS < WATCH_RSS_MB=550）零 IO，落盘位置 files/logs/memspike-<date>.log。
+        try {
+            com.rikkaminis.app.diagnostics.MemorySpikeRecorder.installProductionProviders(
+                logsDir = java.io.File(filesDir, "logs"),
+                nativeHeapBytes = { android.os.Debug.getNativeHeapAllocatedSize() },
+            )
+            applicationScope.launch {
+                val state = com.rikkaminis.app.diagnostics.MemorySpikeRecorder.LoopState()
+                while (isActive) {
+                    kotlinx.coroutines.delay(com.rikkaminis.app.diagnostics.MemorySpikeRecorder.intervalMs)
+                    runCatching { com.rikkaminis.app.diagnostics.MemorySpikeRecorder.sampleOnce(state) }
+                    // [fix/memory-hardening-governor] 采样器只观测，治理器动手：
+                    // 连续 5 拍 RSS≥600MB（且过了 30s 冷却）就把 markdown/KaTeX
+                    // 缓存、idle WebView 页签、idle shell 全部丢掉；没有工具在跑
+                    // 时再补一次同步 GC（同 onTrimMemory 的取舍）。存在的理由：
+                    // onTrimMemory 只在「系统」内存紧张时触发，app 自己涨到 1.7GB
+                    // 而设备还有 6GB 空闲时它永远不来（2026-09-13 16:54 实测）。
+                    // [fix/memory-gate-anon-metric] 采样拍推进压力门状态机（滞回 +
+                    // 置信拍）：只有持续采样方才能攒满置信计数；档位跃迁会落进探针
+                    // 日志（`gate:soft|hard|normal`），后面用"正常重活穿越频率"复核
+                    // 阈值，而不是继续拍脑袋。
+                    runCatching {
+                        com.rikkaminis.app.service.MemoryPressureGate.sampleAndNotify()
+                    }
+                    runCatching {
+                        com.rikkaminis.app.service.AppMemoryGovernor.tick(
+                            anonMb = com.rikkaminis.app.service.MemoryPressureGate.anonMb(),
+                            nowMs = android.os.SystemClock.elapsedRealtime(),
+                            toolRunning = com.rikkaminis.app.service.SessionActivityTracker
+                                .isToolRunning.value,
+                        )
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w("MinisApp", "MemorySpikeRecorder install failed: ${t.message}")
+        }
+
         // T-android-fgs-timeout-crash: chain an UncaughtExceptionHandler
         // ahead of ACRA's so we can intercept
         // android.app.RemoteServiceException$ForegroundServiceDidNotStopInTimeException
@@ -516,9 +560,21 @@ class MinisApp : Application(), ImageLoaderFactory {
             runCatching { ExecutionCoordinator.recycleIdleShells() }
             runCatching { sharedBrowserTabPool.evictIdleTabs() }
         }
-        MemoryPressureGate.pressureListener = { level, rssMB ->
-            AppLogger.warning("MemoryPressureGate", "level=$level rss=${rssMB}MB — " +
+        MemoryPressureGate.pressureListener = { level, anonMB ->
+            AppLogger.warning("MemoryPressureGate", "level=$level anon=${anonMB}MB " +
+                "rss=${MemoryPressureGate.rssMb()}MB — " +
                 (if (level == MemoryPressureLevel.CRITICAL) "admission throttled (reclaim + 2s wait)" else "admission delayed 500ms"))
+        }
+        // [fix/memory-gate-anon-metric] 档位跃迁落探针日志（含降档）。这是"正常重活
+        // 会不会常穿越梯子"的经验依据——阈值 450/1200 后面靠穿越频率复核，不靠拍脑袋。
+        com.rikkaminis.app.service.tierListener = { from, to, anonMB ->
+            runCatching {
+                com.rikkaminis.app.diagnostics.MemorySpikeRecorder.onEvent(
+                    "gate:${to.name.lowercase()}",
+                    "from=$from anon=${anonMB}MB rss=${MemoryPressureGate.rssMb()}MB",
+                )
+            }
+            Unit
         }
 
         // [offload-rss-governance] 把 OffloadRssProbe 的「观测」接到「治理」：
@@ -529,6 +585,34 @@ class MinisApp : Application(), ImageLoaderFactory {
         com.rikkaminis.app.sandbox.OffloadRssProbe.governanceHook = {
             runCatching { ExecutionCoordinator.recycleIdleShells() }
             runCatching { sharedBrowserTabPool.evictIdleTabs() }
+            // [fix/memory-hardening-governor] 治理动作对齐治理器：offload 泄漏
+            // 涨在 app 自身（缓存/映射），只回收 idle shell 治不了「正在跑的
+            // 那个 handler」。丢可重建缓存是安全的（handler 不读 markdown/
+            // KaTeX 缓存），GC 仍留给无工具在跑的时机。
+            runCatching { clearMarkdownParseCachesForMemoryPressure() }
+            runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+        }
+
+        // [fix/memory-hardening-governor] 采样器只观测，这里给它「动手」的能力。
+        // 动作与 onTrimMemory(CRITICAL) 完全一致（同一批可重建缓存 + idle 资源），
+        // 区别只在于触发源是 app 自身 RSS 而不是系统内存压力。
+        com.rikkaminis.app.service.AppMemoryGovernor.dropCachesHook = {
+            runCatching { clearMarkdownParseCachesForMemoryPressure() }
+            runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+            runCatching { sharedBrowserTabPool.evictIdleTabs() }
+            runCatching { ExecutionCoordinator.recycleIdleShells() }
+        }
+        com.rikkaminis.app.service.AppMemoryGovernor.gcHook = {
+            runCatching { System.gc() }
+        }
+        com.rikkaminis.app.service.AppMemoryGovernor.observer = { action, rssMb ->
+            Log.w("MinisApp", "[memory-governor] $action rss=${rssMb}MB")
+            runCatching {
+                com.rikkaminis.app.diagnostics.MemorySpikeRecorder.onEvent(
+                    "govern:${action.name.lowercase()}",
+                    "rss=${rssMb}MB",
+                )
+            }
         }
 
         // [T-android-session-paused-badge] Per-session badge-state queue

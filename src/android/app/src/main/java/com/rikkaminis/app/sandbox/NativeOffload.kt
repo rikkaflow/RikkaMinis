@@ -2,8 +2,11 @@ package com.rikkaminis.app.sandbox
 
 import android.net.LocalServerSocket
 import android.net.LocalSocket
+import android.os.Process
 import android.util.Log
 import com.rikkaminis.app.BuildConfig
+import com.rikkaminis.app.diagnostics.MemorySpikeRecorder
+import com.rikkaminis.app.sandbox.offload.OffloadQueuePolicy
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -102,7 +105,6 @@ fun interface NativeOffloadHandler {
 
 object NativeOffloadServer {
     private const val TAG = "NativeOffloadServer"
-    private const val SOCKET_BASE = "native-offload"
     private const val MAGIC_REQ = 0x46464F4E  // 'N' 'O' 'F' 'F' little-endian
     private const val MAGIC_RSP = 0x52464F4E  // 'N' 'O' 'F' 'R'
     private const val VERSION = 1
@@ -118,13 +120,14 @@ object NativeOffloadServer {
     // (com.rikkaminis.app.lab) and the stable build (com.rikkaminis.app) fight
     // over the same abstract socket name and one of them fails to bind
     // ("failed to bind abstract socket 'native-offload' ... previous process
-    // holding the namespace?") and crashes in MinisApp.onCreate. Keying the
-    // name off BuildConfig.APPLICATION_ID makes each install bind its own
-    // socket. libproot's native_offload extension is fully parameterized over
-    // this name (received via `--native-offload=<name>:<handlers>` in
-    // PRootKernel), so the Kotlin and C sides stay consistent.
-    private val SOCKET_NAME =
-        SOCKET_BASE + "-" + BuildConfig.APPLICATION_ID.replace('.', '_')
+    // holding the namespace?") and crashes in MinisApp.onCreate. libproot's
+    // native_offload extension is fully parameterized over this name
+    // (received via `--native-offload=<name>:<handlers>` in PRootKernel), so
+    // the Kotlin and C sides stay consistent.
+    // [multi-instance] …and per *running instance* (uid): 应用双开 / 多用户
+    // 跑的是同一 applicationId 的不同 uid，只按包名命名会让第二个实例撞名
+    // → bind 全失败 → onCreate 崩溃/重启循环。见 [offloadSocketName]。
+    private val SOCKET_NAME = offloadSocketName(BuildConfig.APPLICATION_ID, Process.myUid())
 
     val socketName: String = SOCKET_NAME
 
@@ -244,6 +247,7 @@ object NativeOffloadServer {
                 // heap. The slot is released on every exit path (success,
                 // decode error, handler throw) so one bad client can't leak
                 // the worker permit.
+                val queueStartNs = System.nanoTime()
                 val acquired = try {
                     workerConcurrency.acquire()
                 } catch (e: InterruptedException) {
@@ -251,8 +255,12 @@ object NativeOffloadServer {
                     runCatching { client.close() }
                     return@thread
                 }
+                // [audit-cs0913] Time spent waiting for a slot — reported by
+                // handleClient (see OffloadQueuePolicy). Pool size is
+                // ConcurrencyPrefs.maxConcurrentSessions() (default 2).
+                val queueMs = (System.nanoTime() - queueStartNs) / 1_000_000
                 try {
-                    handleClient(client)
+                    handleClient(client, queueMs)
                 } catch (e: Exception) {
                     Log.w(TAG, "worker error: ${e.message}", e)
                 } finally {
@@ -263,7 +271,7 @@ object NativeOffloadServer {
         }
     }
 
-    private fun handleClient(client: LocalSocket) {
+    private fun handleClient(client: LocalSocket, queueMs: Long) {
         val input = DataInputStream(client.inputStream)
         val output = DataOutputStream(client.outputStream)
 
@@ -332,8 +340,29 @@ object NativeOffloadServer {
         val rssAfterKb = OffloadRssProbe.rssKb()
         if (handler != null) {
             OffloadRssProbe.record(name, rssBeforeKb, rssAfterKb)
+            // [mem-spike-diag] 同一份归因也写进内存尖峰记录器：offload 工具
+            //（android-* / browser-use / model-use / sessions …）**不走**
+            // ExecutionCoordinator，cmd-start/cmd-end 完全看不到它们 —— 而
+            // 2026-09-13 16:54 那次尖峰（native 38MB→1141MB）恰恰全程无 cmd 记录。
+            val offloadSession = env["MINIS_CHAT_SESSION_ID"] ?: "-"
+            MemorySpikeRecorder.onEvent(
+                "offload",
+                "handler=$name Δ=${(rssAfterKb - rssBeforeKb) / 1024}MB session=$offloadSession",
+            )
         }
         val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+
+        // [audit-cs0913] Back-pressure report. The worker pool blocks on
+        // Semaphore.acquire() with no timeout, so a saturated pool (or one long
+        // handler) silently stalls later tool calls until the shell-level stall
+        // watchdog kills them 180s later — indistinguishable from a broken tool.
+        // Recorded, NOT enforced: measure first, then decide on a guardrail and
+        // its threshold. See OffloadQueuePolicy.
+        if (OffloadQueuePolicy.shouldReport(queueMs, elapsedMs)) {
+            val detail = OffloadQueuePolicy.describe(name, queueMs, elapsedMs)
+            Log.w(TAG, "offload backpressure: $detail")
+            MemorySpikeRecorder.onEvent("offload-latency", detail)
+        }
 
         val tmpDir = rootfsTmpDir ?: throw IllegalStateException("server not started")
         tmpDir.mkdirs()
