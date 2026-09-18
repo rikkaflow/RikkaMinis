@@ -365,6 +365,30 @@ private fun MdText(
     // every animation frame. When no ranges are active overlay() returns the
     // base text unchanged.
     val effectiveText = fadeController?.overlay(text, color) ?: text
+    // [23c-2] Render-time resolve: style minis:// links whose target file no
+    // longer exists as grey / no-underline (disabled), instead of a clickable
+    // blue that only surfaces a Toast after the tap. Resolution goes through
+    // the session-scoped cache (LocalMarkdownLinkRenderResolver) — null in
+    // non-chat contexts, which keep rendering links as before.
+    val linkRenderResolver = LocalMarkdownLinkRenderResolver.current
+    val missingLinkRanges = remember(text, linkRenderResolver) {
+        if (linkRenderResolver == null) emptyList<IntRange>()
+        else text.getStringAnnotations("url", 0, text.length)
+            .distinctBy { it.item }
+            .mapNotNull { ann ->
+                if (linkRenderResolver(ann.item) is ChatLinkAction.MissingFile) {
+                    ann.start until ann.end
+                } else null
+            }
+    }
+    val missingLinkStyle = SpanStyle(
+        color = currentMdColors().link.copy(alpha = 0.4f),
+        textDecoration = TextDecoration.None,
+    )
+    val resolvedText = if (missingLinkRanges.isEmpty()) effectiveText else buildAnnotatedString {
+        append(effectiveText)
+        for (r in missingLinkRanges) addStyle(missingLinkStyle, r.first, r.last + 1)
+    }
     val tapModifier = if (hasUrlAnnotation || hasInlineCodeAnnotation) {
         Modifier.pointerInput(text) {
             detectTapGestures { pos ->
@@ -392,7 +416,7 @@ private fun MdText(
         }
     } else Modifier
     Text(
-        text = effectiveText,
+        text = resolvedText,
         fontSize = fontSize,
         lineHeight = lineHeight,
         fontWeight = fontWeight,
@@ -1315,7 +1339,14 @@ private fun RenderBlock(block: MdBlock) {
             // that global lookup answers with the wrong session's path (or
             // null) and the image quietly renders as a 0-height placeholder.
             // The video/audio renderers already follow this pattern.
-            val file = remember(block.url, sessionId) { resolveMdMediaFile(context, block.url, sessionId) }
+            // [fix/audit-0917-b9] resolveMdMediaFile does disk stat()
+            // (exists/isFile) plus PRoot host-path resolution; it was
+            // synchronous inside remember, so the first render of every image
+            // blocked the composition thread. rememberMdMediaFile produces it
+            // off-main (see helper KDoc); SubcomposeAsyncImage renders against
+            // the URL until the file resolves, then the imageRequest's own
+            // remember(file, url) rebuilds with the File.
+            val file = rememberMdMediaFile(block.url, sessionId)
             // T146: 1dp hairline + 2dp soft shadow so a white-bg PNG (matplotlib
             // chart, screenshot…) reads as a discrete card against the chat
             // surface. Same ChatColors.thumbnailBorder / inputShadow recipe as
@@ -1722,12 +1753,29 @@ private fun formatMdMediaMs(ms: Int): String {
     return "%d:%02d".format(totalSec / 60, totalSec % 60)
 }
 
+/**
+ * [fix/audit-0917-b9] Off-main resolver for markdown media URLs. The old
+ * pattern `remember(url, sessionId) { resolveMdMediaFile(...) }` ran disk
+ * stat() (exists/isFile) + PRoot host-path resolution synchronously in
+ * composition on every image/video/audio first render. Produced on IO;
+ * consumers render against the URL until the File lands and rebuild (their
+ * remembered players/requests key on the absolute path, so the null→File
+ * transition re-runs them exactly once).
+ */
+@Composable
+private fun rememberMdMediaFile(url: String, sessionId: String?): File? {
+    val context = LocalContext.current
+    val resolved by androidx.compose.runtime.produceState<File?>(initialValue = null, url, sessionId) {
+        value = withContext(Dispatchers.IO) { resolveMdMediaFile(context, url, sessionId) }
+    }
+    return resolved
+}
+
 @Composable
 private fun RenderMdVideo(block: MdBlock.Video) {
-    val context = LocalContext.current
     val colors = currentMdColors()
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMdMediaFile(context, block.url, sessionId) }
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromMdUrl(block.url) }
     var showPlayer by remember { mutableStateOf(false) }
 
@@ -1818,7 +1866,7 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
     val context = LocalContext.current
     val colors = currentMdColors()
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMdMediaFile(context, block.url, sessionId) }
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromMdUrl(block.url) }
 
     val player = remember(file?.absolutePath) {

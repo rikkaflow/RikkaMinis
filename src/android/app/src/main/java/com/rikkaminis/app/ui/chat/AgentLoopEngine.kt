@@ -345,11 +345,27 @@ internal class AgentLoopEngine(
             // text block — which may NOT be the last block once trailing
             // content arrived after tool_calls; ordered mode keeps the
             // original trailing-block behaviour.
+            /**
+             * [fix/tool-call-copy-suppress] Fix 1 — the text a user / the next
+             * request may see, with any restated tool call taken out. Remaining
+             * markup is remembered on the loop state for the refill branch in
+             * `toolCalls.isEmpty()` (Fix 2): the stripped text can no longer
+             * answer "did this turn try to call a tool?".
+             */
+            fun visibleToolCallText(raw: String): String {
+                if (raw.takeIf { it.contains("<") } == null) return raw
+                val knownToools = host.agentTools.map { it.name }
+                val seen = ToolCallResiduePolicy.firstResidue(raw, knownToools)
+                if (seen == null) return raw
+                loopState.toolCallResidueRaw = raw
+                return ToolCallResiduePolicy.stripResidue(raw, knownToools)
+            }
+
             fun materializeActiveTextBlock() {
                 val sb = currentTextBlockSb ?: return
                 val idx = if (loopState.currentProvider.streamTextIsMonolithic) turnTextBlockIdx else loopState.allToolBlocks.lastIndex
                 if (idx >= 0 && idx < loopState.allToolBlocks.size && loopState.allToolBlocks[idx].kind == "text") {
-                    loopState.allToolBlocks[idx] = loopState.allToolBlocks[idx].copy(content = sb.toString())
+                    loopState.allToolBlocks[idx] = loopState.allToolBlocks[idx].copy(content = visibleToolCallText(sb.toString()))
                 }
             }
             val turnThinking = StringBuilder()
@@ -515,6 +531,24 @@ internal class AgentLoopEngine(
                         // T307: append-only on the StringBuilder; .toString()
                         // is taken once below at flush time, not per delta.
                         turnTextSb.append(chunk.text)
+                        // [fix/tool-call-copy-suppress] Fix 1 on the turn
+                        // accuмulator: every display flush below reads
+                        // `accumulatedText + turnTextSb.toString()`, and the
+                        // persised turn / the next request read it too. Scanned
+                        // on a tag-bearing delta, on every ~300 new characters,
+                        // and whenever the accuмulator shrank (new turn) — so a
+                        // copy split across deltas is still taken out once its
+                        // closing tag lands.
+                        if (turnTextSb.length < loopState.residueScanAt ||
+                            turnTextSb.length > loopState.residueScanAt + 300 ||
+                            chunk.text.contains("<")) {
+                            val visibleTurn = visibleToolCallText(turnTextSb.toString())
+                            if (visibleTurn.length != turnTextSb.length) {
+                                turnTextSb.setLength(0)
+                                turnTextSb.append(visibleTurn)
+                            }
+                            loopState.residueScanAt = turnTextSb.length
+                        }
                         // Append to the trailing text block — or open a new one if the last
                         // block isn't a text block (i.e. a tool call or thinking was in between).
                         // This preserves the chronological interleaving of text and tool calls
@@ -896,11 +930,16 @@ internal class AgentLoopEngine(
                     // and was misclassified as FATAL: no same-model retry, no fallback
                     // (unless strategy=always). With a proxy route whose first chunk
                     // legitimately takes 20-60s, every 30s guard hit surfaced as a hard
-                    // user-visible error. Both 0-chunk types are equally safe to retry.
-                    val workerDiedZeroChunk =
-                        ((actual is com.rikkaminis.app.sandbox.offload.ModelWorkerDiedException) ||
-                            (actual is com.rikkaminis.app.sandbox.offload.ModelStreamErrorException)) &&
-                        (actual as? com.rikkaminis.app.sandbox.offload.ModelExecutionStreamException)?.hadChunks == false
+                    // user-visible error. Both 0-chunk types are equally safe to retry —
+                    // **as long as the worker did not classify the failure itself**.
+                    // §17 [fix/permanent-4xx-retried-as-transient]: that condition used
+                    // to be missing, so a permanent `[400] model not found` (worker
+                    // stamps kind=provider; hadChunks=false because the relay rejects
+                    // before any chunk) was retried 3x on the same member — 1+2+4s
+                    // of dead wait before a fallback that always succeeded. The
+                    // judgement now lives in one place (decideStreamFailure): a stamped
+                    // kind speaks for itself, and the 0-chunk heuristic only covers
+                    // UNSTAMPED failures (legacy worker / real worker death / timeout).
                     // [fix/stream-error-silent-recovery] A mid-stream failure
                     // (hadChunks=true) used to fall through to the fatal path:
                     // the worker→client error line carried no type info, so the
@@ -914,16 +953,23 @@ internal class AgentLoopEngine(
                     // retries (rate-limit / bad-key members can't self-heal).
                     // Null kind (legacy worker) → FATAL, byte-identical to the
                     // old behavior.
-                    val streamErrorAction =
-                        (actual as? com.rikkaminis.app.sandbox.offload.ModelStreamErrorException)
-                            ?.let { ChatStreamErrorPolicy.classify(it.kind) }
-                    val streamErrorAutoRetry = streamErrorAction == ChatStreamErrorPolicy.Action.AUTO_RETRY
-                    val streamErrorFallbackNow =
-                        streamErrorAction == ChatStreamErrorPolicy.Action.FALLBACK_NOW
+                    // §17: one entry point decides recovery for a failure that
+                    // crossed the worker boundary (worker death / worker-reported
+                    // stream error). It reads the stamped kind when there is one,
+                    // and only falls back to the 0-chunk heuristic when there is not.
+                    val streamFailure =
+                        (actual as? com.rikkaminis.app.sandbox.offload.ModelExecutionStreamException)
+                            ?.let {
+                                ChatStreamErrorPolicy.decideStreamFailure(
+                                    hasChunks = it.hadChunks,
+                                    kind = (it as? com.rikkaminis.app.sandbox.offload.ModelStreamErrorException)?.kind,
+                                )
+                            }
+                    val streamErrorAutoRetry = streamFailure?.isTransient == true
+                    val streamErrorFallbackNow = streamFailure?.fallbackNow == true
                     val isTransient = actual is com.rikkaminis.app.data.model.LLMError.NetworkError ||
                         actual is com.rikkaminis.app.data.model.LLMError.TransientError ||
                         is5xx ||
-                        workerDiedZeroChunk ||
                         streamErrorAutoRetry
                     // [T-fallback-retry-original] Restored original behavior: all members
                     // (including fallback chain members) get bounded retries on transient
@@ -937,7 +983,12 @@ internal class AgentLoopEngine(
                         val delaySec = retryDelays[retryAttempt]
                         retryAttempt += 1
                         val errDesc = actual.message ?: actual.javaClass.simpleName
-                        Log.w("ChatViewModel", "🔁 Transient error on ${loopState.currentProvider.model.displayName}, retry $retryAttempt/${retryDelays.size} in ${delaySec}s: $errDesc")
+                        // §17: which judgement fired rides along in the log — a
+                        // misclassification must be settle-able from the log alone,
+                        // not re-derived from source (that re-derivation is exactly what
+                        // this backlog item cost).
+                        val retryBasis = streamFailure?.basis ?: "llm-error:${actual.javaClass.simpleName}"
+                        Log.w("ChatViewModel", "🔁 Transient error on ${loopState.currentProvider.model.displayName}, retry $retryAttempt/${retryDelays.size} in ${delaySec}s: $errDesc [$retryBasis]")
                         // T7-A: 观察 —— provider 瞬态失败（T5 ProviderAttemptFinished(TRANSIENT_FAILURE)）
                         traceObserver.t7State(ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.CALLING_MODEL), ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.RETRYING), "ProviderAttemptFinished(TRANSIENT_FAILURE)")
                         // T7-D: 旁路验证 —— provider 瞬态失败
@@ -1867,8 +1918,73 @@ internal class AgentLoopEngine(
                         content = verifyNudge,
                         contentParts = listOf(AgentContentPart.Text(verifyNudge)),
                     )
+                    // [fix/same-class-cleanup] Same invariant the entry points
+                    // already enforce ([ensureRoleAlternationBeforeUserAppend]):
+                    // tool results are persisted to history as role=USER
+                    // messages, so the tail here can be user(tool_result) when
+                    // the PREVIOUS turn dispatched tools — a blind USER append
+                    // yields two consecutive user roles (Anthropic hard 400
+                    // `roles must alternate` / OpenAI silent merge that
+                    // swallows the tool_result pairing). Bridge first.
+                    ensureRoleAlternationBeforeUserAppend(host.agentHistory)
                     host.agentHistory.add(nudgeMsg)
                     continue
+                }
+
+                // [fix/tool-call-copy-suppress] Fix 2 — refill instead of
+                // failing silent. When the turn's visible text carried a
+                // tool-call markup but nothing parsed as a call, the model DID
+                // try to call a tool: the markup arrived as text (character
+                // drift on the model / relai side drops the name past every
+                // parser). The old path fell through to the break below, which
+                // reads as a clean completion — the user sees a run stop
+                // mid-task with no banner and no retry. Hand the turn back
+                // instead, bounded so a markup-shaped false positive cannot
+                // loop forever. Consume-on-read: the flag is per turn, or a
+                // later turn that carried no resique would refill on a stale
+                // one.
+                val resiqueRaw = loopState.toolCallResidueRaw
+                loopState.toolCallResidueRaw = null
+                if (resiqueRaw != null && loopState.toolCallResidueNudges < ToolCallResiduePolicy.MAX_RESIDUE_REFILL_NUDGES &&
+                    // [fix/audit0917-b8] Same gate as the verify nudge above, for
+                    // the same reason: a terminal error means the user has
+                    // ALREADY been told the run failed (length wall /
+                    // deterministic-empty / repetition abort / EOF stub).
+                    // `continue` here would revive that run, and a revived turn
+                    // that then succeeds leaves the banner and the trace
+                    // contradicting the outcome. The refill's own trigger is
+                    // markup-shaped text with nothing parsed, which is exactly
+                    // what those terminal states produce — so this path is the
+                    // LIKELIEST to fire after a terminal error, not the least.
+                    !loopState.terminalErrorSurfaced
+                ) {
+                    val seen = ToolCallResiduePolicy.firstResidue(resiqueRaw, host.agentTools.map { it.name })
+                    if (seen != null) {
+                        loopState.toolCallResidueNudges++
+                        val refill = ToolCallResiduePolicy.refillMessage(seen)
+                        AppLogger.warning(
+                            TAG_STREAM,
+                            "runAgentLoop turn=$turn tool-call resique in visible text " +
+                                "(name=${seen.rawName}, sugested=${seen.sugestedName}) — " +
+                                "refilling ${loopState.toolCallResidueNudges}/${ToolCallResiduePolicy.MAX_RESIDUE_REFILL_NUDGES} " +
+                                "instead of failing through to the break",
+                        )
+                        val nudgeMsg = LLMMessage(
+                            role = LLMMessage.Role.USER,
+                            content = refill,
+                            contentParts = listOf(AgentContentPart.Text(refill)),
+                        )
+                        // [fix/same-class-cleanup] Same role-alternation guard
+                        // as the verify nudge above — the refill's trigger
+                        // (tool-call-shaped markup, nothing parsed) is MOST
+                        // common right after a tool-dispatch turn, when the
+                        // tail is user(tool_result). A blind USER append would
+                        // yield two consecutive user roles (Anthropic hard 400
+                        // / OpenAI silent merge).
+                        ensureRoleAlternationBeforeUserAppend(host.agentHistory)
+                        host.agentHistory.add(nudgeMsg)
+                        continue
+                    }
                 }
 
                 AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn no tool calls → break (finishReason=$turnFinishReason)")
@@ -2057,6 +2173,10 @@ internal class AgentLoopEngine(
                 break
             }
             AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn dispatching ${toolCalls.size} tool call(s), continuing")
+            // [fix/tool-call-copy-suppress] The turn DID dispatch: whatever
+            // markup its text carried was a copy of a call that went through,
+            // so forget it — only a turn that dispatched NOTHING may refill.
+            loopState.toolCallResidueRaw = null
 
             // [T-android-session-last-message-live-tool-call] Push a live
             // preview to the session list NOW, before the (possibly long-
@@ -2080,6 +2200,11 @@ internal class AgentLoopEngine(
 
             // Execute all tool calls
             val resultParts = mutableListOf<AgentContentPart>()
+            // [T-sensitive-transcript] tool-call id -> replacement text for the
+            // PERSISTED copy only. Populated while the call is in flight (the
+            // command line exists nowhere else), consumed by the
+            // persistToolResultMessage call at the end of the turn.
+            val transcriptRedactions = mutableMapOf<String, String>()
 
             // ------------------------------------------------------------------
             // Tool dispatch — split into passes so a batch of read-only tools
@@ -2220,6 +2345,19 @@ internal class AgentLoopEngine(
                     ))
                     continue
                 }
+                // [T-sensitive-transcript] Record this call's provenance while
+                // the command line is still in hand — ToolResult carries no
+                // command and the persisted parts JSON never sees one, so
+                // deferring this to backup-export time would leave nothing to
+                // filter on. Placed after the truncation guard on purpose:
+                // a call that will not execute produces an error message, not
+                // a payload worth withholding. See SensitiveCommandPolicy.
+                if (name == "shell_execute") {
+                    val command = if (args.has("command")) args.optString("command") else null
+                    if (SensitiveCommandPolicy.shouldRedactFromTranscript(command)) {
+                        transcriptRedactions[id] = SensitiveCommandPolicy.redactionPlaceholder(command)
+                    }
+                }
                 // [T-android-overlay-tool-title] Pull tool_title uniformly
                 // from args for ALL tools — without this browser_use's
                 // tool_title never reached the overlay (only shell_execute
@@ -2321,7 +2459,9 @@ internal class AgentLoopEngine(
                     // strings.xml refactor in other sessions. Promote to a
                     // localized R.string entry in a follow-up if needed.
                     val uiMessage = "Blocked invalid tool call"
-                    val modelMessage = "Error: Tool call rejected before execution. $preflightError The arguments your client sent were empty or missing required fields — re-issue the call with all required parameters filled in. Do not retry with the same empty arguments."
+                    val modelMessage = "Error: Tool call rejected before execution. $preflightError " +
+                        "Correct the arguments so they match the tool's published schema, then re-issue the call. " +
+                        "Do not retry with the same arguments."
                     val blockIdxPre = loopState.allToolBlocks.indexOfFirst { it.id == id }
                     if (blockIdxPre >= 0) {
                         val elapsedPre = System.currentTimeMillis() - loopState.allToolBlocks[blockIdxPre].startTimeMs
@@ -2564,7 +2704,7 @@ internal class AgentLoopEngine(
 
             // Persist tool results as user-role message (mirrors iOS)
             android.util.Log.i("ChatVMStream", "runAgentLoop turn=$turn persist assistant done (dbId=$assistantDbId), toolResult-begin")
-            val toolResultDbId = host.persistToolResultMessage(resultParts)
+            val toolResultDbId = host.persistToolResultMessage(resultParts, transcriptRedactions)
             android.util.Log.i("ChatVMStream", "runAgentLoop turn=$turn persist-both done (toolDbId=$toolResultDbId)")
 
             // Add tool results to history

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RikkaMinis</string>
+    <string name="onboarding_default_group_name">默认模型</string>
     <string name="new_chat">新对话</string>
     <string name="settings">设置</string>
     <string name="providers">AI 服务商</string>
@@ -1633,6 +1634,7 @@
     <string name="rootfs_insufficient_space">空间不足：需要约 %1$d MB，可用仅 %2$d MB。请清理存储后重试。</string>
 
     <!-- Fix: minis:// 链接失效/文件已清理时的提示，以及本地化的外部 scheme 拦截文案。 -->
+    <string name="chat_link_path_invalid">此链接指向的路径无效。</string>
     <string name="chat_link_file_missing">此文件已不可用。</string>
     <string name="webpreview_blocked_scheme">已拦截指向外部应用的链接。</string>
     <string name="thinking_rules_section">思考规则</string>
@@ -1679,6 +1681,7 @@
     <string name="notification_tool_browser">正在使用浏览器</string>
     <string name="notification_tool_read_image">正在读取图片</string>
     <string name="notification_tool_memory">正在使用记忆</string>
+    <string name="notification_tool_history">正在回看对话记录</string>
     <string name="notification_tool_search">正在搜索</string>
     <string name="notification_tool_generic">正在使用 %1$s</string>
     <string name="config_confirm_title_one">确认更改</string>

@@ -73,9 +73,16 @@ private val taskListItemRegex = Regex("^[-*+]\\s+\\[[ xX]\\]\\s+.*")
 private val taskListPrefixRegex = Regex("^[-*+]\\s+\\[[ xX]\\]\\s+")
 private val bulletListItemRegex = Regex("^[-*+]\\s+.*")
 private val bulletListPrefixRegex = Regex("^[-*+]\\s+")
-private val numberedListItemRegex = Regex("^\\d+[.)\\s]+.*")
-private val numberedListStartRegex = Regex("^(\\d+)")
-private val numberedListPrefixRegex = Regex("^\\d+[.)\\s]+")
+// Marker must be real punctuation (`.`/`)`): a bare number + space is prose.
+// Without this, a paragraph opening like "4 分钟没扫完…" became ordered-list
+// item #4 and rendered as "4.  分钟没扫完" (user report 2026-09-17; chat
+// messages flow through THIS parser — StreamingMarkdownText — while the
+// look-alike regexes in ui/markdown/MarkdownParser.kt serve other screens).
+// \d{1,2} keeps "2020 年…" safe; whitespace-or-EOL after the marker keeps
+// "3.14 是 π" / "1.5倍速" prose. Keep both parsers aligned.
+private val numberedListItemRegex = Regex("^\\d{1,2}[.)](?:\\s+.*)?$")
+private val numberedListStartRegex = Regex("^(\\d{1,2})[.)]")
+private val numberedListPrefixRegex = Regex("^\\d{1,2}[.)](?:\\s+|$)")
 
 /**
  * A blockquote line must be `>` followed by a space, a tab, or end of line.
@@ -87,6 +94,28 @@ private fun isBlockquoteLine(trimmed: String): Boolean {
     if (trimmed.length == 1) return true
     val next = trimmed[1]
     return next == ' ' || next == '\t'
+}
+
+/**
+ * An ATX heading is a `#`…`######` run followed by a space, or a bare run
+ * (`#`, `###` — empty heading). Everything else that starts with `#` is
+ * prose and must stay prose on BOTH sides of the gate: the heading branch
+ * renders it, the paragraph loop uses this same predicate to decide whether
+ * to stop collecting.
+ *
+ * That agreement is load-bearing. When the paragraph loop instead used a bare
+ * `t.startsWith("#")`, a `#`-prefixed non-heading line (`#196 @sha …`,
+ * `#!/bin/sh`, `#include`, `#hashtag`) broke the loop on its FIRST line with
+ * nothing collected, so `i` never advanced and [parseMarkdownBlocks] spun
+ * forever at 100 % CPU — the message/preview never rendered. Repro 2026-09-15:
+ * opening the 1.8 MB dev-history archive in the file preview (it contains
+ * `#196 @68250c1 …`).
+ */
+private fun isAtxHeading(trimmed: String): Boolean {
+    if (!trimmed.startsWith("#")) return false
+    val hashes = trimmed.indexOfFirst { it != '#' }
+    if (hashes < 0) return true // "#", "###" — heading with empty text
+    return trimmed[hashes] == ' '
 }
 
 /**
@@ -245,6 +274,7 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             sinceLastCheck = 0
         }
         sinceLastCheck++
+        val loopStart = i
         val line = lines[i]
         val trimmed = line.trimStart()
 
@@ -322,7 +352,7 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             }
 
             // Heading
-            trimmed.startsWith("#") && (trimmed.length == 1 || trimmed[trimmed.indexOfFirst { it != '#' }.coerceAtLeast(0)] == ' ') -> {
+            isAtxHeading(trimmed) -> {
                 val level = trimmed.takeWhile { it == '#' }.length.coerceAtMost(6)
                 val text = trimmed.drop(level).trimStart()
                 blocks.add(MdBlock.Heading(line, level, text))
@@ -404,8 +434,16 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
                     if (!t.matches(bulletListItemRegex) && indent <= baseIndent) break
-                    if (indent > baseIndent) {
-                        // Continuation or nested — append to last item
+                    if (indent > baseIndent && !t.matches(bulletListItemRegex)) {
+                        // Continuation (indented prose) — append to last item.
+                        // [fix/indented-bullet-continuation] An indented line that is
+                        // itself a bullet marker (`  - item`) is a REAL
+                        // new item, not a continuation: the old branch swallowed it
+                        // into the previous item's text, leaving the raw "- " marker
+                        // visible in the body. Same guard as ui/markdown/
+                        // MarkdownParser.kt (fix/audit-0917-b9), which also excludes
+                        // ONLY bullet markers (an indented numbered line stays a
+                        // continuation there too); keep the two parsers in sync.
                         if (items.isNotEmpty()) {
                             val last = items.last()
                             items[items.lastIndex] = last.copy(text = last.text + "\n" + t)
@@ -432,7 +470,11 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
                     if (!t.matches(numberedListItemRegex) && indent <= baseIndent) break
-                    if (indent > baseIndent) {
+                    if (indent > baseIndent && !t.matches(numberedListItemRegex)) {
+                        // Same guard as the unordered-list branch above (see
+                        // fix/indented-bullet-continuation): an indented line that is
+                        // itself a numbered marker (`  2. item`) is a real new item,
+                        // not continuation text.
                         if (items.isNotEmpty()) {
                             val last = items.last()
                             items[items.lastIndex] = last.copy(text = last.text + "\n" + t)
@@ -455,7 +497,7 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                 while (i < lines.size) {
                     val l = lines[i]
                     val t = l.trimStart()
-                    if (t.isEmpty() || t.startsWith("#") || t.startsWith("```") ||
+                    if (t.isEmpty() || isAtxHeading(t) || t.startsWith("```") ||
                         isBlockquoteLine(t) || t.matches(thematicBreakRegex) ||
                         t.matches(bulletListItemRegex) || t.matches(numberedListItemRegex) ||
                         t.matches(standaloneImageLineRegex) ||
@@ -492,6 +534,15 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                 }
             }
         }
+        // Progress guard: every branch in the `when` above must advance `i`.
+        // The paragraph branch is the only one that can legitimately collect
+        // nothing (it `break`s immediately when the line belongs to another
+        // block type) — and when that happened because a predicate up there
+        // disagreed with the branch that rejected the line, this loop spun
+        // forever with `i` frozen. Forcing one line of progress turns any
+        // future predicate drift into "one stray block" instead of a hung
+        // renderer.
+        if (i == loopStart) i++
     }
     return blocks
 }

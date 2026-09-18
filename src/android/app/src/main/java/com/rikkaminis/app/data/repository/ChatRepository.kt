@@ -568,6 +568,13 @@ class ChatRepository(
                 return if (url != null) cap(cleanPreview("$action $url"))
                 else cap(cleanPreview("browser_use $action"))
             }
+            "conversation_history" -> {
+                // [U10] Show what was looked up: the query, or "reading back" for
+                // a plain tail read. Without this the block title falls back to a
+                // raw "conversation_history" argument dump.
+                val q = str("query")
+                return cap(cleanPreview(if (q != null) "history: $q" else "reading back the conversation"))
+            }
             "memory_write" -> str("content")?.let { return cap(cleanPreview("memory_write: $it")) }
             "memory_get" -> {
                 val arr = input.optJSONArray("keywords")
@@ -802,6 +809,16 @@ class ChatRepository(
      * each. Distinct from [extractTextPreview] / [cleanPreview] above —
      * those collapse markdown for a 100-char single-line preview, while
      * this preserves the full text the offload caller wants to inspect.
+     *
+     * Precedence when a message mixes part kinds (only the first
+     * non-empty tier is returned, so a message carrying both mediaRef
+     * and toolUse yields "[Image]" — deliberate, since the consumers are
+     * previews and a user-visible transcript where the typed text or the
+     * media marker is the more useful signal than the tool list):
+     *   1. text blocks (joined)
+     *   2. "[Image]" when any mediaRef exists
+     *   3. tool names / tool_title when any toolUse exists
+     *   4. "[Tool result: …]" summaries when any toolResult exists
      */
     private fun extractTextForOffload(partsJson: String): String {
         return try {

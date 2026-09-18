@@ -298,3 +298,113 @@ const val CANCELLED_MARKER =
  * by this version.
  */
 internal const val LEGACY_CANCELLED_MARKER = "[cancelled by user]"
+
+/**
+ * [refactor/inflight-predicate] One predicate for "this row belongs to the
+ * live state" — the invariant that previously lived inline at each
+ * rebuild/truncation site and was re-derived there once per incident
+ * (compact graying enumerated it, flushPendingSysInfo re-derived a NARROWER
+ * copy without [isQueued]). From now on: one judgment, called at the
+ * rebuild/truncation sites, not re-derived per incident.
+ *
+ * A live row is any non-system row that is still owned by the current turn:
+ * streaming, queued (user prompt not yet sent), or awaiting its first model
+ * response. System rows (dividers/notices) are never live.
+ */
+internal fun ChatMessage.isLiveRow(): Boolean =
+    role != "system" && (isStreaming || isQueued || isAwaitingModelResponse)
+
+/**
+ * The complement at the settlement boundary: a persisted, non-system row
+ * that no longer belongs to the live state. Compact graying walks to the
+ * last settled row; in-flight rows after the anchor must never inherit the
+ * gray flag.
+ */
+internal fun ChatMessage.isSettledRow(): Boolean =
+    role != "system" && !isLiveRow()
+
+/**
+ * [audit-0916] Marks the UI rows covered by a compact marker and forces the
+ * active tail back to full opacity. Lifted out of [compacktAll] so the
+ * boundary rules are JVM-testable: the greying used to be inline with zero
+ * coverage, and its tail repair was a silent no-op — the condition selected
+ * rows that were NOT greyed (`!msg.isCompactedHistory`) and then "un-greyed"
+ * those, so on the live-session path (the anchor is usually a tool-result
+ * carrier with no UI row of its own) the walk greyed EVERY non-system row,
+ * including the in-flight streaming bubble, and nothing put it back until the
+ * next rebuild. Observed on-device 2026-09-16: the tail below the divider
+ * turned grey mid-compact and only a reload cleared it.
+ *
+ * The walk flips `passedCutoff` on the first row carrying the anchor id —
+ * either directly (`id`) or through `sourceDbIds` (restored / merged rows
+ * carry the union). Everything after the flip keeps its flags.
+ *
+ * The tail repair then runs UNCONDITIONALLY, enforcing two boundaries —
+ * both are always safe:
+ *  - rows STRICTLY after the last settled row: in-flight rows sit after the
+ *    anchor by construction and can never be inside a compacted range;
+ *  - rows AT OR AFTER the last user promt: the compactor keeps the trailing
+ *    user turns, and the anchor walk-back exists precisely to prevent folding
+ *    the in-flight instruction.
+ * Gating the repair on "the walk never met the anchor" (the old shape) left
+ * stale flags standing whenever the walk flipped late (a merged row carrying
+ * the union of sourceDbIds), and updateAssistantMessage's copy() carried a
+ * wrong tail flag for the rest of the run.
+ */
+internal fun applyCompactGreyedRange(messages: List<ChatMessage>, cutoffId: String): List<ChatMessage> {
+    var passedCutoff = false
+    var cleaned = messages
+        .filterNot { msg ->
+            // Drop prior compact-divider rows; appendSystemInfo re-adds the
+            // new one.
+            msg.role == "system" &&
+                msg.toolBlocks.firstOrNull()?.toolName == "compact"
+        }
+        .map { msg ->
+            if (msg.role == "system") msg
+            else if (passedCutoff) msg
+            else {
+                val grayed = if (msg.isCompactedHistory) msg
+                    else msg.copy(isCompactedHistory = true)
+                if (msg.id == cutoffId || msg.sourceDbIds.contains(cutoffId)) {
+                    passedCutoff = true
+                }
+                grayed
+            }
+        }
+    // [audit-0916-fix] When the walk DID flip on a SETTLED row, that row's UI
+    // index is authoritative: everything at or before it is inside the
+    // compacted range and must stay greyed. The settled / instruction
+    // heuristics below are only sound when the anchor has NO greyable UI row
+    // (the tool-result-carrier case) — applied unconditionally they un-grey
+    // in-range rows: a session whose anchor IS the last settled user prompt
+    // (the one-turn session, where the walk-back cannot move earlier, and the
+    // manual compact-before path) rendered the folded instruction at full
+    // opacity while the divider still counted it as compacted.
+    val anchorUiIdx = cleaned.indexOfLast { it.id == cutoffId || it.sourceDbIds.contains(cutoffId) }
+    if (anchorUiIdx >= 0 && !cleaned[anchorUiIdx].isLiveRow()) {
+        return cleaned.mapIndexed { idx, msg ->
+            if (idx > anchorUiIdx && msg.role != "system" && msg.isCompactedHistory) {
+                msg.copy(isCompactedHistory = false)
+            } else msg
+        }
+    }
+    // Either no UI row carries the anchor, or the flipping row is itself
+    // in-flight (a merged row carrying the union of sourceDbIds): fall back to
+    // the settled / instruction boundaries.
+    val lastSettledIdx = cleaned.indexOfLast { msg -> msg.isSettledRow() }
+    // The last SETTLED user prompt — the current instruction. A queued prompt
+    // further down the list must not shadow it: the instruction itself is
+    // never inside the compacted range.
+    val lastUserPromtIdx = cleaned.indexOfLast { msg -> msg.role == "user" && msg.isSettledRow() }
+    if (lastSettledIdx >= 0 || lastUserPromtIdx >= 0) {
+        cleaned = cleaned.mapIndexed { idx, msg ->
+            val afterSettled = lastSettledIdx >= 0 && idx > lastSettledIdx
+            val atOrAfterPromt = lastUserPromtIdx >= 0 && idx >= lastUserPromtIdx
+            if (msg.role != "system" && msg.isCompactedHistory && (afterSettled || atOrAfterPromt)) {
+                msg.copy(isCompactedHistory = false)
+            } else msg
+        }
+    }
+    return cleaned
+}

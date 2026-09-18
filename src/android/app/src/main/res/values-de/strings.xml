@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RikkaMinis</string>
+    <string name="onboarding_default_group_name">Standardmodelle</string>
     <string name="new_chat">Neuer Chat</string>
     <string name="settings">Einstellungen</string>
     <string name="providers">KI-Anbieter</string>
@@ -1316,6 +1317,7 @@
     <string name="rootfs_insufficient_space">Nicht genug Speicherplatz: etwa %1$d MB erforderlich, nur %2$d MB verfügbar. Bitte Speicher freigeben und erneut versuchen.</string>
 
     <!-- Fix: Hinweise für gelöschte minis://-Dateien und blockierte externe Links. -->
+    <string name="chat_link_path_invalid">Dieser Link zeigt auf einen ungültigen Pfad.</string>
     <string name="chat_link_file_missing">Diese Datei ist nicht mehr verfügbar.</string>
     <string name="webpreview_blocked_scheme">Link zu externer App blockiert.</string>
     <string name="thinking_rules_section">Denkregeln</string>
@@ -1362,6 +1364,7 @@
     <string name="notification_tool_browser">RikkaMinis verwendet Browser</string>
     <string name="notification_tool_read_image">RikkaMinis liest Bild</string>
     <string name="notification_tool_memory">RikkaMinis verwendet Speicher</string>
+    <string name="notification_tool_history">RikkaMinis liest Verlauf</string>
     <string name="notification_tool_search">RikkaMinis verwendet Suche</string>
     <string name="notification_tool_generic">RikkaMinis verwendet %1$s</string>
     <string name="config_confirm_title_one">Änderung bestätigen</string>

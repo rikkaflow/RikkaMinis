@@ -210,6 +210,25 @@ class MinisApp : Application(), ImageLoaderFactory {
             // would silently ignore on ALL offloaded runs (chat streaming,
             // title-gen, compaction all go through this process).
             com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.prime(this)
+            // [T-worker-log-capture] The worker is where every chat request
+            // actually executes, but until now its logs reached NEITHER sink:
+            // this early-return skipped AppLogger.init (logDir stayed null →
+            // every AppLogger.info in OpenAIProvider wrote nothing to the
+            // file), and the main process's LogcatTailer filters by
+            // --pid=<main> so the worker's android.util.Log lines never
+            // landed there either. The 2026-09-18 DeepSeek thinking-replay
+            // 400s left zero request/response traces for exactly this
+            // reason. init() here is light: logs dir + prefs read + prune +
+            // a tailer bound to the worker's own pid (the heavy subsystems
+            // this early-return exists to avoid are still skipped). The
+            // :toolservice branch below stays dormant until that process
+            // actually hosts requests.
+            // ponytail: worker + main both append to the same daily log file
+            // (O_APPEND, line-granular, separate writeQueues) | 天花板: a long
+            // line split across two writes can interleave with the other
+            // process's line | 升级触发: garbled/interleaved lines observed in
+            // the daily log
+            AppLogger.init(this)
             return
         }
 
@@ -628,12 +647,19 @@ class MinisApp : Application(), ImageLoaderFactory {
         // message tail is the durable source of truth — scan it off-main and
         // reconcile. Runs after init() so it merges with the restored queues.
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
-            // Exclude any session that is already actively streaming (defensive;
-            // at cold start this is empty, but keeps the rule "active ⇒ never
-            // paused" uniform with the foreground reconcile path).
-            val active = SessionActivityTracker.activeSessions.value
-            com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+            // [audit-0917] Same guard as the foreground path: this scope uses
+            // the default handler, so an unguarded badge-store failure here
+            // crashed the app at cold start.
+            runCatching {
+                val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
+                // Exclude any session that is already actively streaming (defensive;
+                // at cold start this is empty, but keeps the rule "active ⇒ never
+                // paused" uniform with the foreground reconcile path).
+                val active = SessionActivityTracker.activeSessions.value
+                com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+            }.onFailure {
+                android.util.Log.w("MinisApp", "cold-start badge reconcile failed: ${it.message}")
+            }
         }
 
         // T180-bg-notif: background-settings + task-completion notifier.
@@ -714,9 +740,19 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // a mid-loop running session is never flagged.
                 if (wasBackgrounded) {
                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                        val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
-                        val active = SessionActivityTracker.activeSessions.value
-                        com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+                        // [audit-0917] Wrap the reconcile call itself. The two
+                        // reads above are guarded, but the badge-store write was
+                        // not — and this scope is a bare CoroutineScope with the
+                        // default handler, so a failure crashed the app on a
+                        // foreground transition (badge store IO on a corrupt
+                        // prefs file, etc.). A missed badge must never be fatal.
+                        runCatching {
+                            val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
+                            val active = SessionActivityTracker.activeSessions.value
+                            com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+                        }.onFailure {
+                            android.util.Log.w("MinisApp", "foreground badge reconcile failed: ${it.message}")
+                        }
                     }
                 }
             }

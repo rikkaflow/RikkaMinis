@@ -176,6 +176,33 @@ class WebDavClientTest {
         assertTrue(url.encodedPath.endsWith("rikkaminis-backup-1.json"))
     }
 
+    @Test
+    fun `buildUrl refuses dot segments instead of resolving them`() {
+        // [audit-0917] HttpUrl.Builder resolves a segment that is exactly
+        // "." or ".." and pops the previous path element. Measured against
+        // okhttp 4.12.0: base https://h/dav/ + ".." + "escape.json" used to
+        // build https://h/dav/escape.json — a config path could climb out of
+        // the backup directory. Re-encoding is not a fix (addPathSegment
+        // writes "%252E%252E"; addEncodedPathSegment("..") resolves anyway),
+        // so the request is refused.
+        val d = clientFor("https://example.com/dav")
+        for (bad in listOf("..", ".", "../../etc/passwd", "sub/../..")) {
+            try {
+                d.buildUrl(bad)
+                fail("expected WebDavException for traversal segment \"$bad\"")
+            } catch (e: WebDavException) {
+                assertTrue(
+                    "message should name the offending segment: ${e.message}",
+                    e.message!!.contains("outside the backup directory"),
+                )
+            }
+        }
+        // A segment that merely CONTAINS dots is legitimate and untouched.
+        val normal = d.buildUrl("a..b.json")
+        assertTrue("ordinary dotted name must build: $normal", normal.encodedPath.endsWith("a..b.json"))
+        assertEquals("/dav/RikkaMinis_backups/a..b.json", normal.encodedPath)
+    }
+
     // ── Upload ─────────────────────────────────────────────────────────────
 
     @Test
@@ -359,5 +386,64 @@ class WebDavClientTest {
         val json = WebDavSync.restore(config, WebDavBackupItem("h", "rikkaminis-backup-1.json", 17, Instant.EPOCH), client)
         assertEquals("{\"formatVersion\":1}", json)
         assertEquals("/dav/RikkaMinis_backups/rikkaminis-backup-1.json", server.takeRequest().path)
+    }
+
+    // ── Transport security (plain-HTTP refusal) ───────────────────────────
+
+    private fun clientFor(url: String): WebDavClient =
+        WebDavClient(config.copy(url = url), client)
+
+    @Test
+    fun `plain http to a public host is refused`() {
+        val d = clientFor("http://example.com/dav")
+        try {
+            d.buildUrl()
+            fail("expected WebDavException for plain HTTP to a public host")
+        } catch (e: WebDavException) {
+            assertEquals(-1, e.statusCode)
+            assertTrue("message should name the host: ${e.message}", e.message!!.contains("example.com"))
+            assertTrue("message should say HTTPS: ${e.message}", e.message!!.contains("https"))
+        }
+    }
+
+    @Test
+    fun `https to a public host builds the url`() {
+        val url = clientFor("https://example.com/dav").buildUrl()
+        assertTrue("expected https url: $url", url.isHttps)
+        assertTrue(url.toString().startsWith("https://example.com/"))
+    }
+
+    @Test
+    fun `plain http to loopback and private hosts is allowed`() {
+        // MockWebServer itself runs on 127.0.0.1, so every existing test in
+        // this class already depends on the loopback escape.
+        for (url in listOf(
+            "http://127.0.0.1:5240/dav",
+            "http://localhost:5240/dav",
+            "http://192.168.1.20:5240/dav",
+            "http://10.0.0.5:5240/dav",
+            "http://172.16.3.9:5240/dav",
+            "http://172.31.255.1:5240/dav",
+        )) {
+            val built = clientFor(url).buildUrl()
+            assertTrue("expected loopback/private url to build: $url", built.toString().startsWith("http://"))
+        }
+    }
+
+    @Test
+    fun `private-host detection boundaries`() {
+        val f = { h: String -> WebDavClient(config, client).isLoopbackOrPrivateHost(h) }
+        assertTrue(f("localhost"))
+        assertTrue(f("127.0.0.1"))
+        assertTrue(f("10.1.2.3"))
+        assertTrue(f("192.168.0.1"))
+        assertTrue(f("172.16.0.1"))
+        assertTrue(f("172.31.9.9"))
+        // Just outside the private ranges must NOT be allowed
+        assertTrue(!f("172.32.0.1"))
+        assertTrue(!f("172.15.0.1"))
+        assertTrue(!f("11.0.0.1"))
+        assertTrue(!f("193.168.0.1"))
+        assertTrue(!f("example.com"))
     }
 }

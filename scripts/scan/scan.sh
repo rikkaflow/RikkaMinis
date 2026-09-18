@@ -17,7 +17,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # --- 1. Four-way sync check ---
-echo "━━━ [1/7] Four-way sync check ━━━"
+echo "━━━ [1/10] Four-way sync check ━━━"
 if python3 scripts/scan/four_way_sync_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -30,7 +30,7 @@ fi
 # --- 2. i18n consistency ---
 #   - Orphan keys (in code but not in strings.xml) = HARD FAIL
 #   - Missing translations = WARNING only (known legacy from upstream)
-echo "━━━ [2/7] i18n consistency check ━━━"
+echo "━━━ [2/10] i18n consistency check ━━━"
 python3 -c "
 import re, os, sys
 root = '$ROOT'
@@ -72,7 +72,7 @@ fi
 echo ""
 
 # --- 3. Bare valueOf check (persisted enum safety) ---
-echo "━━━ [3/7] Enum parse safety check ━━━"
+echo "━━━ [3/10] Enum parse safety check ━━━"
 if python3 scripts/scan/enum_parse_safety_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -85,7 +85,7 @@ fi
 # --- 4. Provider process-boundary guard (TF-E) ---
 # Mechanical constraint: the app process must never call a provider network
 # entry point directly — only :modelservice (ModelExecutionService) owns them.
-echo "━━━ [4/7] Provider process-boundary guard ━━━"
+echo "━━━ [4/10] Provider process-boundary guard ━━━"
 if python3 scripts/scan/provider_boundary_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -101,7 +101,7 @@ fi
 # loop on AgentTraceRecorder output (produce → consume). Inline selftest
 # goldens keep the evaluator itself honest in CI; device traces can be added
 # later under tests/traces/golden/ referencing real .jsonl files.
-echo "━━━ [5/7] Agent trace replay eval ━━━"
+echo "━━━ [5/10] Agent trace replay eval ━━━"
 if python3 scripts/scan/trace_eval_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -118,7 +118,7 @@ fi
 #   always empty and nothing ever failed, logged or warned. New references are a
 #   build failure unless the file is allow-listed or justifies it inline with
 #   `legacy-ok: <reason>`.
-echo "━━━ [6/7] Legacy pipeline guard ━━━"
+echo "━━━ [6/10] Legacy pipeline guard ━━━"
 if python3 scripts/scan/legacy_pipeline_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -135,7 +135,7 @@ fi
 #   would ship unverified — the same header source is compiled by the host
 #   compiler and asserted against fixture /proc text. Skipped (not failed) on
 #   machines without a host C++ compiler.
-echo "━━━ [7/7] Native crash-field host test ━━━"
+echo "━━━ [7/10] Native crash-field host test ━━━"
 if sh "$ROOT/scripts/native/crash_fields_host_test.sh" > /tmp/minis_crash_fields_host_test.log 2>&1; then
     tail -n 2 /tmp/minis_crash_fields_host_test.log
     PASS=$((PASS + 1))
@@ -148,6 +148,53 @@ elif command -v g++ >/dev/null 2>&1 || command -v clang++ >/dev/null 2>&1; then
 else
     echo "⚠ no host C++ compiler (g++/clang++) — skipped"
     PASS=$((PASS + 1))
+    echo ""
+fi
+
+# --- 8. Debug-code release boundary (source mode) ---
+#   debug/ lives in src/main; release hygiene depends on R8 DCE +
+#   BuildConfig.DEBUG guards at every call site. A NEW debug-package call site
+#   outside the audited allow-list is the silent path by which debug code
+#   (token-free loopback JSON-RPC on 127.0.0.1:5321) reaches release. The apk
+#   mode (below, in build-apk.yml) verifies the artifact itself.
+echo "━━━ [8/10] Debug-code release boundary (source) ━━━"
+if python3 scripts/scan/debug_leak_guard.py source "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 9. Room migration chain (schema integrity) ---
+#   Chain completeness for the hand-written Room migrations: a version gap, a
+#   non-contiguous step, or a migration DECLARED in the builder but never
+#   wired. The last one compiles and runs — it just never executes, so a
+#   fresh install and an upgraded install end up with different schemas and
+#   nothing fails until a user hits the missing column.
+echo "━━━ [9/10] Room migration chain ━━━"
+if python3 scripts/scan/room_migration_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 10. Process-logging coverage (TF full-coverage) ---
+#   Every android:process declaration must have an explicit AppLogger.init
+#   decision (wire init in that process's Application branch, or justify with
+#   `logging-ok:`). The 2026-09-18 incident: :modelservice never ran init, so
+#   the LLM-request process logged zero lines — 9 provider 400s, no trace.
+echo "━━━ [10/10] Process-logging coverage ━━━"
+if python3 scripts/scan/process_logging_gate.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
     echo ""
 fi
 

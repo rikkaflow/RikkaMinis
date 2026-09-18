@@ -261,6 +261,17 @@ class ProviderRepository(private val context: Context) {
      */
     private val configLock = Any()
 
+    /**
+     * [T-android-provider-offmain-persist] Single-thread executor for the
+     * serialize + DB + commit span (see [saveConfig]). One thread = persist
+     * jobs land in submission (mutation) order and never overlap; daemon so
+     * it can never block JVM exit.
+     */
+    private val persistExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "ProviderConfig-Persist").apply { isDaemon = true }
+        }
+
     private fun loadConfig(): ProviderConfig = runBlocking { loadConfigSuspending() }
 
     /**
@@ -502,36 +513,38 @@ class ProviderRepository(private val context: Context) {
         // mirror keeps older app builds able to read current config on
         // downgrade; the DB is the new authoritative store on this build.
         //
-        // Serialize + persist + emit under [configLock] so we never serialize
-        // a list that another writer is mutating. The fresh `.copy(…toMutableList())`
-        // wrapper alone is not enough: data-class structural equals walks the
-        // inner Lists and `prev` (already mutated in place by replaceEntries /
-        // addEntry / removeEntry) compares equal to `next` → MutableStateFlow
-        // suppresses the emission. T273 bumps `revision` so equals always
-        // returns false and 18+ collectAsState callers see the new value.
+        // [T-android-provider-offmain-persist] The serialize + DB + commit
+        // span measured 60-160ms on device (ProviderPerf: 813KB mirror,
+        // serialize 15-45ms + db 35-113ms + prefs commit fsync) and this
+        // function runs on the CALLER's thread — UI click handlers included
+        // (model visibility toggle, entry Save, group costTier), so every
+        // settings action froze the UI for that span while holding
+        // configLock. Now only the pure in-memory canonicalization +
+        // emission stay on the caller; the disk work moves to a
+        // single-thread persist executor:
+        //  - ordering: submissions run in mutation order, so a rapid burst
+        //    of writes lands on disk in the same order;
+        //  - snapshot safety: `config` is the mutator's private
+        //    mutationSnapshot and is not mutated after saveConfig returns
+        //    (verified across all mutators — only cache invalidations
+        //    follow), so serializing it off-lock cannot race a writer;
+        //  - durability tradeoff: the disk write lands ~50-160ms after the
+        //    mutation instead of before saveConfig returns — a crash in
+        //    that window loses the last change. DB + mirror are still
+        //    written by one job, so the json_sync_hash downgrade-detection
+        //    invariant is unchanged.
         synchronized(configLock) {
-            // persistToDbAndMirror returns the canonicalized config (entries'
-            // uuid in composite "{instanceId}/{modelId}" form). Emit that so
-            // subsequent in-memory reads — which compare entry.id by string
-            // equality (e.g. group.memberEntryIds.contains(it.id)) — use one
-            // consistent id shape rather than mixing legacy random uuids and
-            // composite keys.
-            //
-            // Catch persistence failures so callers stay fire-and-forget
-            // (matches the legacy `apply()` contract — pre-Room saveConfig
-            // never threw). DB write fails are rare in practice (disk full,
-            // SQLite corruption, transaction deadlock) but uncaught they'd
-            // crash whichever UI handler triggered the mutation. Still
-            // emit the in-memory state so the UI reflects the user's
-            // intent even when the disk write didn't land; the next
-            // successful save resyncs everything.
+            // Canonicalize synchronously — a pure in-memory round-trip over
+            // ~1200 entries (idMap build + entity map + reverse map), no
+            // disk and no 813KB mirror serialization — so the emission keeps
+            // the consistent composite-id shape without waiting for the
+            // persist job.
             val canonical = try {
-                runBlocking { persistToDbAndMirror(config) }
+                config.toSnapshot(json).toProviderConfig(json)
             } catch (e: Exception) {
-                android.util.Log.e(
+                android.util.Log.w(
                     "ProviderRepo",
-                    "[ProviderStore] saveConfig persistence failed; emitting in-memory only: ${e.message}",
-                    e,
+                    "[ProviderStore] canonicalize failed; emitting raw config: ${e.message}",
                 )
                 config
             }
@@ -541,8 +554,27 @@ class ProviderRepository(private val context: Context) {
                 modelGroups = canonical.modelGroups.toMutableList(),
                 agentLoopModelEntryIds = canonical.agentLoopModelEntryIds.toMutableList(),
                 agentLoopGroupIds = canonical.agentLoopGroupIds.toMutableList(),
+                // T273: structural equals walks the inner Lists and `prev`
+                // (already mutated in place by the mutator) compares equal to
+                // `next` → StateFlow would suppress the emission. Bumping
+                // revision makes equals always false so 18+ collectAsState
+                // callers see the new value.
                 revision = config.revision + 1,
             )
+            persistExecutor.execute {
+                try {
+                    runBlocking { persistToDbAndMirror(config) }
+                } catch (e: Exception) {
+                    // In-memory state is already emitted; the next successful
+                    // save resyncs mirror + DB (same contract as the old
+                    // catch path — fire-and-forget callers never see this).
+                    android.util.Log.e(
+                        "ProviderRepo",
+                        "[ProviderStore] async persist failed; DB+mirror stale until next save: ${e.message}",
+                        e,
+                    )
+                }
+            }
         }
     }
 
@@ -807,16 +839,29 @@ class ProviderRepository(private val context: Context) {
 
     // ── [T-android-thinking-rules-phase2] Custom thinking rules ──
 
+    /**
+     * [T-thinking-rules-single-query] One Room roundtrip returns both the
+     * rules and their persisted ids — the UI previously called
+     * [thinkingRules] and [thinkingRuleIds] separately, i.e. the SAME
+     * loadThinkingRules query twice inside two `remember { }` blocks.
+     */
+    fun thinkingRulesWithIds(instanceId: String): Pair<List<ThinkingRule>, List<String>> = runBlocking {
+        runCatching {
+            val rows = providerDao.loadThinkingRules(instanceId)
+            rows.map { ThinkingRuleCoding.toRule(it) } to rows.map { it.id }
+        }.getOrDefault(emptyList<ThinkingRule>() to emptyList())
+    }
+
     /** Load one instance's custom rules from Room, in stored order. */
     fun thinkingRules(instanceId: String): List<ThinkingRule> = runBlocking {
         runCatching { providerDao.loadThinkingRules(instanceId).map { ThinkingRuleCoding.toRule(it) } }
             .getOrDefault(emptyList())
     }
 
-    /** The persisted ids for one instance's custom rules, parallel to [thinkingRules]. */
-    fun thinkingRuleIds(instanceId: String): List<String> = runBlocking {
-        runCatching { providerDao.loadThinkingRules(instanceId).map { it.id } }.getOrDefault(emptyList())
-    }
+    /** [T-thinking-rules-single-query] The standalone [thinkingRuleIds] was
+     *  folded into [thinkingRulesWithIds] — a second `loadThinkingRules`
+     *  query for the same table existed only because the UI wanted ids
+     *  separately. Call [thinkingRulesWithIds] instead. */
 
     /** First model id served by [instanceId], for the resolution-trace sample. Null if none. */
     fun firstModelId(instanceId: String): String? {
@@ -839,6 +884,20 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * [T-thinking-rules-single-query] Mutation paths pass the rows they just
+     * persisted so the resolver cache is updated WITHOUT a second Room
+     * roundtrip. Null = persistence failed → fall back to a fresh DB query
+     * so the cache never holds stale data.
+     */
+    private fun republishThinkingCache(instanceId: String, rules: List<ThinkingRule>?) {
+        if (rules != null) {
+            ThinkingRuleResolver.setCustomRules(instanceId, rules)
+            return
+        }
+        republishThinkingCache(instanceId)
+    }
+
+    /**
      * Insert or update a custom rule. [id] null ⇒ new rule minted at the TOP of the
      * list (position 0) — a rule overriding a built-in is useless below it; existing
      * rules shift down. A non-null [id] updates in place, preserving position.
@@ -846,6 +905,10 @@ class ProviderRepository(private val context: Context) {
      */
     fun saveThinkingRule(instanceId: String, rule: ThinkingRule, id: String? = null): String = runBlocking {
         val ruleId = id ?: java.util.UUID.randomUUID().toString()
+        // [T-thinking-rules-single-query] Persisted rows are reused for the
+        // resolver cache (republish takes nullable rows — on failure it
+        // falls back to a fresh DB query so the cache never holds stale data).
+        var persistedRules: List<ThinkingRule>? = null
         // [audit-0909 T4-H1] These DAO writes used to be bare. A provider.db
         // that failed to open (e.g. a migration abort on API ≤ 33 — see
         // ProviderDatabase.MIGRATION_9_10) threw an uncaught SQLiteException
@@ -862,43 +925,48 @@ class ProviderRepository(private val context: Context) {
                 existing.add(0, ThinkingRuleCoding.toEntity(rule, ruleId, instanceId, 0))
             }
             val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }
+            persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, renumbered)
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] saveThinkingRule persistence failed ($instanceId/$ruleId)", e)
         }
-        republishThinkingCache(instanceId)
+        republishThinkingCache(instanceId, persistedRules)
         ruleId
     }
 
     fun deleteThinkingRule(instanceId: String, id: String) = runBlocking {
         // [audit-0909 T4-H1] same bare-DAO hardening as saveThinkingRule.
+        var persistedRules: List<ThinkingRule>? = null
         runCatching {
             providerDao.deleteThinkingRule(id)
             // Renumber survivors so sort_order stays dense.
             val survivors = providerDao.loadThinkingRules(instanceId)
                 .sortedBy { it.sortOrder }
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
+            persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, survivors)
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] deleteThinkingRule persistence failed ($instanceId/$id)", e)
         }
-        republishThinkingCache(instanceId)
+        republishThinkingCache(instanceId, persistedRules)
     }
 
     /** Reorder an instance's custom rules to match [orderedIds] (a permutation). */
     fun reorderThinkingRules(instanceId: String, orderedIds: List<String>) = runBlocking {
         // [audit-0909 T4-H1] same bare-DAO hardening as saveThinkingRule.
+        var persistedRules: List<ThinkingRule>? = null
         runCatching {
             val byId = providerDao.loadThinkingRules(instanceId).associateBy { it.id }
             val reordered = orderedIds.mapNotNull { byId[it] }
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
             // Keep any id the caller omitted (defensive against a partial list) appended.
             val omitted = byId.values.filter { it.id !in orderedIds }.map { it }
+            persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, reordered + omitted)
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] reorderThinkingRules persistence failed ($instanceId)", e)
         }
-        republishThinkingCache(instanceId)
+        republishThinkingCache(instanceId, persistedRules)
     }
 
     // ── [T-auto-backup-assets] Backup/restore of custom thinking rules ──
@@ -2407,10 +2475,11 @@ class ProviderRepository(private val context: Context) {
      *   - models are upserted by baseModel.id: models the existing instance
      *     lacks are added, models it already has are reused as-is (the local
      *     overrides / customizations win);
-     *   - credentials (apiKey / OAuth / base URL) are deliberately NOT
-     *     touched — an instance that already exists on this device is presumed
-     *     to be the one in use, and silently swapping its key or endpoint on
-     *     restore would be worse than a duplicate label.
+     *   - credentials (apiKey / OAuth / base URL) ARE written onto the
+     *     existing instance via [importInstanceCredentials] — a restore is a
+     *     restore. (An earlier revision of this doc claimed they were
+     *     deliberately NOT touched; that was stale — the code has always
+     *     written them.)
      *
      * @param srcEntryIds the backup-layer `_entryIds` annotation, positionally
      *   paired with the `models` array (same append order — visible and hidden

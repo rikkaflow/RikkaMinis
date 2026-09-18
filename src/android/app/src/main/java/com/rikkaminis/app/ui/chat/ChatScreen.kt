@@ -1650,6 +1650,18 @@ fun ChatScreen(
     // T-pwa-2: long-press on an HTML attachment chip opens the
     // "Add to Home Screen" sheet for that attachment.
     var webAppSheetTarget by remember { mutableStateOf<InputAttachment?>(null) }
+    // [23c-2] Render-time link resolution cache — markdown text blocks query
+    // this during composition to grey out missing-file links without re-walking
+    // the filesystem on every recomposition. Cleared when the message list
+    // grows (see LaunchedEffect above).
+    val linkRenderCache = remember(viewModel) {
+        ChatLinkRenderCache(resolveFn = { url, sid -> ChatLinkResolver.resolve(url, sid, context) })
+    }
+    // [23c-2] Invalidate the render-time link-resolution cache whenever a
+    // message lands — tool-driven file changes can accompany it, so a stale
+    // "missing file" verdict must not survive into the next turn. Keyed on
+    // size only: content-delta emissions keep the size (and the cache).
+    LaunchedEffect(messages.size) { linkRenderCache.clear() }
     val urlClickHandler = remember<(String) -> Unit>(viewModel) {
         { url ->
             // Pass the current session id so `minis://attachments/...` resolves
@@ -1694,7 +1706,13 @@ fun ChatScreen(
                 is ChatLinkAction.MissingFile ->
                     android.widget.Toast.makeText(
                         context,
-                        context.getString(R.string.chat_link_file_missing),
+                        context.getString(
+                            if (action.reason == ChatLinkMissingReason.ILLEGAL_PATH) {
+                                R.string.chat_link_path_invalid
+                            } else {
+                                R.string.chat_link_file_missing
+                            },
+                        ),
                         android.widget.Toast.LENGTH_SHORT,
                     ).show()
                 is ChatLinkAction.Web -> previewUrl = action.url
@@ -1791,6 +1809,12 @@ fun ChatScreen(
         LocalMarkdownLineHeightSp provides tuning.markdownLineHeightSp,
         LocalToolPreviewEnabled provides toolPreviewEnabled,
         LocalMarkdownUrlClickHandler provides urlClickHandler,
+        // [23c-2] Render-time link checks for markdown text blocks, backed by
+        // the session-scoped cache above (reads viewModel.currentSessionId
+        // live so the cache key follows the owning chat).
+        LocalMarkdownLinkRenderResolver provides { url ->
+            linkRenderCache.resolve(url, viewModel.currentSessionId)
+        },
         LocalMarkdownImageTapHandler provides markdownImageTapHandler,
         // Route markdown media resolution through this chat's session so
         // minis://attachments/* lookups don't rely on the global bindMounts
@@ -4841,6 +4865,17 @@ fun ChatScreen(
             htmlPreviewHolder = null
             htmlPreviewFallbackTitle = ""
             htmlPreviewFullscreen = false
+        }
+        // [fix/audit0917-b8] The holder was destroyed ONLY by the user-initiated
+        // dismiss callback, so any teardown that skips it — navigating away from
+        // chat, process-level recomposition of the host — left a live WebView
+        // (plus its WebViewHolder's page state) attached to the Activity.
+        // DisposableEffect runs its onDispose when the holder is replaced or the
+        // host leaves composition; destroy() is idempotent, so the normal
+        // dismiss path is unaffected. Keyed on the holder instance: swapping
+        // previews disposes the previous one.
+        DisposableEffect(holder) {
+            onDispose { holder.destroy() }
         }
         if (htmlPreviewFullscreen) {
             com.rikkaminis.app.ui.preview.WebPreviewFullscreenScreen(

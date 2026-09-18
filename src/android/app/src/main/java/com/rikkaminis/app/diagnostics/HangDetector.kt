@@ -1,5 +1,6 @@
 package com.rikkaminis.app.diagnostics
 
+import com.rikkaminis.app.MinisApp
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -34,10 +35,86 @@ import kotlinx.coroutines.flow.asStateFlow
  * The counter resets when the user successfully runs a chat session for
  * [RESET_AFTER_QUIET_MS] without another hang firing — see [markHealthyTick].
  *
+ * [T-android-hangdetector-foreground-gate] A silent main thread while the app
+ * is BACKGROUND is classified as a background process freeze (HyperOS freezes
+ * the cached process — see [BackgroundFreezePolicy]) and does NOT count toward
+ * the breakers; only foreground silences do.
+ *
  * No iOS counterpart yet (intentional — iOS only has the DEBUG-mode RPC hang
  * detector at src/ios/Debug/DebugRPCHangDetector.swift; this is a production
  * circuit breaker).
  */
+/**
+ * [T-android-hangdetector-foreground-gate] Pure decision table separating
+ * background process freezes from foreground hangs.
+ *
+ * Evidence (minis-2026-09-15.log): every long "hang" while the app was
+ * backgrounded had the main thread idle in `nativePollOnce` — HyperOS
+ * freezes the cached process, the main looper stops, the heartbeat misses,
+ * and the old code counted that as a hang. Those false positives pushed the
+ * persisted hang counter to the render-breaker threshold 7+ times in one
+ * day, degrading streaming markdown to plain text for entirely healthy
+ * foreground sessions.
+ *
+ * Rule: while the app is BACKGROUND, a silent main thread is a background
+ * freeze — observed in the log only (no counter, no breaker, no stall
+ * sample). The moment the app returns to FOREGROUND and the main thread is
+ * still silent, it becomes a real hang (counted + sampled). Unknown state
+ * fails OPEN (treated as foreground) so the gate can never suppress a real
+ * hang — the worst case is the pre-fix behavior.
+ */
+internal object BackgroundFreezePolicy {
+
+    enum class Phase { IDLE, HANG, BG_FREEZE }
+
+    /**
+     * Decision for one silent-watch tick.
+     * [countHang] = run the full hang path (recordHang: stall sample +
+     * counter + breaker). [log] = optional one-line stdout/logcat note.
+     */
+    data class Decision(
+        val next: Phase,
+        val countHang: Boolean,
+        val log: String? = null,
+    )
+
+    fun onSilent(phase: Phase, foreground: Boolean, sinceMs: Long): Decision = when (phase) {
+        Phase.IDLE ->
+            if (foreground) {
+                Decision(Phase.HANG, countHang = true)
+            } else {
+                Decision(
+                    Phase.BG_FREEZE,
+                    countHang = false,
+                    log = "main thread silent for ${sinceMs}ms while backgrounded — background freeze, not counted as hang",
+                )
+            }
+        Phase.BG_FREEZE ->
+            if (foreground) {
+                Decision(Phase.HANG, countHang = true, log = "background freeze escalated to foreground hang after ~${sinceMs}ms")
+            } else {
+                Decision(Phase.BG_FREEZE, countHang = false)
+            }
+        // Already counted this episode; resampling is driven by the caller.
+        Phase.HANG -> Decision(Phase.HANG, countHang = false)
+    }
+
+    /**
+     * The heartbeat landed again. The caller writes the labeled post-recovery
+     * snapshot for HANG episodes (existing format, log consumers depend on
+     * it); BG_FREEZE episodes only get a lightweight end line.
+     */
+    fun onHeartbeatLanded(phase: Phase, peakMs: Long): Decision = when (phase) {
+        Phase.IDLE -> Decision(Phase.IDLE, countHang = false)
+        Phase.HANG -> Decision(Phase.IDLE, countHang = false)
+        Phase.BG_FREEZE -> Decision(
+            Phase.IDLE,
+            countHang = false,
+            log = "background freeze ENDED peak=${peakMs}ms",
+        )
+    }
+}
+
 object HangDetector {
 
     private const val TAG = "HangDetector"
@@ -80,12 +157,24 @@ object HangDetector {
 
     private const val PREFS_NAME = "hang_detector_prefs"
     private const val KEY_HANG_COUNT = "hang_count"
+
+    /** [audit-0917] Serialises the read-modify-write of the hang counter
+     *  between markHealthyTick (main thread) and recordHang (watchdog). */
+    private val hangCounterLock = Any()
     private const val KEY_LAST_HANG_AT = "last_hang_at_ms"
 
     private const val STALL_LOG_DIR = "logs"
     private const val STALL_LOG_PREFIX = "stall-"
-    private val DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-    private val TIMESTAMP_FORMAT = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    // [audit-0917] Immutable formatters. These are read from the watchdog
+    // thread (writeStallSample) while the main thread may be formatting the
+    // same instances — a shared SimpleDateFormat is not thread-safe and can
+    // emit a garbled stamp exactly when the diagnostic matters.
+    private val DATE_FORMAT: java.time.format.DateTimeFormatter =
+        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
+            .withZone(java.time.ZoneId.systemDefault())
+    private val TIMESTAMP_FORMAT: java.time.format.DateTimeFormatter =
+        java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS", Locale.US)
+            .withZone(java.time.ZoneId.systemDefault())
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val started = AtomicBoolean(false)
@@ -150,13 +239,22 @@ object HangDetector {
     fun markHealthyTick() {
         val ctx = appContext ?: return
         val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // [audit-0917] Read + reset under one lock. markHealthyTick is called
+        // from the main thread (ChatScreen) while recordHang does a concurrent
+        // read-modify-write of the same keys from the watchdog thread; without
+        // mutual exclusion a reset landing between recordHang's read and write
+        // was lost, and a hang recorded during the tick could be zeroed out.
+        // Cheap on the hot path: the count check stays outside the lock.
         if (prefs.getInt(KEY_HANG_COUNT, 0) == 0) return
         val lastHangAt = prefs.getLong(KEY_LAST_HANG_AT, 0L)
         if (lastHangAt > 0 && System.currentTimeMillis() - lastHangAt < RESET_AFTER_QUIET_MS) return
-        prefs.edit()
-            .putInt(KEY_HANG_COUNT, 0)
-            .putLong(KEY_LAST_HANG_AT, 0L)
-            .apply()
+        synchronized(hangCounterLock) {
+            if (prefs.getInt(KEY_HANG_COUNT, 0) == 0) return
+            prefs.edit()
+                .putInt(KEY_HANG_COUNT, 0)
+                .putLong(KEY_LAST_HANG_AT, 0L)
+                .apply()
+        }
         // [T-android-render-breaker] Healthy again — restore full rendering.
         _renderBreakerActive.value = false
         Log.i(TAG, "hang count reset after quiet period")
@@ -208,10 +306,11 @@ object HangDetector {
         // episode starts when the heartbeat gap first crosses the threshold
         // and ends when a heartbeat lands again. The episode is COUNTED once
         // (breakers depend on count semantics) but SAMPLED repeatedly.
-        var hangActive = false
+        var phase = BackgroundFreezePolicy.Phase.IDLE
         var lastSampleAt = 0L
         var escalation = 0
         var episodePeakSinceMs = 0L
+        var lastBgPingAt = 0L
         while (true) {
             try {
                 Thread.sleep(500)
@@ -228,36 +327,74 @@ object HangDetector {
                 println("[T-HANG-DIAG] HangDetector tick=$ticks sinceHeartbeat=${since}ms")
             }
             if (since < HANG_THRESHOLD_MS) {
-                if (hangActive) {
-                    // Episode over — the heartbeat landed. One labeled
-                    // post-recovery snapshot closes the record (its stack is
-                    // expectedly idle; it documents WHEN the thread came
-                    // back and the episode's peak gap).
-                    hangActive = false
-                    writeStallSample("post-recovery", episodePeakSinceMs, escalation)
-                    println(
-                        "[T-HANG-DIAG] hang episode ENDED peak=${episodePeakSinceMs}ms midHangSamples=${escalation + 1}",
-                    )
+                if (phase != BackgroundFreezePolicy.Phase.IDLE) {
+                    val outcome = BackgroundFreezePolicy.onHeartbeatLanded(phase, episodePeakSinceMs)
+                    val wasHang = phase == BackgroundFreezePolicy.Phase.HANG
+                    phase = outcome.next
+                    if (wasHang) {
+                        // Episode over — the heartbeat landed. One labeled
+                        // post-recovery snapshot closes the record (its stack is
+                        // expectedly idle; it documents WHEN the thread came
+                        // back and the episode's peak gap).
+                        writeStallSample("post-recovery", episodePeakSinceMs, escalation)
+                        println(
+                            "[T-HANG-DIAG] hang episode ENDED peak=${episodePeakSinceMs}ms midHangSamples=${escalation + 1}",
+                        )
+                    } else if (outcome.log != null) {
+                        println("[T-HANG-DIAG] ${outcome.log}")
+                    }
                 }
                 continue
             }
-            if (!hangActive) {
-                hangActive = true
+            if (phase == BackgroundFreezePolicy.Phase.HANG) {
+                // Counted hang episode in progress — keep re-sampling the
+                // main-thread stack while the work is actually on it.
+                episodePeakSinceMs = maxOf(episodePeakSinceMs, since)
+                if (now - lastSampleAt >= MID_HANG_RESAMPLE_MS) {
+                    lastSampleAt = now
+                    escalation++
+                    writeStallSample("mid-hang", since, escalation)
+                }
+                continue
+            }
+            // Main thread silent past the threshold. Classify first: a silent
+            // thread while the app is BACKGROUND is a process freeze, not a
+            // hang (see [BackgroundFreezePolicy]).
+            val decision = BackgroundFreezePolicy.onSilent(phase, isAppForegroundSafe(), since)
+            phase = decision.next
+            if (decision.log != null) println("[T-HANG-DIAG] ${decision.log}")
+            if (decision.countHang) {
+                // Real foreground hang (episode start): count once + sample.
                 escalation = 0
                 episodePeakSinceMs = since
                 lastSampleAt = now
                 lastLogAt.set(now)
                 // Counts once per episode + writes the first mid-hang sample.
                 recordHang(durationMs = since)
-                continue
-            }
-            episodePeakSinceMs = maxOf(episodePeakSinceMs, since)
-            if (now - lastSampleAt >= MID_HANG_RESAMPLE_MS) {
-                lastSampleAt = now
-                escalation++
-                writeStallSample("mid-hang", since, escalation)
+            } else {
+                // Background freeze: keep observing at low volume so the log
+                // shows the freeze's duration, but no stall samples / counter /
+                // breaker side effects.
+                if (now - lastBgPingAt >= 30_000L) {
+                    lastBgPingAt = now
+                    println("[T-HANG-DIAG] background freeze ongoing (~${since}ms silent, still backgrounded)")
+                }
             }
         }
+    }
+
+    /**
+     * [T-android-hangdetector-foreground-gate] Live "is the app foreground?"
+     * snapshot for the watchdog thread. Reads [MinisApp]'s @Volatile
+     * foreground-Activity counter (cross-thread visibility is fine for a
+     * 3s-scale decision). FAILS OPEN: if the state is unknown we report
+     * foreground so the gate can never suppress a real hang — the worst case
+     * is the pre-fix behavior.
+     */
+    private fun isAppForegroundSafe(): Boolean = try {
+        (appContext as? MinisApp)?.isAppForeground() ?: true
+    } catch (t: Throwable) {
+        true
     }
 
     /**
@@ -275,8 +412,9 @@ object HangDetector {
         } catch (t: Throwable) {
             arrayOf<StackTraceElement>()
         }
-        val ts = TIMESTAMP_FORMAT.format(Date())
-        val date = DATE_FORMAT.format(Date())
+        val now = java.time.Instant.now()
+        val ts = TIMESTAMP_FORMAT.format(now)
+        val date = DATE_FORMAT.format(now)
         val builder = StringBuilder()
         builder.append(
             "===== HANG @ $ts (duration ~${durationMs}ms) sample=$label escalation=$escalation =====\n",
@@ -316,11 +454,16 @@ object HangDetector {
         writeStallSample("mid-hang", durationMs, escalation = 0)
 
         val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val newCount = prefs.getInt(KEY_HANG_COUNT, 0) + 1
-        prefs.edit()
-            .putInt(KEY_HANG_COUNT, newCount)
-            .putLong(KEY_LAST_HANG_AT, System.currentTimeMillis())
-            .apply()
+        // [audit-0917] Same lock as markHealthyTick's reset — this is the other
+        // half of the read-modify-write pair.
+        val newCount = synchronized(hangCounterLock) {
+            val n = prefs.getInt(KEY_HANG_COUNT, 0) + 1
+            prefs.edit()
+                .putInt(KEY_HANG_COUNT, n)
+                .putLong(KEY_LAST_HANG_AT, System.currentTimeMillis())
+                .apply()
+            n
+        }
         // [T-android-render-breaker] Trip the render degrade one hang BEFORE
         // the system would ANR-kill us (baseline showed death between #2/#3).
         if (newCount >= RENDER_DEGRADE_HANG_COUNT && !_renderBreakerActive.value) {

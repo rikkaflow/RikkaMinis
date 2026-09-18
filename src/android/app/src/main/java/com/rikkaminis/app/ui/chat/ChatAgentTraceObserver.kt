@@ -6,6 +6,7 @@ import com.rikkaminis.app.agent.runtime.AgentRunPhase
 import com.rikkaminis.app.agent.runtime.AgentRunReducer
 import com.rikkaminis.app.agent.runtime.AgentRunState
 import com.rikkaminis.app.agent.runtime.AgentRunTransition
+import com.rikkaminis.app.agent.runtime.traceName
 import com.rikkaminis.app.agent.runtime.AgentTerminal
 import com.rikkaminis.app.agent.runtime.AgentTerminalReason
 import com.rikkaminis.app.agent.runtime.BudgetDecision
@@ -125,7 +126,7 @@ internal class ChatAgentTraceObserver(
             is AgentRunTransition.Rejected -> {
                 warn(
                     "ChatVMStream",
-                    "T7-D reducer REJECTED ${event::class.simpleName}: ${r.rejection.message}",
+                    "T7-D reducer REJECTED ${event.traceName()}: ${r.rejection.message}",
                 )
             }
         }
@@ -321,6 +322,23 @@ internal class ChatAgentTraceObserver(
     ) {
         val budget = activeRunBudget
         val runId = activeRunId
+        // [T-terminate-before-finalize] Route the state into FINALIZING before
+        // RunFinalized: the reducer rejects RunFinalized from any running phase,
+        // and the cancel/exception exits of runAgentLoop reach here without a
+        // pre-emitted termination event (only user_stop / switch_model send
+        // UserCancelled upstream - everything else lands mid-CALLING_MODEL).
+        // Reducer tolerates duplicates as no-op in FINALIZING, so this is safe
+        // when the state is already FINALIZING. [backlog item 15]
+        when (terminal) {
+            AgentTerminal.CANCELLED ->
+                t7Reduce(AgentRunEvent.UserCancelled(error ?: reason?.name ?: "cancelled"))
+            AgentTerminal.FAILED, AgentTerminal.INTERRUPTED ->
+                t7Reduce(AgentRunEvent.ProcessInterrupted(error ?: reason?.name ?: "run end"))
+            AgentTerminal.SUCCEEDED -> {
+                // WorkCompleted already routes the state to FINALIZING; no
+                // pre-emission needed here.
+            }
+        }
         // T7-D: 终态 reducer —— RunFinalized 只产生一次终态（reducer 幂等保护）
         t7Reduce(
             AgentRunEvent.RunFinalized(

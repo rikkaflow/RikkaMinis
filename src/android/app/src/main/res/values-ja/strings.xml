@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RikkaMinis</string>
+    <string name="onboarding_default_group_name">デフォルトモデル</string>
     <string name="new_chat">新しいチャット</string>
     <string name="settings">設定</string>
     <string name="providers">AIプロバイダー</string>
@@ -1323,6 +1324,7 @@
     <string name="rootfs_insufficient_space">容量不足: 約 %1$d MB 必要ですが、利用可能なのは %2$d MB のみです。ストレージを空けて再試行してください。</string>
 
     <!-- Fix: minis:// リンク対象のファイルが消えた場合の表記、および外部 scheme 遮断の文言。 -->
+    <string name="chat_link_path_invalid">このリンクは無効なパスを指しています。</string>
     <string name="chat_link_file_missing">このファイルは利用できなくなりました。</string>
     <string name="webpreview_blocked_scheme">外部アプリへのリンクをブロックしました。</string>
     <string name="thinking_rules_section">思考ルール</string>
@@ -1369,6 +1371,7 @@
     <string name="notification_tool_browser">RikkaMinis はブラウザを使用中</string>
     <string name="notification_tool_read_image">RikkaMinis は画像を読み取り中</string>
     <string name="notification_tool_memory">RikkaMinis はメモリを使用中</string>
+    <string name="notification_tool_history">RikkaMinis は履歴を参照中</string>
     <string name="notification_tool_search">RikkaMinis は検索中</string>
     <string name="notification_tool_generic">RikkaMinis は %1$s を使用中</string>
     <string name="config_confirm_title_one">変更を確認</string>

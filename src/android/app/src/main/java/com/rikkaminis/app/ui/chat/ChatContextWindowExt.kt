@@ -23,7 +23,35 @@ import kotlinx.coroutines.withContext
  */
 internal fun ChatViewModel.reloadSessionFromDb() {
     if (realSessionId.isEmpty() && sessionId.isEmpty()) return
+    // [fix/same-class-cleanup] The queued-bubble re-attach that used to live
+    // here moved into loadSession's tail — the rebuild is the ROOT of the
+    // drop, so the fix belongs at the root: every loadSession caller now
+    // inherits it (init, safe-mode-cleared retry, this wrapper, and any
+    // future one). This wrapper stays as the named entry for the revert
+    // path's comment history.
     loadSession()
+}
+
+/**
+ * Build the UI-only queued bubble for a [QueuedPrompt]. Single source of
+ * truth for the queued-bubble shape — enqueuePrompt and the reload
+ * re-attach path both render through this so the two can't drift.
+ */
+internal fun queuedPromptBubble(prompt: QueuedPrompt): ChatMessage {
+    val pendingAttachments = prompt.attachments
+    val attachmentNames = pendingAttachments.map { it.fileName }
+    val imageUris = pendingAttachments.filter { it.isImage }.map { it.uri }
+    val attachmentUris = pendingAttachments.filterNot { it.isImage }.map { it.uri }
+    return ChatMessage(
+        id = "queued_msg_${prompt.id}",
+        role = "user",
+        content = prompt.text,
+        imageUris = imageUris,
+        attachmentNames = attachmentNames,
+        attachmentUris = attachmentUris,
+        isQueued = true,
+        queuedPromptId = prompt.id,
+    )
 }
 
 /**
@@ -142,7 +170,6 @@ internal fun ChatViewModel.maybeTriggerAutoCompact() {
         }
         return
     }
-    lastAutoCompactAtMs = System.currentTimeMillis()
     appendSystemInfo(
         text = context.getString(R.string.sysmsg_context_full_auto, tokens, window),
         iconKind = "compact",
@@ -171,6 +198,18 @@ internal fun ChatViewModel.maybeTriggerAutoCompact() {
  *     not a half-compacted history. Returns true iff a compact was started
  *     (caller should await before proceeding).
  */
+/**
+ * [T-ctx-offload-escalation] Reads and clears the one-shot "this turn's offload
+ * could not deliver" flag set by [offloadContextIfNeeded]. Consume-on-read is
+ * what keeps it single-turn — a flag can only ever escalate the compact attempt
+ * that immediately follows the offload pass that raised it.
+ */
+private fun ChatViewModel.consumeOffloadUnderDelivery(): Boolean {
+    val flagged = offloadUnderDelivered
+    offloadUnderDelivered = false
+    return flagged
+}
+
 internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     contextWindow: Int,
     lastContextTokens: Int,
@@ -180,7 +219,14 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     val policy = effectiveContextPolicy(contextWindow)
     // Only fire while we're in the compact band (NEEDS_COMPACT), i.e. BEFORE
     // the hard ceiling forces trimContextHistoryWindow to drop turns verbatim.
-    if (policy.check(lastContextTokens, contextWindow) != ContextPolicy.CheckResult.NEEDS_COMPACT) {
+    val inCompactBand =
+        policy.check(lastContextTokens, contextWindow) == ContextPolicy.CheckResult.NEEDS_COMPACT
+    // [T-ctx-offload-escalation] This turn's offload pass may have proved it can
+    // no longer shrink the context (candidate pool exhausted). Sitting in the
+    // dead band between the offload line and the compact line only lets the
+    // context climb, so escalate now rather than waiting for the compact line.
+    val escalatedFromOffload = consumeOffloadUnderDelivery()
+    if (!inCompactBand && !escalatedFromOffload) {
         return false
     }
     val anchorId = _cachedLatestMarker?.lastCompactedMessageId
@@ -195,6 +241,7 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
         // [feat/chat-tuning-panel-b] User-tunable (defaults: 8000 tokens / 5 min).
         minTailTokens = AgentRuntimeLimitsPrefs.autoCompactMinTailTokens().toLong(),
         minIntervalMs = AgentRuntimeLimitsPrefs.autoCompactMinIntervalMin() * 60_000L,
+        escalatedFromOffload = escalatedFromOffload && !inCompactBand,
     )
     if (decision != ContextCompactor.Decision.AUTO_COMPACT) {
         AppLogger.info(
@@ -204,7 +251,16 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
         )
         return false
     }
-    lastAutoCompactAtMs = System.currentTimeMillis()
+    if (!inCompactBand) {
+        AppLogger.info(
+            ChatViewModel.TAG,
+            "[AutoCompactLoop] escalated below the compact line: this turn's offload under-delivered " +
+                "tokens=$lastContextTokens window=$contextWindow compactLine=${policy.compactThreshold}",
+        )
+    }
+    // [fix/audit0917-b8] No stamp here — compactAll stamps the retry gate at
+    // the point the compact actually starts, so a pre-flight abort no longer
+    // disables auto-compaction for the whole minIntervalMs window.
     // [fix/diff-audit-0904-H1] appendSystemInfo is an unlocked
     // read-modify-write over _messages + 5 pendingSysInfo* vars; its KDoc
     // contract is "runs on Main". This extension is called from the agent

@@ -91,6 +91,35 @@ sealed class AgentRunEvent {
     ) : AgentRunEvent()
 }
 
+/**
+ * §16 [backlog]: a stable readable name for trace/anomaly logs.
+ *
+ * The observer used to print `event::class.simpleName`. Under R8 (release
+ * builds) that renders as a single letter (`REJECTED b: ...` — the 09-15 log
+ * shows b / i / o across three different phases), making the line unreadable
+ * exactly where auditing needs it. The names live here once; the `when` is
+ * exhaustive over the sealed hierarchy, so a future event forces a
+ * compiler-visible update instead of silently printing another letter.
+ */
+fun AgentRunEvent.traceName(): String = when (this) {
+    is AgentRunEvent.RunStarted -> "RunStarted"
+    is AgentRunEvent.ProviderAttemptStarted -> "ProviderAttemptStarted"
+    is AgentRunEvent.ProviderAttemptFinished -> "ProviderAttemptFinished"
+    is AgentRunEvent.RetryRequested -> "RetryRequested"
+    is AgentRunEvent.FallbackSelected -> "FallbackSelected"
+    is AgentRunEvent.FallbackExhausted -> "FallbackExhausted"
+    is AgentRunEvent.ToolStarted -> "ToolStarted"
+    is AgentRunEvent.ToolFinished -> "ToolFinished"
+    is AgentRunEvent.CompactionStarted -> "CompactionStarted"
+    is AgentRunEvent.CompactionFinished -> "CompactionFinished"
+    is AgentRunEvent.WorkCompleted -> "WorkCompleted"
+    is AgentRunEvent.UserCancelled -> "UserCancelled"
+    is AgentRunEvent.DeadlineReached -> "DeadlineReached"
+    is AgentRunEvent.ProcessInterrupted -> "ProcessInterrupted"
+    is AgentRunEvent.PersistenceFailed -> "PersistenceFailed"
+    is AgentRunEvent.RunFinalized -> "RunFinalized"
+}
+
 /** reducer 对单个事件的判定结果。 */
 sealed class AgentRunTransition {
     /** 事件被接受。`changed=false` 表示幂等 no-op（状态未变）。 */
@@ -198,7 +227,7 @@ object AgentRunReducer {
                 else -> rejected(
                     state, event,
                     AgentRunRejectionReason.TERMINAL_STATE_IMMUTABLE,
-                    "terminal state $phase cannot accept ${event::class.simpleName}",
+                    "terminal state $phase cannot accept ${event.traceName()}",
                 )
             }
         }
@@ -212,7 +241,7 @@ object AgentRunReducer {
                 else -> rejected(
                     state, event,
                     AgentRunRejectionReason.RUN_NOT_STARTED,
-                    "run not started; ${event::class.simpleName} requires RunStarted first",
+                    "run not started; ${event.traceName()} requires RunStarted first",
                 )
             }
         }
@@ -440,7 +469,7 @@ object AgentRunReducer {
         rejected(
             state, event,
             AgentRunRejectionReason.INVALID_PHASE_FOR_EVENT,
-            "${event::class.simpleName} invalid in phase=$actual (expected $expected)",
+            "${event.traceName()} invalid in phase=$actual (expected $expected)",
         )
 
     private fun finalizeFrom(state: AgentRunState, event: AgentRunEvent.RunFinalized): AgentRunTransition {

@@ -58,6 +58,67 @@ fun resolveCompactAnchorIdx(
                     history[i].dbMessageId.isNullOrEmpty())
             ) i -= 1
         }
+        // [fix/compact-keep-instruction-active] The USER prompt we just landed
+        // on may be the CURRENT turn's driving instruction (run in progress, or
+        // a just-sent message with no answer yet). Anchoring ON it puts the
+        // instruction inside the compacted range: the summary replaces it, the
+        // model loses the instruction (the "swallowed instruction" report), and
+        // the run continues on the summary alone. Walk back past the trailing
+        // block of user-text prompts so the whole current turn (instruction +
+        // tool work + answer) stays on the ACTIVE side of the divider. Manual
+        // compact-before (anchorIdxOverride) is unaffected — an explicit anchor
+        // is the user's own choice.
+        //
+        // [audit-0915] SCOPE — stated because the block above describes only
+        // half of it. This walk-back is UNCONDITIONAL on the compact-all path:
+        // it does NOT test whether a run is in flight, so it also applies to a
+        // manual compact of a settled session. Two visible consequences, both
+        // deliberate:
+        //   1. the compacted range ends one turn earlier than before (the
+        //      PREVIOUS answer is compacted along with the rest, the LAST whole
+        //      turn stays active). The instruction is the thing least safe to
+        //      replace with a summary, so this direction is the safer one.
+        //   2. a second compact with no new turn in between resolves to the
+        //      same anchor, so `effectiveStartIdx > anchorIdx` reports
+        //      "already compacted" instead of re-compacting the last prompt.
+        // If in-flight-only scope is ever wanted, gate this block on the run
+        // state at the CALL SITE — never read `_isStreaming` from in here: this
+        // helper is side-effect-free and JVM-tested.
+        if (i > 0) {
+            var j = i
+            while (j > 0) {
+                val prev = history[j - 1]
+                if (prev.role != LLMMessage.Role.USER ||
+                    prev.contentParts.all { p -> p is AgentContentPart.ToolResult } ||
+                    prev.dbMessageId.isNullOrEmpty()
+                ) break
+                j -= 1
+            }
+            if (j > 0) {
+                var k = j - 1
+                while (k >= 0 && history[k].dbMessageId.isNullOrEmpty()) k -= 1
+                i = k // may end at -1 when nothing persisted precedes → caller aborts
+            } else {
+                // [audit-0916] The walk reached the very start: every entry
+                // before the tail is a persisted user-text prompt with no
+                // assistant reply in between. A role bridge does not persist,
+                // so a reload that collapses bridges produces exactly this
+                // shape — and the tail prompt may be the CURRENT instruction,
+                // still unanswered. Nothing settled exists to anchor on, and
+                // anchoring on the tail would swallow the instruction (the
+                // failure this walk-back exists to prevent). Abort, mirroring
+                // the sole-prompt branch below.
+                return -1
+            }
+        } else if (i == 0 &&
+            history[0].role == LLMMessage.Role.USER &&
+            history[0].contentParts.any { p -> p !is AgentContentPart.ToolResult } &&
+            history.drop(1).none { it.role == LLMMessage.Role.ASSISTANT }
+        ) {
+            // Sole unanswered user prompt and nothing anchored before it —
+            // compacting [0..0] would swallow the only instruction. Abort.
+            return -1
+        }
         i
     }
 }
@@ -138,9 +199,15 @@ fun buildConversationTextForSummary(history: List<LLMMessage>): String = buildSt
  */
 fun isContextTooLargeError(error: Throwable): Boolean {
     val desc = (error.message ?: error.toString()).lowercase()
+    // [fix/audit-0917-b9] "max_tokens" was dropped: it appears in OUTPUT
+    // parameter errors ("max_tokens must be at most N") which halving the
+    // input does NOT fix — classifying them here sent the retry loop into
+    // repeated non-converging halvings. True input-overflow texts are all
+    // covered by the remaining substrings (context window / context length /
+    // too many tokens / prompt is too long / …). Deliberate deviation from
+    // the iOS implementation this was mirrored from.
     return desc.contains("too many tokens") ||
         desc.contains("context length") ||
-        desc.contains("max_tokens") ||
         desc.contains("content is too long") ||
         desc.contains("exceeds the model") ||
         desc.contains("request too large") ||

@@ -118,6 +118,16 @@ internal fun ChatViewModel.compactAll(anchorIdxOverride: Int? = null, allowInStr
         appendSystemInfo(context.getString(R.string.sysmsg_compact_budget_exhausted), "compact")
         return
     }
+    // [fix/audit0917-b8] Stamp the auto-compact retry gate HERE — at the last
+    // point before real work starts — instead of in the two callers, which
+    // stamped it *before* invoking compactAll. Those callers stamped even when
+    // compactAll returned early (stream in flight / no persisted anchor /
+    // already compacted / nothing to compact / budget exhausted), so a
+    // pre-flight abort left the gate closed for the whole minIntervalMs window
+    // with nothing compacted: auto-compaction silently went quiet. Stamping
+    // here (not on success) still keeps the anti-thrash interval for genuine
+    // failures — repeated provider errors must not re-hammer the model.
+    lastAutoCompactAtMs = System.currentTimeMillis()
     traceObserver.t7State(
         traceObserver.t7ObservedPhase ?: ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS),
         ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.COMPACTING),
@@ -215,10 +225,24 @@ internal fun ChatViewModel.compactAll(anchorIdxOverride: Int? = null, allowInStr
                 lastCompactedMessageId = lastCompactedDbId,
                 version = 2,
             )
-            runCatching { chatRepository.dao.insertCompactMarker(marker) }
+            // [audit-0917] Only publish the in-memory compact state when the
+            // marker actually persisted. The DB write was best-effort (logged
+            // and ignored) while _compactSummary/_cachedLatestMarker were set
+            // unconditionally — so a failed insert showed a compacted session
+            // that silently reverted (dividers gone, full history replayed)
+            // after the next reload. Now the failure is surfaced and the
+            // in-memory boundary is not advertised as durable.
+            val markerSaved = runCatching { chatRepository.dao.insertCompactMarker(marker) }
                 .onFailure {
                     Log.w(ChatViewModel.TAG, "Failed to persist compact marker: ${it.message}")
                 }
+                .isSuccess
+            if (!markerSaved) {
+                AppLogger.warning(
+                    ChatViewModel.TAG_STREAM,
+                    "compact marker not persisted; keeping the summary in memory only",
+                )
+            }
             _compactSummary.value = summary
             // Keep the marker in memory so effectiveAgentHistory() can
             // resolve the boundary on the very next outgoing turn.
@@ -238,7 +262,7 @@ internal fun ChatViewModel.compactAll(anchorIdxOverride: Int? = null, allowInStr
                 // [fix/diff-audit-0904-F2] The cutoff row match must cover
                 // the LIVE-session id dialect, not just the cold-rebuild
                 // one. Cold rebuild (loadSession) sets ChatMessage.id =
-                // entity.id (the DB id), so `msg.id == cutoffId` hits.
+                // entity.id (the DB id), so the id match in applyCompactGreyedRange hits.
                 // A live in-loop compact runs while the current turn's
                 // bubbles still carry runtime ids (`assistant_<ts>` for
                 // the streaming assistant row; tool-result carriers have
@@ -256,48 +280,16 @@ internal fun ChatViewModel.compactAll(anchorIdxOverride: Int? = null, allowInStr
                 //      the anchor, so the walk flips passedCutoff at the
                 //      last settled row even when the anchor row itself
                 //      has no UI representation (tool-result carrier).
-                val cutoffId: String = lastCompactedDbId
-                var passedCutoff = false   // anchor is guaranteed non-null in v2
-                var cleaned = _messages.value
-                    .filterNot { msg ->
-                        // Drop prior compact-divider rows; appendSystemInfo
-                        // below will re-add the new one.
-                        msg.role == "system" &&
-                            msg.toolBlocks.firstOrNull()?.toolName == "compact"
-                    }
-                    .map { msg ->
-                        if (msg.role == "system") msg
-                        else if (passedCutoff) msg
-                        else {
-                            val grayed = if (msg.isCompactedHistory) msg
-                                else msg.copy(isCompactedHistory = true)
-                            if (msg.id == cutoffId || msg.sourceDbIds.contains(cutoffId)) {
-                                passedCutoff = true
-                            }
-                            grayed
-                        }
-                    }
-                // In-flight bubbles (current turn) sit after the anchor even
-                // when the anchor has no UI row: force the boundary at the
-                // last settled row so the streaming/queued placeholder and
-                // any already-created follow-ups never inherit the gray flag.
-                if (!passedCutoff) {
-                    val lastSettledIdx = cleaned.indexOfLast { msg ->
-                        msg.role != "system" && !msg.isStreaming && !msg.isQueued && !msg.isAwaitingModelResponse
-                    }
-                    if (lastSettledIdx >= 0) {
-                        cleaned = cleaned.mapIndexed { idx, msg ->
-                            if (idx > lastSettledIdx && msg.role != "system" && !msg.isCompactedHistory) {
-                                msg.copy(isCompactedHistory = false)
-                            } else msg
-                        }
-                    }
-                }
+                // [audit-0916] The greying walk + tail repair moved into
+                // [applyCompactGreyedRange] (ChatModels.kt) so the boundary
+                // rules are JVM-testable — see that function's doc for the
+                // no-op repair this replaces.
+                val cleaned = applyCompactGreyedRange(_messages.value, lastCompactedDbId)
                 // T84: count UI bubbles in this pass's compacted range.
                 // Filters: role != system (dividers/notices don't count).
                 // Range: everything up to and including the cutoff row,
                 // since the kept-tail starts immediately after.
-                // Falls back to "all non-system" when cutoffId is null
+                // Falls back to "all non-system" when the anchor id is null
                 // (compact-everything path), matching iOS dividerInsertIdx
                 // == messages.count behavior.
                 //
@@ -308,7 +300,7 @@ internal fun ChatViewModel.compactAll(anchorIdxOverride: Int? = null, allowInStr
                 // even though `toCompact.size` was nonzero. The divider's
                 // count should reflect the size of THIS pass's range, not
                 // the delta of newly-grayed rows.
-                val cutoffIdx = cleaned.indexOfLast { it.id == cutoffId || it.sourceDbIds.contains(cutoffId) }
+                val cutoffIdx = cleaned.indexOfLast { it.id == lastCompactedDbId || it.sourceDbIds.contains(lastCompactedDbId) }
                 val compactedUICount = if (cutoffIdx < 0) {
                     cleaned.count { it.role != "system" }
                 } else {
@@ -703,30 +695,81 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     // TF-D: compaction runs through :modelservice via the gateway — the main
     // process never calls provider.sendMessage. A remote failure (typed)
     // throws so the splitter can halve the input and retry.
-    return when (val r = ProviderExecutionGateway.send(
-        context = context,
-        instance = instance,
-        model = provider.model,
-        messages = listOf(
-            LLMMessage(role = LLMMessage.Role.USER, content = userMessage)
-        ),
-        systemPrompt = compactSummarySystemPrompt,
-        maxTokens = maxOut,
-        // Mirror iOS AIChatViewModel.swift:12926 — null lets the
-        // provider/model use its default. gpt-5.x family rejects any
-        // temperature != 1 with HTTP 400, and Android
-        // OpenAIProvider.buildRequestBody omits the field entirely when
-        // temperature is null.
-        temperature = null,
-        imageParts = emptyList(),
-        tools = emptyList(),
-        thinkingLevel = ThinkingLevel.OFF,
-    )) {
+    //
+    // [fix/compact-model-fallback] A RemoteFailure/Unavailable on the ACTIVE
+    // member no longer fails the whole compact: the group's healthy fallback
+    // candidates get ONE pass each via the same gateway (the group router
+    // already ordered them cheapest-first and filtered cooling/dead members).
+    // CancellationException is not a result type — it propagates as before,
+    // so a user cancel never degrades into a fallback retry. All-fallbacks-
+    // failed throws the same typed exceptions the splitter expects, so the
+    // halving path is untouched. Fallback outcomes are NOT recorded into the
+    // group router: a compaction failure says nothing about the member's
+    // chat-traffic health, and recording would demote a healthy member.
+    suspend fun sendVia(p: LLMProvider): ProviderExecutionGateway.SendResult {
+        // A fallback candidate without an instance context is skipped, not
+        // fatal — the chain continues to the next candidate.
+        val inst = p.instanceContext
+            ?: return ProviderExecutionGateway.SendResult.Unavailable(
+                "no instance context for ${p.model.displayName}"
+            )
+        return ProviderExecutionGateway.send(
+            context = context,
+            instance = inst,
+            model = p.model,
+            messages = listOf(
+                LLMMessage(role = LLMMessage.Role.USER, content = userMessage)
+            ),
+            systemPrompt = compactSummarySystemPrompt,
+            maxTokens = maxOut,
+            // Mirror iOS AIChatViewModel.swift:12926 — null lets the
+            // provider/model use its default. gpt-5.x family rejects any
+            // temperature != 1 with HTTP 400, and Android
+            // OpenAIProvider.buildRequestBody omits the field entirely when
+            // temperature is null.
+            temperature = null,
+            imageParts = emptyList(),
+            tools = emptyList(),
+            thinkingLevel = ThinkingLevel.OFF,
+        )
+    }
+    return when (val r = sendVia(provider)) {
         is ProviderExecutionGateway.SendResult.Success -> r.response.text
-        is ProviderExecutionGateway.SendResult.RemoteFailure ->
-            throw IllegalStateException("compaction failed (${r.code}): ${r.message}")
-        is ProviderExecutionGateway.SendResult.Unavailable ->
-            throw IllegalStateException("compaction unavailable: ${r.reason}")
+        is ProviderExecutionGateway.SendResult.RemoteFailure,
+        is ProviderExecutionGateway.SendResult.Unavailable -> {
+            val fallbacks = buildFallbackProviders(provider)
+            AppLogger.info(
+                ChatViewModel.TAG,
+                "[Compact] summary failed on active member ($r) — trying ${fallbacks.size} fallback candidate(s)",
+            )
+            var lastFailure: Exception = IllegalStateException("compaction failed")
+            for (candidate in fallbacks) {
+                when (val fr = sendVia(candidate.provider)) {
+                    is ProviderExecutionGateway.SendResult.Success -> {
+                        AppLogger.info(
+                            ChatViewModel.TAG,
+                            "[Compact] summary fallback SUCCESS entry=${candidate.entryId} " +
+                                "model=${candidate.provider.model.displayName}",
+                        )
+                        return fr.response.text
+                    }
+                    else -> {
+                        AppLogger.info(
+                            ChatViewModel.TAG,
+                            "[Compact] summary fallback failed entry=${candidate.entryId}: $fr",
+                        )
+                        lastFailure = when (fr) {
+                            is ProviderExecutionGateway.SendResult.RemoteFailure ->
+                                IllegalStateException("compaction failed (${fr.code}): ${fr.message}")
+                            is ProviderExecutionGateway.SendResult.Unavailable ->
+                                IllegalStateException("compaction unavailable: ${fr.reason}")
+                            else -> lastFailure
+                        }
+                    }
+                }
+            }
+            throw lastFailure
+        }
     }
 }
 
@@ -1040,6 +1083,21 @@ internal fun ChatViewModel.loadSession() {
         // stale delta would render a "thinking" row pinned to a message
         // after switching sessions.
         _streamingById.value = emptyMap()
+
+        // [fix/same-class-cleanup] The rebuild above is the ROOT of the
+        // queued-bubble drop (queued prompts are UI-only — they never
+        // persist), so the re-attach lives HERE rather than in the
+        // reloadSessionFromDb wrapper: every loadSession caller (init,
+        // safe-mode-cleared retry, revertCompact's reload, and any future
+        // one) inherits it. At init/retry the queue is empty (fresh VM), so
+        // this is a no-op there. Mirrors the reload wrapper's re-attach,
+        // which this supersedes.
+        val droppedQueued = _promptQueue.value.filter { q ->
+            _messages.value.none { it.queuedPromptId == q.id }
+        }
+        if (droppedQueued.isNotEmpty()) {
+            _messages.value = _messages.value + droppedQueued.map { queuedPromptBubble(it) }
+        }
 
         // Cold-start interrupt detection: an agent loop that was killed by
         // the OS (or app force-quit) leaves agentHistory in one of three

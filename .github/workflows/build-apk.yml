@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Needed by the "Publish to Releases" step to create/update a GitHub Release
     # and upload the APK asset. Everything else here only reads the repo.
     permissions:
@@ -59,6 +59,14 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # [T-ci-sdk-tools-deprecation] The action's default is
+          # `tools platform-tools`, but Google stopped serving the deprecated
+          # `tools` package on 2026-09-15 — sdkmanager now exits with
+          # "Warning: Failed to find package 'tools'" (measured: CI run #1532,
+          # 2026-09-15; upstream issue android-actions/setup-android#537).
+          # We never needed `tools`; request only what the build uses.
+          packages: 'platform-tools'
 
       # Build the proot sandbox engine from source: deps/proot (submodule) +
       # deps/build_proot.sh + vendored deps/talloc. Needs NDK r28; the runner
@@ -325,6 +333,14 @@ jobs:
             exit 1
           fi
           echo "libproot.so matches the source-built binary."
+
+          # Debug-code release hygiene: debug/ lives in src/main, so the APK
+          # must NOT contain any debug-only marker string. This is the exact
+          # property that matters — a -keep rule, a minify disable, or a new
+          # BuildConfig.DEBUG-less entry point would ship the token-free
+          # loopback debug JSON-RPC (127.0.0.1:5321) to users with no other
+          # gate noticing. Verified on the BUILT artifact, not the source.
+          python3 scripts/scan/debug_leak_guard.py apk "$APK"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v7

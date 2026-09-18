@@ -12,11 +12,18 @@ import java.util.Locale
  * these from the same package.
  */
 
-internal val stepTimestampFormatter: SimpleDateFormat =
-    SimpleDateFormat("HH:mm:ss", Locale.US)
+// [audit-0917] DateTimeFormatter, not a shared SimpleDateFormat: minSdk is 26
+// so java.time is available natively, and SimpleDateFormat carries mutable
+// calendar state — this formatter is a top-level val used from both Compose
+// composition and tool-execution coroutines, where a concurrent format() call
+// could interleave and emit a garbled timestamp.
+internal val stepTimestampFormatter: java.time.format.DateTimeFormatter =
+    java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
 
 internal fun formatStepTimestamp(epochMs: Long): String =
-    stepTimestampFormatter.format(Date(epochMs))
+    java.time.Instant.ofEpochMilli(epochMs)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(stepTimestampFormatter)
 
 internal fun formatStepDuration(seconds: Long, stillRunning: Boolean): String {
     val safe = seconds.coerceAtLeast(0L)
@@ -45,6 +52,7 @@ internal fun toolDisplayName(toolName: String): String = when (toolName) {
     "read_image" -> "image viewer"
     "memory_write" -> "memory"
     "memory_get" -> "memory"
+    "conversation_history" -> "history"
     "web_search" -> "search"
     else -> toolName
 }
@@ -57,6 +65,7 @@ internal fun toolTitleLabel(toolName: String): String = when (toolName) {
     "browser_use" -> "RikkaMinis is using Browser"
     "read_image" -> "RikkaMinis is reading Image"
     "memory_write", "memory_get" -> "RikkaMinis is using Memory"
+    "conversation_history" -> "RikkaMinis is reading History"
     "web_search" -> "RikkaMinis is using Search"
     else -> "RikkaMinis is using ${toolDisplayName(toolName)}"
 }

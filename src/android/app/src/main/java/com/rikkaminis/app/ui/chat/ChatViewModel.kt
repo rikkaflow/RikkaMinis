@@ -97,6 +97,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -127,6 +128,13 @@ class ChatViewModel(
         // when checking for missing required fields. Mirrors iOS
         // AIChatViewModel.preflightNonBlockingFields.
         private val PREFLIGHT_NON_BLOCKING_FIELDS = setOf("tool_title")
+        // [T-preflight-enum-and-type] Types published to the model as JSON
+        // scalars. Every AgentToolParam in the codebase currently declares one of
+        // these (string/integer/boolean). A future container parameter
+        // (array/object) needs the structural check in
+        // preflightValidateToolCallImpl extended — widening this set would let a
+        // container slip through unexamined.
+        private val PREFLIGHT_SCALAR_TYPES = setOf("string", "integer", "number", "boolean")
 
         /**
          * (tool name → field names) where an EMPTY STRING is a semantically
@@ -169,10 +177,13 @@ class ChatViewModel(
          * validator never drifts from the schema published to the model. For
          * string fields we additionally require non-blank content — the model
          * occasionally emits `{"path": ""}` which passes the "key exists" check
-         * but is just as broken as a missing key. We do NOT validate type beyond
-         * string-emptiness here; richer schema checks (enum, regex, integer
-         * range) belong in each tool's own helper because they need tool-specific
-         * context.
+         * but is just as broken as a missing key.
+         *
+         * Also consumes the two schema facts that need no tool-specific context
+         * and were previously published but never read: `enum` membership and
+         * scalar-vs-container shape — see the [T-preflight-enum-and-type] block
+         * below. Constraints that DO need tool context (integer range, regex,
+         * cross-field rules) stay in each tool's own helper, as before.
          *
          * Mirror of iOS preflightValidateToolCall in AIChatViewModel.swift.
          *
@@ -228,6 +239,38 @@ class ChatViewModel(
             }
             if (missing.isNotEmpty()) {
                 return "Tool '$name' is missing required parameter(s): ${missing.joinToString(", ")}."
+            }
+            // [T-preflight-enum-and-type] The schema published to the model has
+            // always carried `type` and `enum` (AgentToolParam.toJson), but this
+            // validator only ever read `required` — so an off-schema payload
+            // reached the tool and was resolved by whatever fallback that tool
+            // happened to have. Two families are worth refusing here:
+            //
+            //  * Enum membership. memory_get's `scope` is the canonical case:
+            //    only `scope == "all"` takes the all-logs branch
+            //    (MemoryRepository), so "ALL" or "al" silently searched dailies
+            //    only while the answer still looked complete.
+            //  * A scalar parameter handed an object/array. ToolJsonRepair used
+            //    to `toString()` those into JSON text; it now leaves them alone
+            //    precisely so this check can refuse them (see Strategy 2 there).
+            //
+            // Deliberately NOT policed: integer/number/boolean spelling. org.json
+            // reports Integer/Long/Double/BigDecimal by parse path, and the
+            // coercion above exists to accept `30` for a string field.
+            for ((field, param) in toolDef.parameters) {
+                if (!args.has(field) || args.isNull(field)) continue
+                val raw = args.opt(field)
+                if (raw is JSONObject || raw is JSONArray) {
+                    if (param.type in PREFLIGHT_SCALAR_TYPES) {
+                        val shape = if (raw is JSONObject) "an object" else "an array"
+                        return "Tool '$name' parameter '$field' expects ${param.type} but received $shape."
+                    }
+                    continue
+                }
+                val allowed = param.enumValues ?: continue
+                if (raw is String && raw !in allowed) {
+                    return "Tool '$name' parameter '$field' must be one of ${allowed.joinToString(", ")} but was '$raw'."
+                }
             }
             return null
         }
@@ -1139,8 +1182,10 @@ class ChatViewModel(
             toolBlockMeta: Map<String, AssistantBlock>, modelId: String?, entryId: String?,
         ): String? = this@ChatViewModel.persistAssistantTurn(
             parts, usage, reasoningContent, toolBlockMeta, modelId, entryId)
-        override suspend fun persistToolResultMessage(parts: List<AgentContentPart>): String? =
-            this@ChatViewModel.persistToolResultMessage(parts)
+        override suspend fun persistToolResultMessage(
+            parts: List<AgentContentPart>,
+            transcriptRedactions: Map<String, String>,
+        ): String? = this@ChatViewModel.persistToolResultMessage(parts, transcriptRedactions)
         override suspend fun executeTool(
             name: String, argsJson: String, toolId: String,
             toolBlocks: MutableList<AssistantBlock>, assistantId: String, currentText: String,
@@ -1249,6 +1294,15 @@ class ChatViewModel(
      */
     @Volatile
     internal var _browserTabPoolRef: BrowserTabPool? = null
+
+    /**
+     * [audit-0917] Unsubscribe handle for the safe-mode-cleared listener.
+     * CrashFrequencyDetector holds listeners in a process-lifetime singleton,
+     * so registering without keeping the returned unsubscribe lambda pinned the
+     * whole ChatViewModel (and its repositories / browser pool) for the life of
+     * the process — one leak per chat screen the user opened.
+     */
+    private var safeModeClearedUnsubscribe: (() -> Unit)? = null
 
     /** Browser tab pool for browser_use tool. Lazily created on first access. */
     val browserTabPool: BrowserTabPool by lazy {
@@ -1839,9 +1893,16 @@ class ChatViewModel(
         // in-flight bubble instead, which is also where the cold-reload
         // path puts the divider (applyCompactMarkerGraying inserts it
         // after the anchor row, i.e. before the live tail).
-        val inFlightIdx = list.indexOfLast { msg ->
-            msg.role != "system" && (msg.isStreaming || msg.isAwaitingModelResponse)
-        }
+        // [refactor/inflight-predicate] One predicate instead of an inline
+        // re-derivation. Behavior fix: the old inline copy enumerated only
+        // (isStreaming || isAwaitingModelResponse) and DROPPED isQueued, so
+        // when the tail was a queued bubble with no in-flight row, the
+        // notice landed AFTER it — contradicting this comment's own intent
+        // ("before the live tail") and the graying boundary's full set.
+        // isLiveRow includes isQueued, so the notice now inserts before a
+        // queued prompt too (it relates to the state the prompt will run
+        // into, and the prompt's run output starts below the divider).
+        val inFlightIdx = list.indexOfLast { msg -> msg.isLiveRow() }
         _messages.value = if (inFlightIdx >= 0) {
             list.toMutableList().apply { add(inFlightIdx, notice) }
         } else {
@@ -2027,6 +2088,18 @@ class ChatViewModel(
     internal var lastAutoCompactAtMs = Long.MIN_VALUE
 
     /**
+     * [T-ctx-offload-escalation] Set by [offloadContextIfNeeded] when a pass
+     * fell well short of its token target — the signature of a long session
+     * whose large tool results have all been offloaded already, leaving only
+     * conversation text the offloader cannot touch. Read (and cleared) by
+     * [maybeAutoCompactInLoop], which then compacts even though the context is
+     * still below the compact line. Single-turn by construction: the consumer
+     * resets it, so a stale flag can never escalate a compact minutes later.
+     */
+    @Volatile
+    internal var offloadUnderDelivered = false
+
+    /**
      * Result of a bounded walk-back. `priorIdx` is the agentHistory index
      * the caller should use as the start of preAnchor; `null` means even
      * the first user turn including anchor would exceed `maxMessages`, so
@@ -2127,6 +2200,9 @@ class ChatViewModel(
                         }
                 }
             }
+            // [audit-0917] Pin the unsubscribe lambda so onCleared() can drop
+            // the registration — otherwise the singleton keeps this VM alive.
+            .also { safeModeClearedUnsubscribe = it }
         // Re-resolve provider when config changes (models may load async)
         viewModelScope.launch {
             // T306: wait for loadSession to finish BEFORE observing config.
@@ -2653,6 +2729,20 @@ class ChatViewModel(
                             _messages.value = cur.subList(0, ai).toList() + trimmed
                         }
                     }
+                    // [fix/same-class-cleanup] Same re-attach as
+                    // retryFromMessage and the loadSession tail: this
+                    // truncation rewound past queued bubbles (they sit at the
+                    // tail), but their _promptQueue entries survive — the
+                    // bubble vanishes from the UI while the queue keeps it
+                    // (invisible, not withdrawable, fires on the next drain).
+                    // Re-attach so a queued prompt the rerun swept past stays
+                    // visible and cancellable.
+                    val droppedQueued = _promptQueue.value.filter { q ->
+                        _messages.value.none { it.queuedPromptId == q.id }
+                    }
+                    if (droppedQueued.isNotEmpty()) {
+                        _messages.value = _messages.value + droppedQueued.map { queuedPromptBubble(it) }
+                    }
                 }
                 val keptIds = _messages.value.mapTo(mutableSetOf()) { it.id }
                 retainStreamFlushStates(keptIds)
@@ -2738,6 +2828,20 @@ class ChatViewModel(
             } else m
         }
         _messages.value = retainedHead
+        // [fix/same-class-cleanup] The truncation above rewound past queued
+        // bubbles too (they sit at the tail of _messages), but their
+        // _promptQueue entries SURVIVE — the bubble vanishes from the UI
+        // while the queue keeps it: invisible, not withdrawable (the
+        // withdraw button lives on the bubble), and it fires later when the
+        // drain runs. Mirror the reload path's re-attach
+        // (loadSession tail) so a queued prompt the rewind swept past stays
+        // visible and cancellable — same fix, another entry point.
+        val droppedQueued = _promptQueue.value.filter { q ->
+            _messages.value.none { it.queuedPromptId == q.id }
+        }
+        if (droppedQueued.isNotEmpty()) {
+            _messages.value = _messages.value + droppedQueued.map { queuedPromptBubble(it) }
+        }
         // T-streaming-side-channel: scrub stream deltas pointing at
         // messages we just truncated so they can't resurface later.
         val keptIds = retainedHead.mapTo(mutableSetOf()) { it.id }
@@ -2893,20 +2997,11 @@ class ChatViewModel(
         )
         _promptQueue.value = _promptQueue.value + prompt
 
-        val attachmentNames = pendingAttachments.map { it.fileName }
-        val imageUris = pendingAttachments.filter { it.isImage }.map { it.uri }
-        val attachmentUris = pendingAttachments.filterNot { it.isImage }.map { it.uri }
-        val chatMsg = ChatMessage(
-            id = "queued_msg_${prompt.id}",
-            role = "user",
-            content = trimmed,
-            imageUris = imageUris,
-            attachmentNames = attachmentNames,
-            attachmentUris = attachmentUris,
-            isQueued = true,
-            queuedPromptId = prompt.id,
-        )
-        _messages.value = _messages.value + chatMsg
+        // [fix/compact-revert-drops-queued] Bubble shape extracted to
+        // queuedPromptBubble() — the reload re-attach path
+        // (reloadSessionFromDb) renders through the same builder so the
+        // two can't drift.
+        _messages.value = _messages.value + queuedPromptBubble(prompt)
         clearAttachments()
         Log.i(TAG, "Enqueued prompt (${trimmed.length}ch, ${pendingAttachments.size} attachments), queue=${_promptQueue.value.size}")
     }
@@ -3355,8 +3450,22 @@ class ChatViewModel(
 
     fun cancelStream() {
         AppLogger.info(TAG_STREAM, "cancelStream invoked _isStreaming=false (sid=$activeSessionId)")
+        val epochAtCancel = streamEpoch
         streamJob?.cancel()
-        _isStreaming.value = false
+        // [audit-0917] Guard the flag with the same epoch discipline every
+        // other clear site uses (rerunFromToolBlock / retry / resume finally
+        // blocks all compare sendEpoch == streamingClaimEpoch). An
+        // unconditional assignment could clear the flag of a turn that had
+        // already claimed streaming in the meantime — a stale cancel landing
+        // after the new claim but before the new job is established.
+        if (streamEpoch == epochAtCancel) {
+            _isStreaming.value = false
+        } else {
+            AppLogger.info(
+                TAG_STREAM,
+                "cancelStream _isStreaming=false SKIPPED (superseded; epoch=$epochAtCancel now=$streamEpoch)",
+            )
+        }
         // T7-A: 观察 —— 用户取消（T5 UserCancelled 语义，进入收尾）
         traceObserver.t7State(
             traceObserver.t7ObservedPhase ?: ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.CALLING_MODEL),
@@ -3531,6 +3640,11 @@ class ChatViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        // [audit-0917] Drop the safe-mode listener registration: the singleton
+        // holds it for the process lifetime, so without this the whole VM
+        // (repositories, browser pool) leaked per opened chat screen.
+        safeModeClearedUnsubscribe?.invoke()
+        safeModeClearedUnsubscribe = null
         // [T-chat-sysinfo-coalesce] Flush any pending coalesce window so the
         // last system notice isn't lost when the ViewModel is destroyed.
         flushPendingSysInfo()

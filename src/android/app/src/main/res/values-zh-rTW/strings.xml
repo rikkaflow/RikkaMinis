@@ -1000,6 +1000,7 @@
 
     <!-- i18n-rtw-backfill -->
     <string name="app_name">RikkaMinis</string>
+    <string name="onboarding_default_group_name">預設模型</string>
     <string name="new_chat">新對話</string>
     <string name="settings">設定</string>
     <string name="providers">AI 服務商</string>
@@ -1610,6 +1611,7 @@
     </plurals>
 
     <!-- Fix: minis:// 連結失效/檔案已清理時的提示，以及本地化的外部 scheme 攔截文案。 -->
+    <string name="chat_link_path_invalid">此連結指向的路徑無效。</string>
     <string name="chat_link_file_missing">此檔案已不可用。</string>
     <string name="webpreview_blocked_scheme">已攔截指向外部應用的連結。</string>
     <string name="thinking_rules_section">思考規則</string>
@@ -1656,6 +1658,7 @@
     <string name="notification_tool_browser">正在使用瀏覽器</string>
     <string name="notification_tool_read_image">正在讀取圖片</string>
     <string name="notification_tool_memory">正在使用記憶</string>
+    <string name="notification_tool_history">正在回看對話記錄</string>
     <string name="notification_tool_search">正在搜尋</string>
     <string name="notification_tool_generic">正在使用 %1$s</string>
     <string name="config_confirm_title_one">確認變更</string>

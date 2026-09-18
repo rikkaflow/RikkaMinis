@@ -84,6 +84,20 @@ object ModelExecutionDispatcher {
             put("model_id", model.id)
             put("model_display_name", model.displayName)
             put("model_provider", model.provider)
+            // [T-worker-reasoning-metadata] The two descriptors that gate the
+            // REASONING ECHO must survive the process boundary. Without them the
+            // worker rebuilt an LLMModel with both null, so:
+            //   • `supportsReasoning == true` (always-reasoning families: the level
+            //     cannot turn their reasoning off, so the echo is mandatory) never
+            //     reached the gate — it degraded to "echo only when the local level
+            //     is enabled";
+            //   • `interleavedReasoningField != null` (Anthropic-style interleaved
+            //     thinking, GH OpenMinis#70) was never satisfied in the process that
+            //     actually sends chat requests → that fix was inert on every
+            //     offloaded stream.
+            // Same cross-process class as the custom-rule transport below.
+            model.supportsReasoning?.let { put("supports_reasoning", it) }
+            model.interleavedReasoningField?.let { put("interleaved_reasoning_field", it) }
             model.inputModalities.orEmpty().let { if (it.isNotEmpty()) put("input_modalities", JSONArray(it)) }
             model.outputModalities.orEmpty().let { if (it.isNotEmpty()) put("output_modalities", JSONArray(it)) }
             model.contextWindow?.let { put("context_window", it) }
@@ -416,16 +430,13 @@ object ModelExecutionDispatcher {
         return safe
     }
 
-    /** True when THIS run dir's worker is provably done writing / reaped. */
-    private fun reapSafe(dir: File): Boolean {
-        // Worker's LAST durable marker — once present, it will self-reap.
-        if (ModelExecutionRunDir.terminalPresent(dir)) return true
-        // result committed by a worker that has stopped beating.
-        val result = File(dir, ModelExecutionMailbox.FILE_RESULT).exists()
-        val beatFile = File(dir, ModelExecutionRunDir.FILE_LIVENESS_BEAT)
-        val beatGoneOrStale = !beatFile.isFile || ModelExecutionRunDir.beatStale(dir)
-        return result && beatGoneOrStale
-    }
+    /** True when THIS run dir's worker is provably done writing / reaped.
+     *  Delegates to the shared [ModelExecutionRunDir.workerDrained] so the
+     *  streaming and non-streaming paths cannot drift apart again — the drift
+     *  between these two definitions is exactly what produced the
+     *  TF-G-ack-evidence bug (the streaming copy accepted client.ack and
+     *  bare result.json as "worker gone"; this one never did). */
+    private fun reapSafe(dir: File): Boolean = ModelExecutionRunDir.workerDrained(dir)
 
     /**
      * [T-stale-apikey-worker-cache] True when the worker for this run dir is

@@ -556,13 +556,23 @@ private fun SkillImportSheet(
                                     }
                                 }
                                 1 -> {
-                                    val result = skillRepository.importFromContent(pasteContent)
-                                    if (result != null) onDismiss()
-                                    else errorText = context.getString(R.string.skill_import_error_format)
+                                    isLoading = true
+                                    scope.launch {
+                                        try {
+                                            // [audit-0917] Mirror the URL branch: importFromContent does
+                                            // disk IO, so it must not run on the Main thread (ANR), and
+                                            // an exception must be caught, not propagated out of a click
+                                            // handler (crash).
+                                            val result = skillRepository.importFromContent(pasteContent)
+                                            if (result != null) onDismiss()
+                                            else errorText = context.getString(R.string.skill_import_error_format)
+                                        } catch (e: Exception) { errorText = "Error: ${e.message}" }
+                                        finally { isLoading = false }
+                                    }
                                 }
                             }
                         },
-                        enabled = when (selectedTab) { 0 -> urlText.isNotBlank() && !isLoading; 1 -> pasteContent.isNotBlank(); else -> false },
+                        enabled = when (selectedTab) { 0 -> urlText.isNotBlank() && !isLoading; 1 -> pasteContent.isNotBlank() && !isLoading; else -> false },
                     ) { Text(if (isLoading) stringResource(R.string.skill_import_in_progress) else stringResource(R.string.skill_import_submit)) }
                 }
             }
@@ -788,9 +798,13 @@ fun SkillDetailScreen(
                 DetailRow(clickable = !isBusy, onClick = {
                     if (isBusy) return@DetailRow
                     updateStatus = UpdateStatus.InProgress(context.getString(R.string.skill_detail_status_rescanning))
-                    val refreshed = skillRepository.rescanFromDisk(skill.id)
-                    updateStatus = if (refreshed != null) UpdateStatus.Done
-                        else UpdateStatus.Failed(context.getString(R.string.skill_detail_error_missing))
+                    // [audit-0917] rescanFromDisk walks the skill dir on disk - run it
+                    // off the Main thread like the update row above.
+                    scope.launch {
+                        val refreshed = skillRepository.rescanFromDisk(skill.id)
+                        updateStatus = if (refreshed != null) UpdateStatus.Done
+                            else UpdateStatus.Failed(context.getString(R.string.skill_detail_error_missing))
+                    }
                 }) {
                     SettingsActionIcon(Icons.Default.Refresh, SettingsIconGreen)
                     Spacer(Modifier.width(14.dp))
@@ -1210,6 +1224,14 @@ fun SkillFileViewerScreen(
                 textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
             )
         } else {
+            // Render markdown sibling files (references/, docs/) with the
+            // shared renderer; SKILL.md stays raw because its frontmatter
+            // (--- / name: / version:) would be distorted by markdown
+            // parsing, and it is the agent-facing contract where what you
+            // see should equal what the agent reads. Editing remains raw
+            // for every file type.
+            val renderAsMarkdown =
+                relativePath.endsWith(".md", ignoreCase = true) && !isSkillMd
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1217,11 +1239,19 @@ fun SkillFileViewerScreen(
                     .padding(horizontal = 16.dp),
             ) {
                 item {
-                    Text(
-                        initialContent,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
+                    if (renderAsMarkdown) {
+                        MarkdownText(
+                            markdown = initialContent,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    } else {
+                        Text(
+                            initialContent,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
         }

@@ -29,26 +29,7 @@ private data class OffloadCandidate(
     val toolName: String,
 )
 
-internal fun ChatViewModel.estimateContextTokens(): Int {
-    var totalChars = 0
-    var imageTokens = 0
-    for (msg in agentHistory) {
-        for (part in msg.contentParts) {
-            when (part) {
-                is AgentContentPart.Text -> totalChars += part.text.length
-                is AgentContentPart.ToolUse -> totalChars += part.input.toString().length
-                is AgentContentPart.ToolResult -> {
-                    totalChars += part.content.length
-                    part.imageData?.let { imageTokens += BPETokenizer.countImageTokens(it) }
-                }
-                is AgentContentPart.ImageData -> {
-                    imageTokens += BPETokenizer.countImageTokens(part.data)
-                }
-            }
-        }
-    }
-    return (totalChars / 3.5).toInt() + imageTokens
-}
+internal fun ChatViewModel.estimateContextTokens(): Int = estimateHistoryTokens(agentHistory)
 
     /**
      * Approximate token count for a single agent content part. Used to rank
@@ -64,6 +45,65 @@ internal fun ChatViewModel.countPartTokens(part: AgentContentPart): Int = when (
     }
     is AgentContentPart.ImageData -> BPETokenizer.countImageTokens(part.data)
 }
+
+/**
+ * [fix/offload-payload-stub] Whether [part] may be replaced, in the history
+ * sent to the provider, by a disk stub of the form
+ * `[CONTEXT OFFLOADED] … saved to: <path>`.
+ *
+ * Only **observations** are eligible. Replacing a large `ToolResult` (or a
+ * bare image) with a stub is lossless in the sense that matters: the stub
+ * names a path, the bytes are on disk, and a model that needs them again can
+ * `file_read` them.
+ *
+ * `ToolUse` parts are **not** eligible. Their arguments are *instructions*,
+ * and for `file_write` the `content` argument **is the payload** — not a
+ * reference to one. Stubbing it puts a pointer where the data belongs, and
+ * the model's own history then reads "the content I sent last time was this
+ * stub text", which it reproduces the next time it plans the same write.
+ *
+ * Field evidence (2026-09-14, session 051f8698, build 1.0.0+1522):
+ * a `file_write` of `SensitiveCommandPolicy.kt` carried
+ * `content = "[CONTEXT OFFLOADED] Content (~1103 tokens, 3936 bytes) saved
+ * to: …/file_write_0lBaMiNz5926.txt"`; the tool reported `success=true` and
+ * the file held ~150 bytes instead of 3714. That session had 23 `file_write`
+ * payloads offloaded and 97 parts already stubbed — i.e. 23 chances per day
+ * to silently truncate a file. The old rule also read `input["content"]` for
+ * both tools, but `file_edit` carries `old_string`/`new_string`, so that half
+ * never matched anything.
+ *
+ * Trade-off, deliberate: large `file_write` payloads now stay in the context
+ * window. They are still reclaimable at whole-turn granularity by
+ * [trimContextHistoryWindow] and auto-compaction, which drop turns instead of
+ * rewriting an instruction's payload. Correctness of a write beats the token
+ * saving — and [com.rikkaminis.app.data.OffloadedPayloadGuard] is the second
+ * line of defence in case a stub reaches a payload slot anyway.
+ */
+internal fun isOffloadEligible(part: AgentContentPart): Boolean = when (part) {
+    is AgentContentPart.ToolResult ->
+        part.content.length > 500 || (part.imageData?.size ?: 0) > 1024
+    is AgentContentPart.ImageData -> part.data.size > 1024
+    is AgentContentPart.ToolUse -> false
+    is AgentContentPart.Text -> false
+}
+
+/**
+ * [fix/offload-protected-tools] Tools whose output must NEVER be offloaded —
+ * parity with OpenCode's compaction `PRUNE_PROTECTED_TOOLS = ["skill"]`.
+ * These tools' results are reference material the agent is expected to keep
+ * consulting verbatim; stubbing them swaps knowledge for a pointer and the
+ * only recovery is another tool call (a full turn of latency + tokens).
+ *
+ * ponytail: name-list protection, not a per-tool capability axis |
+ * 天花板: a tool whose output is huge AND disposable would waste window
+ * space by staying in context | 升级触发: a session where memory lookups
+ * dominate the context budget → make the list configurable per tool.
+ */
+internal val OFFLOAD_PROTECTED_TOOLS = setOf("memory_get")
+
+/** Pure check: is this ToolResult protected from offload/prune by tool name? */
+internal fun isProtectedToolResult(toolName: String?): Boolean =
+    toolName != null && toolName in OFFLOAD_PROTECTED_TOOLS
 
     /**
      * Walk [agentHistory], identify large tool outputs in the older
@@ -139,6 +179,12 @@ internal fun ChatViewModel.offloadContextIfNeeded(
     val candidates = mutableListOf<OffloadCandidate>()
     var skippedAlreadyOffloaded = 0
     var skippedTooSmall = 0
+    // [fix/offload-protected-tools] Counted separately from `too small`:
+    // protected tool results are excluded by *name*, not by size.
+    var skippedProtected = 0
+    // [fix/offload-payload-stub] Counted separately from `too small`: these are
+    // tool-call payloads, which are excluded by *kind*, not by size.
+    var skippedPayloadParts = 0
 
     for (msgIdx in 0 until candidateUpper) {
         val msg = agentHistory[msgIdx]
@@ -149,9 +195,14 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                         skippedAlreadyOffloaded++
                         continue
                     }
-                    val hasLargeContent = part.content.length > 500
-                    val hasLargeImage = (part.imageData?.size ?: 0) > 1024
-                    if (!hasLargeContent && !hasLargeImage) {
+                    // [fix/offload-protected-tools] Protected tool results are
+                    // never offload candidates, regardless of size — counted
+                    // separately so the reason is greppable in logs.
+                    if (isProtectedToolResult(part.name)) {
+                        skippedProtected++
+                        continue
+                    }
+                    if (!isOffloadEligible(part)) {
                         skippedTooSmall++
                         continue
                     }
@@ -160,16 +211,16 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                         (part.imageData?.size ?: 0)
                     candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, bytes, part.id, part.name))
                 }
+                // [fix/offload-payload-stub] ToolUse parts are deliberately NOT
+                // offload candidates any more — see [isOffloadEligible] for the
+                // field evidence and the reasoning. Kept as an explicit arm (not
+                // a silent `continue`) so the reason is greppable.
                 is AgentContentPart.ToolUse -> {
-                    if (part.name != "file_write" && part.name != "file_edit") continue
-                    val content = part.input.optString("content", "")
-                    if (content.length <= 500) continue
-                    val tokens = countPartTokens(part)
-                    val bytes = content.toByteArray(Charsets.UTF_8).size
-                    candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, bytes, part.id, part.name))
+                    skippedPayloadParts++
+                    continue
                 }
                 is AgentContentPart.ImageData -> {
-                    if (part.data.size <= 1024) {
+                    if (!isOffloadEligible(part)) {
                         skippedTooSmall++
                         continue
                     }
@@ -186,7 +237,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
     candidates.sortByDescending { it.tokens }
     val totalCandidateTokens = candidates.sumOf { it.tokens }
     AppLogger.info(ChatViewModel.TAG, "  Candidates: ${candidates.size} parts (~$totalCandidateTokens tokens total)")
-    AppLogger.info(ChatViewModel.TAG, "  Skipped: $skippedAlreadyOffloaded already offloaded, $skippedTooSmall too small")
+    AppLogger.info(ChatViewModel.TAG, "  Skipped: $skippedAlreadyOffloaded already offloaded, $skippedTooSmall too small, $skippedPayloadParts tool-call payloads (never offloaded), $skippedProtected protected tool results")
 
     var offloadedCount = 0
     var freedTokens = 0
@@ -221,17 +272,21 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                 part.copy(content = stub, imageData = null, imageMimeType = null)
             }
             is AgentContentPart.ToolUse -> {
-                val content = part.input.optString("content", "")
-                linuxPath = ContextOffload.offloadContent(
-                    context, sid, content,
-                    toolId = part.id, toolName = part.name,
-                )
-                val newInput = org.json.JSONObject(part.input.toString())
-                newInput.put(
-                    "content",
-                    ContextOffload.stub(candidate.tokens, candidate.bytes, linuxPath),
-                )
-                part.copy(input = newInput)
+                // [fix/offload-payload-stub] Unreachable by construction:
+                // ToolUse parts are never added as candidates ([isOffloadEligible]
+                // returns false for them). Kept as an explicit dead arm rather
+                // than deleted so that anyone re-introducing payload offload has
+                // to argue with this comment — and so the sealed `when` stays
+                // exhaustive without an `else` that could swallow a new arm.
+                //
+                // History: this arm rewrote the model's own `file_write.content`
+                // argument into a `[CONTEXT OFFLOADED] …` stub. The model then
+                // reproduced that stub as the payload of a later write, silently
+                // truncating a 3714-byte file to ~150 bytes while file_write
+                // reported success. It also read `input["content"]` for both
+                // tools, but `file_edit` carries `old_string`/`new_string`, so
+                // that half never matched anything.
+                null
             }
             is AgentContentPart.ImageData -> {
                 linuxPath = ContextOffload.offloadImage(
@@ -271,6 +326,19 @@ internal fun ChatViewModel.offloadContextIfNeeded(
         AppLogger.info(ChatViewModel.TAG, "  After:  $currentTokens/$contextWindow ($afterPct%)")
         AppLogger.info(ChatViewModel.TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     }
+
+    // [T-ctx-offload-escalation] Record how much of the target this pass
+    // actually delivered. In a long session the candidate pool runs dry —
+    // every large tool result already carries a stub and what remains is
+    // conversation text the offloader structurally cannot touch — so the pass
+    // frees (almost) nothing, still costs a full scan, and the context keeps
+    // climbing until the much higher compact line is reached. Measured on
+    // 2026-09-14: 35 consecutive triggers freed 0–8.5 k tokens against a
+    // 25–51 k shortfall over 25 minutes; auto-compact eventually fired at 84 %
+    // of the window. The flag lets the loop escalate on the same turn instead
+    // of waiting for that line.
+    val neededTokens = (beforeTokens - targetTokens).coerceAtLeast(0)
+    offloadUnderDelivered = neededTokens > 0 && freedTokens < neededTokens / 2
 }
     /**
      * [T-context-limit-enforce] Hard-cap fallback after offload: if the
@@ -342,24 +410,7 @@ internal fun ChatViewModel.trimContextHistoryWindow(
         iconKind = "compact",
 )
 }
-internal fun ChatViewModel.estimateContextHistoryTokens(): Int {
-    var totalChars = 0
-    var imageTokens = 0
-    for (msg in agentHistory) {
-        for (part in msg.contentParts) {
-            when (part) {
-                is AgentContentPart.Text -> totalChars += part.text.length
-                is AgentContentPart.ToolUse -> totalChars += part.input.toString().length
-                is AgentContentPart.ToolResult -> {
-                    totalChars += part.content.length
-                    part.imageData?.let { imageTokens += BPETokenizer.countImageTokens(it) }
-                }
-                is AgentContentPart.ImageData -> imageTokens += BPETokenizer.countImageTokens(part.data)
-            }
-        }
-    }
-    return (totalChars / 3.5).toInt() + imageTokens
-}
+internal fun ChatViewModel.estimateContextHistoryTokens(): Int = estimateHistoryTokens(agentHistory)
 
 internal fun ChatViewModel.estimateHistoryTokens(messages: List<LLMMessage>): Int {
     var totalChars = 0

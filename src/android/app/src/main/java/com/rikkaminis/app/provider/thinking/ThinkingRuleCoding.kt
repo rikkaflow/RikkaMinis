@@ -195,6 +195,13 @@ object ThinkingRuleCoding {
     /** Mirror of [toRule] over the request-JSON shape. Defensive: bad rows degrade to "no opinion" rules. */
     fun decodeRuleJson(o: JSONObject): ThinkingRule? {
         val label = o.optString("label", "")
+        // [fix/audit-0917-b9] Emptiness gate RESTORED after review: the rule
+        // editor refuses to save a blank label (ThinkingRuleEditor.isValid =
+        // label.isNotBlank() && …), so a label-less row can only be corrupt
+        // or imported junk — and WorkerThinkingRulesRestoreTest pins "corrupt
+        // row degrades to null instead of throwing". [toRule] accepting any
+        // label is the Room path's own gap; it is not a reason to let junk
+        // through the process boundary.
         if (label.isEmpty()) return null
         val scope = when (o.optString("scopeKind", "allModels")) {
             "modelPattern" -> ThinkingRule.Scope.ModelPattern(o.optString("scopePattern", "*"))

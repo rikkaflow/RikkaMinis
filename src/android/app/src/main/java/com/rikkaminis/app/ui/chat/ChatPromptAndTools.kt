@@ -24,6 +24,7 @@ import com.rikkaminis.app.tools.FileWriteTool
 import com.rikkaminis.app.tools.ReadImageTool
 import com.rikkaminis.app.tools.SubagentSkill
 import com.rikkaminis.app.tools.ToolExecutionResult
+import com.rikkaminis.app.tools.UnknownToolMessage
 import com.rikkaminis.app.util.Utf16Sanitizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -305,10 +306,22 @@ internal suspend fun ChatViewModel.executeTool(
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
             "memory_rollup" -> executeMemoryRollupTool()
+            // [U10] conversation_history: reads THIS session's persisted
+            // transcript (session id comes from the ViewModel, never from
+            // arguments) so turns dropped by compaction are still reachable.
+            com.rikkaminis.app.tools.ConversationHistoryContract.NAME -> executeConversationHistoryTool(argsJson)
             // [T7-subagent] spawn_agent: delegate to an independent sub-agent
             // instance running the named skill.
             SubagentSkill.NAME -> executeSpawnAgentTool(argsJson)
-            else -> ToolExecutionResult("Unknown tool: $name", false)
+            // [audit-0916] A bare rejection names nothing the model can correct
+            // towards; hand it the real tool names instead (see
+            // UnknownToolMessage for the log that motivated this). toolTitle is
+            // filled so the block/log line isn't empty for an unknown tool.
+            else -> ToolExecutionResult(
+                UnknownToolMessage.message(name, agentTools.map { it.name }),
+                false,
+                toolTitle = toolTitle,
+            )
         }
     } finally {
         // T7-B: 无条件释放 tool slot —— 覆盖成功、普通异常、CancellationException
@@ -443,7 +456,15 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
                 thinkingLevel = ThinkingLevel.OFF,
             )
         },
-        executeSubTool = { name, subArgs -> executeSubagentTool(name, subArgs) },
+        // [audit-0916] The sub-agent's own filtered list is passed in so a
+        // rejected name is answered with the names this level may use.
+        executeSubTool = { name, subArgs ->
+            executeSubagentTool(name, subArgs, subagentTools.map { it.name })
+        },
+        // [fix/same-class-cleanup] The residue policy resolves a drifted
+        // tool call against the sub-agent's OWN allowed tools — the same
+        // filtered list the loop executes against.
+        knownToolNames = subagentTools.map { it.name },
         log = { AppLogger.warning(ChatViewModel.TAG, it) },
     )
 }
@@ -455,7 +476,13 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
  * Tools that are FORBIDDEN for sub-agents never reach this method
  * because [SubagentSkill.buildFilteredTools] excludes them.
  */
-internal fun ChatViewModel.executeSubagentTool(name: String, argsJson: String): ToolExecutionResult = when (name) {
+internal suspend fun ChatViewModel.executeSubagentTool(
+    name: String,
+    argsJson: String,
+    // [audit-0916] Names this sub-agent may call - used to answer an unknown
+    // (or forbidden) tool with the real options instead of a bare rejection.
+    allowedToolNames: List<String>,
+): ToolExecutionResult = when (name) {
     FileReadTool.NAME -> FileReadTool.execute(argsJson, activeSessionId, context)
     FileWriteTool.NAME -> FileWriteTool.execute(argsJson, activeSessionId, context).also {
         if (it.success) maybeReloadSkillsForPath(argsJson)
@@ -467,7 +494,17 @@ internal fun ChatViewModel.executeSubagentTool(name: String, argsJson: String): 
     "memory_write" -> executeMemoryWriteTool(argsJson)
     "memory_get" -> executeMemoryGetTool(argsJson)
     "memory_rollup" -> executeMemoryRollupTool()
-    else -> ToolExecutionResult("Error: Unknown or forbidden tool: $name", false)
+    // Subagents run inside the same session, so the same transcript is fair
+    // game (read-only, redacted). Kept in sync with the main dispatch switch —
+    // a missing arm here is silent: the tool would work in the main loop and
+    // answer "Unknown or forbidden tool" only inside a subagent.
+    com.rikkaminis.app.tools.ConversationHistoryContract.NAME -> executeConversationHistoryTool(argsJson)
+    // [audit-0916] List the names this sub-agent may actually use; a bare
+    // rejection gives the model no way back (see UnknownToolMessage).
+    else -> ToolExecutionResult(
+        UnknownToolMessage.message(name, allowedToolNames, forbidden = true),
+        false,
+    )
 }
 
 /**
@@ -636,6 +673,32 @@ internal fun ChatViewModel.executeMemoryGetTool(argsJson: String): ToolExecution
         _memoryToolRecords.value = _memoryToolRecords.value + record
     }
 }
+
+// [U10] conversation_history: the session is bound here — the tool never takes
+// one from arguments, and the DB rows go through the same store the UI reads,
+// so a message the model can see in the transcript is a message the user can
+// scroll back to.
+internal suspend fun ChatViewModel.executeConversationHistoryTool(argsJson: String): ToolExecutionResult =
+    com.rikkaminis.app.tools.executeConversationHistoryTool(
+        argsJson = argsJson,
+        sessionId = activeSessionId,
+        loadRows = { sessionId ->
+            chatRepository.loadMessages(sessionId).map { m ->
+                com.rikkaminis.app.tools.TranscriptRow(
+                    // [T-tools-history-cursor-stable] Use the DB sort_order, not
+                    // the list position: the loader reads ORDER BY sort_order ASC,
+                    // so mapIndexed and sort_order coincide on a fresh read — but
+                    // a message deleted mid-conversation between two tool calls
+                    // shifts every later list position while sort_order values of
+                    // the surviving rows never move. Cursors are persisted in the
+                    // model's next turn, so index MUST be stable across reads.
+                    index = m.sortOrder,
+                    role = m.role,
+                    partsJson = m.partsJson,
+                )
+            }
+        },
+    )
 
 // [T6-rollup] On-demand memory rollup: distills the previous day's daily
 // log into MEMORY-ROLLUP.md. Uses the same memory dir as the repository.
@@ -1178,9 +1241,17 @@ Environment variables:
     // appended only when non-null; absent fragments leave no separator.
     // T-skillscan: rescan disk before reading the fragment so a skill
     // that an earlier turn dropped via shell `git clone` (which bypasses
-    // the file_write hook below) becomes visible on the very next user
-    // turn instead of "after kill app". Cheap: loadAll is a SQLite
-    // SELECT + listFiles, no network.
+    // the file_write hook below) is picked up by the repository right away —
+    // no "kill app" needed. Cheap: loadAll is a SQLite SELECT + listFiles,
+    // no network.
+    //
+    // Careful: this re-scan does NOT put the new skill in front of the model
+    // on the next turn. The prompt assembled here is frozen per session
+    // (systemPromptForSession; see the Hermes prefix-cache invariant), so a
+    // mid-session install becomes visible only when the next session starts.
+    // Comment corrected 2026-09-14 — it previously claimed "visible on the
+    // very next user turn", which the session-level freeze had already
+    // invalidated.
     skillRepository?.reloadFromDisk()
     val skillFragment = skillRepository?.skillPromptFragment(activeSessionId)
     // [T-mcp-integration-android] Re-read servers.json (the CLI / file

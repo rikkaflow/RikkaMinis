@@ -9,6 +9,7 @@ package com.rikkaminis.app.ui.chat
 // repository / state-flow members, only their file location changed. No
 // logic change.
 
+import com.rikkaminis.app.agent.runtime.AgentRunEvent
 import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMUsage
@@ -66,22 +67,61 @@ internal suspend fun ChatViewModel.persistAssistantTurn(
     if (parts.isEmpty()) return null
     val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
     val tokenJson = usage?.let { buildUsageJson(it) }
-    val entity = chatRepository.appendMessage(
-        realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,
-        reasoningContent = reasoningContent,
-        usageModelId = modelId,
-        usageEntryId = entryId,
-)
+    // [T-persistence-failed] Emission point for the state machine's
+    // PersistenceFailed event [backlog item 14]: the reducer / recovery policy
+    // handle it (any running state -> FINALIZING + SUCCEEDED forbidden), but
+    // nothing ever emitted it - the protection was dead code. Emit before
+    // rethrowing so the existing error path is unchanged.
+    val entity = try {
+        chatRepository.appendMessage(
+            realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,
+            reasoningContent = reasoningContent,
+            usageModelId = modelId,
+            usageEntryId = entryId,
+    )
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        traceObserver.t7Reduce(
+            AgentRunEvent.PersistenceFailed("assistantTurn: ${e.message?.take(120)}")
+        )
+        throw e
+    }
     return entity.id
 }
 
 
 /** Persist tool results as a user-role message (mirrors iOS behavior). */
-internal suspend fun ChatViewModel.persistToolResultMessage(parts: List<AgentContentPart>): String? {
+internal suspend fun ChatViewModel.persistToolResultMessage(
+    parts: List<AgentContentPart>,
+    transcriptRedactions: Map<String, String> = emptyMap(),
+): String? {
     val results = parts.filterIsInstance<AgentContentPart.ToolResult>()
     if (results.isEmpty()) return null
-    val partsJson = buildToolResultPartsJson(results)
-    val entity = chatRepository.appendMessage(realSessionId.ifEmpty { sessionId }, "user", partsJson)
+    // [T-sensitive-transcript] Replace the payload of calls whose command line
+    // invoked a redacted helper (android-clipboard / android-speech). Only the
+    // persisted copy changes — [parts] itself, which the running turn keeps
+    // reasoning over, is left alone, so a redaction never costs the model
+    // information it already had. Why the decision cannot be deferred to
+    // backup-export time is documented in [SensitiveCommandPolicy].
+    val persisted = if (transcriptRedactions.isEmpty()) {
+        results
+    } else {
+        results.map { result ->
+            transcriptRedactions[result.id]?.let { result.copy(content = it) } ?: result
+        }
+    }
+    val partsJson = buildToolResultPartsJson(persisted)
+    val entity = try {
+        chatRepository.appendMessage(realSessionId.ifEmpty { sessionId }, "user", partsJson)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        traceObserver.t7Reduce(
+            AgentRunEvent.PersistenceFailed("toolResult: ${e.message?.take(120)}")
+        )
+        throw e
+    }
     return entity.id
 }
 
@@ -320,14 +360,21 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
         try {
             SessionConcurrencyManager.acquireSlot(activeSessionId)
             AppLogger.debug(ChatViewModel.TAG_STREAM, "$label streamJob slot acquired")
-            SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
-            val activeFallbackStrategy = run {
-                val groupId = _selectedGroupId.value
-                groupId?.let { providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy }
-                    ?: com.rikkaminis.app.data.model.FallbackStrategy.default
-            }
-            val fallbackProviders = buildFallbackProviders(launchedProvider)
+            // [audit-0917] Everything between acquireSlot and the releaseSlot
+            // finally must live INSIDE the guarded region. setActive and
+            // buildFallbackProviders used to sit between the outer try and the
+            // inner try, so an exception from either (tracker callback
+            // registration, provider-config read) skipped releaseSlot and the
+            // session's concurrency slot was never returned — the next send for
+            // that session then queued forever behind a phantom holder.
             try {
+                SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
+                val activeFallbackStrategy = run {
+                    val groupId = _selectedGroupId.value
+                    groupId?.let { providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy }
+                        ?: com.rikkaminis.app.data.model.FallbackStrategy.default
+                }
+                val fallbackProviders = buildFallbackProviders(launchedProvider)
                 AppLogger.info(ChatViewModel.TAG_STREAM, "$label runAgentLoop CALL")
                 runAgentLoop(
                     provider = launchedProvider,
