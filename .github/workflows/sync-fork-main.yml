@@ -37,9 +37,14 @@ concurrency:
   group: sync-fork-main
   cancel-in-progress: false
 
+# workflows: write lets the default GITHUB_TOKEN push commits that touch
+# .github/workflows/*. Since 09-15 upstream keeps editing build-apk.yml, so every
+# sync merge includes a workflow-file change — without this the push is rejected
+# with 'refusing to allow a GitHub App to create or update workflow'.
 permissions:
   contents: write
   actions: write
+  workflows: write
 
 jobs:
   sync:
