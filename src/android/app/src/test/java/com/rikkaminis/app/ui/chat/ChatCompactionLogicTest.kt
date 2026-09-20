@@ -105,6 +105,150 @@ class ChatCompactionLogicTest {
         assertEquals(-1, resolveCompactAnchorIdx(h, null))
     }
 
+    // ── [fix/compact-anchor-resolution] plain-text user prompts ─
+    //
+    // Every helper above builds a message WITH a Text part, which is exactly
+    // why the empty-parts case went unnoticed: production user messages are
+    // built as `LLMMessage(role = USER, content = <typed text>)` with
+    // contentParts EMPTY (ChatSessionLifecycle send path). Kotlin's `all {}`
+    // is vacuously true on an empty list, so the anchor walk-back classified
+    // every typed prompt as a tool-result carrier and skipped it — collapsing
+    // the anchor onto message 0 (or -1) and freezing every later compact in
+    // the "already compacted" early return.
+
+    @Test
+    fun `isToolResultOnly is false for an empty part list`() {
+        assertFalse(
+            LLMMessage(role = LLMMessage.Role.USER, content = "hi").isToolResultOnly(),
+        )
+        assertTrue(toolResultUser("tr1").isToolResultOnly())
+    }
+
+    @Test
+    fun `plain text prompt is anchored on instead of skipped`() {
+        fun plain(id: String) =
+            LLMMessage(role = LLMMessage.Role.USER, content = "a typed prompt", dbMessageId = id)
+        val h = listOf(
+            plain("u1"),
+            assistant("a1"),
+            plain("u2"),
+            assistant("a2"),
+        )
+        // Before the fix u2 was skipped → anchor 0. Now the newest plain prompt
+        // is the boundary and keep-instruction-active backs off one turn → 1.
+        assertEquals(1, resolveCompactAnchorIdx(h, null))
+    }
+
+    @Test
+    fun `all plain text history no longer aborts with minus one`() {
+        val h = listOf(
+            LLMMessage(role = LLMMessage.Role.USER, content = "prompt", dbMessageId = "u1"),
+            assistant("a1"),
+        )
+        // Before the fix every candidate was skipped → -1 and compactAll
+        // reported "no persisted messages yet" on a perfectly healthy session.
+        assertEquals(0, resolveCompactAnchorIdx(h, null))
+    }
+
+    @Test
+    fun `second compact with no new user turn folds nothing`() {
+        // Minimal machine reproduction of the reported symptom: a long tool
+        // loop under a single prompt. The anchor resolves to message 0, the
+        // marker records it, and the next pass starts at anchor + 1 → empty
+        // range → "already compacted", every turn, while the summary is still
+        // re-injected. The write side still reports it this way — the fallback
+        // lives in `compactAll` (budget anchor, see the
+        // [compact-budget-anchor] section below) and leaves
+        // resolveCompactStartIdx untouched.
+        val h = mutableListOf(
+            LLMMessage(role = LLMMessage.Role.USER, content = "prompt", dbMessageId = "u0"),
+        )
+        for (k in 1..4) {
+            h += assistant("a$k")
+            h += toolResultUser("r$k")
+        }
+        val anchor = resolveCompactAnchorIdx(h, null)
+        assertEquals(0, anchor)
+        val start = resolveCompactStartIdx(h, marker(version = 2, lastCompacted = h[anchor].dbMessageId))
+        assertTrue("expected an empty range after the marker", start > anchor)
+    }
+
+    // ── [compact-budget-anchor] write-side budget anchor ───────
+    //
+    // A long agent run is ONE user turn, so the turn-boundary anchor is
+    // always message 0 and the fold range stays empty forever. The fallback
+    // keeps a token budget of tail verbatim and folds everything before it.
+
+    /** [rounds] tool rounds under a single plain-text prompt. */
+    private fun toolLoopSession(rounds: Int): MutableList<LLMMessage> {
+        val h = mutableListOf(
+            LLMMessage(role = LLMMessage.Role.USER, content = "prompt", dbMessageId = "u0"),
+        )
+        for (k in 1..rounds) {
+            h += assistant("a$k")
+            h += toolResultUser("r$k")
+        }
+        return h
+    }
+
+    private val flatEstimate: (LLMMessage) -> Long = { 1_000L }
+
+    @Test
+    fun `budget anchor lands near the tail of a single prompt tool loop`() {
+        val h = toolLoopSession(rounds = 60)
+        val start = resolveCompactStartIdx(h, marker(version = 2, lastCompacted = "u0"))
+        // The stuck state this fallback exists for: nothing new to fold.
+        assertTrue("expected the turn anchor to be exhausted", start > resolveCompactAnchorIdx(h, null))
+        val anchor = resolveBudgetAnchorIdx(h, startIdx = start, keepTailTokens = 20_000L, estimate = flatEstimate)
+        // 20 messages × 1000 tokens kept verbatim, rest folded.
+        assertEquals(h.size - 21, anchor)
+        assertFalse(h[anchor + 1].isToolResultOnly())
+    }
+
+    @Test
+    fun `budget anchor never leaves an orphan tool result in the kept region`() {
+        val h = mutableListOf<LLMMessage>(user("u0"))
+        for (k in 1..5) {
+            h += assistant("a$k")
+            h += toolResultUser("r$k")
+        }
+        // Budget keeps indices 8..10 (r4, a5, r5); the raw candidate would be
+        // index 7 (a4), leaving r4 without its tool_use → step back to r3.
+        val anchor = resolveBudgetAnchorIdx(h, startIdx = 0, keepTailTokens = 3_000L, estimate = flatEstimate)
+        assertEquals(6, anchor)
+        assertFalse(h[anchor + 1].isToolResultOnly())
+    }
+
+    @Test
+    fun `budget anchor skips entries without a persisted id`() {
+        val h = mutableListOf<LLMMessage>(user(null), assistant(null))
+        // Nothing persisted to anchor on → no foldable range.
+        assertEquals(-1, resolveBudgetAnchorIdx(h, startIdx = 0, keepTailTokens = 500L, estimate = flatEstimate))
+    }
+
+    @Test
+    fun `budget anchor reports nothing to fold when the tail already fits`() {
+        val h = toolLoopSession(rounds = 3)
+        assertEquals(-1, resolveBudgetAnchorIdx(h, startIdx = 0, keepTailTokens = 1_000_000L, estimate = flatEstimate))
+    }
+
+    // ── [compact-budget-anchor] read-side pre-anchor clamp ─────
+
+    @Test
+    fun `pre anchor slice is clamped to the token budget`() {
+        val h = toolLoopSession(rounds = 60)
+        val start = clampSliceStartByBudget(h, startIdx = 0, anchorIdx = h.size - 1, maxTokens = 6_000L, estimate = flatEstimate)
+        // Six messages fit; the slice must not open on a lone tool result.
+        assertEquals(h.size - 6, start)
+        assertFalse(h[start].isToolResultOnly())
+    }
+
+    @Test
+    fun `pre anchor slice is left alone when it already fits the budget`() {
+        val h = toolLoopSession(rounds = 2)
+        assertEquals(0, clampSliceStartByBudget(h, startIdx = 0, anchorIdx = 1, maxTokens = 12_000L, estimate = flatEstimate))
+    }
+
     // ── resolveCompactStartIdx ─────────────────────────────────
 
     @Test

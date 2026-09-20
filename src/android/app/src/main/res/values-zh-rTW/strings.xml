@@ -1137,6 +1137,8 @@
     <string name="soul_restore_confirm_body">當前修改將被覆蓋為預設人格檔案。該模板可作為出發點，隨時可再次修改。</string>
     <string name="soul_save_error_title">儲存失敗</string>
     <string name="soul_injection_error">這看起來像是對模型的指令而不是人格引導。SOUL.md 中不允許出現「忽略之前的指令」之類的內容——請只寫真正的性格、語氣和行為描述。</string>
+    <string name="settings_terminal">終端機</string>
+    <string name="settings_terminal_subtitle">開啟沙箱 Shell</string>
     <string name="settings_env_vars">環境變數</string>
     <string name="settings_env_vars_subtitle">注入到沙箱內的變數</string>
     <string name="settings_max_concurrent">併發會話數</string>
@@ -1492,6 +1494,8 @@
     <string name="provider_detail_custom_user_agent">自定義 User-Agent</string>
     <string name="provider_detail_custom_user_agent_placeholder">留空使用預設值</string>
     <string name="add_provider_endpoint_anthropic_hint">按原樣使用官方 Anthropic 端點。對於第三方 Anthropic 相容服務（如 Mimo），基礎 URL 可能需要路徑字尾，如 "/anthropic" — 請查閱提供商文件。URL 會被原樣使用並追加 "/v1/messages"。</string>
+    <string name="add_provider_endpoint_hint">留空則使用預設端點。會自動附加 “/v1” —— 只需填寫基礎主機位址。</string>
+    <string name="add_provider_endpoint_gemini_hint">留空則使用 Google 預設端點。請填寫包含版本路徑的完整基礎 URL。</string>
     <string name="modeldetail_video_output">影片輸出</string>
     <string name="model_group_detail_session_defaults">會話預設值</string>
     <string name="model_group_detail_session_defaults_footer">繫結到此分組的新會話將自動應用。</string>
@@ -1729,4 +1733,24 @@
     <string name="runtime_limits_shell_timeout">終端：預設逾時（秒）</string>
     <string name="runtime_limits_shell_timeout_desc">呼叫未自帶逾時參數時，shell 命令的預設逾時（顯式傳參的呼叫仍用自帶值，上限 900 秒）。預設 900。</string>
     <string name="runtime_limits_media_footer">調高圖片上限可讓更高品質圖片進入模型，代價是請求體積變大。</string>
+
+    <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that
+         were previously hardcoded in ViewModels / handlers. -->
+    <string name="rootfs_msg_preparing">正在準備 rootfs…</string>
+    <string name="rootfs_msg_extracting">正在解壓縮 rootfs…%1$d%%</string>
+    <string name="rootfs_msg_finalizing">正在完成…</string>
+    <string name="rootfs_msg_installing">正在安裝 rootfs…</string>
+    <string name="rootfs_msg_installed">rootfs 安裝成功</string>
+    <string name="rootfs_msg_install_failed">安裝失敗，詳情請見日誌。</string>
+    <string name="rootfs_msg_resetting">正在重設 rootfs…</string>
+    <string name="rootfs_msg_reset_complete">rootfs 重設完成</string>
+    <string name="rootfs_msg_reset_failed">重設失敗，詳情請見日誌。</string>
+    <string name="rootfs_msg_healthy">rootfs 狀態正常，無需修復</string>
+    <string name="rootfs_msg_repairing">正在修復 rootfs…</string>
+    <string name="rootfs_msg_repaired">rootfs 已修復，缺少的檔案已還原</string>
+    <string name="rootfs_msg_repair_failed">修復失敗，詳情請見日誌。</string>
+    <string name="rootfs_msg_repair_missing">修復失敗，仍缺少：%1$s</string>
+    <string name="browser_no_app_for_link">沒有可開啟此連結的應用程式。</string>
+    <string name="browser_could_not_open_link">無法開啟此連結。</string>
+    <string name="filepreview_pdf_render_failed_fallback">PDF 轉譯失敗</string>
 </resources>
