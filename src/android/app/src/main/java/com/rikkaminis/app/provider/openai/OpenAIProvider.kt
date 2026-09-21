@@ -14,6 +14,8 @@ import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderBoundary
+import com.rikkaminis.app.provider.causeChainSummary
+import com.rikkaminis.app.provider.asConsumerSideCancellation
 import com.rikkaminis.app.sandbox.offload.FirstChunkTimeoutPolicy
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.extractHttpErrorMessage
@@ -34,6 +36,7 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Connection
@@ -1311,14 +1314,37 @@ class OpenAIProvider constructor(
                 )
             }
         } catch (e: Exception) {
-            // T321: never silently swallow — log message + top-3 stack frames.
-            val frames = e.stackTrace.take(3).joinToString(" | ") { "${it.className}.${it.methodName}:${it.lineNumber}" }
-            com.rikkaminis.app.logging.AppLogger.error(
-                "OpenAIProvider",
-                "[T321] stream parse exception: ${e.javaClass.simpleName}: ${e.message} @ $frames " +
-                    "(events=$sseEventCount contentLen=$contentLen reasoningLen=$reasoningLen)"
-            )
-            cancel("Stream error", mapError(e))
+            // [F-177] A cause-less CancellationException is the coroutine
+            // machinery tearing this stream down (user tapped stop → the
+            // worker's collector threw ModelExecutionCancelledException and the
+            // callbackFlow producer sees the kotlinx wrapper). Logging it as a
+            // "stream parse exception" made 57% of a day's ERROR lines a
+            // non-error and hid the real reason. A CE *with* a cause is a real
+            // downstream failure and stays on the ERROR path below.
+            //
+            // NOTE: no early return here — control must fall through to
+            // `channel.close()` / `awaitClose { call.cancel() … }` below, which
+            // is what tears the socket down. Returning would skip it.
+            val consumerCancel = e.asConsumerSideCancellation()
+            if (consumerCancel != null) {
+                com.rikkaminis.app.logging.AppLogger.info(
+                    "OpenAIProvider",
+                    "[T321] stream cancelled by consumer: ${e.causeChainSummary()} " +
+                        "(events=$sseEventCount contentLen=$contentLen reasoningLen=$reasoningLen)"
+                )
+                cancel(consumerCancel)
+            } else {
+                // T321: never silently swallow — log message + top-3 stack frames.
+                // [F-177] the cause chain is now included: the outermost throwable
+                // alone (usually the kotlinx wrapper) never named the real failure.
+                val frames = e.stackTrace.take(3).joinToString(" | ") { "${it.className}.${it.methodName}:${it.lineNumber}" }
+                com.rikkaminis.app.logging.AppLogger.error(
+                    "OpenAIProvider",
+                    "[T321] stream parse exception: ${e.causeChainSummary()} @ $frames " +
+                        "(events=$sseEventCount contentLen=$contentLen reasoningLen=$reasoningLen)"
+                )
+                cancel("Stream error", mapError(e))
+            }
         } finally {
             reader.close()
             response.close()
@@ -1341,7 +1367,25 @@ class OpenAIProvider constructor(
             // next stream always starts clean.
             thinkState.reset()
         }
-    }
+        // [fix/provider-stream-flowon] The flow body above is SYNCHRONOUS: it
+        // blocks inside call.execute() and then inside reader.readLine(). Left
+        // on the collector's context it occupies that thread for the entire
+        // stream, and every timer scheduled on the same dispatcher starves —
+        // including this flow's own TTFB/first-data watchdogs. That was
+        // invisible while the collector was a thread pool (pre-offload main
+        // process); 01cfcc0e (2026-08-22, TF-D) moved the only collector into
+        // the :modelservice worker's `runBlocking { ... }`, which has no
+        // dispatcher of its own, so the body now owns the worker thread and
+        // all three guards (TTFB, first-data, worker first-chunk timeout)
+        // became unreachable — 2026-09-20: a 1.6MB request sat 272s with no
+        // byte back and nothing fired.
+        //
+        // flowOn moves ONLY the producer (this flow body + its launched
+        // watchdogs) to the IO pool; the collector stays where it was. It also
+        // relocates awaitClose to the IO pool — its body is just call.cancel()
+        // + response.close() + thinkState.reset() (a local object created
+        // inside this flow), all thread-agnostic, so that is safe.
+    }.flowOn(Dispatchers.IO)
 
     // MARK: - Raw Passthrough [T-android-model-use-passthrough-mode]
 

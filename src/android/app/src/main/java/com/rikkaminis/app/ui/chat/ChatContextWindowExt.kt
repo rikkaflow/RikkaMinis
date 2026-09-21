@@ -6,8 +6,6 @@ import com.rikkaminis.app.data.ContextPolicy
 import com.rikkaminis.app.conversation.ContextCompactor
 import com.rikkaminis.app.R
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 // [FE-5 batch 8] Context management cluster (reloadSessionFromDb /
 // checkContextBeforeSend / maybeTriggerAutoCompact / awaitAutoCompactIfNeeded)
@@ -74,6 +72,52 @@ internal fun ChatViewModel.effectiveContextPolicy(contextWindow: Int): ContextPo
     )
 
 /**
+ * [fix/context-exhausted-loop] A context-pressure reading: the tokens the
+ * provider last reported, the live window they are measured against, and the
+ * resulting [ContextPolicy] verdict.
+ */
+internal data class ContextPressure(
+    val tokens: Int,
+    val window: Int,
+    val result: ContextPolicy.CheckResult,
+)
+
+/**
+ * [fix/context-exhausted-loop] The single source of truth for "how much
+ * pressure is the context under right now". Returns null when there is no
+ * reading yet (first call of a run) or the window is unknown — callers treat
+ * that as "no pressure".
+ *
+ * Why this exists: the EXHAUSTED verdict used to be computed inline inside
+ * [checkContextBeforeSend], which only the send entry calls. The agent loop's
+ * own turns never consulted it, so [ContextCompactor]'s KDoc claim that
+ * "EXHAUSTED blocking lives at the send entry" described the entry and was
+ * simply false for the loop — the 2026-09-20 field log shows
+ * `[AutoCompactLoop] skipped: EXHAUSTED` immediately followed by a fresh
+ * `chat stream offload -> :modelservice` request, three times in a row.
+ * Both landing points now read this one function, so they cannot drift.
+ */
+internal fun ChatViewModel.contextPressure(): ContextPressure? {
+    val tokens = _lastTurnContextTokens.value
+    if (tokens <= 0) return null
+    // [T-context-window-live-read] Live window (entry re-resolved + group
+    // contextLimitTokens folded in) — not the currentModel snapshot.
+    val window = effectiveContextWindowTokens() ?: return null
+    return ContextPressure(tokens, window, effectiveContextPolicy(window).check(tokens, window))
+}
+
+/**
+ * [fix/context-exhausted-loop] Side-effect-free EXHAUSTED query for the agent
+ * loop — no `appendSystemInfo`, no blocking, just the verdict. The send entry
+ * needs the blocking + dialog shape ([checkContextBeforeSend]); the loop
+ * cannot stash a draft, so it only needs to know whether a retry is provably
+ * futile. Shares [contextPressure] with the entry so the two agree by
+ * construction.
+ */
+internal fun ChatViewModel.isContextExhausted(): Boolean =
+    contextPressure()?.result == ContextPolicy.CheckResult.EXHAUSTED
+
+/**
  * Consult [ContextPolicy] before sending. Returns true to proceed.
  *
  * [T-context-limit-enforce] Behaviour:
@@ -89,17 +133,12 @@ internal fun ChatViewModel.effectiveContextPolicy(contextWindow: Int): ContextPo
  * The user resolves EXHAUSTED via explicit `/compact` or a new chat.
  */
 internal fun ChatViewModel.checkContextBeforeSend(): Boolean {
-    val tokens = _lastTurnContextTokens.value
-    if (tokens <= 0) return true
-    // [T-context-window-live-read] Live window (entry re-resolved + group
-    // contextLimitTokens folded in) — not the currentModel snapshot.
-    val window = effectiveContextWindowTokens() ?: return true
-    val policy = effectiveContextPolicy(window)
-    return when (policy.check(tokens, window)) {
+    val pressure = contextPressure() ?: return true
+    return when (pressure.result) {
         ContextPolicy.CheckResult.OK -> true
         ContextPolicy.CheckResult.NEEDS_COMPACT -> {
             appendSystemInfo(
-                text = context.getString(R.string.sysmsg_context_full_hint, tokens, window),
+                text = context.getString(R.string.sysmsg_context_full_hint, pressure.tokens, pressure.window),
                 iconKind = "compact",
             )
             true
@@ -170,17 +209,20 @@ internal fun ChatViewModel.maybeTriggerAutoCompact() {
         }
         return
     }
-    appendSystemInfo(
-        text = context.getString(R.string.sysmsg_context_full_auto, tokens, window),
-        iconKind = "compact",
-    )
+    // [fix/silent-auto-compact] No "context is getting full" notice either.
+    // It announced an internal event the user cannot act on (the compact
+    // fires on its own) and landed mid-answer during long runs. The log line
+    // below keeps the diagnostic trace.
     AppLogger.info(
         ChatViewModel.TAG,
         "[AutoCompact] triggering (tokens=$tokens window=$window tail=$tail " +
             "compactLine=${policy.compactThreshold} offloadLine=${policy.offloadThreshold} " +
             "reserve=${contextGrowthTracker.reserveTokens(window)} growth=${contextGrowthTracker.perTurnEstimate}/turn)",
     )
-    compactAll() // fire-and-forget; internally launches on Dispatchers.IO
+    // [fix/silent-auto-compact] Silent: an auto-compact is agent-side
+    // context management, not a user-facing event. No divider card, no
+    // graying — the transcript must look untouched.
+    compactAll(silent = true) // fire-and-forget; internally launches on Dispatchers.IO
 }
 
 /**
@@ -260,20 +302,17 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
                 "tokens=$lastContextTokens window=$contextWindow compactLine=${policy.compactThreshold}",
         )
     }
-    // [fix/audit0917-b8] No stamp here — compactAll stamps the retry gate at
-    // the point the compact actually starts, so a pre-flight abort no longer
-    // disables auto-compaction for the whole minIntervalMs window.
-    // [fix/diff-audit-0904-H1] appendSystemInfo is an unlocked
-    // read-modify-write over _messages + 5 pendingSysInfo* vars; its KDoc
-    // contract is "runs on Main". This extension is called from the agent
-    // loop, which runs on Dispatchers.IO — hop to Main for the UI write
-    // instead of racing the coalesce-flush job.
-    withContext(Dispatchers.Main) {
-        appendSystemInfo(
-            text = context.getString(R.string.sysmsg_context_full_auto, lastContextTokens, contextWindow),
-            iconKind = "compact",
-        )
-    }
+    // [fix/silent-auto-compact] No "context is getting full" notice on this
+    // path either — see maybeTriggerAutoCompact for the rationale. The
+    // commit that introduced the silent contract removed it from the SEND
+    // path only, which left the in-loop path — the one that fires mid-answer
+    // during long agent runs, i.e. the exact case the change is about —
+    // still posting it. Worse, on the abort branches of compactAll
+    // (already-compacted / empty range) `neutralizeCompactArtifacts` never
+    // runs, so the notice could not be swept up afterwards even in principle:
+    // `appendSystemInfo` only queues the block into the 200 ms coalesce
+    // buffer, so it is not in `_messages` when the silent pass reads it. The
+    // log line below keeps the diagnostic trace.
     AppLogger.info(
         ChatViewModel.TAG,
         "[AutoCompactLoop] triggering (tokens=$lastContextTokens window=$contextWindow tail=$tail " +
@@ -282,7 +321,11 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     )
     val markerBefore = _cachedLatestMarker?.lastCompactedMessageId
     val summaryBefore = _compactSummary.value
-    compactAll(allowInStream = true) // fire-and-forget; internally launches on IO
+    // [fix/silent-auto-compact] Silent — see maybeTriggerAutoCompact. The
+    // in-loop path is the one that fires mid-answer during long agent runs,
+    // which is exactly where a divider card was most disruptive (it landed at
+    // the transcript tail and the running answer kept growing above it).
+    compactAll(allowInStream = true, silent = true) // fire-and-forget; internally launches on IO
     // Await completion so the next provider call assembles summary + tail.
     awaitAutoCompactIfNeeded()
     // [fix/compact-anchor-resolution] Report whether the compact ACTUALLY

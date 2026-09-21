@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -935,6 +936,11 @@ fun SkillDetailScreen(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             title = { Text(stringResource(R.string.skill_detail_edit_name_title)) },
             text = {
+                // ime-ok: host is an AlertDialog (independent Window,
+                // decorFitsSystemWindows=true -> SOFT_INPUT_ADJUST_UNSPECIFIED),
+                // so the platform pans/resizes to keep this single-line field
+                // visible; the bare Scaffold's missing IME inset does not apply.
+                // Not user-reported; re-verify on device before changing.
                 DialogTextField(
                     value = editName,
                     onValueChange = { editName = it },
@@ -1219,6 +1225,12 @@ fun SkillFileViewerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
+                    // [T-android-ime-occlusion-0920] Bare Scaffold does not
+                    // consume WindowInsets.ime (systemBars only) and
+                    // edge-to-edge + adjustResize no longer resizes for the
+                    // keyboard, so this full-height editor's own "scroll caret
+                    // into view" logic could park the caret behind the IME.
+                    .imePadding()
                     .padding(horizontal = 8.dp),
                 singleLine = false,
                 textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),

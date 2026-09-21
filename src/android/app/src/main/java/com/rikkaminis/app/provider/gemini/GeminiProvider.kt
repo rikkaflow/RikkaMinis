@@ -27,6 +27,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -39,7 +40,9 @@ import java.io.InputStreamReader
 import java.io.IOException
 import com.rikkaminis.app.sandbox.offload.FirstChunkTimeoutPolicy
 import java.util.concurrent.TimeUnit
+import com.rikkaminis.app.provider.causeChainSummary
 import com.rikkaminis.app.provider.failOnSilentEmptyCompletion
+import com.rikkaminis.app.provider.asConsumerSideCancellation
 
 class GeminiProvider(
     private val apiKey: String,
@@ -276,14 +279,34 @@ class GeminiProvider(
                 send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
             }
         } catch (e: Exception) {
-            cancel("Stream error", mapError(e))
+            // [F-177] same defect as OpenAIProvider: a cause-less
+            // CancellationException here means the consumer asked us to stop
+            // (user tapped stop), not that the stream broke. Classifying it as
+            // a stream error made a cancel look like a provider failure.
+            val consumerCancel = e.asConsumerSideCancellation()
+            if (consumerCancel != null) {
+                com.rikkaminis.app.logging.AppLogger.info(
+                    "GeminiProvider",
+                    "[F-177] stream cancelled by consumer: ${e.causeChainSummary()}",
+                )
+                cancel(consumerCancel)
+            } else {
+                cancel("Stream error", mapError(e))
+            }
         } finally {
             reader.close()
             response.close()
         }
         channel.close()
         awaitClose()
-    }
+        // [fix/provider-stream-flowon] Same starvation as OpenAIProvider: the
+        // body blocks in call.execute() + reader.readLine(), and the only
+        // collector (ModelExecutionService, :modelservice) runs it under
+        // `runBlocking` — so the producer owned the worker thread and both
+        // in-flow watchdogs (TTFB 30s / first-data) could never fire. flowOn
+        // relocates only the producer + awaitClose to the IO pool; awaitClose
+        // here is empty, so nothing thread-sensitive moves.
+    }.flowOn(Dispatchers.IO)
 
     private fun buildRequestBody(
         messages: List<LLMMessage>,

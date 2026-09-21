@@ -640,6 +640,487 @@ def test_extra_days_container():
         check(f"{label} writer is caught (exit 1)", code == 1, f"exit={code}\n{out}")
         shutil.rmtree(bad)
 
+def test_stale_closure():
+    print("━━━ stale_closure_guard ━━━")
+    # Ground truth: the guard must accept rememberUpdatedState and reject a
+    # long-lived produceState whose closure reads a plain parameter while that
+    # parameter is NOT in the key list. The defect it catches is silent: the
+    # producer is never restarted, `snapshotFlow { plainParam }` observes
+    # nothing, and the UI freezes at the first composed frame (2026-09-20).
+    good = make_tree({
+        KOTLIN_PKG + "/ui/Good.kt": (
+            "@Composable\n"
+            "private fun Good(content: String, isStreaming: Boolean) {\n"
+            "    val latestContent by rememberUpdatedState(content)\n"
+            "    val d by produceState(initialValue = content, isStreaming) {\n"
+            "        snapshotFlow { latestContent }.collect { value = it }\n"
+            "    }\n"
+            "}\n"
+        ),
+        # key 里含 content ⇒ 每次变化都重启闭包 ⇒ 安全
+        KOTLIN_PKG + "/ui/Keyed.kt": (
+            "@Composable\n"
+            "private fun Keyed(content: String) {\n"
+            "    val d by produceState(initialValue = content, content) {\n"
+            "        snapshotFlow { content }.collect { value = it }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stale_closure_guard.py", good)
+    check("rememberUpdatedState + keyed param pass (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(good)
+
+    bad = make_tree({
+        KOTLIN_PKG + "/ui/Bad.kt": (
+            "@Composable\n"
+            "private fun Bad(content: String, isStreaming: Boolean) {\n"
+            "    val d by produceState(initialValue = content, isStreaming) {\n"
+            "        snapshotFlow { content }.collect { value = it }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stale_closure_guard.py", bad)
+    check("plain param without rememberUpdatedState is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(bad)
+
+    # 逃生口：带 stale-ok 说明的必须放行
+    escaped = make_tree({
+        KOTLIN_PKG + "/ui/Esc.kt": (
+            "@Composable\n"
+            "private fun Esc(content: String) {\n"
+            "    // stale-ok: content is immutable for the lifetime of this effect\n"
+            "    val d by produceState(initialValue = content) {\n"
+            "        snapshotFlow { content }.collect { value = it }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stale_closure_guard.py", escaped)
+    check("stale-ok escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(escaped)
+
+def test_ime_inset():
+    print("━━━ ime_inset_guard ━━━")
+    # Ground truth: a text field hosted by a bare Scaffold with no imePadding is
+    # invisible behind the keyboard (edge-to-edge + adjustResize = the window is
+    # NOT resized for the IME). The guard must flag that, accept the fixed shape,
+    # and honour both escape hatches. Two false negatives found while building
+    # this guard are pinned here so they cannot regress:
+    #   - a trailing-lambda `Scaffold { }` (no parens) must count as a host;
+    #   - a `"*/*"` string literal must not swallow the rest of the file.
+    good = make_tree({
+        KOTLIN_PKG + "/ui/Good.kt": (
+            "@Composable\n"
+            "private fun Good() {\n"
+            "    Scaffold { padding ->\n"
+            "        Column(Modifier.fillMaxSize().padding(padding).imePadding()) {\n"
+            "            OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        ),
+        # 保护宿主（SettingsScaffold）⇒ 不在判据内
+        KOTLIN_PKG + "/ui/Protected.kt": (
+            "@Composable\n"
+            "private fun Protected() {\n"
+            "    SettingsScaffold(title = \"x\") {\n"
+            "        OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "    }\n"
+            "}\n"
+        ),
+        # 没有文本输入点的裸 Scaffold ⇒ 不该报
+        KOTLIN_PKG + "/ui/NoField.kt": (
+            "@Composable\n"
+            "private fun NoField() {\n"
+            "    Scaffold { padding -> Text(\"hi\") }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", good)
+    check("fixed + protected + fieldless pass (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(good)
+
+    bad = make_tree({
+        KOTLIN_PKG + "/ui/Bad.kt": (
+            "@Composable\n"
+            "private fun Bad() {\n"
+            "    Scaffold { padding ->\n"
+            "        Column(Modifier.fillMaxSize().padding(padding)) {\n"
+            "            OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", bad)
+    check("bare Scaffold + field, no imePadding is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(bad)
+
+    # 假阴性回归 1：`Scaffold {` 尾随 lambda 形态必须被识别为宿主
+    trailing = make_tree({
+        KOTLIN_PKG + "/ui/Trailing.kt": (
+            "@Composable\n"
+            "private fun Trailing() {\n"
+            "    Scaffold { padding ->\n"
+            "        OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", trailing)
+    check("trailing-lambda `Scaffold {` counts as host (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(trailing)
+
+    # 假阴性回归 2：文件中的 "*/*" 字符串不得吞掉后续代码
+    star = make_tree({
+        KOTLIN_PKG + "/ui/Star.kt": (
+            "@Composable\n"
+            "private fun Star() {\n"
+            "    val launcher = remember { \"\" }\n"
+            "    Button(onClick = { launcher.launch(\"*/*\") }) { Text(\"pick\") }\n"
+            "}\n"
+            "\n"
+            "@Composable\n"
+            "private fun Later() {\n"
+            "    Scaffold { padding ->\n"
+            "        OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", star)
+    check("\"*/*\" literal does not swallow later functions (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(star)
+
+    # 逃生口 1：ime-ok
+    ok_esc = make_tree({
+        KOTLIN_PKG + "/ui/OkEsc.kt": (
+            "@Composable\n"
+            "private fun OkEsc() {\n"
+            "    Scaffold { padding ->\n"
+            "        AlertDialog(onDismissRequest = {}) {\n"
+            "            // ime-ok: independent Window, platform pans to the field\n"
+            "            OutlinedTextField(value = \"\", onValueChange = {})\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", ok_esc)
+    check("ime-ok escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(ok_esc)
+
+    # 逃生口 2：ime-unreachable
+    un_esc = make_tree({
+        KOTLIN_PKG + "/ui/UnEsc.kt": (
+            "@Composable\n"
+            "private fun UnEsc() {\n"
+            "    Scaffold { padding -> Text(\"list\") }\n"
+            "    // ime-unreachable: the field lives in the sheet branch below\n"
+            "    Sheet { OutlinedTextField(value = \"\", onValueChange = {}) }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("ime_inset_guard.py", un_esc)
+    check("ime-unreachable escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(un_esc)
+
+def test_stream_flow_dispatch():
+    print("━━━ stream_flow_dispatch_guard ━━━")
+    # Ground truth: a callbackFlow whose body blocks must carry a flowOn, or the
+    # producer runs on the COLLECTOR's dispatcher and starves every timer on it
+    # — including the flow's own watchdogs. The 2026-09-20 hang: the
+    # :modelservice collector is `runBlocking` (no dispatcher), so the TTFB
+    # watchdog, the first-data watchdog and the worker's outer timeout all
+    # became unreachable at once and a 1.6MB request sat 272s with no byte back.
+    good = make_tree({
+        KOTLIN_PKG + "/provider/Good.kt": (
+            "fun goodStream(): Flow<Int> = callbackFlow<Int> {\n"
+            "    val reader = BufferedReader(InputStreamReader(resp.body!!.byteStream()))\n"
+            "    val call = client.newCall(req)\n"
+            "    val resp = call.execute()\n"
+            "    while (reader.readLine() != null) { }\n"
+            "    awaitClose { call.cancel() }\n"
+            "}.flowOn(Dispatchers.IO)\n"
+        ),
+        # 链上还有别的 operator，flowOn 不在第一个位置 —— 也算放行
+        KOTLIN_PKG + "/provider/Chained.kt": (
+            "fun chainedStream(): Flow<String> = channelFlow<Int> {\n"
+            "    Thread.sleep(1)\n"
+            "}.flowOn(Dispatchers.IO).map { it.toString() }\n"
+        ),
+        # 体内没有阻塞调用 ⇒ 不归本门管
+        KOTLIN_PKG + "/provider/NonBlocking.kt": (
+            "fun pureStream(): Flow<Int> = callbackFlow<Int> {\n"
+            "    trySend(1)\n"
+            "    awaitClose { }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stream_flow_dispatch_guard.py", good)
+    check("dispatched / non-blocking flows pass (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(good)
+
+    # 负例：体内阻塞且链上无 flowOn ⇒ 必须翻红
+    bad = make_tree({
+        KOTLIN_PKG + "/provider/Bad.kt": (
+            "fun badStream(): Flow<Int> = callbackFlow<Int> {\n"
+            "    val call = client.newCall(req)\n"
+            "    val resp = call.execute()\n"
+            "    while (reader.readLine() != null) { }\n"
+            "    awaitClose { call.cancel() }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stream_flow_dispatch_guard.py", bad)
+    check("blocking cold flow without flowOn is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(bad)
+
+    # flowOn(Dispatchers.Main) 只是把阻塞搬到 UI 线程，同样要翻红
+    main_disp = make_tree({
+        KOTLIN_PKG + "/provider/MainDisp.kt": (
+            "fun mainStream(): Flow<Int> = callbackFlow<Int> {\n"
+            "    val resp = call.execute()\n"
+            "    awaitClose { }\n"
+            "}.flowOn(Dispatchers.Main)\n"
+        ),
+    })
+    code, out = run_scanner("stream_flow_dispatch_guard.py", main_disp)
+    check("flowOn(Dispatchers.Main) is still a violation (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(main_disp)
+
+    # ★ 回归守卫：注释里的花括号/关键字不得干扰作用域配平。
+    # 首版判据在这里翻车 —— 我加的解释性注释里写了 `// runBlocking { ... }`，
+    # 行注释未掩码 ⇒ 花括号计数失衡 ⇒ match_brace 冲过真正的 } 一路吞掉文件后半段，
+    # 反向对照时多报 11 处无关命中（含注释自身）。这个 fixture 把该 bug 钉死。
+    comment_braces = make_tree({
+        KOTLIN_PKG + "/provider/CommentBrace.kt": (
+            "fun commented(): Flow<Int> = callbackFlow<Int> {\n"
+            "    // the collector's `runBlocking { ... }` has no dispatcher\n"
+            "    // see https://example.com/docs/flow {not a brace}\n"
+            "    val resp = call.execute()\n"
+            "    awaitClose { }\n"
+            "}.flowOn(Dispatchers.IO)\n"
+            "\n"
+            "fun unrelated(): Int {\n"
+            "    val s = \"https://example.com/a//b\"\n"
+            "    return 1\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stream_flow_dispatch_guard.py", comment_braces)
+    check("comment/string braces do not break scoping (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(comment_braces)
+
+    # 逃生口：带 stream-ok 说明的必须放行
+    escaped = make_tree({
+        KOTLIN_PKG + "/provider/Esc.kt": (
+            "fun escStream(): Flow<Int> = callbackFlow<Int> {\n"
+            "    // stream-ok: body runs on a dedicated single-thread executor\n"
+            "    val resp = call.execute()\n"
+            "    awaitClose { }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("stream_flow_dispatch_guard.py", escaped)
+    check("stream-ok escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(escaped)
+
+
+def test_prefs_listener_holder():
+    print("━━━ prefs_listener_holder_guard ━━━")
+    tmp = tempfile.mkdtemp()
+    good = os.path.join(tmp, "good")
+    os.makedirs(good)
+
+    # Positive: named field holder (the F-240 shape).
+    with open(os.path.join(good, "Good.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+class Good(private val prefs: SharedPreferences) {
+    private val prefsListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+    init { prefs.registerOnSharedPreferenceChangeListener(prefsListener) }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", good)
+    check("named field holder passes (exit 0)", code == 0, f"exit={code}\n{out}")
+
+    # Negative A: the exact hazard -- trailing-lambda call (NO parentheses).
+    # This is the shape that shipped in ConfigBuiltins.kt:152, and the shape an
+    # earlier version of this guard silently skipped.
+    bad = os.path.join(tmp, "bad")
+    os.makedirs(bad)
+    with open(os.path.join(bad, "Bad.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+object Bad {
+    fun reg(prefs: SharedPreferences) {
+        prefs.registerOnSharedPreferenceChangeListener { _, _ -> refresh() }
+    }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", bad)
+    check("trailing-lambda inline hazard fails (exit != 0)", code != 0, f"exit={code}\n{out}")
+    check("hazard is reported as INLINE", "INLINE" in out, out[:400])
+
+    # Negative B: parenthesised anonymous-listener argument, also unheld.
+    bad2 = os.path.join(tmp, "bad2")
+    os.makedirs(bad2)
+    with open(os.path.join(bad2, "Bad2.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+object Bad2 {
+    fun reg(prefs: SharedPreferences) {
+        prefs.registerOnSharedPreferenceChangeListener(
+            SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() })
+    }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", bad2)
+    check("parenthesised anonymous listener fails (exit != 0)", code != 0, f"exit={code}\n{out}")
+
+    # Negative C: named local that is never stored anywhere -- looks held to a
+    # naive reader, but nothing keeps it alive past the frame.
+    bad3 = os.path.join(tmp, "bad3")
+    os.makedirs(bad3)
+    with open(os.path.join(bad3, "Bad3.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+object Bad3 {
+    fun reg(prefs: SharedPreferences) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+    }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", bad3)
+    check("unheld named local fails (exit != 0)", code != 0, f"exit={code}\n{out}")
+
+    # Positive: named local that IS stored into a field.
+    good2 = os.path.join(tmp, "good2")
+    os.makedirs(good2)
+    with open(os.path.join(good2, "Good2.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+object Good2 {
+    @Volatile private var listener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    fun reg(prefs: SharedPreferences) {
+        val l = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+        listener = l
+        prefs.registerOnSharedPreferenceChangeListener(l)
+    }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", good2)
+    check("local stored into a field passes (exit 0)", code == 0, f"exit={code}\n{out}")
+
+    # Escape hatch.
+    esc = os.path.join(tmp, "esc")
+    os.makedirs(esc)
+    with open(os.path.join(esc, "Esc.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+object Esc {
+    fun reg(prefs: SharedPreferences) {
+        // prefs-listener-ok: held by the caller for the screen's lifetime
+        prefs.registerOnSharedPreferenceChangeListener { _, _ -> refresh() }
+    }
+    private fun refresh() {}
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", esc)
+    check("prefs-listener-ok escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+
+    # Regression fixtures for the scope-classification bug found 2026-09-21.
+    # The guard fused `@Composable` + `fun` across the newline into one token,
+    # `\bfun\b` stopped matching, and the function body was classified as a
+    # class -- so every local `val listener` inside it looked like a field and
+    # reported `held`. Four real sites (ChatScreen, AppearanceScreen,
+    # ChatMenuSettingsScreen, MemoryManagementScreen) got that false pass, and
+    # deleting their actual holder still passed. These fixtures are the ground
+    # truth: both shapes MUST fail when unheld.
+    for label, sig in (
+        ("annotated multi-line signature",
+         "@Composable\nfun Screen(\n    prefs: SharedPreferences,\n    context: Context,\n) {"),
+        ("annotated single-line signature",
+         "@Composable\nfun Screen(prefs: SharedPreferences, context: Context) {"),
+        ("unannotated multi-line signature",
+         "fun reg(\n    prefs: SharedPreferences,\n) {"),
+    ):
+        d = os.path.join(tmp, "shape_" + label.replace(" ", "_"))
+        os.makedirs(d)
+        with open(os.path.join(d, "Shape.kt"), "w") as f:
+            f.write(f"""
+import android.content.SharedPreferences
+object Shape {{
+    {sig}
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener {{ _, _ -> refresh() }}
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+    }}
+    private fun refresh() {{}}
+}}
+""")
+        code, out = run_scanner("prefs_listener_holder_guard.py", d)
+        check(f"unheld local with {label} fails (exit != 0)", code != 0, f"exit={code}\n{out}")
+
+    # And the DisposableEffect shape these four sites actually use MUST pass --
+    # otherwise the fixtures above could be satisfied by a guard that just
+    # reports everything as unheld.
+    disp = os.path.join(tmp, "dispose_shape")
+    os.makedirs(disp)
+    with open(os.path.join(disp, "Disp.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+@Composable
+fun rememberThing(
+    context: Context,
+) {
+    val prefs = ChatMenuPrefs.prefs(context)
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", disp)
+    check("onDispose-held listener in annotated multi-line fn passes (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+
+    # Mutation: remove the onDispose holder -> must now FAIL. This is the exact
+    # edit that used to stay green.
+    mut = os.path.join(tmp, "dispose_mutated")
+    os.makedirs(mut)
+    with open(os.path.join(mut, "Mut.kt"), "w") as f:
+        f.write("""
+import android.content.SharedPreferences
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+@Composable
+fun rememberThing(
+    context: Context,
+) {
+    val prefs = ChatMenuPrefs.prefs(context)
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+    }
+}
+""")
+    code, out = run_scanner("prefs_listener_holder_guard.py", mut)
+    check("removing the onDispose holder fails (exit != 0)", code != 0, f"exit={code}\n{out}")
+    shutil.rmtree(tmp)
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -650,6 +1131,10 @@ def test_real_repo():
         "legacy_pipeline_guard.py",
         "trace_eval_check.py",
         "extra_days_container_guard.py",
+        "stale_closure_guard.py",
+        "ime_inset_guard.py",
+        "stream_flow_dispatch_guard.py",
+        "prefs_listener_holder_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -669,6 +1154,10 @@ def main():
     test_process_logging()
     test_trace_eval()
     test_extra_days_container()
+    test_stale_closure()
+    test_ime_inset()
+    test_stream_flow_dispatch()
+    test_prefs_listener_holder()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
