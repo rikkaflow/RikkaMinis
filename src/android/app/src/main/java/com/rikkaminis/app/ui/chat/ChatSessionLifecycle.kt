@@ -968,9 +968,20 @@ internal fun ChatViewModel.loadSession() {
         // choice persisted across cold-start. runCatching guards against
         // a stale enum name from a future rename — fall back silently
         // rather than crashing the session load.
-        _thinkingLevel.value = session.thinkingOverride
+        val persistedOverride = session.thinkingOverride
             ?.let { runCatching { ThinkingLevel.valueOf(it) }.getOrNull() }
-            ?: ThinkingLevel.OFF
+        _thinkingLevel.value = persistedOverride ?: ThinkingLevel.OFF
+        // [T-thinking-effective-level] A value already in the DB counts as an
+        // explicit choice, so a later group (re-)selection must not clobber it
+        // — see applyGroupSessionDefaults. Null override = never chose → the
+        // group default may still seed this session.
+        //
+        // Known limitation (ponytail): we cannot tell a value the USER set from
+        // one a group default previously persisted, so a group whose default
+        // later changes won't reach this session. Acceptable trade — silently
+        // reverting a manual choice is the worse failure. Upgrade path: a
+        // thinking_override_source column.
+        thinkingLevelUserSet = persistedOverride != null
 
         // Priority 1: restore from persisted model_binding (group or entry)
         var resolved = restoreFromBinding(session.modelBinding)
@@ -1248,6 +1259,28 @@ internal fun ChatViewModel.loadSession() {
         //   Case C: last entry is user with the synthetic "Continue"
         //           reminder text — text-cancel handler committed it
         //           but [resume] never re-entered the agent loop.
+        //
+        // [S5-resume-guard] Why this predicate deliberately does NOT also
+        // check "was the last tool result known?" (audit finding §27c(2)):
+        //
+        // The two questions live on different layers. This one is
+        // "session-level: is there a valid starting point for the next API
+        // call?", and the answer is yes whenever the shape holds — no tool is
+        // re-executed here (Case A appends nothing — see [resume] — the
+        // Continue reminder is only emitted when history ends with the
+        // ASSISTANT). The OutcomeUnknown concern quoted at
+        // ExecutionCoordinator.internalShouldRetryCommand belongs to
+        // "command-level: should the SAME command be re-sent?" — a different
+        // decision, made before this one ever runs.
+        //
+        // The "result may be unknown" warning is already carried to the model
+        // inside the tool_result CONTENT, on every path that can produce an
+        // interrupted tail: the timeout line written by PersistentShell, the
+        // cancellation reminder in ChatModels.CANCELLED_MARKER, and
+        // SANITIZE_PLACEHOLDER_RESULT_CONTENT for a tool_use whose result
+        // never landed. The model therefore does not resume from a silently
+        // false premise — so adding a second check here would duplicate a
+        // warning rather than supply a missing one.
         val lastEntry = agentHistory.lastOrNull()
         if (lastEntry != null && !_isStreaming.value) {
             val isInterrupted = when (lastEntry.role) {
@@ -1620,6 +1653,19 @@ internal fun ChatViewModel.resolveProviderFromGroup(
 internal fun ChatViewModel.applyGroupSessionDefaults(groupId: String) {
     val group = providerRepository.group(groupId) ?: return
     val level = group.defaultThinkingLevel ?: return
+    // [T-thinking-effective-level] B3: a group default must NOT clobber a
+    // level the user picked by hand. Before this guard, re-selecting a group
+    // (even the SAME one) unconditionally overwrote a manual "Max" with the
+    // group's "Medium" AND persisted it, so the user's choice was gone for
+    // good. The flag is seeded on session load from the persisted override —
+    // anything already in the DB counts as an explicit choice.
+    //
+    // ponytail: flag, not a DB column | 天花板: a group default that was itself
+    // persisted reads back as "user-set" on cold start, so later edits to the
+    // group's default no longer reach that session | 升级触发: a user reports
+    // "I changed the group default but this chat didn't pick it up" — then add
+    // a thinking_override_source column (user|group) via a Room migration.
+    if (thinkingLevelUserSet) return
     if (_thinkingLevel.value == level) return
     _thinkingLevel.value = level
     viewModelScope.launch {

@@ -21,7 +21,6 @@ import com.rikkaminis.app.agent.runtime.ProviderAttemptOutcome
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
-import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -171,6 +170,30 @@ internal class AgentLoopEngine(
                 loopState.allToolBlocks,
             )
         }
+    }
+
+    /**
+     * §24a Zero the five per-stream throttle clocks so the next stream's
+     * first delta publishes immediately instead of coalescing against the
+     * previous stream's baseline.
+     *
+     * Extracted (change-ladder level 2) because three sites needed the same
+     * five assignments and only two had them: the retry path and the normal
+     * completion path reset all five, while the provider-fallback path reset
+     * none — so the first delta after a fallback could be swallowed by a
+     * stale gate and the reply visibly stalled at its head. Keeping one copy
+     * is what stops a fourth site from drifting the same way.
+     *
+     * Values are the [AgentLoopState] declaration defaults (`0L` / `0`), and
+     * `System.currentTimeMillis() - 0` exceeds every throttle tier, so a zeroed
+     * clock always opens the gate.
+     */
+    private fun resetStreamThrottle(loopState: AgentLoopState) {
+        loopState.lastUiUpdateMs = 0L
+        loopState.lastFlushedLen = 0
+        loopState.lastThinkingUiUpdateMs = 0L
+        loopState.lastFileToolInputMs = 0L
+        loopState.lastOtherToolInputMs = 0L
     }
 
     /** Verbatim lift of ChatViewModel.runAgentLoop entry (FE-5 route C step 3). */
@@ -553,7 +576,14 @@ internal class AgentLoopEngine(
                         temperature = null,
                         imageParts = emptyList(),
                         tools = host.agentTools,
-                        thinkingLevel = if (host.currentModelSupportsReasoning) host.thinkingLevel else ThinkingLevel.OFF,
+                        // [T-thinking-effective-level] host.thinkingLevel is
+                        // already the EFFECTIVE level (supportsReasoning + ceiling
+                        // folded in by the host), so no guard belongs here. The
+                        // old `if (host.currentModelSupportsReasoning) … else OFF`
+                        // was a SECOND, independent answer to the same question —
+                        // and the one that let the navbar badge disagree with the
+                        // wire. One expression, one answer.
+                        thinkingLevel = host.thinkingLevel,
                     ).collect { chunk ->
                 // [stream-timing 2026-09-14] one-shot marks: Started (server
                 // accepted the request) and the first user-visible content chunk.
@@ -1015,11 +1045,7 @@ internal class AgentLoopEngine(
                     // T256: reset throttle bookkeeping for the next turn so the
                     // first delta of the next assistant message fires immediately
                     // rather than coalescing against this turn's stale baseline.
-                    loopState.lastFlushedLen = 0
-                    loopState.lastUiUpdateMs = 0L
-                    loopState.lastThinkingUiUpdateMs = 0L
-                    loopState.lastFileToolInputMs = 0L
-                    loopState.lastOtherToolInputMs = 0L
+                    resetStreamThrottle(loopState)
                     collectDone = true
                     // T7-A: 观察 —— provider 尝试成功（T5 ProviderAttemptFinished(SUCCESS)）
                     traceObserver.t7State(ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.CALLING_MODEL), ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS), "ProviderAttemptFinished(SUCCESS)")
@@ -1187,11 +1213,7 @@ internal class AgentLoopEngine(
                         // the next attempt's first delta fires through immediately
                         // rather than coalescing against stale baselines.
                         loopState.pendingChunkSb.setLength(0)
-                        loopState.lastUiUpdateMs = 0L
-                        loopState.lastFlushedLen = 0
-                        loopState.lastThinkingUiUpdateMs = 0L
-                        loopState.lastFileToolInputMs = 0L
-                        loopState.lastOtherToolInputMs = 0L
+                        resetStreamThrottle(loopState)
                         // T7-A: 观察 —— 决定重试（T5 RetryRequested：RETRYING → CALLING_MODEL）
                         traceObserver.t7State(ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.RETRYING), ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.CALLING_MODEL), "RetryRequested(provider_attempt)")
                         // T7-D: 旁路验证 —— 重试请求
@@ -1380,6 +1402,11 @@ internal class AgentLoopEngine(
                         turnTextBlockIdx = -1
                         turnThinking.clear()
                         toolCalls.clear()
+                        // §24a Same per-stream throttle reset as the retry and
+                        // completion paths — without it the fallback provider's
+                        // first delta coalesces against the failed attempt's
+                        // clocks and the reply head stalls visibly.
+                        resetStreamThrottle(loopState)
                         // loop continues — will retry collect with loopState.currentProvider
                     } else {
                         // All fallbacks exhausted. Surface the trail of tried

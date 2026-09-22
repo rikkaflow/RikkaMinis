@@ -818,6 +818,23 @@ class ChatViewModel(
     val queueWaitingAhead: StateFlow<Int> = _queueWaitingAhead.asStateFlow()
 
     /**
+     * [fix/zero-chunk-cancel] When the in-flight request last went out to the
+     * provider, or 0 when nothing is awaiting a response.
+     *
+     * Distinguishes "the model is thinking" from "the request is out and the
+     * network has gone quiet" — the two states the user could not tell apart on
+     * 2026-09-21, when a wedged proxy held a 255 KB request for 60 s while the
+     * UI showed the same three dots throughout (they found out only by
+     * switching proxies). TypingIndicator renders an elapsed-seconds counter
+     * from this while it is non-zero.
+     *
+     * Set at dispatch and cleared on the first content chunk, so the counter
+     * only ever describes a real network wait — never a finished message.
+     */
+    internal val _awaitingResponseSinceMs = MutableStateFlow(0L)
+    val awaitingResponseSinceMs: StateFlow<Long> = _awaitingResponseSinceMs.asStateFlow()
+
+    /**
      * [audit-0907 B2] Reset the queue-position state. Every streamJob entry
      * point's finally calls this (send / retryLast / resume /
      * runRerunStreamTail / resumeQueueAfterCancel) — the field itself stays
@@ -825,6 +842,15 @@ class ChatViewModel(
      */
     internal fun resetQueueWaitingAhead() {
         _queueWaitingAhead.value = -1
+    }
+
+    /**
+     * [fix/zero-chunk-cancel] Mirror of [resetQueueWaitingAhead] for the
+     * network-wait clock. Called from the same streamJob finally sites so the
+     * counter cannot outlive the turn it describes.
+     */
+    internal fun resetAwaitingResponseSince() {
+        _awaitingResponseSinceMs.value = 0L
     }
 
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
@@ -1198,6 +1224,11 @@ class ChatViewModel(
                     isAwaitingModelResponse = true,
                     thinkingLevel = thinkingLevel,
                 )
+                // [fix/zero-chunk-cancel] Start the network-wait clock at
+                // dispatch: from here until the first content chunk the only
+                // thing that can happen is a network wait, which is exactly
+                // what the elapsed counter is meant to describe.
+                _awaitingResponseSinceMs.value = System.currentTimeMillis()
             }
         }
         override fun updateAssistantMessage(
@@ -1270,9 +1301,8 @@ class ChatViewModel(
         }
         override val toolLoopDetector: ToolLoopDetector get() = this@ChatViewModel.toolLoopDetector
         override val groupRouter: com.rikkaminis.app.data.routing.GroupRouter get() = this@ChatViewModel.groupRouter
-        override val thinkingLevel: ThinkingLevel get() = _thinkingLevel.value
+        override val thinkingLevel: ThinkingLevel get() = this@ChatViewModel.effectiveThinkingLevel
         override val isStreaming: Boolean get() = _isStreaming.value
-        override val currentModelSupportsReasoning: Boolean get() = this@ChatViewModel.currentModelSupportsReasoning
         override val enhancedCacheEnabled: Boolean get() = _enhancedCacheEnabled.value
         override val autoRetryAttempt: Int get() = _autoRetryAttempt.value
         override val autoRetryCountdown: Int get() = _autoRetryCountdown.value
@@ -1480,7 +1510,75 @@ class ChatViewModel(
     val memoryEnabled: StateFlow<Boolean> = _memoryEnabled.asStateFlow()
 
     internal val _thinkingLevel = MutableStateFlow(ThinkingLevel.OFF)
-    val thinkingLevel: StateFlow<ThinkingLevel> = _thinkingLevel.asStateFlow()
+
+    /**
+     * [T-thinking-effective-level] True once the USER (not a group default) has
+     * expressed a thinking-level opinion for this VM's session. Guards
+     * [applyGroupSessionDefaults] from clobbering a manual choice when the user
+     * re-selects a group — see the B3 note there.
+     *
+     * Seeded from the persisted override on session load: a value already in
+     * the DB is treated as an explicit choice and is never overwritten by a
+     * group default.
+     *
+     * ponytail: in-memory only, no new DB column | 天花板: a group default that
+     * was itself persisted to the DB reads back as "user-set" on cold start, so
+     * a later change to the group's default no longer reaches that session |
+     * 升级触发: a user reports "I changed the group default but this old chat
+     * didn't pick it up" — then add a `thinking_override_source` column
+     * (user|group) via a Room migration and seed this flag from it.
+     */
+    internal var thinkingLevelUserSet: Boolean = false
+
+    /**
+     * [T-thinking-effective-level] The level the UI must DISPLAY — i.e. what
+     * will actually go on the wire this turn, not what the user once picked.
+     *
+     * Reading the raw [_thinkingLevel] here was the root of a user-visible
+     * split: a group rotation onto a non-reasoning member left the badge
+     * claiming "High" while AgentLoopEngine sent OFF, the level sheet showed
+     * no ticked row, and every tap was silently swallowed. All three now
+     * derive from this one expression, so they cannot disagree.
+     *
+     * Recomputed on every read (cheap: a few StateFlow `.value` reads), which
+     * is what makes it track group rotation / model switch without extra
+     * invalidation plumbing.
+     */
+    val effectiveThinkingLevel: ThinkingLevel
+        get() = com.rikkaminis.app.provider.effectiveThinkingLevel(
+            requested = _thinkingLevel.value,
+            supportsReasoning = currentModelSupportsReasoning,
+            ceiling = currentModelMaxThinkingLevel,
+        )
+
+    /**
+     * [T-thinking-effective-level] Observable form of [effectiveThinkingLevel]
+     * for Compose. Re-emits whenever any input to the rule changes: the user's
+     * choice, the active entry (group rotation / model switch), or the
+     * repository config (a model's declared tiers edited in Settings).
+     */
+    val thinkingLevel: StateFlow<ThinkingLevel> = combine(
+        _thinkingLevel,
+        _activeEntryId,
+        providerRepository.config,
+    ) { _, _, _ -> effectiveThinkingLevel }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ThinkingLevel.OFF)
+
+    /**
+     * [T-thinking-effective-level] Observable form of the RAW stored choice —
+     * what the user last picked, BEFORE the model's capability and ceiling are
+     * folded in.
+     *
+     * The picker needs both this and [thinkingLevel], and they are NOT
+     * interchangeable: [thinkingLevel] (effective) drives the capsule
+     * highlight, this one drives the orange "your setting is capped here"
+     * up-arrow. Wiring the cue to the effective value makes `isCappedBy`
+     * trivially false — the cue vanishes with no error anywhere (it was
+     * reachable in 15 of the 64 (ceiling, choice) combinations on main, and 0
+     * on a build that fed it the effective flow). Each consumer must read its
+     * own source.
+     */
+    val requestedThinkingLevel: StateFlow<ThinkingLevel> = _thinkingLevel.asStateFlow()
 
     /**
      * [T-android-enhanced-cache] Enhanced Cache (1-hour Anthropic cache TTL)
@@ -3389,6 +3487,8 @@ class ChatViewModel(
                         // state — the run is over, whatever it showed must not
                         // leak into the next one.
                         resetQueueWaitingAhead()
+                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                        resetAwaitingResponseSince()
                         // [T-android-overlay-reply-status-34599] Surface
                         // the assistant's most recent reply text to the
                         // overlay BEFORE setInactive so the post-completion
@@ -3665,6 +3765,8 @@ class ChatViewModel(
                         // worker reported while queued must not leak into the
                         // next run's typing indicator.
                         resetQueueWaitingAhead()
+                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                        resetAwaitingResponseSince()
                         // [T-android-overlay-reply-status-34599] Surface
                         // the assistant's most recent reply text to the
                         // overlay BEFORE setInactive so the post-completion

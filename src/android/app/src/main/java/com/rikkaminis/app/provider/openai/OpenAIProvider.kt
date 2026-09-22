@@ -23,12 +23,16 @@ import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.provider.sanitizeToolPairing
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
+import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
+import com.rikkaminis.app.provider.openai.explicitOffEffortFor
 import com.rikkaminis.app.provider.thinking.ReasoningEchoDecider
 import com.rikkaminis.app.provider.thinking.ReasoningEchoPolicy
 import com.rikkaminis.app.provider.thinking.ThinkingResolveContext
 import com.rikkaminis.app.provider.thinking.ThinkingRuleResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -143,7 +147,7 @@ class OpenAIProvider constructor(
          * first-line recovery, so the dead-tunnel case stays bounded and
          * self-healing.
          */
-        private const val STREAM_TTFB_TIMEOUT_MS = 90_000L
+        private const val STREAM_TTFB_TIMEOUT_MS = StreamTimeouts.TTFB_TIMEOUT_MS
 
         /**
          * First-data-row watchdog budget. A response whose headers arrived but
@@ -511,19 +515,37 @@ class OpenAIProvider constructor(
      * vendor's own default. Azure stays omission too: its off tier is
      * model-dependent ('none' on gpt-5.1+, 'minimal' on original gpt-5,
      * unsupported on o1/o3), so an explicit value risks a 400.
+     *
+     * [GH#377] The allowlist answers "which VENDOR do we trust to document an
+     * off tier", but the value is only accepted if the MODEL declares it. Those
+     * are two different questions, and the base alone cannot answer the second:
+     * a gateway serving a model whose catalog entry declares `low..max` (no
+     * `none`) still got `effort:"none"` from us whenever its base looked like
+     * official OpenAI — the backend then rejects the whole request with 400.
+     * A JVM experiment over the real source pair confirmed the shape: the SAME
+     * model with `declared=low..max` sent `none` on `api.openai.com` (400) and
+     * omitted the field on a relay (accepted) — i.e. the decision was driven by
+     * the base URL rather than by what the model said it accepts. That relay arm
+     * is the control: it proves the model's own capability is not what the old
+     * predicate was reading.
+     *
+     * So the declared set is now a veto: an explicit off tier is emitted ONLY
+     * when `reasoningEffortValues` is non-null AND contains it. `null` (the
+     * catalog never heard of this model) stays permissive on purpose — it means
+     * "unknown", not "declares nothing"; the latter is the separate
+     * [com.rikkaminis.app.data.model.LLMModel.declaresNoEffortTiers] flag, and
+     * treating unknown as a veto would silently re-disable the explicit-off
+     * behaviour on every model the catalog does not cover (i.e. the exact
+     * pre-#377 behaviour for the whole allowlist).
      */
-    private fun explicitOffEffort(): String? {
-        if (isAzure) return null
-        val base = basePath.lowercase()
-        if (base.startsWith("https://api.openai.com")) return "none"
-        val lid = model.id.lowercase()
-        if (base.contains("volces") || base.contains("ark.") ||
-            lid.contains("seed-") || lid.contains("doubao")
-        ) {
-            return "minimal"
-        }
-        return null
-    }
+    private fun explicitOffEffort(): String? =
+        explicitOffEffortFor(
+            basePath = basePath,
+            isAzure = isAzure,
+            modelId = model.id,
+            declaredEffortValues = model.reasoningEffortValues,
+            unifiedEffortGateway = usesUnifiedReasoningEffort,
+        )
 
     /**
      * Non-streaming entry point. Some providers (e.g. GPT-5.x via certain
@@ -682,6 +704,68 @@ class OpenAIProvider constructor(
                     "[T-android-stale-conn-retry-hang] no response headers after ${STREAM_TTFB_TIMEOUT_MS / 1000}s — cancelling call (stale pooled connection?)",
                 )
                 call.cancel()
+            }
+        }
+        // [fix/zero-chunk-cancel] Cancellation BRIDGE, registered BEFORE the
+        // first blocking call (call.execute() below, then reader.readLine()).
+        //
+        // On a wedged upstream (accepted the request, sent nothing) the read
+        // loop blocks inside readLine(). A blocking read is NOT interruptible
+        // by coroutine cancellation — measured with a real wedged server:
+        // cancelling the outer job, the inner job, a wrapping coroutineScope,
+        // and a withTimeoutOrNull each still ran the full 60s budget, while
+        // call.cancel() stopped it in 324ms.
+        //
+        // `awaitClose { call.cancel() }` cannot cover that window: it is
+        // registered only AFTER the loop exits, so a wedged read never reaches
+        // it. This child coroutine is registered first, so cancelling the
+        // producer scope reaches it even while the parent body is stuck — its
+        // `finally` then closes the socket and unblocks the read.
+        //
+        // Measured with the real nesting (outer runBlocking -> inner
+        // runBlocking -> callbackFlow + flowOn(IO)): 335ms with the bridge vs
+        // 60018ms without, user cancel at 300ms.
+        //
+        // Pairs with the worker's cancel watcher (ModelExecutionService),
+        // which cancels the collecting job when the user's cancel file
+        // appears — that is what reaches this bridge.
+        // Set once the stream body has been fully consumed, so the bridge can
+        // tell "we finished normally" from "we are being cancelled".
+        val streamCompleted = java.util.concurrent.atomic.AtomicBoolean(false)
+        // [fix/zero-chunk-cancel] The bridge's OWN cancellation cause.
+        //
+        // Closing the socket makes the blocking read fail with
+        // `SocketException: Socket closed` — and that exception is what the
+        // catch below sees. It says "the socket was closed", NOT *why*, so the
+        // user cancel that F-177 taught us to classify as INFO arrives looking
+        // exactly like a transport failure and is logged as
+        // `stream parse exception` again (measured: healthy stream, user cancel
+        // -> ERROR; same on the wedged path).
+        //
+        // Capturing the cause here restores the distinction: the CE handed to
+        // this cancelled coroutine IS its cancellation cause (user cancel ->
+        // ModelExecutionCancelledException; consumer died of an IOException ->
+        // a CE carrying that IOException). Recorded BEFORE `call.cancel()`, so
+        // it is always visible to the catch that the socket error triggers.
+        val bridgeCancelCause = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val cancelBridge = launch {
+            // `catch` rather than `finally`: a cancelled coroutine's
+            // CancellationException is its cancellation cause, and this is the
+            // only public way to read it (`Job.getCancellationException` is
+            // internal kotlinx API).
+            val cause: Throwable? = try {
+                awaitCancellation()
+                null
+            } catch (e: CancellationException) {
+                e
+            }
+            // Only tear the socket down when we are being CANCELLED. On a
+            // normal completion the body is already fully consumed and
+            // OkHttp may return the connection to the pool — cancelling
+            // then would throw away a reusable connection for no reason.
+            if (!streamCompleted.get()) {
+                bridgeCancelCause.set(cause)
+                try { call.cancel() } catch (_: Exception) {}
             }
         }
         val response = try {
@@ -1326,6 +1410,14 @@ class OpenAIProvider constructor(
             // `channel.close()` / `awaitClose { call.cancel() … }` below, which
             // is what tears the socket down. Returning would skip it.
             val consumerCancel = e.asConsumerSideCancellation()
+                // [fix/zero-chunk-cancel] The read died of `SocketException:
+                // Socket closed` because OUR bridge closed it — not because the
+                // upstream failed. Re-ask F-177's question of the bridge's own
+                // cancellation cause, which is the information the socket error
+                // erased. Deliberately the SAME predicate, so "consumer-side
+                // cancellation" keeps one definition: a cause-less CE is a
+                // teardown, while a CE carrying a real failure stays an error.
+                ?: bridgeCancelCause.get()?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "OpenAIProvider",
@@ -1348,11 +1440,16 @@ class OpenAIProvider constructor(
         } finally {
             reader.close()
             response.close()
+            // [fix/zero-chunk-cancel] The body was fully read (or failed) — mark
+            // it so the cancellation bridge does not tear down a connection
+            // OkHttp could otherwise return to the pool.
+            streamCompleted.set(true)
             // [T-thinking-fold-leak] Always drop the per-stream tag state on
             // every exit (normal, error, cancellation) so a half-open tag can
             // never leak into the next stream served by this provider instance.
             thinkState.reset()
         }
+        cancelBridge.cancel()
         channel.close()
         // T171: when the coroutine is cancelled (user tapped stop), the
         // reader loop above is suspended inside the OkHttp source — only
@@ -2012,7 +2109,7 @@ class OpenAIProvider constructor(
                                                 // — emit text placeholder (iOS-parity literal).
                                                 contentArray.put(JSONObject().apply {
                                                     put("type", "text")
-                                                    put("text", "[Image attached but this model does not support vision input]")
+                                                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
                                                 })
                                             }
                                         }
@@ -2067,7 +2164,7 @@ class OpenAIProvider constructor(
                                 // emit text placeholder (iOS-parity literal).
                                 contentArray.put(JSONObject().apply {
                                     put("type", "text")
-                                    put("text", "[Image attached but this model does not support vision input]")
+                                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
                                 })
                             }
                         }
@@ -2860,7 +2957,7 @@ class OpenAIProvider constructor(
                                             // branch above at line 1038).
                                             contentArray.put(JSONObject().apply {
                                                 put("type", "input_text")
-                                                put("text", "[Image attached but this model does not support vision input]")
+                                                put("text", VISION_UNSUPPORTED_PLACEHOLDER)
                                             })
                                         }
                                     }
@@ -3029,7 +3126,11 @@ class OpenAIProvider constructor(
         val params = JSONObject().apply {
             put("type", "object")
             put("properties", props)
-            if (required.isNotEmpty()) put("required", JSONArray(required))
+            // [fix/tool-schema-required-empty-array] Same rationale as
+            // AgentToolDefinition.toOpenAIJson: strict validators (agentrouter,
+            // 2026-09-22) 400 a missing `required` as `null is not of type
+            // "array"`. Always present; empty list → [].
+            put("required", JSONArray(required))
         }
         return JSONObject().apply {
             put("type", "function")

@@ -5,6 +5,10 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMStreamChunk
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
@@ -61,6 +65,25 @@ class ModelExecutionService : Service() {
         const val STREAM_FILE = "stream.jsonl"
         /** Cancellation signal file: when created, a running stream aborts. */
         const val CANCEL_FILE = "cancel"
+
+        /**
+         * [fix/zero-chunk-cancel] How often the in-stream cancel watcher polls
+         * [CANCEL_FILE] while the provider stream is running.
+         *
+         * WHY a watcher at all: every other cancel check on this path only runs
+         * when a chunk ARRIVES. A wedged upstream that accepted the request but
+         * sends nothing (measured on-device 2026-09-21 13:51:50: a 255 KB body
+         * went out, the HTTP proxy returned no response headers for 60 s, and
+         * the user's tap-to-stop could not end the turn) never reaches them, so
+         * the cancel stayed invisible for the full 30-minute budget.
+         *
+         * 250 ms: a user-perceptible "stop" should land well inside a second,
+         * while 4 polls/s of a single `File.exists()` stat is negligible against
+         * a network-bound worker. The directory is the one the client writes to
+         * (same app data dir, shared uid), so the stat is a reliable
+         * cross-process signal.
+         */
+        private const val CANCEL_POLL_MS = 250L
         /** Max time a non-streaming worker waits for the client's client.ack. */
         private const val CLIENT_ACK_TIMEOUT_MS = 8_000L
         private const val ACK_POLL_MS = 100L
@@ -810,6 +833,12 @@ class ModelExecutionService : Service() {
             inputModalities = jsonStrList(req.optJSONArray("input_modalities")),
             outputModalities = jsonStrList(req.optJSONArray("output_modalities")),
             contextWindow = req.optInt("context_window", 0).takeIf { it > 0 },
+            // [P0-worker-max-output-tokens] Mirror of the write side in
+            // ModelExecutionDispatcher — see the note there. Absent key keeps the
+            // "no declared ceiling" semantics (null), which is what
+            // effectiveMaxOutputTokens turns into the provider default.
+            maxOutputTokens =
+                if (req.has("max_output_tokens")) req.getInt("max_output_tokens") else null,
             // [T-worker-reasoning-metadata] Present only when the dispatcher had a
             // value; absent keeps the pre-fix "unknown" semantics (null), which is what
             // a model with no catalog entry gets. Echo-gate inputs — see the
@@ -1111,6 +1140,12 @@ class ModelExecutionService : Service() {
                 inputModalities = jsonStrList(req.optJSONArray("input_modalities")),
                 outputModalities = jsonStrList(req.optJSONArray("output_modalities")),
                 contextWindow = req.optInt("context_window", 0).takeIf { it > 0 },
+                // [P0-worker-max-output-tokens] Mirror of the write side in
+                // ModelExecutionDispatcher — see the note there. Absent key keeps the
+                // "no declared ceiling" semantics (null), which is what
+                // effectiveMaxOutputTokens turns into the provider default.
+                maxOutputTokens =
+                    if (req.has("max_output_tokens")) req.getInt("max_output_tokens") else null,
                 // [T-worker-reasoning-metadata] Present only when the dispatcher had a
                 // value; absent keeps the pre-fix "unknown" semantics (null), which is what
                 // a model with no catalog entry gets. Echo-gate inputs — see the
@@ -1244,6 +1279,48 @@ class ModelExecutionService : Service() {
             }
             ModelExecutionRunLog.log(dir, android.os.Process.myPid(), ModelExecutionRunLog.Phase.PROVIDER_BUILT, "provider=${instance.providerType}", runId = runIdOf(dir))
             kotlinx.coroutines.runBlocking {
+                // [fix/zero-chunk-cancel] User-cancel watcher for the pre-chunk
+                // window.
+                //
+                // Everything below only reacts to a chunk ARRIVING: the
+                // in-collect check needs one to run at all. A wedged upstream
+                // that accepted the request and sends nothing therefore left
+                // the turn uncancellable for the whole 30-minute budget —
+                // measured on-device 2026-09-21 13:51:50: a 255 KB body went
+                // out, the HTTP proxy returned no headers for 60 s, and the
+                // user's tap-to-stop did nothing (they recovered only by
+                // switching proxies, which changed the TCP path).
+                //
+                // This watcher polls the same cancel file independently of
+                // chunk arrival and cancels THIS job. Cancelling it propagates
+                // to the collecting coroutine, which reaches the provider's
+                // cancellation bridge and closes the socket — the only thing
+                // that unblocks a wedged read. Measured with the real nesting
+                // and a real wedged server: 335ms vs 60018ms without.
+                //
+                // Note the failure modes already ruled out by experiment:
+                // cancelling the OUTER job (onStartCommand's runBlocking) does
+                // not reach this nested runBlocking, and neither does cancelling
+                // the inner job alone unless the provider bridge exists. Both
+                // halves are required; each is useless alone.
+                // Captured OUTSIDE the launch: inside it, the context's Job is
+                // the watcher's own, and cancelling that would be a no-op.
+                val collectJob = currentCoroutineContext()[Job]!!
+                val cancelWatcher = launch {
+                    while (true) {
+                        if (cancelFile.exists()) {
+                            ModelExecutionRunLog.log(
+                                dir, android.os.Process.myPid(),
+                                ModelExecutionRunLog.Phase.STREAM_ERROR,
+                                "cancel observed by watcher (pre-chunk phase)", runId = runIdOf(dir),
+                            )
+                            collectJob.cancel(ModelExecutionCancelledException())
+                            return@launch
+                        }
+                        delay(CANCEL_POLL_MS)
+                    }
+                }
+                try {
                 // [worker-first-chunk-guard] Wrap provider streaming in a bounded
                 // first-chunk timeout. A wedged/absent upstream must not hang the
                 // worker silently past the client five-second death grace (which would
@@ -1320,6 +1397,13 @@ class ModelExecutionService : Service() {
                     // (A cancel landing mid-window treats the run the same way.)
                     ModelExecutionRunLog.log(dir, android.os.Process.myPid(), ModelExecutionRunLog.Phase.STREAM_ERROR, "first_chunk_timeout", runId = runIdOf(dir))
                     throw ModelStreamErrorException("provider produced no first chunk within ${firstChunkTimeoutMs}ms (hadChunks=false)", hadChunks = false)
+                }
+                } finally {
+                    // [fix/zero-chunk-cancel] Stop the watcher on EVERY exit
+                    // path — normal completion, provider error, or its own
+                    // cancellation. Without this it would outlive the run and
+                    // keep polling a directory the client may delete.
+                    cancelWatcher.cancel()
                 }
             }
             appendLine(ChatStreamJsonl.DONE_LINE)
@@ -1444,10 +1528,9 @@ class ModelExecutionService : Service() {
         Thread {
             try {
                 while (System.currentTimeMillis() < deadline) {
-                    // Late client ack during the grace: release the token and
-                    // stop — the normal locked finalizer will reap.
+                    // Late client ack during the grace: stop — the normal
+                    // locked finalizer will reap. (Token released by finally.)
                     if (ModelExecutionRunDir.clientAckPresent(dir)) {
-                        runId?.let { releaseAckToken(it) }
                         Log.i(TAG, "late client ack — controlled drain cancelled")
                         return@Thread
                     }
@@ -1457,12 +1540,41 @@ class ModelExecutionService : Service() {
                 // genuinely idle; do NOT kill a new request or an un-acked run.
                 var reaped = false
                 synchronized(lifecycleLock) {
+                    // [S4-ack-token-leak] THE token release for this drain, and
+                    // it MUST be the first statement here — every branch below
+                    // early-returns, and the pending-work check at the bottom
+                    // reads this very map. The old code released AFTER the stale
+                    // check, so a stale drain leaked its token permanently:
+                    // `pendingAckTokens` then only grew, `isQuiescent()` (which
+                    // requires unacked == 0) could never hold again, and the
+                    // worker outlived every request it served. Measured on
+                    // device 2026-09-21: pid 20731 alive 3h54m across 1492
+                    // requests with pendingAck pinned at 9-11, against 310
+                    // sibling pids that each died after one request; the same
+                    // window logged 14x `controlled drain stale` (11 of them in
+                    // 20731) and 4x `controlled drain aborted: active/queued/
+                    // pending work present` — the aborts being drains of LATER
+                    // runs poisoned by the leaked token of an earlier one.
+                    //
+                    // Unconditional is correct, and matches the author's own
+                    // ordering: the pre-existing release point was already
+                    // BEFORE the terminal-absent branch, so "keep worker alive
+                    // when the stream was cut before any result" never depended
+                    // on this token — that branch only means "do not self-reap
+                    // from THIS thread". The token's sole job is to block a
+                    // quiescence snapshot taken while this run is still
+                    // outstanding, and `finishRequestLocked` — which already ran
+                    // immediately after the ack barrier — was that snapshot.
+                    runId?.let { releaseAckToken(it) }
                     // A newer request may have arrived; our drain window is stale.
                     if (requestGeneration.get() != genAtSchedule) {
-                        Log.w(TAG, "controlled drain stale (gen ${requestGeneration.get()} != $genAtSchedule) — leaving to new request")
+                        Log.w(
+                            TAG,
+                            "controlled drain stale (gen ${requestGeneration.get()} != $genAtSchedule) " +
+                                "— released ack token for runId=$runId, leaving to new request",
+                        )
                         return@synchronized
                     }
-                    runId?.let { releaseAckToken(it) }
                     // If the run dir is gone, nothing more to write; only the
                     // general sweep may reap it.
                     if (!dir.isDirectory) return@synchronized
@@ -1489,7 +1601,19 @@ class ModelExecutionService : Service() {
                     reaped = true
                 }
                 if (reaped) return@Thread
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+                // Swallowed by design (best-effort drain) — the finally below
+                // still has to release the token.
+            } finally {
+                // Belt-and-braces: the primary release is the first statement
+                // inside the lock above. This covers the paths that never reach
+                // it (an InterruptedException inside the grace loop, or any
+                // throw before `synchronized`), which the bare `catch` would
+                // otherwise turn into another permanent leak. Idempotent:
+                // releaseAckToken is a map remove, so on the normal path this is
+                // a no-op.
+                runId?.let { releaseAckToken(it) }
+            }
         }.apply { isDaemon = true }.start()
     }
 

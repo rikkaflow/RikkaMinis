@@ -495,7 +495,11 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
                 // sub-agents that reasoned at none. Inherit the dispatching
                 // session's level, same "no silent downgrade on a dispatch
                 // path" rule as the `send` fix in HeadlessChatRunner.
-                thinkingLevel = _thinkingLevel.value,
+                // [T-thinking-effective-level] Read the EFFECTIVE level: a
+                // sub-agent must inherit what this turn actually sends, not a
+                // stored choice the current model can't honour (e.g. after a
+                // group rotation onto a non-reasoning member).
+                thinkingLevel = effectiveThinkingLevel,
             )
         },
         // [audit-0916] The sub-agent's own filtered list is passed in so a
@@ -767,6 +771,19 @@ internal fun ChatViewModel.updateAssistantMessage(
     // surrogate pair straddling two flushes still re-pairs on the next one
     // instead of being replaced twice.
     val content = Utf16Sanitizer.sanitize(rawContent)
+
+    // [fix/zero-chunk-cancel] Drive the network-wait clock off the awaiting
+    // flag, which is already the app's canonical "request is out, no content
+    // yet" signal (set at dispatch, cleared on first content). Starting here
+    // rather than at a second call site keeps the clock's lifetime tied to the
+    // same flag the indicator renders from, so the two can never disagree.
+    if (isAwaitingModelResponse) {
+        if (_awaitingResponseSinceMs.value == 0L) {
+            _awaitingResponseSinceMs.value = System.currentTimeMillis()
+        }
+    } else if (_awaitingResponseSinceMs.value != 0L) {
+        _awaitingResponseSinceMs.value = 0L
+    }
     // T-streaming-side-channel: during a live turn, write high-frequency
     // fields into [_streamingById] instead of mutating the canonical
     // message list. This keeps the `messages` StateFlow reference stable
