@@ -26,6 +26,8 @@ import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.StreamTimeouts
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.openai.explicitOffEffortFor
+import com.rikkaminis.app.provider.thinking.EffortTierLearner
+import com.rikkaminis.app.provider.thinking.GatewayEffortTruth
 import com.rikkaminis.app.provider.thinking.ReasoningEchoDecider
 import com.rikkaminis.app.provider.thinking.ReasoningEchoPolicy
 import com.rikkaminis.app.provider.thinking.ThinkingResolveContext
@@ -818,6 +820,12 @@ class OpenAIProvider constructor(
                     )
                 )
             }
+            // [T-android-effort-self-learn] The gateway's 400 body often spells out the
+            // exact effort enum it accepts — the cheapest one-hand truth we will ever get.
+            // No probe request, and a gateway changing its enum does not need a release
+            // from us to be absorbed. Learning nothing is not an error: record() returns
+            // null and throws nothing.
+            EffortTierLearner.record(request.url.host, bodyStr, errorBody)
             throw mapHttpError(
                 response.code,
                 errorBody,
@@ -1191,6 +1199,10 @@ class OpenAIProvider constructor(
                     if (inlineError != null) {
                         val code = inlineError.optInt("code", 0)
                         val msg = inlineError.optString("message", "Unknown SSE error")
+                        // [T-android-effort-self-learn] Same hook as the HTTP-400 path:
+                        // some relays report the identical error inside a 200 stream, so
+                        // the enum lands in the event instead of the status body.
+                        EffortTierLearner.record(request.url.host, bodyStr, event.toString())
                         val err = mapHttpError(code, event.toString())
                         throw err
                     }
@@ -2454,7 +2466,13 @@ class OpenAIProvider constructor(
             modelId = model.id,
             instanceId = thinkingRuleInstanceId,
             supportsReasoning = model.supportsReasoning,
-            declaredEffortValues = model.reasoningEffortValues,
+            // [T-android-effort-self-learn] A tier set the gateway told us about on a
+            // previous 400 outranks the catalog's declaration — it is one-hand truth and
+            // the only source that ever updates itself. With nothing learned the
+            // expression is byte-identical to `model.reasoningEffortValues`, so a host we
+            // have never heard a complaint from keeps today's behaviour exactly.
+            declaredEffortValues = EffortTierLearner.learned(host, model.id)
+                ?: model.reasoningEffortValues,
             declaresNoEffortTiers = model.declaresNoEffortTiers == true,
             level = level,
             maxTokens = maxTokens,
@@ -2513,15 +2531,24 @@ class OpenAIProvider constructor(
             }
 
             // [T-sensenova-effort-enum] Sensenova's OpenAI-compat gateway
-            // (token.sensenova.cn / api.sensenova.cn) validates reasoning_effort
-            // against a STRICT {low, medium, high, xhigh, none} enum on the streaming
-            // path and rejects "max" with
+            // (token.sensenova.cn / api.sensenova.cn) validates reasoning_effort against
+            // a STRICT per-model enum and 400s anything outside it:
             //   400 field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none
-            // while deepseek-v4's built-in relay rule (and the generic wireEffort map)
-            // emit "max" for every tier above HIGH. Measured live 2026-09-06:
-            // non-streaming accepted max, streaming 400'd it — so the clamp applies
-            // unconditionally. deepseek-v4-flash was the observed victim; the same
-            // shape protects glm-5.2 / kimi-k3 / sensenova-* ids on this host.
+            // The enum is per MODEL, not per host — measured live 2026-09-23, glm-5.2
+            // accepts `max` while sensenova-6.8-flash-lite rejects it. See
+            // GatewayEffortTruth for the measured table and the probe that produced it.
+            //
+            // Re-measured 2026-09-23: an earlier note here claimed "non-streaming
+            // accepted max, streaming 400'd it". Both paths reject it now, so the only
+            // reason for a clamp is that the gateway's enum is strict — not a per-path
+            // difference. deepseek-v4-flash was the original observed victim.
+            //
+            // The clamp is applied PER TIER. Collapsing every enabled tier onto one
+            // value (the previous behaviour: unconditional "xhigh") avoided the 400 but
+            // silently made LOW/MEDIUM/HIGH indistinguishable — the picker drew three
+            // options that produced one request, which is the bug users reported.
+            // clampEffort walks down then up, so a tier the model's enum lacks degrades
+            // to the strongest tier below it instead of failing.
             "token.sensenova.cn", "api.sensenova.cn" -> {
                 if (level == ThinkingLevel.AUTO) return echo
                 if (model.supportsReasoning == false) return echo
@@ -2532,9 +2559,13 @@ class OpenAIProvider constructor(
                     body.put("reasoning_effort", "none")
                     return echo
                 }
-                // ON: clamp the tier onto the gateway's enum. HIGH and above all land
-                // on xhigh — the strongest tier the endpoint accepts.
-                body.put("reasoning_effort", "xhigh")
+                // ON: emit the tier the user asked for, clamped onto the gateway's
+                // measured enum (see GatewayEffortTruth.resolveTier — measurement first,
+                // then whatever the catalog declared, then the conservative fallback).
+                body.put(
+                    "reasoning_effort",
+                    GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
+                )
                 return echo
             }
         }
