@@ -8,6 +8,8 @@ import android.content.Context
 import android.text.format.Formatter
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -50,6 +53,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -77,7 +81,34 @@ private data class StorageSnapshot(
     val sessionCount: Int,
     val sessions: List<SessionStorageInfo>,
     val orphanInfo: SessionFileStore.ReclaimReport?,
+    // [storage-rescan-jank] When this scan was taken — the freshness gate reads
+    // it to decide whether a re-entry needs a background rescan at all.
+    val scannedAt: Long,
 )
+
+// [storage-rescan-jank] Rescan budget constants.
+// Re-entering Storage re-runs a full scan (~125k rootfs lstat entries + a
+// recursive walk of EVERY session dir, incl. multi-GB workspaces with tens of
+// thousands of files). The walk runs on Dispatchers.IO, but its allocation
+// storm (hundreds of thousands of short-lived objects) and syscall/CPU load
+// compete with the main thread exactly while the nav enter/exit transition
+// animates — the reported jank. These two constants keep that storm off the
+// transition and out of re-entries that don't need fresh data.
+//
+// SNAPSHOT_STALE_MS: a re-entry within this window renders the cached snapshot
+// and skips the rescan entirely (sizes this fresh are not worth the storm).
+private const val SNAPSHOT_STALE_MS = 3 * 60 * 1000L
+// RESCAN_DELAY_MS: when the cached snapshot IS stale, wait this long before
+// starting the background rescan so it never overlaps the transition frames.
+private const val RESCAN_DELAY_MS = 500L
+
+// SESSION_LIST_MAX_HEIGHT: cap for the bounded LazyColumn of session rows.
+// The value is a plain viewport budget (≈9 rows of the ~48dp row height), not
+// a tuned constant — it exists so the nested LazyColumn gets a bounded
+// max-height (required inside a verticalScroll Column) while staying tall
+// enough that most users never see the inner scrollbar. Plain `val` — Dp is
+// not allowed as a `const val` (only primitives and String are).
+private val SESSION_LIST_MAX_HEIGHT = 432.dp
 
 /** Process-lifetime holder for the latest [StorageSnapshot]. SWR cache:
  *  no age gate — re-entry always renders the last scan immediately and a
@@ -115,18 +146,25 @@ fun StorageManagementScreen(
     var isReclaiming by remember { mutableStateOf(false) }
     var showReclaimDialog by remember { mutableStateOf(false) }
 
-    fun reload() {
+    fun reload(force: Boolean = false) {
         scope.launch {
-            // [SWR] Render the last known snapshot immediately if we have one
-            // (any age — the background rescan below replaces it within a
-            // few seconds), so re-entering Storage never stares at a spinner
-            // while ~125k rootfs entries are re-lstat'ed cold (page-cache
-            // retry aside). First visit this process still shows the skeleton.
-            // ponytail: no visible "refreshing…" indicator | 天花板: shown
-            // values can be one full rescan old for a few seconds | 升级触发:
-            // user reports confusion over momentarily-stale sizes.
+            // [SWR] Render the last known snapshot immediately if we have one,
+            // so re-entering Storage never stares at a spinner while ~125k
+            // rootfs entries are lstat'ed. First visit this process still
+            // shows the skeleton.
+            // [storage-rescan-jank] A re-entry inside the freshness window now
+            // SKIPS the rescan entirely — the old code re-ran a full scan
+            // (~125k rootfs lstat entries + a recursive walk of EVERY session
+            // dir, incl. multi-GB workspaces) on every enter AND every exit,
+            // and the storm's allocation churn + syscall load competed with
+            // the nav transition exactly at the moment of the reported jank.
+            // ponytail: no visible "refreshing…" indicator; shown values can
+            // be up to SNAPSHOT_STALE_MS old | 天花板: deleted sessions /
+            // cleared files may linger up to 3 min | 升级触发: user reports
+            // confusion over stale sizes (reclaim/clear flows bypass the gate
+            // via force=true).
             val cached = StorageSnapshotCache.snapshot
-            if (cached != null) {
+            if (cached != null && !force) {
                 shellSize = cached.shellSize
                 shellBreakdown = cached.shellBreakdown
                 dbSize = cached.dbSize
@@ -135,11 +173,16 @@ fun StorageManagementScreen(
                 orphanInfo = cached.orphanInfo
                 isSizingSessions = false
                 isScanningOrphans = false
+                if (System.currentTimeMillis() - cached.scannedAt < SNAPSHOT_STALE_MS) {
+                    return@launch // fresh enough — not worth the rescan storm
+                }
+                // Stale: wait out the nav transition before the background
+                // rescan so it never overlaps the animation frames.
+                delay(RESCAN_DELAY_MS)
             } else {
-                // Reset state so a first entry / fresh scan shows a skeleton.
+                // Reset state so a first entry / forced scan shows a skeleton.
                 isSizingSessions = true
                 sessions = emptyList()
-                // [B] fresh scan every reload so the banner reflects reality.
                 isScanningOrphans = true
                 orphanInfo = null
             }
@@ -149,29 +192,48 @@ fun StorageManagementScreen(
                 // walkTopDown()+length() double-counted versioned .so symlinks
                 // and followed symlinked dirs (e.g. default-jvm), overstating
                 // the "Terminal Shell" row by ~50%+.
-                val report = com.rikkaminis.app.sandbox.RootfsUsageScanner.scan(
-                    File(context.filesDir, "alpine-rootfs"),
-                    com.rikkaminis.app.sandbox.RootfsUsageScanner.androidStat(),
-                )
-                shellSize = report.totalBytes
-                // Only surface buckets that can actually explain a large
-                // footprint. A rootfs has ~15 top-level dirs and most are
-                // filesystem scaffolding (/bin, /etc, /run, /srv … a few KB
-                // to 1 MB); listing them all buries the two that matter
-                // (/tmp scratch files and /usr installed packages).
-                shellBreakdown = report.entries
-                    .filter { it.bytes >= 8L * 1024 * 1024 }
-                    .take(8)
+                // [storage-rescan-jank] The ~125k-entry walk only runs when
+                // this process has no cached rootfs values; a refresh reuses
+                // them (installed packages / scaffolding change slowest on the
+                // page). ROOTFS_MANAGEMENT shows its own live scan.
+                if (StorageSnapshotCache.snapshot == null) {
+                    val report = com.rikkaminis.app.sandbox.RootfsUsageScanner.scan(
+                        File(context.filesDir, "alpine-rootfs"),
+                        com.rikkaminis.app.sandbox.RootfsUsageScanner.androidStat(),
+                    )
+                    shellSize = report.totalBytes
+                    // Only surface buckets that can actually explain a large
+                    // footprint. A rootfs has ~15 top-level dirs and most are
+                    // filesystem scaffolding (/bin, /etc, /run, /srv … a few KB
+                    // to 1 MB); listing them all buries the two that matter
+                    // (/tmp scratch files and /usr installed packages).
+                    shellBreakdown = report.entries
+                        .filter { it.bytes >= 8L * 1024 * 1024 }
+                        .take(8)
+                }
                 dbSize = databaseSize(context)
 
                 val allSessions = chatRepository.dao.listSessions()
                 val liveIds = allSessions.map { it.id }.toSet()
-                val mediaSizes = sessionFiles.mediaSizesBySessionBrief(liveIds)
+                // [storage-rescan-jank] ONE media-tree walk for both the
+                // per-session sizes and the orphan media half — the old code
+                // walked the whole media tree twice per entry.
+                val mediaScan = sessionFiles.scanMediaOnce(liveIds)
+                val mediaSizes = mediaScan.liveSizes
                 sessionCount = allSessions.size
 
                 // [B] Scan for leftover dirs whose session no longer exists
                 // (measure only — nothing is deleted until the user confirms).
-                orphanInfo = sessionFiles.scanOrphans(liveIds)
+                // Session-root part here; the media part came from the walk
+                // above.
+                val orphanSessionPart = sessionFiles.scanOrphanSessionDirs(liveIds)
+                orphanInfo = SessionFileStore.ReclaimReport(
+                    sessionIds = orphanSessionPart.sessionIds,
+                    sessionDirs = orphanSessionPart.sessionDirs,
+                    sessionBytes = orphanSessionPart.sessionBytes,
+                    mediaDirs = mediaScan.orphanDirs,
+                    mediaBytes = mediaScan.orphanBytes,
+                )
 
                 // Size every session directory in parallel (async) instead of
                 // the previous serial map, so the whole list appears roughly
@@ -207,6 +269,7 @@ fun StorageManagementScreen(
                     sessionCount = sessionCount,
                     sessions = sessions,
                     orphanInfo = orphanInfo,
+                    scannedAt = System.currentTimeMillis(),
                 )
             }
             isScanningOrphans = false
@@ -351,23 +414,45 @@ fun StorageManagementScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(16.dp),
                 )
-                else -> sessions.forEachIndexed { index, session ->
-                    val valueLabel = buildString {
-                        append(Formatter.formatFileSize(context, session.totalSize))
-                        val top = session.topSubdir
-                        if (top != null) {
-                            val ratio = if (session.totalSize > 0) top.second.toFloat() / session.totalSize else 0f
-                            if (ratio >= 0.15f) {
-                                append(" (${top.first}: ${Formatter.formatFileSize(context, top.second)})")
+                else -> {
+                    // [storage-lazy-session-list] The session list previously
+                    // composed EVERY row eagerly (`forEachIndexed` inside the
+                    // page's verticalScroll Column) — with hundreds of
+                    // sessions that is hundreds of composables in one frame,
+                    // on the main thread, on every entry to this screen. A
+                    // LazyColumn with a bounded height only composes visible
+                    // rows; `heightIn` coerces the unbounded max-height the
+                    // scrolling Column passes down, which is what lets a
+                    // LazyColumn nest inside it at all.
+                    // ponytail: inner list scrolls independently of the page |
+                    // 天花板: swiping on the list scrolls the list, not the
+                    // page | 升级触发: user reports the page being hard to
+                    // scroll by touching the list (then convert the whole
+                    // SettingsScaffold content to a LazyColumn).
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = SESSION_LIST_MAX_HEIGHT),
+                    ) {
+                        itemsIndexed(sessions, key = { _, session -> session.id }) { index, session ->
+                            val valueLabel = buildString {
+                                append(Formatter.formatFileSize(context, session.totalSize))
+                                val top = session.topSubdir
+                                if (top != null) {
+                                    val ratio = if (session.totalSize > 0) top.second.toFloat() / session.totalSize else 0f
+                                    if (ratio >= 0.15f) {
+                                        append(" (${top.first}: ${Formatter.formatFileSize(context, top.second)})")
+                                    }
+                                }
                             }
+                            SettingsValueRow(
+                                title = session.title ?: "Untitled",
+                                value = valueLabel,
+                                onClick = { onSessionClick(session.id) },
+                                showDivider = index < sessions.size - 1,
+                            )
                         }
                     }
-                    SettingsValueRow(
-                        title = session.title ?: "Untitled",
-                        value = valueLabel,
-                        onClick = { onSessionClick(session.id) },
-                        showDivider = index < sessions.size - 1,
-                    )
                 }
             }
         }
@@ -399,7 +484,12 @@ fun StorageManagementScreen(
                         }
                         orphanInfo = null
                         isReclaiming = false
-                        reload()
+                        // [storage-rescan-jank] force=true + drop the cached
+                        // snapshot: the pre-reclaim scan must not be re-rendered
+                        // by the freshness gate (it still lists the just-reclaimed
+                        // orphans), and the rescan must not be skipped.
+                        StorageSnapshotCache.snapshot = null
+                        reload(force = true)
                     }
                 }) {
                     Text(stringResource(R.string.storage_reclaim_confirm_button))

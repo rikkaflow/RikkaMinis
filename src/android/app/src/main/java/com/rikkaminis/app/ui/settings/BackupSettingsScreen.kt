@@ -167,6 +167,10 @@ fun BackupSettingsScreen(
     }
     var autoBackupRunning by remember { mutableStateOf(false) }
     var autoBackupFiles by remember { mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)) }
+    // [fix-autobackup-keep-3] Local auto-backup copies collapse by default —
+    // same treatment as the pre-restore snapshot list: they are a rollback
+    // utility, not a primary surface. Tap the toggle row to expand the list.
+    var autoBackupsExpanded by remember { mutableStateOf(false) }
     var autoBackupLastRun by remember {
         mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context))
     }
@@ -190,6 +194,11 @@ fun BackupSettingsScreen(
     // LaunchedEffect below populate the list on the IO dispatcher.
     var snapshotFiles by remember { mutableStateOf<List<java.io.File>>(emptyList()) }
     var snapshotRestoreTarget by remember { mutableStateOf<File?>(null) }
+    // [fix-snapshot-keep-1] Snapshot section collapses by default — it is a
+    // rollback utility, not a primary backup surface. Auto-backup pulls from
+    // the remote; local backup navigates to the file. Tap the toggle row to
+    // expand the list.
+    var snapshotsExpanded by remember { mutableStateOf(false) }
 
     // Refresh the snapshot list on entry (and after restore writes a new one).
     LaunchedEffect(Unit) {
@@ -586,22 +595,35 @@ fun BackupSettingsScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             } else {
-                Text(
-                    stringResource(R.string.auto_backup_restore_hint),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                // [fix-autobackup-keep-3] Collapsed by default: the local copy
+                // list is a rollback utility (auto-backup restores from the
+                // remote; local backup navigates to the file), so it no longer
+                // pushes every row into the section. Toggle row reuses the
+                // auto_backup_local string — mirrors auto_backup_remote above.
+                SettingsRow(
+                    title = stringResource(R.string.auto_backup_local),
+                    icon = Icons.Filled.Restore,
+                    onClick = { autoBackupsExpanded = !autoBackupsExpanded },
+                    showDivider = autoBackupsExpanded,
                 )
-                autoBackupFiles.take(7).forEach { file ->
-                    SettingsRow(
-                        title = file.name.removePrefix(com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX)
-                            .removeSuffix(".json"),
-                        subtitle = java.text.SimpleDateFormat(
-                            "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
-                        ).format(java.util.Date(file.lastModified())),
-                        icon = Icons.Filled.Restore,
-                        onClick = { snapshotRestoreTarget = file },
+                if (autoBackupsExpanded) {
+                    Text(
+                        stringResource(R.string.auto_backup_restore_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     )
+                    autoBackupFiles.take(com.rikkaminis.app.backup.WebDavSync.AUTO_BACKUP_KEEP).forEach { file ->
+                        SettingsRow(
+                            title = file.name.removePrefix(com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX)
+                                .removeSuffix(".json"),
+                            subtitle = java.text.SimpleDateFormat(
+                                "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
+                            ).format(java.util.Date(file.lastModified())),
+                            icon = Icons.Filled.Restore,
+                            onClick = { snapshotRestoreTarget = file },
+                        )
+                    }
                 }
             }
         }
@@ -632,28 +654,38 @@ fun BackupSettingsScreen(
         // [fix-audit-p0-2] Local pre-restore snapshots with a rollback entry
         // point. Before this the snapshots were written but unreachable — the
         // UI promised "snapshot saved" yet nothing could restore from it.
+        // [fix-snapshot-keep-1] Collapsed by default: the snapshot list is a
+        // rollback utility, not a primary backup surface. The toggle row
+        // expands it. Reuses the section-title string — no new i18n keys.
         SettingsSection(
-            header = stringResource(R.string.backup_snapshot_section_title),
             footer = stringResource(R.string.backup_snapshot_section_footer),
         ) {
-            if (snapshotFiles.isEmpty()) {
-                Text(
-                    stringResource(R.string.backup_snapshot_empty),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                )
-            } else {
-                snapshotFiles.forEachIndexed { index, file ->
-                    SettingsRow(
-                        title = file.name,
-                        subtitle = java.text.SimpleDateFormat(
-                            "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
-                        ).format(java.util.Date(file.lastModified())),
-                        icon = Icons.Filled.Restore,
-                        onClick = { snapshotRestoreTarget = file },
-                        showDivider = index < snapshotFiles.size - 1,
+            SettingsRow(
+                title = stringResource(R.string.backup_snapshot_section_title),
+                icon = Icons.Filled.Restore,
+                onClick = { snapshotsExpanded = !snapshotsExpanded },
+                showDivider = snapshotsExpanded,
+            )
+            if (snapshotsExpanded) {
+                if (snapshotFiles.isEmpty()) {
+                    Text(
+                        stringResource(R.string.backup_snapshot_empty),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     )
+                } else {
+                    snapshotFiles.forEachIndexed { index, file ->
+                        SettingsRow(
+                            title = file.name,
+                            subtitle = java.text.SimpleDateFormat(
+                                "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
+                            ).format(java.util.Date(file.lastModified())),
+                            icon = Icons.Filled.Restore,
+                            onClick = { snapshotRestoreTarget = file },
+                            showDivider = index < snapshotFiles.size - 1,
+                        )
+                    }
                 }
             }
         }
