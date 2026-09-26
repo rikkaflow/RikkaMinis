@@ -2095,6 +2095,11 @@ fun ChatScreen(
                         chatRepository.pinSession(id, session.pinnedAt == null)
                     }
                 },
+                // [feat/drawer-context-menu] Manual title regeneration from
+                // the drawer context menu. Acts on the CURRENT session's
+                // ViewModel — the drawer only shows the item on the current
+                // session's row (the VM has no per-session regeneration path).
+                onRegenerateTitle = { viewModel.regenerateSessionTitle() },
             )
         },
     ) {
@@ -4089,6 +4094,54 @@ fun ChatScreen(
                         .lastOrNull { it.role == "assistant" }
                         ?.error
                         ?.isNotBlank() == true
+                    // [fix/typing-band-live] Persistent fixed-height status
+                    // band at the visual bottom of the transcript. Idle →
+                    // blank 36dp placeholder (zero layout shift, ever);
+                    // streaming → the typing indicator shows INSIDE the band
+                    // (same 36dp). typingActive is derived from the LIVE
+                    // trailing message's state: FlatChatItem.AssistantTyping
+                    // items only ever come from the runtime-dead legacy
+                    // pipeline (LegacyFlatChatBuilder), so they can't be the
+                    // signal. Mirrors the old in-bubble indicator condition
+                    // (streaming + no visible content), whose render site this
+                    // band replaces (see ChatAssistantMessageUI).
+                    // [fix/typing-band-overlay] The band previously read the
+                    // canonical trailing message, whose content/toolBlocks
+                    // stay empty for the WHOLE live turn — during streaming
+                    // those fields live in the streamingById side-channel
+                    // (T-streaming-side-channel) and only drain back into the
+                    // canonical list at stream end, so typingActive was stuck
+                    // true until the turn finished and the band showed
+                    // "thinking / waiting" the entire time (user-reported
+                    // 2026-09-26). Derive from the overlay-merged view — the
+                    // same source the message renderers use — so the band
+                    // goes dark the moment real content or tool blocks become
+                    // visible, and the awaiting seconds counter only ticks
+                    // during actual network waits. The collect lives INSIDE
+                    // the item lambda: LazyListScope's builder is not a
+                    // composable context (CI caught the first placement at
+                    // 4121:70), while LazyItemScope is — and per-item
+                    // subscription keeps recomposition scoped to this 36dp
+                    // band instead of the whole transcript.
+                    item(key = "__typing_band__", contentType = "typing_band") {
+                        val streamingBandById by viewModel.streamingById.collectAsState()
+                        val bandMerged = if (streamingBandById.isEmpty()) messages
+                            else mergeStreamingOverlay(messages, streamingBandById, viewModel.currentStreamEpoch())
+                        val lastAssistant = bandMerged.lastOrNull { it.role == "assistant" }
+                        val typingActive = lastAssistant != null &&
+                            lastAssistant.isStreaming &&
+                            lastAssistant.content.isEmpty() &&
+                            lastAssistant.toolBlocks.none { it.kind != "info" }
+                        if (typingActive) {
+                            TypingIndicator(
+                                queueWaitingAhead = queueWaitingAhead,
+                                awaitingNetworkSinceMs =
+                                    if (lastAssistant?.isAwaitingModelResponse == true) awaitingResponseSinceMs else 0L,
+                            )
+                        } else {
+                            Spacer(Modifier.height(TYPING_BAND_HEIGHT))
+                        }
+                    }
                     if (canResume && !isStreaming && error == null && !lastAssistantHasError) {
                         item(key = "__resume_banner__", contentType = "resume_banner") {
                             ResumeBanner(onResume = {
@@ -4188,27 +4241,35 @@ fun ChatScreen(
                 // Floating tool status bar — shows only actual tool calls (not text/thinking/info).
                 // Matches iOS: filter on toolStatus != nil (text blocks have toolStatus = null).
                 //
-                // T-streaming-side-channel-tool-blocks: derive lastToolBlocks
-                // from a state that combines messages + streamingById INSIDE
-                // a LaunchedEffect (not via a top-level collectAsState read),
-                // so streaming-tick churn stays off the ChatScreen invalidation
-                // list. Without including streamingById, a tool pill clicked
-                // mid-turn is missing from lastToolBlocks → ToolDetailSheet
-                // never opens (and its sentinel LaunchedEffect immediately
-                // closes the detail state because the id "doesn't exist").
-                var lastToolBlocks by remember { mutableStateOf<List<AssistantBlock>>(emptyList()) }
-                LaunchedEffect(messages) {
-                    kotlinx.coroutines.flow.combine(
-                        kotlinx.coroutines.flow.flowOf(messages),
-                        viewModel.streamingById,
-                    ) { msgs, stream ->
-                        val merged = if (stream.isEmpty()) msgs else mergeStreamingOverlay(msgs, stream, viewModel.currentStreamEpoch())
-                        merged.filter { it.role == "assistant" }
-                            .flatMap { it.toolBlocks }
-                            .filter { it.toolStatus != null && it.kind != "thinking" && it.kind != "info" }
-                    }.collect { lastToolBlocks = it }
+                // T-streaming-side-channel-tool-blocks: lastToolBlocks must
+                // include the streamingById side-channel, otherwise a tool
+                // pill mounted mid-turn is missing → ToolDetailSheet never
+                // opens (its sentinel closes the detail because the id
+                // "doesn't exist").
+                //
+                // [fix/tool-bar-reserve-frame-skew] Computed SYNCHRONOUSLY in
+                // composition (remember(messages, streamingById)), not via a
+                // LaunchedEffect collect. The old async derivation lagged the
+                // reserve by one frame: bottomReserve is driven off
+                // `hasFloatingTools` (a synchronous remember over the same
+                // sources), so on the frame a tool first appeared the reserve
+                // flipped 20dp → 79dp while the bar itself was still missing —
+                // a 59dp hole at the transcript bottom, then the bar mounted a
+                // frame later (user-reported jump "when calling tools";
+                // the unmount side mirrored it: reserve collapsed first, bar
+                // covered the bottom rows one extra frame). Same state source
+                // as the reserve, same frame — bar and reserve now flip
+                // together. The old "keeps streaming-tick churn off the
+                // ChatScreen invalidation list" rationale no longer holds:
+                // hasFloatingTools already collects streamingById in
+                // composition.
+                val lastToolBlocks = remember(messages, streamingById) {
+                    val merged = if (streamingById.isEmpty()) messages
+                        else mergeStreamingOverlay(messages, streamingById, viewModel.currentStreamEpoch())
+                    merged.filter { it.role == "assistant" }
+                        .flatMap { it.toolBlocks }
+                        .filter { it.toolStatus != null && it.kind != "thinking" && it.kind != "info" }
                 }
-                val allToolBlocks = lastToolBlocks
                 // Whole-bar visibility gate: when the user disables the
                 // floating tool status bar in Appearance, skip both the render
                 // AND the height reserve (otherwise an empty gap lingers above

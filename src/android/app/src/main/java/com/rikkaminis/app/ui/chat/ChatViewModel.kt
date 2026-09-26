@@ -1204,7 +1204,7 @@ class ChatViewModel(
             this@ChatViewModel.applyRequestImageBudget(messages)
         override fun checkContextBeforeSend(): Boolean = this@ChatViewModel.checkContextBeforeSend()
         override fun isContextExhausted(): Boolean = this@ChatViewModel.isContextExhausted()
-        override fun offloadContextIfNeeded(contextWindow: Int, lastContextTokens: Int, force: Boolean) =
+        override fun offloadContextIfNeeded(contextWindow: Int, lastContextTokens: Int, force: Boolean): Int? =
             this@ChatViewModel.offloadContextIfNeeded(contextWindow, lastContextTokens, force)
         override fun trimContextHistoryWindow(contextWindow: Int, lastContextTokens: Int) =
             this@ChatViewModel.trimContextHistoryWindow(contextWindow, lastContextTokens)
@@ -1247,6 +1247,9 @@ class ChatViewModel(
             toolBlockMeta: Map<String, AssistantBlock>, modelId: String?, entryId: String?,
         ): String? = this@ChatViewModel.persistAssistantTurn(
             parts, usage, reasoningContent, toolBlockMeta, modelId, entryId)
+        override suspend fun updatePersistedAssistantTurn(
+            dbId: String, parts: List<AgentContentPart>, toolBlockMeta: Map<String, AssistantBlock>,
+        ) = this@ChatViewModel.updatePersistedAssistantTurn(dbId, parts, toolBlockMeta)
         override suspend fun persistToolResultMessage(
             parts: List<AgentContentPart>,
             transcriptRedactions: Map<String, String>,

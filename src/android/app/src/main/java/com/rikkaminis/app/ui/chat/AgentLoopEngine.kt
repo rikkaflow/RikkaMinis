@@ -353,10 +353,21 @@ internal class AgentLoopEngine(
             // snapshot inside a long-running agent turn is exactly the iOS
             // fcc22b66 item-3 bug.
             host.effectiveContextWindowTokens()?.takeIf { it > 0 }?.let { window ->
-                host.offloadContextIfNeeded(
+                // [fix/offload-stale-token-compact] When the offload pass
+                // actually shrunk the history, it returns the post-offload
+                // estimate (same accounting basis as lastContextTokens); use
+                // that for the compact + hard-trim decisions below instead of
+                // the pre-offload figure. 2026-09-25 real-session evidence:
+                // two runs offloaded down to 117470/250000 and 91107/200000 —
+                // both already BELOW their compact lines (162457 / 131639) —
+                // yet still triggered a summary wait (92 s / 38 s) because
+                // the decisions ran on the stale 166806 / 147380. Null (no
+                // offload happened) falls back to the previous behavior.
+                val postOffloadTokens = host.offloadContextIfNeeded(
                     contextWindow = window,
                     lastContextTokens = loopState.lastContextTokens,
                 )
+                val decisionTokens = postOffloadTokens ?: loopState.lastContextTokens
                 // [T-auto-compact-in-loop] Before falling back to the hard trim
                 // (which drops the oldest turns verbatim and inserts a jarring
                 // "trimmed N messages" line mid-answer), try to summarise the
@@ -369,7 +380,7 @@ internal class AgentLoopEngine(
                 // model is mid-task.
                 val compacted = host.maybeAutoCompactInLoop(
                     contextWindow = window,
-                    lastContextTokens = loopState.lastContextTokens,
+                    lastContextTokens = decisionTokens,
                 )
                 // [fix/diff-audit-0904-F3] When auto-compact just fired, SKIP the
                 // trim this turn. Compact does NOT shrink agentHistory (it only
@@ -397,7 +408,7 @@ internal class AgentLoopEngine(
                 if (!compacted) {
                     host.trimContextHistoryWindow(
                         contextWindow = window,
-                        lastContextTokens = loopState.lastContextTokens,
+                        lastContextTokens = decisionTokens,
                     )
                 } else {
                     AppLogger.info(TAG_STREAM, "auto-compact folded old turns; skipping hard trim this turn (anchor preserved)")
@@ -1167,6 +1178,27 @@ internal class AgentLoopEngine(
                             host.setTransientInlineError("$errSummary — retrying ($retryAttempt/${retryDelays.size})…")
                         }
                         try {
+                            // [absorb-network-pack: P0-2-offline-retry-hold]
+                            // Wait for connectivity ONCE per retry attempt, before
+                            // the countdown starts, so the attempt is not burned
+                            // into a dead network (Wi-Fi↔cellular swap / elevator).
+                            // The visible countdown simply does not start until
+                            // the link is back.
+                            //
+                            // Placement is deliberate: `awaitConnected` is bounded
+                            // at 90s per call, so calling it once per attempt caps
+                            // the stall at 90s. Calling it inside the per-second
+                            // loop below would re-arm that 90s budget on every
+                            // second and stretch a single attempt to
+                            // `delaySec × 90s` (10.5 min on the default ladder),
+                            // which is exactly the failure path the bound exists
+                            // to avoid. The probe fails-open when no NetworkMonitor
+                            // was ever started.
+                            com.rikkaminis.app.network.OfflineRetryHold.awaitConnected {
+                                com.rikkaminis.app.network.NetworkMonitor.activeMonitor
+                                    ?.let { it.status.value == com.rikkaminis.app.network.NetworkMonitor.NetworkStatus.DISCONNECTED }
+                                    ?: false
+                            }
                             for (remaining in delaySec downTo 1) {
                                 host.setAutoRetryCountdown(remaining)
                                 kotlinx.coroutines.delay(1000)
@@ -2365,6 +2397,10 @@ internal class AgentLoopEngine(
             // assistant's partial text and falls back to the tool summary, so
             // the list reflects exactly what the model just emitted. Mirrors
             // iOS overlaying the live VM's last message over the DB value.
+            // [fix/early-turn-persist] Row id written BEFORE the tools run (see
+            // the dispatch block below); the post-tool persist site updates it
+            // in place instead of inserting a second row for the same turn.
+            var earlyAssistantDbId: String? = null
             run {
                 val livePreviewParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val liveMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
@@ -2372,6 +2408,28 @@ internal class AgentLoopEngine(
                     host.updateSessionPreview(
                         host.buildAssistantPartsJson(livePreviewParts, liveMeta),
                     )
+                    // [fix/early-turn-persist] Make the turn durable *now*
+                    // rather than after the tools return. Tool execution is the
+                    // longest single stretch of a turn (minutes for sandbox
+                    // calls) and it used to hold the ONLY copy of text the user
+                    // had already read: a kill inside that window (app update,
+                    // swipe-away, OOM) erased the whole turn and left the
+                    // session tail on a tool_result row, which cold start then
+                    // reported as "paused". Worst case now is a missing tool
+                    // outcome on a row whose text is intact.
+                    earlyAssistantDbId = host.persistAssistantTurn(
+                        livePreviewParts, lastUsage, turnReasoningContent, liveMeta,
+                        modelId = loopState.currentProvider.model.id,
+                        entryId = host.activeEntryId,
+                    )
+                    earlyAssistantDbId?.let { earlyId ->
+                        val earlyIdx = host.agentHistory.indexOfLast {
+                            it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null
+                        }
+                        if (earlyIdx >= 0) {
+                            host.agentHistory[earlyIdx] = host.agentHistory[earlyIdx].copy(dbMessageId = earlyId)
+                        }
+                    }
                 }
             }
 
@@ -2867,11 +2925,22 @@ internal class AgentLoopEngine(
             android.util.Log.i("ChatVMStream", "runAgentLoop turn=$turn persist-begin blocks=${loopState.allToolBlocks.size}")
             val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
             val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-            val assistantDbId = host.persistAssistantTurn(
-                turnParts, lastUsage, turnReasoningContent, blockMeta,
-                modelId = loopState.currentProvider.model.id,
-                entryId = host.activeEntryId,
-            )
+            // [fix/early-turn-persist] When the row already exists (written
+            // before the tools ran) refresh it with the finished tool blocks
+            // instead of inserting a second row for the same turn. Copy to a
+            // local val first: the var is captured by the dispatch block
+            // above, so it no longer smart-casts.
+            val earlyId = earlyAssistantDbId
+            val assistantDbId = if (earlyId != null) {
+                host.updatePersistedAssistantTurn(earlyId, turnParts, blockMeta)
+                earlyId
+            } else {
+                host.persistAssistantTurn(
+                    turnParts, lastUsage, turnReasoningContent, blockMeta,
+                    modelId = loopState.currentProvider.model.id,
+                    entryId = host.activeEntryId,
+                )
+            }
             if (assistantDbId != null) {
                 val lastIdx = host.agentHistory.indexOfLast { it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null }
                 if (lastIdx >= 0) {

@@ -20,10 +20,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -102,6 +106,11 @@ fun ChatHistoryDrawer(
     footerActions: List<ChatActionSpec> = emptyList(),
     onAction: (String) -> Unit = {},
     onPinSession: (String) -> Unit = {},
+    // [feat/drawer-context-menu] Manual title regeneration. Only wire it for
+    // the CURRENT session — the ChatViewModel has no per-session regeneration
+    // path, so callers must ignore the id for non-current rows (the menu item
+    // is only shown on the current session's row).
+    onRegenerateTitle: (String) -> Unit = {},
 ) {
     val sessions by chatRepository.observeSessions()
         .collectAsState(initial = emptyList())
@@ -220,14 +229,100 @@ fun ChatHistoryDrawer(
                             DrawerSectionHeader(period)
                         }
                         items(group, key = { it.id }) { session ->
-                            DrawerSessionRow(
-                                session = session,
-                                selected = session.id == currentSessionId,
-                                onClick = { onSessionClick(session.id) },
-                                onLongClick = { deleteTarget = session },
-                                isPinned = session.pinnedAt != null,
-                                onTogglePin = { onPinSession(session.id) },
-                            )
+                            // [fix/drawer-row-slim] showTime only in the Today
+                            // section (other section headers already carry the
+                            // date) and showPin only in the Pinned section
+                            // (the section header marks pinned state; the icon
+                            // is the unpin entry).
+                            //
+                            // [feat/drawer-context-menu] The long-press menu is
+                            // a compact DropdownMenu anchored to the pressed
+                            // row, mirroring rikkahub ConversationList:
+                            // per-row local open state (no hoisted
+                            // menuTarget), items with leading icons, tapping
+                            // outside dismisses — no cancel button, no title
+                            // (the anchored row IS the context). Delete still
+                            // routes through the confirm dialog (deleteTarget).
+                            // Regenerate shows only on the current session's
+                            // row: the ChatViewModel regenerates the CURRENT
+                            // session's title, so wiring it for other rows
+                            // would rewrite the wrong session.
+                            var menuOpen by remember { mutableStateOf(false) }
+                            Box {
+                                DrawerSessionRow(
+                                    session = session,
+                                    selected = session.id == currentSessionId,
+                                    onClick = { onSessionClick(session.id) },
+                                    onLongClick = { menuOpen = true },
+                                    showTime = period == DatePeriod.TODAY,
+                                    showPin = period == DatePeriod.PINNED,
+                                    onTogglePin = { onPinSession(session.id) },
+                                )
+                                if (menuOpen) {
+                                    DropdownMenu(
+                                        expanded = menuOpen,
+                                        onDismissRequest = { menuOpen = false },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = stringResource(
+                                                        if (session.pinnedAt != null) R.string.sessionlist_unpin
+                                                        else R.string.sessionlist_pin,
+                                                    ),
+                                                )
+                                            },
+                                            onClick = {
+                                                menuOpen = false
+                                                onPinSession(session.id)
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = if (session.pinnedAt != null) Icons.Outlined.PushPin
+                                                    else Icons.Filled.PushPin,
+                                                    contentDescription = null,
+                                                )
+                                            },
+                                        )
+                                        if (session.id == currentSessionId) {
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(text = stringResource(R.string.sessionlist_regenerate_title))
+                                                },
+                                                onClick = {
+                                                    menuOpen = false
+                                                    onRegenerateTitle(session.id)
+                                                },
+                                                leadingIcon = {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Refresh,
+                                                        contentDescription = null,
+                                                    )
+                                                },
+                                            )
+                                        }
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = stringResource(R.string.delete),
+                                                    color = MaterialTheme.colorScheme.error,
+                                                )
+                                            },
+                                            onClick = {
+                                                menuOpen = false
+                                                deleteTarget = session
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Delete,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.error,
+                                                )
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                     item { Spacer(modifier = Modifier.height(8.dp)) }
@@ -289,6 +384,12 @@ fun ChatHistoryDrawer(
             },
         )
     }
+
+    // [feat/drawer-context-menu] The long-press context menu moved to a
+    // compact DropdownMenu anchored at each row (see the items loop above) —
+    // the old full AlertDialog (title + option rows + redundant cancel) is
+    // gone: menu items are natively full-row tappable and tapping outside
+    // dismisses.
 }
 
 /**
@@ -372,7 +473,8 @@ private fun DrawerSessionRow(
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
-    isPinned: Boolean,
+    showTime: Boolean,
+    showPin: Boolean,
     onTogglePin: () -> Unit,
 ) {
     val style = remember(session.category) { categoryStyle(session.category) }
@@ -401,44 +503,34 @@ private fun DrawerSessionRow(
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 10.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Box(
-            modifier = Modifier
-                .size(34.dp)
-                .background(color = style.color.copy(alpha = 0.18f), shape = CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
+        // [fix/drawer-row-slim] The 34dp category-icon circle is gone: the
+        // category style is already visible on the chat screen's sticky title
+        // pill, so the circle was decorative here. The status markers it used
+        // to carry move to a conditional leading indicator rendered ONLY when
+        // active/paused — idle rows (the vast majority) have zero leading
+        // footprint, while active/paused sessions become MORE visible than
+        // they were as a corner overlay on the circle.
+        if (badgePaused) {
+            // Semantic badge: interruption must be perceivable without vision,
+            // so it gets a real contentDescription instead of null.
             Icon(
-                imageVector = style.icon,
-                contentDescription = null,
-                tint = style.color,
-                modifier = Modifier.size(17.dp),
+                imageVector = Icons.Filled.Pause,
+                contentDescription = stringResource(R.string.sessionlist_badge_paused),
+                tint = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier.size(12.dp),
             )
-            if (badgePaused) {
-                // Semantic badge (unlike the decorative isActive dot below):
-                // interruption must be perceivable without vision, so it gets a
-                // real contentDescription instead of null.
-                Icon(
-                    imageVector = Icons.Filled.Pause,
-                    contentDescription = stringResource(R.string.sessionlist_badge_paused),
-                    tint = MaterialTheme.colorScheme.tertiary,
-                    modifier = Modifier
-                        .size(10.dp)
-                        .align(Alignment.BottomEnd),
-                )
-            } else if (isActive) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .background(style.color, CircleShape)
-                        .align(Alignment.BottomEnd),
-                )
-            }
-            // ponytail: 只渲染 PAUSED（当前唯一产出态），ICLOUD_SYNCING 作 head 时回落为无标记
-            // 天花板: 第二个产出态上线后列表静默看不到它
-            // 升级触发: 写侧出现 push(.., SessionBadgeState.ICLOUD_SYNCING)（grep 即知）
+        } else if (isActive) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .background(style.color, CircleShape),
+            )
         }
+        // ponytail: 状态标记只在活跃/暂停时条件渲染，空闲行前缘零占用
+        // 天花板: 第三种状态上线后仍只有两个渲染分支
+        // 升级触发: 写侧出现新 SessionBadgeState 值被推入，grep push 即知
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -449,38 +541,53 @@ private fun DrawerSessionRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            session.lastMessage?.takeIf { it.isNotBlank() }?.let { preview ->
-                Text(
-                    text = preview,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+            // [fix/row-height-jump] Always render the preview line so every row
+            // keeps the same two-line height. It used to be skipped whenever
+            // lastMessage was empty/blank — exactly the state of a session whose
+            // turn is still running (its assistant row is not durable yet) — and
+            // then reappeared the moment a tool call pushed a live preview
+            // ([T-android-session-last-message-live-tool-call]). Every tool
+            // dispatch therefore flipped the row between one and two lines and
+            // shifted the whole list. A blank preview renders a space, which
+            // keeps the same line box.
+            // ponytail: 空预览用空格占位，不新增文案键 | 天花板: 行高恒定但空行
+            // 无信息量 | 升级触发: 产品要求空预览显示「正在处理…」类提示（需新 i18n 键）
+            Text(
+                text = session.lastMessage?.takeIf { it.isNotBlank() } ?: " ",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
 
-        Text(
-            text = timeText,
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.outline,
-        )
-
-        // Pin toggle — inline icon, same style as the provider's favorite
-        // star. Placed at the right edge of the row, after the timestamp.
-        IconButton(
-            onClick = onTogglePin,
-            modifier = Modifier.size(28.dp),
-        ) {
-            Icon(
-                imageVector = if (isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
-                contentDescription = stringResource(
-                    if (isPinned) R.string.sessionlist_unpin else R.string.sessionlist_pin,
-                ),
-                tint = if (isPinned) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.outlineVariant,
-                modifier = Modifier.size(16.dp),
+        // [fix/drawer-row-slim] Relative time only in the Today section: in
+        // every other section the header itself already carries the date
+        // (Yesterday / This Week / This Month / Earlier), so the per-row label
+        // repeated it verbatim.
+        if (showTime) {
+            Text(
+                text = timeText,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.outline,
             )
+        }
+
+        // [fix/drawer-row-slim] Pin toggle only in the Pinned section (the
+        // section header already marks pinned state; the icon is the unpin
+        // entry). Unpinned rows reach pin/unpin through the long-press menu.
+        if (showPin) {
+            IconButton(
+                onClick = onTogglePin,
+                modifier = Modifier.size(28.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PushPin,
+                    contentDescription = stringResource(R.string.sessionlist_unpin),
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
         }
     }
 }
