@@ -147,6 +147,8 @@ import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.components.MinisAlertDialog
 import com.rikkaminis.app.ui.settings.autoExpandThinkingEnabled
+import com.rikkaminis.app.ui.settings.thinkingCharCountVisibleEnabled
+import com.rikkaminis.app.ui.settings.thinkingDurationVisibleEnabled
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
@@ -1236,6 +1238,11 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
     // where the same UserDefaults gate sits at the one-shot auto-expand site.
     val context = LocalContext.current
     val autoExpandThinking = remember { autoExpandThinkingEnabled(context) }
+    // [T-thinking-header-toggles] Which extras this row shows on its right
+    // edge. Read once at mount, same convention as the auto-expand gate above:
+    // a settings change lands on the next mounted row, not mid-stream.
+    val showThinkingDuration = remember { thinkingDurationVisibleEnabled(context) }
+    val showThinkingCharCount = remember { thinkingCharCountVisibleEnabled(context) }
     var expanded by remember(block.id) { mutableStateOf(autoExpandThinking && isLast && isStreaming) }
     var userTouched by remember(block.id) { mutableStateOf(false) }
     LaunchedEffect(block.id, isStreaming) {
@@ -1245,10 +1252,16 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
     }
     val thinkingBlue = ChatColors.thinking
     val charCount = block.content.length
-    val charLabel = when {
-        charCount >= 1000 -> "${charCount / 1000}K"
-        else -> "$charCount"
-    }
+    // [T-thinking-header-toggles] Duration + char count are user-toggled; the
+    // decision itself lives in a pure function (ChatFormattingUtils) so the
+    // whole toggle matrix is JVM-testable.
+    val headerExtras = thinkingHeaderExtras(
+        showDuration = showThinkingDuration,
+        showCharCount = showThinkingCharCount,
+        isStreaming = isStreaming,
+        durationMs = block.durationMs,
+        charCount = charCount,
+    )
     // [T-thinking-render-perf-android] Compose `Text` measures/lays out the
     // ENTIRE string even when only ~300dp is visible, so a 200k-char thinking
     // block froze the UI (and a per-token recomposition re-measured all 200k
@@ -1304,16 +1317,45 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 )
                 Spacer(modifier = Modifier.width(6.dp))
             }
+            // [T-thinking-title] While this block is live the header shows the
+            // model's own newest action phrase instead of the fixed label, so a
+            // collapsed header answers "what is it doing right now" at a glance.
+            // Frozen blocks keep the static label — see [extractThinkingTitle]'s
+            // KDoc for why the title is live-only in this app.
+            val thinkingTitle = remember(block.content.length, isStreaming) {
+                if (isStreaming) extractThinkingTitle(block.content) else null
+            }
             Text(
-                text = stringResource(R.string.chat_deep_thinking),
+                text = thinkingTitle ?: stringResource(R.string.chat_deep_thinking),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = thinkingBlue,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // Holds the leftover width itself (the Spacer that used to do
+                // that job is gone): a long phrase ellipsizes while the duration
+                // / char count and the chevron stay pinned to the right edge.
+                // With a short label the layout is identical to before.
+                modifier = Modifier.weight(1f),
             )
-            Spacer(modifier = Modifier.weight(1f))
-            if (charCount > 0) {
+            // [T-thinking-header-toggles] Both extras are optional (Settings →
+            // Appearance → Deep Thinking) and each can be absent on its own, so
+            // they render independently. Duration keeps the in-session-only
+            // convention: the stamp is never persisted, so a reloaded row has
+            // nothing to show even with the toggle ON.
+            headerExtras.duration?.let { durationLabel ->
                 Text(
-                    text = charLabel,
+                    text = durationLabel,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    color = thinkingBlue.copy(alpha = 0.6f),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            headerExtras.charCount?.let { countLabel ->
+                Text(
+                    text = countLabel,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
                     fontFamily = FontFamily.Monospace,
