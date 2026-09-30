@@ -4,6 +4,7 @@ import android.app.LocaleManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
 import android.os.LocaleList
@@ -24,6 +25,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
+import com.rikkaminis.app.accessibility.AccessibilityRecoveryManager
 import com.rikkaminis.app.offload.OffloadPermissionManager
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
@@ -35,6 +37,7 @@ import com.rikkaminis.app.deeplink.DeepLinkHandler
 
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.service.SessionActivityTracker
+import com.rikkaminis.app.ui.NewerDatabaseGuidanceScreen
 import com.rikkaminis.app.ui.navigation.AppNavigation
 import com.rikkaminis.app.ui.navigation.coldStartRestoreAllowed
 import com.rikkaminis.app.ui.navigation.Routes
@@ -223,6 +226,24 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // [T-android-downgrade-compat] Handle BEFORE anything that touches
+        // MinisApp's lateinit deps — every one of them was skipped (see the
+        // SHOW_NEWER_DB_GUIDANCE early return in MinisApp.onCreate), so
+        // reaching them here would throw UninitializedPropertyAccessException.
+        // Placed after the safe-mode block on purpose: safe mode has the more
+        // generic remedy (a crash burst) and already owns its screen.
+        //
+        // This is not a crash — it is a recoverable state with a specific
+        // remedy, and the database file has deliberately been left untouched.
+        // Nothing on disk was migrated or dropped: Room was never constructed.
+        if ((application as MinisApp).dbVersionDecision ==
+            com.rikkaminis.app.data.db.DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE
+        ) {
+            android.util.Log.w("MainActivity", "database is from a newer build — showing guidance screen")
+            setContent { NewerDatabaseGuidanceScreen(onExit = { finishAndRemoveTask() }) }
+            return
+        }
+
         // T166: if we were killed by LMK while the user was inside a
         // chat, restore the sessionId now so the synthesised deep-link
         // re-opens it before any composable is composed. ChatViewModel
@@ -351,6 +372,66 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         .show()
+                }
+        }
+
+        // [T-android-a11y-force-stop-recovery] Bridge: the accessibility-grant
+        // repair prompt. Raised from the a11y tool path when the framework has
+        // stripped our component out of ENABLED_ACCESSIBILITY_SERVICES (the
+        // force-stop case). Two shapes depending on whether Shizuku can do the
+        // privileged write for us.
+        //
+        // setCancelable(true) + setOnCancelListener, unlike the settings gate
+        // above: an interrupted dialog must count as a cancel and must not
+        // wedge the waiting agent turn. Every exit path — button, back press,
+        // outside tap — resolves the continuation exactly once (respond()
+        // no-ops if already resolved, e.g. after a timeout).
+        lifecycleScope.launch {
+            AccessibilityRecoveryManager.pendingPrompt
+                .filterNotNull()
+                .collect { prompt ->
+                    val b = AlertDialog.Builder(this@MainActivity)
+                        .setTitle(getString(R.string.a11y_repair_dialog_title))
+                        .setCancelable(true)
+                        .setOnCancelListener {
+                            AccessibilityRecoveryManager.respond(
+                                AccessibilityRecoveryManager.Decision.CANCEL
+                            )
+                        }
+                        .setNegativeButton(R.string.a11y_repair_cancel) { d, _ ->
+                            d.dismiss()
+                            AccessibilityRecoveryManager.respond(
+                                AccessibilityRecoveryManager.Decision.CANCEL
+                            )
+                        }
+                    if (prompt.shizukuAvailable) {
+                        b.setMessage(getString(R.string.a11y_repair_dialog_message_shizuku))
+                            .setPositiveButton(R.string.a11y_repair_action_repair) { d, _ ->
+                                d.dismiss()
+                                AccessibilityRecoveryManager.respond(
+                                    AccessibilityRecoveryManager.Decision.REPAIR
+                                )
+                            }
+                    } else {
+                        b.setMessage(getString(R.string.a11y_repair_dialog_message_manual))
+                            .setPositiveButton(R.string.a11y_repair_action_open_settings) { d, _ ->
+                                d.dismiss()
+                                try {
+                                    startActivity(
+                                        Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                    )
+                                } catch (_: Throwable) {
+                                    // Some OEMs hide this panel; the user can
+                                    // still reach it from Settings manually.
+                                }
+                                AccessibilityRecoveryManager.respond(
+                                    AccessibilityRecoveryManager.Decision.OPEN_SETTINGS
+                                )
+                            }
+                    }
+                    b.show()
                 }
         }
 
