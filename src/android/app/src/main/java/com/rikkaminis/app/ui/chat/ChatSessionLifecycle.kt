@@ -239,7 +239,12 @@ internal fun ChatViewModel.compactAll(
     )
     // T7-D: 旁路验证 —— compact 开始
     traceObserver.t7Reduce(AgentRunEvent.CompactionStarted("compact_all"))
-    viewModelScope.launch(Dispatchers.IO) {
+    // [fix/compact-cancel-on-stop-1002] Store the job so cancelStream can
+    // kill the compact (see compactJob KDoc). CancellationException already
+    // propagates cleanly through this launch: the catch rethrows, the
+    // finally resets _isCompacting + traces, and nothing is persisted
+    // before the commit block — a cancelled compact leaves zero trace.
+    compactJob = viewModelScope.launch(Dispatchers.IO) {
         // [T-android-compact-queued-drain] Only a SUCCESSFUL compact kicks
         // the queued-prompt drain below; failure/cancel/empty-summary paths
         // keep today's behavior (queued bubbles stay pending + cancellable).
@@ -278,6 +283,17 @@ internal fun ChatViewModel.compactAll(
             // both non-empty AND present in rawDbIds.
             val rawDbIds: Set<String> = try {
                 chatRepository.dao.loadMessages(sid).map { it.id }.toSet()
+            } catch (e: CancellationException) {
+                // [fix/clearchat-compact-ce-1002] A stop press cancels
+                // compactJob (fix/compact-cancel-on-stop-1002). The summary
+                // LLM call is the first suspend point and usually unwinds
+                // first, but a cancel can also land on this read —
+                // swallowing CE here would misreport cancellation as "DB
+                // verify failed" and fall back to the in-memory anchor,
+                // continuing a cancelled compact on stale state. Rethrow so
+                // the coroutine unwinds exactly like every other cancel
+                // point; other failures keep the best-effort semantics.
+                throw e
             } catch (e: Exception) {
                 Log.w(ChatViewModel.TAG, "[Compact] loadMessages for raw-id verify failed: ${e.message}")
                 emptySet()
@@ -336,11 +352,22 @@ internal fun ChatViewModel.compactAll(
             // that silently reverted (dividers gone, full history replayed)
             // after the next reload. Now the failure is surfaced and the
             // in-memory boundary is not advertised as durable.
-            val markerSaved = runCatching { chatRepository.dao.insertCompactMarker(marker) }
-                .onFailure {
-                    Log.w(ChatViewModel.TAG, "Failed to persist compact marker: ${it.message}")
-                }
-                .isSuccess
+            // [fix/compact-cancel-on-stop-1002] runCatching around a suspend
+            // call swallows CancellationException — with stop now able to
+            // cancel this coroutine mid-insert, that would set the in-memory
+            // marker/summary while the DB row never landed (the exact
+            // [audit-0917] "compacted in memory, full history after reload"
+            // inconsistency this guard exists to prevent). Rethrow
+            // cancellation; other failures keep the best-effort semantics.
+            val markerSaved = try {
+                chatRepository.dao.insertCompactMarker(marker)
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(ChatViewModel.TAG, "Failed to persist compact marker: ${e.message}")
+                false
+            }
             if (!markerSaved) {
                 AppLogger.warning(
                     ChatViewModel.TAG_STREAM,
