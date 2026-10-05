@@ -3,12 +3,17 @@ package com.rikkaminis.app.ui.chat
 import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.conversation.ContextCompactor
+import com.rikkaminis.app.conversation.appendPinnedSection
+import com.rikkaminis.app.conversation.extractPinnedUserMessages
+import com.rikkaminis.app.conversation.pinnedSectionInner
+import com.rikkaminis.app.conversation.stripPinnedSection
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.db.CompactMarkerEntity
 import com.rikkaminis.app.data.db.MessageEntity
 import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.LLMResponse
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.diagnostics.SessionIdAliases
@@ -789,14 +794,25 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
     previousSummary: String? = null,
     depth: Int = 0,
     ): String {
+    // [feat/compact-pin-v0-1005] Pin v0: user verbatim text never passes
+    // through a rewrite. Extraction + strip happen at the depth-0 entry
+    // (BEFORE any LLM call); the re-append happens at the one exit below
+    // (AFTER the LLM). At depth > 0 previousSummary is always null and the
+    // recursion passes no pin — the split/merge prompts never see one.
+    // previousSummary comes from the previous round's summary and may carry
+    // a `<pinned-user-messages>` block: strip it here, carry the payload,
+    // and re-merge it with this fold's user text at the exit.
+    val pinNew = if (depth == 0) extractPinnedUserMessages(messages) else emptyList()
+    val pinCarried = if (depth == 0) pinnedSectionInner(previousSummary) else null
+    val prevSummaryStripped = if (depth == 0) stripPinnedSection(previousSummary) else previousSummary
     val transcript = buildConversationTextForSummary(messages)
-    val conversationText = if (previousSummary.isNullOrBlank()) {
+    val conversationText = if (prevSummaryStripped.isNullOrBlank()) {
         transcript
     } else {
-        "Previous context summary:\n$previousSummary\n\n" +
+        "Previous context summary:\n$prevSummaryStripped\n\n" +
             "New conversation to merge:\n$transcript"
     }
-    return try {
+    val summary = try {
         generateCompactSummary(conversationText)
     } catch (e: CancellationException) {
         throw e
@@ -830,6 +846,14 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
             append("Part 2:\n").append(summary2)
         }
         generateCompactSummary(mergeInput)
+    }
+    // [feat/compact-pin-v0-1005] Re-append AFTER the LLM — the pinned user
+    // verbatim text never passes through a rewrite. Empty pin + no carried
+    // block → today's behavior, byte-identical.
+    return if (pinNew.isEmpty() && pinCarried == null) {
+        summary
+    } else {
+        appendPinnedSection(summary, pinNew, pinCarried)
     }
 }
 
@@ -914,8 +938,12 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     // compact then burned 82s per halving round with the user's chat queue
     // behind it. A summary does not need the active member's persona, so
     // members that cannot silence thinking go LAST; every attempt gets a
-    // 30s wall budget and the whole chain a 120s deadline (rationale on the
-    // ChatViewModel companion constants). withTimeoutOrNull swallows ONLY
+    // per-candidate wall budget — 30s, or 60s for the cannot-silence members
+    // ([fix/compact-truncation-guard-1005]) — and the whole chain a 120s
+    // deadline (rationale on the ChatViewModel companion constants). A
+    // success whose stopReason was cut at the output ceiling ("length")
+    // counts as a failure and tries the next candidate — a truncated
+    // summary must never replace the context. withTimeoutOrNull swallows ONLY
     // its own TimeoutCancellationException — a user cancel still propagates
     // (termination path unchanged) — and an exhausted chain throws
     // lastFailure exactly as before, so the splitter's halving retry is
@@ -925,9 +953,10 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     var lastFailure: Exception = IllegalStateException("compaction failed")
     for ((index, step) in chain.withIndex()) {
         val (candidate, entryId) = step
-        val budgetMs = minOf(
-            ChatViewModel.COMPACT_SUMMARY_CANDIDATE_BUDGET_MS,
-            deadlineAt - SystemClock.elapsedRealtime(),
+        val budgetMs = compactionCandidateBudgetMs(
+            candidate.model.declaresNoEffortTiers,
+            SystemClock.elapsedRealtime(),
+            deadlineAt,
         )
         if (budgetMs <= 0) {
             lastFailure = IllegalStateException(
@@ -956,10 +985,23 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
         }
         when (r) {
             is ProviderExecutionGateway.SendResult.Success -> {
+                if (compactSummaryIsTruncated(r.response.stopReason)) {
+                    AppLogger.info(
+                        ChatViewModel.TAG,
+                        "[Compact] summary TRUNCATED on ${candidate.model.displayName} " +
+                            "candidate=${index + 1}/${chain.size} ($label) — trying next",
+                    )
+                    lastFailure = compactSummaryTruncatedFailure(candidate.model.displayName)
+                    continue
+                }
                 AppLogger.info(
                     ChatViewModel.TAG,
                     "[Compact] summary ${if (entryId != null) "fallback " else ""}SUCCESS " +
-                        "candidate=${index + 1}/${chain.size} ($label ${candidate.model.displayName}) in ${ms}ms",
+                        "candidate=${index + 1}/${chain.size} ($label ${candidate.model.displayName}) in ${ms}ms" +
+                        // [fix/compact-telemetry-superseded-1005] horizon telemetry on
+                        // the same INFO line (SUCCESS is low-frequency): summary
+                        // length + model-reported output tokens, usage-null-safe.
+                        compactSummaryTelemetrySuffix(r.response),
                 )
                 return r.response.text
             }
@@ -983,6 +1025,80 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     throw lastFailure
 }
 
+/**
+ * [fix/compact-truncation-guard-1005] Per-candidate wall budget for the
+ * compaction summary chain: candidates the relay cannot silence
+ * ([LLMModel.declaresNoEffortTiers] == true) get the 60s budget, everything
+ * else the 30s quiet floor; both are clamped by the chain deadline so the
+ * whole operation never exceeds COMPACT_SUMMARY_TOTAL_BUDGET_MS. A spent
+ * deadline yields a non-positive budget and the caller's `budgetMs <= 0`
+ * branch ends the chain.
+ *
+ * Top-level (not a ChatViewModel extension) so JVM unit tests call it
+ * without instantiating the VM — same pattern as [ordersCompactionCandidates]
+ * (the companion consts it reads are compile-time inlined, no Android
+ * classes are loaded).
+ */
+internal fun compactionCandidateBudgetMs(
+    declaresNoEffortTiers: Boolean?,
+    nowMs: Long,
+    deadlineAt: Long,
+): Long {
+    val perCandidate = if (declaresNoEffortTiers == true) {
+        ChatViewModel.COMPACT_SUMMARY_NOISY_CANDIDATE_BUDGET_MS
+    } else {
+        ChatViewModel.COMPACT_SUMMARY_CANDIDATE_BUDGET_MS
+    }
+    return minOf(perCandidate, deadlineAt - nowMs)
+}
+
+/**
+ * [fix/compact-truncation-guard-1005] True when the summary response was cut
+ * at the output ceiling and must NOT be adopted. The provider passes
+ * `finish_reason` through verbatim; the output-ceiling probe over 8
+ * OpenAI-compatible relays (compact-exp-1004/capprobe) showed silent
+ * truncation arrives as the OpenAI spelling "length" (WorkBuddy), while
+ * relays that error out go through SendResult.RemoteFailure instead — so
+ * only that one spelling is intercepted. Null / "end_turn" / "stop" /
+ * unrecognised values pass (conservative: a channel's non-standard
+ * completion marker must never cost a good summary its candidacy).
+ * Deliberately narrower than [TruncatedToolCallPolicy.isTruncatedFinish],
+ * which guards a different contract (turn tool-calls) with a wider set.
+ */
+internal fun compactSummaryIsTruncated(stopReason: String?): Boolean =
+    stopReason?.trim()?.lowercase() == "length"
+
+/**
+ * [fix/compact-truncation-guard-1005] The failure recorded when a candidate's
+ * summary came back truncated — assigned to `lastFailure`, so an
+ * all-truncated chain throws the same shape the timeout/failure paths use.
+ */
+internal fun compactSummaryTruncatedFailure(modelDisplayName: String): IllegalStateException =
+    IllegalStateException("compaction summary truncated (stopReason=length) on $modelDisplayName")
+
+/**
+ * [fix/compact-telemetry-superseded-1005] Telemetry segment appended to the
+ * SUCCESS log line: the adopted summary's character count plus the
+ * model-reported output tokens, so "how far into the summary horizon is this
+ * conversation" (compact-exp-1004 D-hold: the compactor hit the 4096 output
+ * cap six times in a row before the truncation guard existed; E: low-density
+ * material saturates ~2.1k tok) becomes a log reading instead of a surprise.
+ * usage is null on channels that don't report it — the outTok segment is
+ * omitted then, never logged as a placeholder 0 (absent reads as "unknown",
+ * 0 would read as "empty"). Pure function over [LLMResponse], JVM-testable
+ * like the guard helpers above; the leading space keeps
+ * `in ${ms}ms chars=…` single-spaced at the call site.
+ */
+internal fun compactSummaryTelemetrySuffix(response: LLMResponse): String =
+    buildString {
+        append(" chars=")
+        append(response.text.length)
+        response.usage?.let { usage ->
+            append(" outTok=")
+            append(usage.outputTokens)
+        }
+    }
+
 internal fun ChatViewModel.loadSession() {
     // T-android-crash-detected-halt: when CrashFrequencyDetector
     // tripped (#459, ≥3 crashes in last hour), skip the heavy
@@ -1004,6 +1120,13 @@ internal fun ChatViewModel.loadSession() {
         )
         return
     }
+    // [fix/compact-exhausted-rescue-1005] Opening a session is a user action:
+    // re-arm the EXHAUSTED rescue gate (reset #3) so a freshly opened session
+    // can rescue-compact once if the restored transcript is already past the
+    // hard ceiling. Placed AFTER the safe-mode early return above: that path
+    // skips session restore entirely (crash-recovery loop) — the user never
+    // actually entered a session there, so it must not re-arm the gate.
+    rescueAttemptedForCompact = false
     viewModelScope.launch {
         // [T-HANG-DIAG] timing markers to localise where session entry
         // stalls. Sentinel-tagged so a single grep -v can strip them
