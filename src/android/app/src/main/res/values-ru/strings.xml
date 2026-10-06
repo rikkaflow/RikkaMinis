@@ -1460,6 +1460,12 @@
     <string name="runtime_limits_compact_tail_desc">Автосжатие никогда не урезает ниже этого числа хвостовых токенов — свежий диалог остаётся дословным. По умолчанию 8000.</string>
     <string name="runtime_limits_compact_interval">Интервал автосжатия (мин)</string>
     <string name="runtime_limits_compact_interval_desc">Минимум минут между автосжатиями одного диалога. По умолчанию 5.</string>
+    <string name="runtime_limits_compact_model">Модель сжатия</string>
+    <string name="runtime_limits_compact_model_desc">Модель, которая пробуется первой при автосжатии; остальная цепочка следует за сессией.</string>
+    <string name="runtime_limits_compact_model_follow">Как в сессии</string>
+    <string name="runtime_limits_compact_model_follow_desc">Использовать собственную цепочку моделей сессии</string>
+    <string name="runtime_limits_compact_model_stale">недоступна</string>
+    <string name="runtime_limits_compact_model_dialog_title">Выбрать модель сжатия</string>
     <string name="runtime_limits_memory_inject">Память: строк инъекции</string>
     <string name="runtime_limits_memory_inject_desc">Максимум строк дневного лога в системном промпте. По умолчанию 200.</string>
     <string name="runtime_limits_memory_rollup">Память: лимит rollup (КБ)</string>
@@ -1577,7 +1583,6 @@
     <string name="scheduled_identity_footer">Задача выполняется в новой отдельной сессии и не затрагивает текущий чат.</string>
     <string name="scheduled_field_title">Название (необязательно)</string>
     <string name="scheduled_field_prompt">Промпт задачи</string>
-    <string name="scheduled_prompt_placeholder">например: собрать и обобщить мои уведомления GitHub</string>
     <string name="scheduled_section_window">Дневное окно</string>
     <string name="scheduled_window_footer">24-часовой формат HH:MM, начало раньше конца. Задача выполняется при первой проверке в окне, раз в день.</string>
     <string name="scheduled_field_window_start">Начало</string>
