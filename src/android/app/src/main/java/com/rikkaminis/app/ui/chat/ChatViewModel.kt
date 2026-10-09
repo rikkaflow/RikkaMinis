@@ -931,8 +931,16 @@ class ChatViewModel(
      * before persisting the new content as a fresh user turn.
      * Mirrors iOS AIChatViewModel.editingMessageIndex.
      */
-    private val _editingMessageId = MutableStateFlow<String?>(null)
+    // [sweep-p1] flipped private->internal: removeAttachment/clearAttachments
+    // (ChatViewModelUiStateExt.kt) must sync the edit snapshot while editing,
+    // same visibility convention as the other backing state fields.
+    internal val _editingMessageId = MutableStateFlow<String?>(null)
     val editingMessageId: StateFlow<String?> = _editingMessageId.asStateFlow()
+    // [T-edit-resend-attachment-loss-1008] Pre-edit composer attachment
+    // staging, snapshotted when edit mode starts and restored by
+    // cancelEdit(). A successful send consumes the snapshot together with
+    // the edited turn (the send path clears _attachments itself).
+    internal val _preEditAttachments = MutableStateFlow<List<InputAttachment>?>(null)
 
     internal val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
@@ -2685,6 +2693,12 @@ class ChatViewModel(
         toolLoopDetector.reset()
         _canResume.value = false
         _attachments.value = emptyList()
+        // [sweep-p1] Editing state must go too (backlog §72): a mid-edit
+        // clearChat used to leave _preEditAttachments/_editingMessageId
+        // alive, so tapping "Exit Edit Mode" after the wipe restored the
+        // stale pre-edit composer staging into the fresh chat.
+        _preEditAttachments.value = null
+        _editingMessageId.value = null
         _promptQueue.value = emptyList()
         _hasInjectedShareContent.value = false
         // T261: tool-detail sheet is per-session UI state — clear it so a
@@ -3222,6 +3236,44 @@ class ChatViewModel(
                 text.substring(0, startIdx).trim()
             }
         }
+        // [T-edit-resend-attachment-loss-1008] Re-stage this turn's persisted
+        // attachments into the composer. sendMessage() sources attachments
+        // solely from _attachments (the composer), and truncateBeforeEdit()
+        // deletes the original DB row — whose mediaRef parts carried the
+        // file:// URIs — so without this the edited resend silently loses
+        // every attachment (text survives, files vanish). The pure mapping
+        // (restageEditAttachments, JVM-tested) walks attachmentNames in the
+        // persisted image-first order; dead files are skipped (the send path
+        // would skip them anyway).
+        val restaged = restageEditAttachments(
+            attachmentNames = msg.attachmentNames,
+            imageUris = msg.imageUris,
+            attachmentUris = msg.attachmentUris,
+            fileExists = { path -> path?.let { java.io.File(it).exists() } == true },
+        )
+        // Snapshot-once / restore-on-cancel: while editing, the composer
+        // REPRESENTS the edited turn (restaged attachments replace whatever
+        // was staged). cancelEdit() puts the pre-edit staging back; a
+        // successful send consumes both (cleared below + by the send path).
+        if (_preEditAttachments.value == null) {
+            _preEditAttachments.value = _attachments.value
+        }
+        _attachments.value = restaged.map { r ->
+            val mime = android.webkit.MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(
+                    r.uri.path?.substringAfterLast('.')?.lowercase() ?: "",
+                ) ?: "application/octet-stream"
+            InputAttachment(
+                fileName = r.fileName,
+                uri = r.uri,
+                mimeType = mime,
+                kind = if (r.isImage) InputAttachment.Kind.IMAGE
+                       else InputAttachment.Kind.DOCUMENT,
+            )
+        }
+        if (restaged.isNotEmpty()) {
+            AppLogger.info(TAG_STREAM, "✏️ editMessage restaged ${restaged.size} attachment(s)")
+        }
         _editingMessageId.value = messageId
         AppLogger.info(TAG_STREAM, "✏️ editMessage id=${messageId.take(8)} text=${text.length}ch")
         return text
@@ -3236,6 +3288,12 @@ class ChatViewModel(
         if (_editingMessageId.value != null) {
             AppLogger.info(TAG_STREAM, "✏️ cancelEdit")
         }
+        // [T-edit-resend-attachment-loss-1008] Restore whatever the composer
+        // was staging before edit mode started (snapshot-once /
+        // restore-on-cancel; _attachments may have been replaced by the
+        // restage in editMessage()).
+        _preEditAttachments.value?.let { _attachments.value = it }
+        _preEditAttachments.value = null
         _editingMessageId.value = null
     }
 
@@ -3486,7 +3544,16 @@ class ChatViewModel(
         // any error in the truncate path doesn't leave the composer stuck
         // in edit mode.
         val editingId = _editingMessageId.value
-        if (editingId != null) _editingMessageId.value = null
+        if (editingId != null) {
+            _editingMessageId.value = null
+            // [T-edit-resend-attachment-loss-1008] The send consumes the edit
+            // session: drop the pre-edit snapshot so a later cancelEdit() (or
+            // a later edit of another message) can't resurrect stale staging.
+            // The composer now carries the restaged attachments; the existing
+            // `currentAttachments` snapshot + clearAttachments() below is what
+            // the send path will persist.
+            _preEditAttachments.value = null
+        }
 
         // [fix/compact-cancel-on-stop-1002] Store the shell job so
         // cancelStream can kill the whole turn (see sendShellJob KDoc):
@@ -3538,7 +3605,7 @@ class ChatViewModel(
             val userContentParts = mutableListOf<AgentContentPart>()
             if (trimmed.isNotEmpty()) userContentParts.add(AgentContentPart.Text(trimmed))
             imageParts.forEachIndexed { idx, part ->
-                val path = prepared.imageUploadPaths.getOrNull(idx)
+                val path = part.linuxPath
                 if (path != null) userContentParts.add(AgentContentPart.Text("[attached image: $path]"))
                 userContentParts.add(AgentContentPart.ImageData(part.data, part.mimeType, linuxPath = path))
             }
