@@ -18,6 +18,7 @@ import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
+import com.rikkaminis.app.provider.TOOL_LOG_INPUT_STEP_CHARS
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
@@ -257,6 +258,9 @@ class AnthropicProvider(
         var currentToolId: String? = null
         var currentToolName: String? = null
         val toolInputBuffer = StringBuilder()
+        // [T-toolinput-sample-1012] -1 = "no delta logged yet" for the current
+        // tool call; reset alongside toolInputBuffer in content_block_start.
+        var lastLoggedInputChars = -1
         // [RC2-truncated-detection] Accumulated assistant text/thinking chars
         // and whether the stream reached a clean terminal (message_delta with
         // stop_reason). If the loop exits by EOF / [DONE] before a clear
@@ -314,6 +318,7 @@ class AnthropicProvider(
                             currentToolId = contentBlock.safeOptString("id", "")
                             currentToolName = contentBlock.safeOptString("name", "")
                             toolInputBuffer.clear()
+                            lastLoggedInputChars = -1 // [T-toolinput-sample-1012] reset sampling state
                             android.util.Log.d("ToolChain[Provider]", "→ ToolUseStart id=$currentToolId name=$currentToolName")
                             send(LLMStreamChunk.ToolUseStart(currentToolId!!, currentToolName!!))
                         }
@@ -339,7 +344,14 @@ class AnthropicProvider(
                                 val partial = delta.safeOptString("partial_json", "")
                                 if (partial.isNotEmpty() && currentToolId != null) {
                                     toolInputBuffer.append(partial)
-                                    android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=$currentToolId accumulated=${toolInputBuffer.length}chars")
+                                    // [T-toolinput-sample-1012] Sampled like the OpenAI paths:
+                                    // first delta + one per TOOL_LOG_INPUT_STEP_CHARS of growth
+                                    // (per-fragment lines measured 74% of the worker's daily file).
+                                    val n = toolInputBuffer.length
+                                    if (lastLoggedInputChars < 0 || n - lastLoggedInputChars >= TOOL_LOG_INPUT_STEP_CHARS) {
+                                        lastLoggedInputChars = n
+                                        android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=$currentToolId accumulated=${n}chars")
+                                    }
                                     send(LLMStreamChunk.ToolInputDelta(currentToolId!!, toolInputBuffer.toString()))
                                 }
                             }
@@ -919,6 +931,14 @@ class AnthropicProvider(
     }
 
     companion object {
+        /**
+         * [T-toolinput-sample-1012] Granularity of the "→ ToolInputDelta"
+         * debug line — one per this-many chars of accumulated tool-args
+         * growth (plus the first delta). Value lives in ToolInputLogStep.kt
+         * (shared with OpenAIProvider — D-2 review note: duplicated consts
+         * drift); the per-fragment line measured 251K lines / 33.5 MB per day
+         * (74% of the worker's daily file) while carrying only a length.
+         */
         /**
          * Parse the `-<major>-<minor>` (or `/<major>.<minor>`) version out of a Claude id.
          * [T-anthropic-temp-claude5-android] The minor segment is OPTIONAL and

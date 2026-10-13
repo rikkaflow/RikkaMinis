@@ -1,5 +1,7 @@
 package com.rikkaminis.app.backup
 
+import com.rikkaminis.app.tools.SkillInfo
+import com.rikkaminis.app.tools.SubagentSkill
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -362,5 +364,167 @@ class ConfigBackupPayloadTest {
         }
         assertEquals(0, payload.optJSONArray("chatSessions")!!.length())
         assertEquals(0, payload.optJSONArray("chatMessages")!!.length())
+    }
+
+    // ── MCP secret gating (sweep1013-D1/F-3) ─────────────────────────────
+
+    @Test
+    fun `stripMcpSecretValues blanks header and env values but keeps keys`() {
+        val server = JSONObject()
+            .put("command", "python3")
+            .put("args", JSONArray().put("server.py"))
+            .put(
+                "env",
+                JSONObject()
+                    .put("GITHUB_TOKEN", "ghp_literal_secret")
+                    .put("NODE_ENV", "production"),
+            )
+            .put(
+                "headers",
+                JSONObject()
+                    .put("Authorization", "Bearer sk-literal-secret")
+                    .put("X-Api-Key", "key-12345"),
+            )
+            .put("note", "my server")
+            .put("enabled", true)
+
+        ConfigBackup.stripMcpSecretValues(server)
+
+        // Key names survive (so the server still imports and the user sees
+        // what to refill), values are blanked.
+        val env = server.getJSONObject("env")
+        assertEquals("", env.getString("GITHUB_TOKEN"))
+        assertEquals("", env.getString("NODE_ENV"))
+        val headers = server.getJSONObject("headers")
+        assertEquals("", headers.getString("Authorization"))
+        assertEquals("", headers.getString("X-Api-Key"))
+        // Non-secret fields untouched.
+        assertEquals("python3", server.getString("command"))
+        assertEquals("my server", server.getString("note"))
+        assertTrue(server.getBoolean("enabled"))
+    }
+
+    @Test
+    fun `stripMcpSecretValues leaves absent sections absent`() {
+        val server = JSONObject().put("url", "https://example.com/sse").put("enabled", true)
+        ConfigBackup.stripMcpSecretValues(server)
+        assertFalse(server.has("headers"))
+        assertFalse(server.has("env"))
+        assertEquals("https://example.com/sse", server.getString("url"))
+    }
+
+    // ── [review D-3] credential carriers beyond headers/env ──────────────
+
+    @Test
+    fun `stripMcpSecretValues blanks token-shaped args but keeps benign args`() {
+        val server = JSONObject()
+            .put("command", "npx")
+            .put(
+                "args",
+                JSONArray()
+                    .put("--token=ghp_literal_secret")
+                    .put("--port=8080")
+                    .put("-y")
+                    .put("--API_KEY=abc123def"),
+            )
+        ConfigBackup.stripMcpSecretValues(server)
+        val args = server.getJSONArray("args")
+        // Credential-shaped flags keep the flag name, lose the value —
+        // the restored entry still shows WHAT to refill.
+        assertEquals("--token=", args.getString(0))
+        assertEquals("--port=8080", args.getString(1))
+        assertEquals("-y", args.getString(2))
+        assertEquals("--API_KEY=", args.getString(3))
+    }
+
+    @Test
+    fun `stripMcpSecretValues redacts sensitive url query values keeps benign`() {
+        val server = JSONObject()
+            .put("url", "https://gateway.example.com/sse?key=supersecret&client=app#frag")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals(
+            "https://gateway.example.com/sse?key=[redacted:11]&client=app#frag",
+            server.getString("url"),
+        )
+    }
+
+    @Test
+    fun `stripMcpSecretValues leaves url without query untouched`() {
+        val server = JSONObject().put("url", "https://example.com/sse")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals("https://example.com/sse", server.getString("url"))
+    }
+
+    // ── [review G1] MCP export wrapper shape (stripExportedMcpSecrets) ───
+
+    @Test
+    fun `stripExportedMcpSecrets strips the nested wrapper exportServerJSON emits`() {
+        // exportServerJSON emits {"mcpServers":{"<id>":{…}}} — the entry with
+        // headers/env/args/url sits ONE level down. Stripping the wrapper
+        // itself (the old call) was a no-op: every secret survived into the
+        // backup payload even with includeSecrets=false. This pins the shape
+        // the export path actually passes.
+        val entry = JSONObject()
+            .put("url", "https://gw.example.com/sse?key=supersecret&client=app")
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("args", JSONArray().put("--token=ghp_arg"))
+        val wrapper = JSONObject().put("mcpServers", JSONObject().put("ctx7", entry))
+
+        ConfigBackup.stripExportedMcpSecrets(wrapper)
+
+        val inner = wrapper.getJSONObject("mcpServers").getJSONObject("ctx7")
+        assertEquals(
+            "https://gw.example.com/sse?key=[redacted:11]&client=app",
+            inner.getString("url"),
+        )
+        assertEquals("", inner.getJSONObject("headers").getString("Authorization"))
+        assertEquals("", inner.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("--token=", inner.getJSONArray("args").getString(0))
+    }
+
+    @Test
+    fun `stripExportedMcpSecrets falls back to bare entry like the import side`() {
+        val bare = JSONObject()
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+
+        ConfigBackup.stripExportedMcpSecrets(bare)
+
+        assertEquals("", bare.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("", bare.getJSONObject("headers").getString("Authorization"))
+    }
+
+    // ── Skill frontmatter fallback (sweep1013-D1/F-8) ────────────────────
+
+    private fun skillInfoFor(frontmatter: String, body: String): SkillInfo = object : SkillInfo {
+        override val name = "demo"
+        override val description = "d"
+        override val body = body
+        override val frontmatter = frontmatter
+    }
+
+    @Test
+    fun `frontmatter rejoined to body keeps subagent-only keys parseable`() {
+        // The export fallback carries the raw frontmatter block alongside the
+        // frontmatter-STRIPPED body; the restore branch re-joins them exactly
+        // as `frontmatter + "\n" + body` before importFromContent re-parses.
+        // A skill whose `subagent: true` / `max_turns` exist ONLY in the
+        // frontmatter must survive that re-join.
+        val frontmatter = "---\nname: demo\ndescription: d\nsubagent: true\nmax_turns: 7\n---"
+        val body = "You are a fix executor."
+        val joined = frontmatter + "\n" + body // mirror of the restore branch
+
+        val parsed = SubagentSkill.parseSubagentConfig(skillInfoFor(joined, joined))
+        assertTrue("subagent flag must survive the re-join", parsed.isSubagent)
+        assertEquals(7, parsed.maxTurns)
+    }
+
+    @Test
+    fun `body-only legacy fallback still parses without frontmatter`() {
+        // Older backups carry body only (no "frontmatter" key) — the restore
+        // branch treats frontmatter as absent and hands the body through.
+        val parsed = SubagentSkill.parseSubagentConfig(skillInfoFor("", "plain skill body"))
+        assertFalse("no frontmatter means not a subagent", parsed.isSubagent)
     }
 }
