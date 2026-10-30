@@ -35,6 +35,8 @@ import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.db.ChatDao
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ProviderConfig
+import com.rikkaminis.app.data.usage.ModelIdentity
+import com.rikkaminis.app.data.usage.UNKNOWN_PROVIDER
 import com.rikkaminis.app.data.usage.UsageAggregator
 import com.rikkaminis.app.data.usage.UsageRow
 import kotlinx.coroutines.CancellationException
@@ -88,11 +90,15 @@ fun UsageStatsScreen(
     var isLoaded by remember { mutableStateOf(false) }
     var range by remember { mutableStateOf(UsageRange.ALL) }
 
-    LaunchedEffect(range) {
+    LaunchedEffect(range, providerConfig) {
         // A (usage-stats-perf-1007): the whole compute used to run on the main
         // dispatcher — with enough history the spinner froze for seconds.
         // Query + aggregation off-main, then hand the results back to
         // composition (state writes stay on main).
+        // `providerConfig` is a key too: computeUsageStats resolves custom
+        // model entries out of it, so a config update must re-run the
+        // aggregation instead of leaving the page on the previous provider /
+        // model labelling.
         val (total, groups) = withContext(Dispatchers.Default) {
             computeUsageStats(range, chatDao, providerConfig)
         }
@@ -190,19 +196,24 @@ private suspend fun computeUsageStats(
         UsageRange.DAYS_30 -> (now - 30L * 24 * 60 * 60 * 1000) to (now + 1)
     }
 
-    // modelId → (displayName, provider), builtin models first then custom
-    // entries from the live config. Shared by both paths below.
-    val modelLookup = mutableMapOf<String, Pair<String, String>>()
-    for (m in LLMModel.allModels) modelLookup[m.id] = m.displayName to m.provider
-    providerConfig?.let { config ->
-        for (entry in config.modelEntries) {
-            if (entry.model.id !in modelLookup) {
-                val instance = config.instances.find { it.id == entry.providerInstanceId }
-                val providerName = instance?.providerType?.displayName ?: entry.model.provider
-                modelLookup[entry.model.id] = entry.model.displayName to providerName
-            }
-        }
-    }
+    // modelId → (displayName, provider). [da1033-I06] The LIVE config wins over the
+    // static catalog: a model the user renamed must show the renamed label, and a
+    // catalog id that is also configured must not keep the catalog's hardcoded provider
+    // ("Google" / "Kimi") — that split one Gemini instance across two group cards. The
+    // catalog is still the fallback for ids the config does not know (historical rows).
+    val modelLookup = UsageAggregator.modelDisplayLookup(
+        configured = providerConfig?.modelEntries.orEmpty().map { entry ->
+            val instance = providerConfig?.instances?.find { it.id == entry.providerInstanceId }
+            ModelIdentity(
+                modelId = entry.model.id,
+                displayName = entry.model.displayName,
+                provider = instance?.providerType?.displayName ?: entry.model.provider,
+            )
+        },
+        builtins = LLMModel.allModels.map {
+            ModelIdentity(it.id, it.displayName, it.provider)
+        },
+    )
 
     fun statsFor(
         modelId: String,
@@ -213,7 +224,7 @@ private suspend fun computeUsageStats(
         days: Int,
         sessions: Int,
     ): ModelStats {
-        val (displayName, provider) = modelLookup[modelId] ?: (modelId to "Unknown")
+        val (displayName, provider) = modelLookup[modelId] ?: (modelId to UNKNOWN_PROVIDER)
         return ModelStats(
             modelId = modelId,
             displayName = displayName,
@@ -288,11 +299,11 @@ private suspend fun computeUsageStats(
         }
     }
 
-    val providerOrder = listOf("OpenAI", "Anthropic", "Google Gemini", "Google", "Antigravity", "Unknown")
     val grouped = statsList.groupBy { it.provider }
+    // [da1033-I06] Known providers keep their order, any other real provider follows
+    // them, and the "Unknown" bucket (unattributed/modelId-less rows) is always last.
     val sortedGroups = grouped.entries.sortedBy { (name, _) ->
-        val idx = providerOrder.indexOf(name)
-        if (idx >= 0) idx else providerOrder.size
+        UsageAggregator.providerGroupSortKey(name)
     }.map { (name, models) ->
         ProviderGroup(name, models.sortedByDescending { it.totalInput })
     }

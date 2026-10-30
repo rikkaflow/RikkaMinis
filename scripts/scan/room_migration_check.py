@@ -79,6 +79,10 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _kotlin_ast as _ast          # noqa: E402  (shared Kotlin primitives)
+import _kotlin_lexer as _lex        # noqa: E402  (shared Kotlin lexer)
+
 DB_DIR = "src/android/app/src/main/java/com/rikkaminis/app/data/db"
 DATABASES = ["AppDatabase.kt", "ProviderDatabase.kt"]
 
@@ -103,8 +107,135 @@ def check(name, ok, detail=""):
     return False
 
 
+def mask_comments(src):
+    """Code view of `src` — comments AND string bodies blanked, length preserved.
+
+    [wide4 parser-death] The hand-written scanner this replaces tracked string
+    state by hand and got two constructions wrong: a nested block comment
+    (`/* a /* b */ c */`, which Kotlin allows) ended at the first `*/`, and a
+    string template `"${…}"` was not jumped, so a brace inside one moved the
+    bracket walk. Both now go through the repo-wide lexer, whose views are
+    equal-length (every index below still lines up with `src`).
+
+    Strings are blanked here too — `val _sql = "db.execSQL(…)"` is a string, not
+    a statement, and must not read as migration work. The SQL TEXT a real call
+    passes is read from `views['comments']` (comments masked, literals kept) at
+    the same offsets; see `check_db`.
+    """
+    return _lex.mask_code(src)
+
+
+def _balanced(text, open_idx, opener="(", closer=")"):
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _skip_ws(text, i):
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def dead_condition(cond):
+    """True when the condition is decidable FALSE without running it.
+
+    `if (false)`, `if (!true)`, `if (0 == 1)`, `false && guard`, `true || guard`
+    all keep every identifier a substring-based criterion looks for while pinning
+    the decision — the single most common way a witness deleted a statement's
+    effect without deleting the statement. Decided by the shared folder, so the
+    family no longer has one spelling per gate.
+
+    `if (true) { … }` is NOT dead: it always runs, and calling it dead would be a
+    false red on correct code.
+    """
+    return _ast.const_bool(cond) is False
+
+
+def _if_guards(text):
+    """[(cond, body_start, body_end)] for every `if (...)` in `text`."""
+    out = []
+    for m in re.finditer(r"\bif\s*\(", text):
+        q = m.end() - 1
+        end = _balanced(text, q)
+        if end < 0:
+            continue
+        j = _skip_ws(text, end + 1)
+        if j < len(text) and text[j] == "{":
+            be = _balanced(text, j, "{", "}")
+            if be < 0:
+                continue
+            out.append((text[q + 1:end], j, be))
+        else:
+            k = j
+            while k < len(text) and text[k] != "\n":
+                k += 1
+            out.append((text[q + 1:end], j, k))
+    return out
+
+
+def dead_guarded(text, idx):
+    """True when `idx` sits inside the body of an `if` a literal decides."""
+    for cond, start, end in _if_guards(text):
+        if start <= idx < end and dead_condition(cond):
+            return True
+    return False
+
+
+# 4b. [wide4 family-hole] "the body runs a `db.*` call" was satisfied by ANY
+# member — `db.toString()` (the witness) declares the step, wires it, does no
+# work, and the user still crashes on open-time schema validation. Only a
+# write-capable member counts, and for the SQL channels the statement has to
+# carry schema/data-changing keywords: `db.execSQL("SELECT 1")` migrates
+# nothing either.
+DB_CALL_RE = re.compile(r"\bdb\s*\.\s*([A-Za-z_]\w*)\s*\(")
+DB_WRITE_METHODS = {"insert", "insertOrThrow", "insertOrReplace", "update",
+                    "delete", "replace", "execSQL", "execSQLAsync"}
+DB_SQL_METHODS = {"execSQL", "execSQLAsync", "compileStatement"}
+SQL_WORK_RE = re.compile(r"\b(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE|PRAGMA|VACUUM|WITH)\b",
+                         re.I)
+
+
+def live_db_writes(body, body_lit):
+    """Offsets (within `body`) of live, write-capable `db.*` statements.
+
+    [body] is the code view (strings blanked), [body_lit] the same span in the
+    literal-preserving view — the SQL text a call passes lives only in the
+    latter, and both are index-aligned.
+    """
+    out = []
+    for m in DB_CALL_RE.finditer(body):
+        method = m.group(1)
+        if method not in DB_WRITE_METHODS:
+            continue
+        if dead_guarded(body, m.start()):
+            continue
+        if method not in DB_SQL_METHODS:
+            out.append(m.start())
+            continue
+        open_paren = body.find("(", m.end() - 1)
+        close_paren = _balanced(body, open_paren) if open_paren >= 0 else -1
+        if close_paren < 0:
+            continue
+        args = body[open_paren + 1:close_paren]
+        pieces = _ast.split_top(args, (",",))
+        if not pieces:
+            continue
+        a, b = pieces[0]
+        sql_text = body_lit[open_paren + 1 + a:open_paren + 1 + b]
+        if SQL_WORK_RE.search(sql_text):
+            out.append(m.start())
+    return out
+
+
 def parse_database(src):
-    """Return (version, {MIGRATION_name: (a, b)})."""
+    """Return (version, {MIGRATION_name: (a, b)}). `src` must be masked."""
     m = VERSION_RE.search(src)
     version = int(re.search(r"version\s*=\s*(\d+)", m.group(1)).group(1)) if m else None
     decls = {}
@@ -113,17 +244,151 @@ def parse_database(src):
     return version, decls
 
 
+def parse_migration_bodies(src):
+    """{name: (body_start, body_end)} — the `override fun migrate(...)` body span.
+
+    None means the body could not be located, which callers must treat as a
+    violation, never as "nothing to check" (parser-death is fail-closed).
+
+    Spans, not text: the body has to be read in TWO views (code for structure,
+    literal-preserving for the SQL a call passes) and both are index-aligned
+    with `src`, so the caller slices each one with the same span.
+    """
+    bodies = {}
+    for m in MIG_DECL_RE.finditer(src):
+        name = m.group(1)
+        fm = re.search(r"\bfun\s+migrate\s*\(", src[m.end():])
+        if not fm:
+            bodies[name] = None
+            continue
+        open_paren = m.end() + fm.end() - 1
+        close_paren = _balanced(src, open_paren)
+        if close_paren < 0:
+            bodies[name] = None
+            continue
+        brace = src.find("{", close_paren)
+        if brace < 0:
+            bodies[name] = None
+            continue
+        close_brace = _balanced(src, brace, "{", "}")
+        bodies[name] = None if close_brace < 0 else (brace + 1, close_brace)
+    return bodies
+
+
 def parse_wired(src):
+    """Names registered on the real `Room.databaseBuilder(...)…build()` chain.
+
+    Returns (names, problems). Walking the builder chain — instead of grepping
+    every `addMigrations(` in the file — is what makes an off-chain call
+    visible: `.apply { if (false) addMigrations(...) }` and a commented-out
+    argument look identical to a live registration when you only read tokens,
+    yet neither registers anything with Room.
+    """
+    problems = []
+    chains = []
+    for m in re.finditer(r"\bdatabaseBuilder\s*\(", src):
+        close = _balanced(src, m.end() - 1)
+        if close < 0:
+            problems.append("databaseBuilder(...) has unbalanced parentheses — wiring not verifiable")
+            continue
+        elements = []
+        complete = False
+        j = close + 1
+        while True:
+            k = _skip_ws(src, j)
+            nm = re.match(r"\.\s*([A-Za-z_]\w*)", src[k:]) if k < len(src) else None
+            if not nm:
+                break
+            label = nm.group(1)
+            q = _skip_ws(src, k + nm.end())
+            args = None
+            if q < len(src) and src[q] == "(":
+                e = _balanced(src, q)
+                if e < 0:
+                    break
+                args = src[q + 1:e]
+                q = e + 1
+            elif q < len(src) and src[q] == "{":
+                e = _balanced(src, q, "{", "}")
+                if e < 0:
+                    break
+                q = e + 1
+            elements.append((label, args))
+            j = q
+            if label == "build":
+                complete = True
+                break
+        chains.append((complete, elements))
+
+    if not chains:
+        return set(), ["no Room.databaseBuilder(...) call found — wiring not verifiable"]
+
     names = set()
-    for block in WIRED_RE.findall(src):
-        for m in re.findall(r"MIGRATION_\d+_\d+", block):
-            names.add(m)
-    return names
+    saw_chain = False
+    for complete, elements in chains:
+        if not complete:
+            continue
+        saw_chain = True
+        for label, args in elements:
+            if label != "addMigrations" or args is None:
+                continue
+            # [wide4 family-hole] The argument list used to be read with
+            # `findall(MIGRATION_\d+_\d+)`, so a name that is only MENTIONED in
+            # the list counted as registered — the witness passed
+            # `*if (false) arrayOf(MIGRATION_13_14, MIGRATION_14_13) else
+            # emptyArray()` and both migrations stayed unwired. Each argument
+            # must now BE a migration identifier; anything else (a spread of a
+            # conditional, a vararg holder, a call) registers nothing Room can
+            # see, so the names it mentions do not count.
+            pieces = _ast.split_top(args, (",",))
+            bare = [args[a:b].strip() for a, b in pieces]
+            literal = [n for n in bare if re.fullmatch(r"MIGRATION_\d+_\d+", n)]
+            if not bare:
+                problems.append(
+                    "addMigrations(...) on the builder chain carries no migration "
+                    "names — wiring unreadable")
+            elif len(literal) != len(bare):
+                bad = [n for n in bare if n not in literal]
+                problems.append(
+                    "addMigrations(...) carries "
+                    f"{len(bad)} non-literal argument(s) (e.g. {bad[0][:80]!r}) — only a "
+                    "bare MIGRATION_A_B registers with Room; names mentioned inside a "
+                    "conditional/lambda are not migrated")
+            names |= set(literal)
+    if not saw_chain:
+        problems.append("no ...addMigrations(...).build() chain found — declarations "
+                        "are registered nowhere")
+
+    calls = len(re.findall(r"addMigrations\s*\(", src))
+    on_chain = sum(1 for _, elements in chains
+                   for label, _args in elements if label == "addMigrations")
+    if calls > on_chain:
+        problems.append(
+            f"{calls - on_chain} addMigrations(...) call(s) are NOT on the "
+            f"databaseBuilder→build() chain (a lambda or a dead branch registers "
+            f"nothing with Room)")
+    return names, problems
 
 
 def check_db(path):
     """Return (problems, info) for one database file."""
-    src = open(path, encoding="utf-8").read()
+    # Two views, one scan: the code view (comments AND string bodies blanked)
+    # is what every criterion below reads — a commented-out declaration is not
+    # wired and `val _sql = "db.execSQL(…)"` is not a statement — while the SQL
+    # text a live call passes is read from the literal-preserving view at the
+    # same offsets.
+    #
+    # [wide4 parser-death] Lexing first, fail-closed: a file whose strings or
+    # comments cannot be followed must be a violation, never a green built on a
+    # half-parsed view.
+    raw = open(path, encoding="utf-8").read()
+    ok, reason, views = _lex.analyse(raw)
+    if not ok:
+        return [f"{os.path.basename(path)}: cannot be lexed ({reason}) — the gate "
+                f"refuses to judge a database file whose strings/comments it cannot "
+                f"follow"], {}
+    src = views["code"]
+    src_lit = views["comments"]
     problems = []
     name = os.path.basename(path)
     version, decls = parse_database(src)
@@ -206,8 +471,38 @@ def check_db(path):
     # cross-direction pair sharing a target (MIGRATION_11_12 and
     # MIGRATION_13_12 both ending at 12) is correct by construction.
 
+    # 4. BODY — an upgrade migration must actually migrate.
+    #
+    # 0-3 all read the declaration HEADER. A `Migration(13, 14)` whose
+    # `override fun migrate` body was emptied (or reduced to comments) declares
+    # the step, wires it, and migrates nothing: the v13 user opens the app, Room
+    # runs the no-op, then fails open-time schema validation on the index the
+    # migration was supposed to create. Upgrade bodies therefore need at least
+    # one live `db.*` statement — a call inside an `if (false)` branch does not
+    # count, because the guard decides it. Empty DOWNGRADE bodies stay legal by
+    # design ([T-android-downgrade-compat], e.g. MIGRATION_13_12).
+    bodies = parse_migration_bodies(src)
+    for mig, (a, b) in sorted(decls.items()):
+        span = bodies.get(mig)
+        if span is None:
+            problems.append(
+                f"{name}: {mig} — cannot locate its `override fun migrate(...)` "
+                f"body, so the migration work is unverifiable")
+            continue
+        body = src[span[0]:span[1]]
+        body_lit = src_lit[span[0]:span[1]]
+        writes = live_db_writes(body, body_lit)
+        if b == a + 1 and not writes:
+            problems.append(
+                f"{name}: {mig} = Migration({a}, {b}) — the upgrade body "
+                f"{'is empty' if not body.strip() else 'has no live, write-capable db.* statement'}; "
+                f"Room runs it as a no-op and the schema it was meant to create "
+                f"(or the data it was meant to move) is missing at open time — "
+                f"users on version {a} crash on the open-time validation")
+
     # 2. WIRED
-    wired = parse_wired(src)
+    wired, wired_problems = parse_wired(src)
+    problems.extend(f"{name}: {p}" for p in wired_problems)
     unwired = sorted(set(decls) - wired)
     if unwired:
         problems.append(
@@ -240,17 +535,20 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 '''
-    build = 'fun build() = builder().addMigrations({WIRED}).build()'
+    build = ('fun build() = Room.databaseBuilder(ctx, AppDatabase::class.java, "x.db")\n'
+             '    .addMigrations({WIRED})\n'
+             '    .build()')
     trailer = '''    }
 }
 @Entity(tableName = "foos")
 data class Foo(@PrimaryKey val id: String, @ColumnInfo(name = "a") val a: String?)
 '''
 
-    def make(migrations_block, wired, version=3):
+    def make(migrations_block, wired, version=3, build_block=None):
         src = (header.replace("version = 3", f"version = {version}")
                + migrations_block
-               + build.replace("{WIRED}", wired) + "\n" + trailer)
+               + (build if build_block is None else build_block).replace("{WIRED}", wired)
+               + "\n" + trailer)
         root = tempfile.mkdtemp(prefix="mig-")
         d = os.path.join(root, DB_DIR)
         os.makedirs(d, exist_ok=True)
@@ -410,6 +708,181 @@ data class Foo(@PrimaryKey val id: String, @ColumnInfo(name = "a") val a: String
         "MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_2, MIGRATION_2_1",
     )
     ok &= check("self-test: cross-direction same target is not a dupe", len(probs8) == 0, str(probs8))
+
+    # ── wide3 witness arms (each blocks one criterion that used to be blind) ──
+    MIG23 = '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE foos ADD COLUMN b TEXT")
+            }
+        }
+'''
+    # (a) dataflow: the declaration, the pair and the wiring are all intact —
+    #     only the body is emptied. Before the BODY check this was green.
+    probs9, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // no-op migration body
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check(
+        "self-test: emptied upgrade body CATCHES",
+        any("the upgrade body" in p for p in probs9),
+        str(probs9),
+    )
+
+    # (b) same axis, dead guard: the execSQL is still spelled out but never runs.
+    probs9b, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                if (false) db.execSQL("ALTER TABLE foos ADD COLUMN b TEXT")
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check(
+        "self-test: dead-guarded migration statement CATCHES",
+        any("no live, write-capable db.* statement" in p for p in probs9b),
+        str(probs9b),
+    )
+
+    # (c) parser-death: the name is only mentioned in a comment inside the
+    #     addMigrations argument list — nothing is registered.
+    probs10, _ = make(
+        MIG23,
+        "MIGRATION_1_2,\n        // MIGRATION_2_3",
+    )
+    ok &= check(
+        "self-test: commented-out wiring argument CATCHES",
+        any("MIGRATION_2_3" in p and "NOT wired" in p for p in probs10),
+        str(probs10),
+    )
+
+    # (d) anchor: addMigrations exists, but inside an `apply { }` lambda /
+    #     dead branch — not on the databaseBuilder→build() chain.
+    probs11, _ = make(
+        MIG23,
+        "",
+        build_block='''fun build() = Room.databaseBuilder(ctx, AppDatabase::class.java, "x.db")
+    .apply { if (false) addMigrations(MIGRATION_1_2, MIGRATION_2_3) }
+    .build()''',
+    )
+    ok &= check(
+        "self-test: off-chain addMigrations CATCHES",
+        any("NOT on the databaseBuilder" in p or "registered nowhere" in p for p in probs11),
+        str(probs11),
+    )
+    ok &= check(
+        "self-test: off-chain addMigrations also reported unwired",
+        any("NOT wired" in p for p in probs11),
+        str(probs11),
+    )
+
+    # (e) control: the same empty body on a DOWNGRADE stays legal.
+    probs12, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE foos ADD COLUMN b TEXT")
+            }
+        }
+        val MIGRATION_3_2 = object : Migration(3, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // no-op downgrade
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_2",
+    )
+    ok &= check(
+        "self-test: empty DOWNGRADE body stays legal",
+        not any("upgrade body" in p for p in probs12),
+        str(probs12),
+    )
+    # ── wide4 witnesses: one arm per falsified axis ─────────────────────────
+    NOLIVE = "no live, write-capable db.* statement"
+    # (f) family-hole: `!true` — the same deadness the wide3 arm covered for
+    #     `if (false)`, spelled so a bare-literal folder cannot see it.
+    probs13, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                if (!true) db.execSQL("ALTER TABLE foos ADD COLUMN b TEXT")
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check("self-test: w4 `if (!true)` migration statement CATCHES",
+                any(NOLIVE in p for p in probs13), str(probs13))
+
+    # (g) family-hole: a `db.*` call that is not a write. `db.toString()`
+    #     declares the step, wires it and does nothing.
+    probs14, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.toString()
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check("self-test: w4 side-effect-free `db.toString()` CATCHES",
+                any(NOLIVE in p for p in probs14), str(probs14))
+
+    # (h) family-hole: `execSQL` that runs no schema/data work.
+    probs15, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("SELECT 1")
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check("self-test: w4 `db.execSQL(\"SELECT 1\")` CATCHES",
+                any(NOLIVE in p for p in probs15), str(probs15))
+
+    # (i) family-hole: only SOME arguments are migration identifiers — a name
+    #     mentioned inside a dead conditional registers nothing.
+    probs16, _ = make(
+        MIG23,
+        "MIGRATION_1_2, *if (false) arrayOf(MIGRATION_2_3) else emptyArray()",
+    )
+    ok &= check("self-test: w4 non-literal addMigrations argument CATCHES",
+                any("non-literal argument" in p for p in probs16), str(probs16))
+    ok &= check("self-test: w4 dead-spread name still reported unwired",
+                any("NOT wired" in p and "MIGRATION_2_3" in p for p in probs16),
+                str(probs16))
+
+    # (j) parser-death: the call is only a STRING. `val _sql = "db.execSQL(…)"`.
+    probs17, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val _sql = "db.execSQL(CREATE INDEX index_foos ON foos(b))"
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check("self-test: w4 statement inside a string literal CATCHES",
+                any(NOLIVE in p for p in probs17), str(probs17))
+
+    # (k) control: `if (true)` really runs — calling it dead would be a false
+    #     red on correct code.
+    probs18, _ = make(
+        '''        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                if (true) db.execSQL("ALTER TABLE foos ADD COLUMN b TEXT")
+            }
+        }
+''',
+        "MIGRATION_1_2, MIGRATION_2_3",
+    )
+    ok &= check("self-test: w4 `if (true)` migration statement stays legal",
+                len(probs18) == 0, str(probs18))
+
     return 0 if ok else 1
 
 

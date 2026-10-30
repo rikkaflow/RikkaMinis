@@ -348,6 +348,94 @@ class PersistentShellTest {
         assertEquals("output-part1 partial ", flushed.toString())
     }
 
+    // ── internalScanMarker: exit-code / `__` split [fix/da1017-marker-boundary]
+    //
+    // A 4096-char read boundary can fall between `_EXIT_` and the digits (or
+    // inside the digits), leaving a marker prefix with no closing `__`. The old
+    // scan reported a hit there with the -1 "shell died" code and discarded the
+    // rest of the line; these tests pin the wait-for-the-full-marker contract.
+
+    @Test
+    fun `scanMarker does not hit while only the prefix has arrived`() {
+        val r = internalScanMarker("", "out__MINIS_DONE_abc123_EXIT_", "abc123")
+        assertFalse(r.hit)
+        assertEquals(-1, r.exitCode)
+        assertEquals("out", r.beforeMarker)
+        assertEquals("__MINIS_DONE_abc123_EXIT_", r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker hits once the split exit code arrives in the next chunk`() {
+        val r = internalScanMarker("__MINIS_DONE_abc123_EXIT_", "0__\n", "abc123")
+        assertTrue(r.hit)
+        assertEquals(0, r.exitCode)
+        assertEquals("", r.beforeMarker)
+        assertEquals("", r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker carries a partially delivered multi-digit exit code`() {
+        val first = internalScanMarker("", "a__MINIS_DONE_abc123_EXIT_12", "abc123")
+        assertFalse(first.hit)
+        assertEquals("a", first.beforeMarker)
+        assertEquals("__MINIS_DONE_abc123_EXIT_12", first.keptTail)
+
+        val second = internalScanMarker(first.keptTail, "7__", "abc123")
+        assertTrue(second.hit)
+        assertEquals(127, second.exitCode)
+        assertEquals("", second.beforeMarker)
+    }
+
+    @Test
+    fun `scanMarker waits for exit code split at the 4096 read boundary`() {
+        // Real shape: the reader's CharArray(4096) boundary lands exactly after
+        // `_EXIT_` — body 4069 chars + 25-char prefix = 4096 chars in chunk 1.
+        val prefix = "__MINIS_DONE_abc123_EXIT_"
+        val body = "x".repeat(4096 - prefix.length)
+        var tail = ""
+        val flushed = StringBuilder()
+        var exit = -2
+        for (chunk in listOf(body + prefix, "0__\n")) {
+            val r = internalScanMarker(tail, chunk, "abc123")
+            flushed.append(r.beforeMarker)
+            if (r.hit) { exit = r.exitCode; break }
+            tail = r.keptTail
+        }
+        assertEquals(0, exit)
+        assertEquals(body, flushed.toString())
+    }
+
+    @Test
+    fun `scanMarker flushes an over-long pending marker instead of buffering it`() {
+        // A literal prefix followed by 1000 chars without `__` is not a split
+        // marker (the marker is a fresh random token per command). It degrades
+        // to ordinary output — no unbounded withheld window.
+        val junk = "__MINIS_DONE_abc123_EXIT_" + "9".repeat(1000)
+        val r = internalScanMarker("", junk, "abc123")
+        assertFalse(r.hit)
+        assertEquals(-1, r.exitCode)
+        assertEquals("__MINIS_DONE_abc123_EXIT_" + "9".repeat(976), r.beforeMarker)
+        assertEquals("9".repeat(24), r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker still finds a real marker after an over-long window was flushed`() {
+        val junk = "__MINIS_DONE_abc123_EXIT_" + "9".repeat(1000)
+        var tail = ""
+        val flushed = StringBuilder()
+        var exit = -2
+        for (chunk in listOf("A" + junk, "__MINIS_DONE_abc123_EXIT_3__\n")) {
+            val r = internalScanMarker(tail, chunk, "abc123")
+            flushed.append(r.beforeMarker)
+            if (r.hit) { exit = r.exitCode; break }
+            tail = r.keptTail
+        }
+        assertEquals(3, exit)
+        // Only the trailing 24-char window of the junk is carried, never the
+        // whole 1025-char run.
+        assertEquals(24, tail.length)
+    }
+
     // ── splitDisplayLines / DisplayLineBuffer ─────────────────────────
     //
     // Read chunks routinely end mid-line: internalScanMarker withholds the
@@ -437,5 +525,91 @@ class PersistentShellTest {
             "b12: in_progress None\nmain: in_progress None\nWed Sep  9 16:43:51 UTC 2026",
             buf.render(),
         )
+    }
+
+    // ── internalBuildShellCommand [fix/sweep1014-shell] ──────────────
+
+    @Test
+    fun `buildShellCommand full shape for known input`() {
+        val cmd = internalBuildShellCommand("echo hi", "deadbeef")
+        assertEquals(
+            "__MINIS_CWD='/tmp/.minis_cwd_deadbeef'\n" +
+                "( trap 'pwd > \"\$__MINIS_CWD\"' EXIT\n" +
+                "eval \"\$(cat <<'ENDOFMINISCMD_deadbeef'\n" +
+                "echo hi\n" +
+                "ENDOFMINISCMD_deadbeef\n" +
+                ")\" )\n" +
+                "RET=\$?\n" +
+                "set +e\n" +
+                "[ -f \"\$__MINIS_CWD\" ] && cd \"\$(cat \"\$__MINIS_CWD\")\" 2>/dev/null\n" +
+                "rm -f \"\$__MINIS_CWD\"\n" +
+                "echo \"__MINIS_DONE_deadbeef_EXIT_\${RET}__\"\n",
+            cmd,
+        )
+    }
+
+    @Test
+    fun `buildShellCommand passes body through verbatim`() {
+        // No expansion, no escaping of the body: quotes, backticks, dollars
+        // must reach the heredoc literally.
+        val body = "echo 'single \"double\" `tick` \$dollar \\ backslash"
+        val cmd = internalBuildShellCommand(body, "m1")
+        assertTrue(cmd.contains("\n$body\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand appends newline when body lacks one`() {
+        val cmd = internalBuildShellCommand("echo hi", "m1")
+        assertTrue(cmd.contains("echo hi\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand does not double trailing newline`() {
+        val cmd = internalBuildShellCommand("echo hi\n", "m1")
+        assertTrue(cmd.contains("echo hi\nENDOFMINISCMD_m1\n"))
+        assertFalse(cmd.contains("echo hi\n\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand empty body still produces heredoc and marker`() {
+        val cmd = internalBuildShellCommand("", "m1")
+        assertTrue(cmd.contains("<<'ENDOFMINISCMD_m1'\n\nENDOFMINISCMD_m1\n"))
+        assertTrue(cmd.endsWith("echo \"__MINIS_DONE_m1_EXIT_\${RET}__\"\n"))
+    }
+
+    @Test
+    fun `buildShellCommand cwd file is marker-unique`() {
+        val a = internalBuildShellCommand("true", "aaaa1111")
+        val b = internalBuildShellCommand("true", "bbbb2222")
+        assertTrue(a.contains("__MINIS_CWD='/tmp/.minis_cwd_aaaa1111'\n"))
+        assertTrue(b.contains("__MINIS_CWD='/tmp/.minis_cwd_bbbb2222'\n"))
+        assertFalse(a == b)
+    }
+
+    @Test
+    fun `buildShellCommand marker line matches parser contract`() {
+        // Cross-check: the trailing echo line the wrapper emits is exactly the
+        // shape internalParseMinisExitCode (readLoop) consumes. Statically the
+        // line contains the ${RET} shell template; the parser only ever sees
+        // the runtime-expanded form, so simulate the expansion with a real code.
+        val cmd = internalBuildShellCommand("echo hi", "abc123")
+        val echoed = cmd.substringAfterLast("echo \"").substringBefore("\"\n")
+        assertEquals("__MINIS_DONE_abc123_EXIT_\${RET}__", echoed)
+        assertEquals(0, internalParseMinisExitCode(echoed.replace("\${RET}", "0"), "abc123"))
+    }
+
+    @Test
+    fun `buildShellCommand isolates body in subshell before RET capture`() {
+        // Order contract: the subshell closes BEFORE `RET=$?` so the exit
+        // status captured is the subshell's, and `set +e` runs after capture
+        // so the real exit code is not clobbered by the guard reset.
+        val cmd = internalBuildShellCommand("true", "m1")
+        val closeIdx = cmd.indexOf(")\" )\n")
+        val retIdx = cmd.indexOf("RET=\$?\n")
+        val setEIdx = cmd.indexOf("set +e\n")
+        val markerIdx = cmd.indexOf("echo \"__MINIS_DONE_")
+        assertTrue(closeIdx in 0 until retIdx)
+        assertTrue(retIdx in 0 until setEIdx)
+        assertTrue(setEIdx in 0 until markerIdx)
     }
 }

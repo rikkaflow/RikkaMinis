@@ -7,9 +7,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.drag
-import androidx.compose.foundation.relocation.BringIntoViewRequester
-import androidx.compose.foundation.relocation.bringIntoViewRequester
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -35,7 +32,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -48,7 +44,6 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.foundation.lazy.LazyListState
-import kotlin.math.abs
 
 /**
  * Long-press + drag selection gesture for MinisTextKit. Mounted on the
@@ -788,6 +783,14 @@ fun MinisSelectionToolbarHost(
                 val labelCopyRichText = androidx.compose.ui.res.stringResource(com.rikkaminis.app.R.string.selection_copy_rich_text)
                 val toastCopiedAsMarkdown = androidx.compose.ui.res.stringResource(com.rikkaminis.app.R.string.selection_copied_as_markdown_toast)
                 val toastCopiedAsRichText = androidx.compose.ui.res.stringResource(com.rikkaminis.app.R.string.selection_copied_as_rich_text_toast)
+                // [fix/dv16-b] Copy Table / Copy Table Image: the same actions
+                // the markdown-toolbar path already surfaces, resolved per
+                // render from the controller. selectionTableActions() used to
+                // be wired into MinisMarkdownTextToolbar only — the main-chat
+                // long-press toolbar never saw them even though the table
+                // publishes them for exactly this toolbar's consumption.
+                val labelCopyTable = androidx.compose.ui.res.stringResource(com.rikkaminis.app.R.string.markdown_table_copy_table)
+                val labelCopyTableImage = androidx.compose.ui.res.stringResource(com.rikkaminis.app.R.string.markdown_table_copy_table_image)
                 MinisToolbarButton(label = labelCopy) {
                     val text = controller.selectedPlainText()
                     if (text.isNotEmpty()) {
@@ -839,6 +842,24 @@ fun MinisSelectionToolbarHost(
                         toast(toastCopiedAsRichText)
                     }
                     controller.clearSelection()
+                }
+                // [fix/dv16-b] Same table actions the markdown-toolbar path
+                // appends (one menu, all items). Resolved at render time from
+                // the controller — reading it in the composition body is what
+                // subscribes the toolbar to the table registry, so the buttons
+                // surface the moment a table publishes its actions.
+                val tableActions = controller.selectionTableActions()
+                if (tableActions != null) {
+                    MinisToolbarDivider()
+                    MinisToolbarButton(label = labelCopyTable) {
+                        tableActions.copyTableMarkdown()
+                        controller.clearSelection()
+                    }
+                    MinisToolbarDivider()
+                    MinisToolbarButton(label = labelCopyTableImage) {
+                        tableActions.copyTableImage()
+                        controller.clearSelection()
+                    }
                 }
             }
         }

@@ -73,6 +73,10 @@ object ModelExecutionDispatcher {
         // toggle stamped on the main-process provider object never reached the
         // wire. Carried as an explicit payload key instead.
         enhancedCache: Boolean = false,
+        // [fix/audit3-1015 F-03] Raw passthrough request (endpoint/method/
+        // headers/body) assembled by :app; the worker performs the HTTP call
+        // because ProviderBoundary forbids provider calls in the app process.
+        passthroughRequest: JSONObject? = null,
     ): String {
         return JSONObject().apply {
             put("instance_id", instance.id)
@@ -221,7 +225,37 @@ object ModelExecutionDispatcher {
             put("max_tokens", maxTokens)
             temperature?.let { put("temperature", it) }
 
-            if (imageParts.isNotEmpty()) {
+            // [fix/audit-1015 PERF-04] Double-payload guard. `imageParts` is
+            // serialized twice on the chat path: once here and once inside the
+            // messages' contentParts (`AgentContentPart.ImageData` →
+            // "b64Data", :196), because the composer puts the same bytes into
+            // both the message's `imageParts` field and its `contentParts`
+            // (ChatViewModel:3695-3699 / ChatStreamToolHelpers:106-107). Base64
+            // for a photo is hundreds of KB, so the request file, the IPC
+            // write, and the worker's two decodes all doubled.
+            //
+            // The top-level `image_parts` array exists for exactly ONE
+            // consumer path: every provider (OpenAIProvider:2059→:2196,
+            // AnthropicProvider:815→:819, GeminiProvider:~440→:439) attaches
+            // the `imageParts` parameter to the last user message ONLY in the
+            // legacy branch taken when that message's `contentParts` is EMPTY.
+            // When the last user message carries contentParts, the providers
+            // read the images out of contentParts and ignore the parameter, so
+            // emitting `image_parts` in that case is pure dead weight — the
+            // bytes are still delivered, through contentParts, byte-identical
+            // on the wire.
+            //
+            // So emit it only when it can actually be consumed. The
+            // `minis-model-use run` path (ModelUseOffloadHandler:274) builds
+            // messages with no contentParts and relies on this array, so its
+            // behavior is unchanged; the chat path stops paying for the second
+            // copy. Absent ⇒ the worker's `jsonObjList(null)` yields an empty
+            // list (ModelExecutionService:1755), which is what the providers
+            // would have effectively used anyway.
+            val lastUserHasContentParts =
+                messages.lastOrNull { it.role == LLMMessage.Role.USER }
+                    ?.contentParts?.isNotEmpty() == true
+            if (imageParts.isNotEmpty() && !lastUserHasContentParts) {
                 put("image_parts", JSONArray().apply {
                     imageParts.forEach { img ->
                         put(JSONObject().apply {
@@ -236,6 +270,7 @@ object ModelExecutionDispatcher {
             }
 
             if (inputJson.isNotBlank()) put("input_json", inputJson)
+            if (passthroughRequest != null) put("passthrough_request", passthroughRequest)
             outputExt?.let { put("output_ext", it) }
 
             if (tools.isNotEmpty()) {
@@ -289,29 +324,48 @@ object ModelExecutionDispatcher {
      * dispatch failure (timeout / IO / service unavailable) so callers can
      * fall back to the in-process path.
      */
-    suspend fun dispatch(context: Context, requestJson: String): String? {
-        // [fix/audit-s3l2] Only retry on a CONFIRMED worker death. The previous
-        // code retried on ANY null result, but dispatchOnce also returns null
-        // on timeout — where the worker may STILL be executing the provider
-        // call (slow image/long-text generation). Re-dispatching then started
-        // a second provider call → duplicate billing / duplicate generation.
-        // A timeout must NOT be transparently retried; only the stale-key
-        // worker-death (worker beat then died before writing any output) is
-        // safe to re-run onto a fresh process.
-        val first = dispatchOnce(context, requestJson)
-        if (first.result != null) return first.result
-        return if (first.workerDied) {
-            Log.w(TAG, "dispatch got no result after confirmed worker death — one retry onto a fresh process (stale-key cache / crash)")
-            dispatchOnce(context, requestJson).result
-        } else {
-            // timeout / IO / service-unavailable: do NOT re-dispatch (worker
-            // may still be running the request); surface null to the caller
-            // for its in-process fallback.
-            null
-        }
+    suspend fun dispatch(context: Context, requestJson: String, apiKey: String = ""): String? {
+        // [fix/audit-s3l2] A TIMEOUT is never retried: dispatchOnce also returns
+        // null on timeout — where the worker may STILL be executing the
+        // provider call (slow image/long-text generation). Re-dispatching then
+        // starts a SECOND provider call → duplicate billing / duplicate
+        // generation. Only a CONFIRMED worker death (beat then silence, no
+        // output) is safe to re-run onto a fresh process.
+        //
+        // [meta1028-D2 F-01] Retrying now keys off the worker's TYPED rejection
+        // as well as the death evidence, and the whole decision table lives in
+        // [ModelExecutionRetryPolicy]. The old code short-circuited on
+        // `first.result != null`, which made its own retry branch unreachable
+        // for the case it was written for: since `feat/provider-exec-concurrency`
+        // the stale-key handoff writes `{"error":"stale_key_cache"}` into
+        // result.json (and the admission gate writes `worker_queue_full`)
+        // instead of killing the process silently — so a dispatch that should
+        // have re-run on a fresh worker returned the rejection verbatim. Both
+        // codes are written BEFORE any provider call, which is why they may be
+        // retried while a timeout may not (the invariant is documented on
+        // ModelExecutionRetryPolicy, not re-derived here).
+        val outcome = dispatchWithRetry(
+            attempt = {
+                val one = dispatchOnce(context, requestJson, apiKey)
+                ModelDispatchAttempt(one.result, one.workerDied)
+            },
+            onRetry = { attemptsMade, errorCode, delayMs ->
+                Log.w(
+                    TAG,
+                    "dispatch attempt #$attemptsMade returned no usable result " +
+                        "(code=${errorCode ?: "workerDied"} / no result) — " +
+                        "re-dispatching in ${delayMs}ms",
+                )
+            },
+        )
+        return outcome.resultJson
     }
 
-    private suspend fun dispatchOnce(context: Context, requestJson: String): DispatchOutcome {
+    private suspend fun dispatchOnce(
+        context: Context,
+        requestJson: String,
+        apiKey: String = "",
+    ): DispatchOutcome {
         val dir = try {
             val root = File(context.cacheDir, STAGING_ROOT)
             root.mkdirs()
@@ -333,6 +387,13 @@ object ModelExecutionDispatcher {
         try {
             val intent = Intent(context, ModelExecutionService::class.java).apply {
                 putExtra(ModelExecutionService.EXTRA_REQUEST_DIR, dir.absolutePath)
+                // [T-worker-key-intent-handoff] The worker's prefs map is frozen
+                // at process birth, so the key it would read there can be the
+                // quota-exhausted one the user just replaced. Carry the current
+                // key on the Intent (Binder/RAM — never disk) so this request
+                // needs no process handoff at all. Resolved by the caller: the
+                // gateway holds the instance, this layer only sees the bundle.
+                WorkerKeyHandoff.attachKey(this, apiKey)
             }
             context.startService(intent)
         } catch (e: Exception) {

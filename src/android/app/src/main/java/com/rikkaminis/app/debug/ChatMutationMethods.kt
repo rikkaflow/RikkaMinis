@@ -5,6 +5,7 @@ import androidx.core.content.FileProvider
 import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.service.SessionBadgeStore
+import kotlinx.coroutines.flow.first
 import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.chat.InputAttachment
 import org.json.JSONObject
@@ -45,6 +46,11 @@ internal object ChatMutationMethods {
         val sessionId = params.optString("sessionId", "").ifEmpty { null }
             ?: store.activeSessionId
             ?: throw RPCException(-32000, "No chat is on screen (activeSessionId is null) and no sessionId was given")
+        // [dv29-A2] Same existence gate as the headless entries: this drives the
+        // SCREEN-owned VM, and `activeSessionId` can outlive the row it names (delete
+        // while the screen is open) — the send would then append into a missing FK
+        // parent. A draft (`__new__…`) passes through the resident-VM half.
+        HeadlessChatRunner.requireSendableSession(app, sessionId)
         val vm = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             androidx.lifecycle.ViewModelProvider(
                 store.ownerFor(sessionId),
@@ -57,12 +63,37 @@ internal object ChatMutationMethods {
                     skillRepository = app.skillRepository,
                     mcpRepository = app.mcpRepository,
                 ),
-            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java].also { it.sendMessage(text) }
+            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java]
+        }
+        // [deep-audit-1043 A-05] Cold-session guard. `loadSession` publishes in
+        // two steps: `_activeEntryId` flips at step 1 (ChatSessionLifecycle:423)
+        // while `_messages` is only assigned at step 2 (:477) and
+        // `_sessionLoaded` flips in that block's `finally` (:786). Dispatching
+        // into the window between them lets the turn start against an empty
+        // in-memory history AND lets step 2's `_messages.value = loaded`
+        // overwrite the just-appended user message — the exact race
+        // `HeadlessChatRunner.prompt` closes with the same latch wait
+        // ([fix/send-dispatch-race]). This entry drives the LIVE (screen-owned)
+        // VM, so it cannot reuse that path; it uses the identical barrier:
+        // OFF Main (the load resumes on Main.immediate — waiting on Main would
+        // deadlock it) and bounded (an unbounded wait pins the RPC connection).
+        val sessionReady = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            kotlinx.coroutines.withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            throw RPCException(-32000, "session_not_loaded_in_5s: $sessionId")
+        }
+        val started = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            vm.sendMessage(text)
+            // Same-dispatcher read straight after the call: sendMessage claims
+            // `_isStreaming` SYNCHRONOUSLY (after its drop gates), so this
+            // answers "did a run actually start?" without a second suspension.
+            vm.isStreaming.value
         }
         return JSONObject().apply {
             put("ok", true)
             put("sessionId", sessionId)
-            put("isStreaming", vm.isStreaming.value)
+            put("isStreaming", started)
         }
     }
 
@@ -76,6 +107,8 @@ internal object ChatMutationMethods {
         val sessionId = existingId ?: HeadlessChatRunner.ensureSession(context)
 
         // Resolve model override (mutually exclusive with sessionId binding).
+        // [dv25-A05] Only an explicit request changes the binding; passing null
+        // for both leaves an already bound session alone.
         val modelEntryId = if (params.has("modelEntryId") && !params.isNull("modelEntryId")) params.optString("modelEntryId").ifEmpty { null } else null
         val modelGroupId = if (params.has("modelGroupId") && !params.isNull("modelGroupId")) params.optString("modelGroupId").ifEmpty { null } else null
         val overrideName = HeadlessChatRunner.applyModelOverride(context, sessionId, modelEntryId, modelGroupId)
@@ -99,7 +132,7 @@ internal object ChatMutationMethods {
         )
 
         // Re-read DB to pick up the latest message metadata after the run.
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
+        val msgs = app.chatRepository.loadMessages(sessionId)
         val userMsg = msgs.lastOrNull { it.role == "user" }
         val displayedModelName = overrideName ?: app.chatRepository.dao.getSession(sessionId)?.let { resolveDisplay(context, it.modelId) }
         return JSONObject().apply {
@@ -123,10 +156,10 @@ internal object ChatMutationMethods {
             ?: throw RPCException(-32602, "Session not found")
         val messageId = if (params.has("messageId") && !params.isNull("messageId")) params.optString("messageId").ifEmpty { null } else null
 
-        // Apply model override (per-call only; iOS docs say session binding is
-        // untouched — but the existing ChatViewModel doesn't expose a per-call
-        // override, so we update + restore around the call. Acceptable for
-        // automation harnesses.)
+        // Apply a model override only when the caller asked for one
+        // ([dv25-A05] `applyModelOverride` no longer treats "no model passed" as
+        // "apply the new-session default group" — a retry of a session the user
+        // pinned keeps that pin; the runner reads the row's binding itself).
         val modelEntryId = if (params.has("modelEntryId") && !params.isNull("modelEntryId")) params.optString("modelEntryId").ifEmpty { null } else null
         val modelGroupId = if (params.has("modelGroupId") && !params.isNull("modelGroupId")) params.optString("modelGroupId").ifEmpty { null } else null
         val overrideName = HeadlessChatRunner.applyModelOverride(context, sessionId, modelEntryId, modelGroupId)
@@ -197,7 +230,7 @@ internal object ChatMutationMethods {
         val app = app(context)
         val s = app.chatRepository.dao.getSession(sessionId)
             ?: throw RPCException(-32602, "Session not found")
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
+        val msgs = app.chatRepository.loadMessages(sessionId)
         val lastMsg = msgs.lastOrNull()
         return JSONObject().apply {
             put("sessionId", sessionId)
@@ -417,12 +450,15 @@ internal object ChatMutationMethods {
         }
     }
 
-    /** T9-L4: drop attachment blobs older than 24h before writing new ones. */
+    /**
+     * T9-L4: drop attachment blobs older than 24h before writing new ones.
+     * [da1028-C] Delegates to the one shared pruner instead of keeping a second
+     * hand-rolled copy of the same loop: two copies of the TTL/`isFile`/`<`
+     * triple can drift apart silently (and did — the copy here and
+     * `ui/components/pruneShareDir` were byte-identical only by luck).
+     */
     private fun pruneStaleAttachments(dir: File) {
-        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
-        dir.listFiles()?.forEach { f ->
-            if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
-        }
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
     }
 
     private fun parseAttachments(context: Context, params: JSONObject): List<InputAttachment> {
@@ -532,8 +568,12 @@ internal object ChatMutationMethods {
     }
 
     private fun resolveDisplay(context: Context, modelId: String): String {
-        val cfg = app(context).providerRepository.config.value
-        val entry = cfg.modelEntries.firstOrNull { it.baseModel.id == modelId } ?: return modelId
-        return entry.model.displayName
+        // Single-sourced [da1032-B]: the predicate that decides what a model
+        // reference means must not exist twice. This used to be a local copy
+        // with the bare-id predicate only, so a composite entry id
+        // (`providerInstanceId:modelId`, which chat.sessions.create / .update
+        // accept) resolved to the raw id here while `chat.sessions.get`
+        // resolved the display name — same session, two answers.
+        return ChatDebugMethods.resolveModelDisplay(app(context).providerRepository, modelId)
     }
 }

@@ -121,6 +121,14 @@ object SpeechRecognitionManager {
         val engine = currentEngine() ?: return
         if (engine is SystemSpeechRecognitionEngine) {
             engine.fetchSupportedLocales { locales ->
+                // [r5f-F05] The broadcast is asynchronous (up to 2500 ms), and
+                // its result belongs to the engine that ASKED for it. Without
+                // this check, selectEngine("provider") inside that window let
+                // the late system reply overwrite the provider engine's (empty)
+                // locale table with the system offline list — and re-validate /
+                // move the user's `_locale` against a list that does not
+                // describe the engine now in use.
+                if (localeProbeSuperseded(engine.id, currentEngine()?.id)) return@fetchSupportedLocales
                 _supportedLocales.value = locales
                 if (locales.isNotEmpty() && locales.none { it.toLanguageTag() == _locale.value.toLanguageTag() }) {
                     val fallback = locales.firstOrNull { it.language == Locale.getDefault().language }
@@ -130,6 +138,8 @@ object SpeechRecognitionManager {
                 }
             }
         } else {
+            // Synchronous branch: no suspension between currentEngine() and the
+            // write, so the probe cannot be superseded here.
             _supportedLocales.value = engine.supportedLocales
         }
     }
@@ -139,9 +149,28 @@ object SpeechRecognitionManager {
 
     fun selectEngine(id: String) {
         if (_selectedEngineId.value == id) return
+        // Mid-recording engine switch: cancel the in-flight session and reset the
+        // state machine so a stale session can never keep the mic (or wedge the
+        // state in FINISHING). This deliberately does NOT restart like
+        // [selectLocale]: a locale switch is semantically continuous (same engine,
+        // same transcript), while an engine switch would splice transcripts from
+        // two different backends into one session. Minimal cleanup preferred.
+        if (_state.value != RecognitionState.IDLE) {
+            activeEngine?.cancel()
+            activeEngine = null
+            _state.value = RecognitionState.IDLE
+        }
         _selectedEngineId.value = id
         prefs.edit().putString(KEY_ENGINE_ID, id).apply()
         refreshAvailability()
+        // [r3-B11-F06] The locale list belongs to the ENGINE, not to the app:
+        // it was only ever populated from init()/selectLocale(), so switching
+        // engines left _supportedLocales showing the previous engine's list
+        // (and re-validating the saved locale against a list it does not
+        // belong to could silently switch the user's language). The waveform
+        // is cleared for the same reason — it was the cancelled session's.
+        refreshSupportedLocales()
+        resetLevels()
     }
 
     fun selectLocale(locale: Locale) {
@@ -153,7 +182,8 @@ object SpeechRecognitionManager {
         if (_state.value == RecognitionState.RECORDING || _state.value == RecognitionState.STARTING) {
             val cb = activeCallbacks
             if (cb != null) {
-                currentEngine()?.cancel()
+                (activeEngine ?: currentEngine())?.cancel()
+                activeEngine = null
                 _state.value = RecognitionState.IDLE
                 startRecording(cb.first, cb.second)
             }
@@ -162,6 +192,18 @@ object SpeechRecognitionManager {
 
     /** Callbacks from the most recent [startRecording] so [selectLocale] can restart with them. */
     private var activeCallbacks: Pair<(String, Boolean) -> Unit, (RecognitionError, String?) -> Unit>? = null
+
+    /**
+     * [T-da1021-G] Engine instance bound to the in-flight session. `currentEngine()`
+     * re-resolves from `_selectedEngineId` and silently falls back to the first
+     * available engine when the selected one degrades — so a mid-session change
+     * (explicit `selectEngine`, or that internal fallback) would otherwise redirect
+     * stop/cancel to a different, never-started engine and leak the real one's
+     * AudioRecord / SpeechRecognizer handle. `@Volatile` is sufficient: every site
+     * is a single write or a single read, no read-modify-write compound.
+     */
+    @Volatile
+    private var activeEngine: SpeechRecognitionEngine? = null
 
     fun availableEngines(): List<SpeechRecognitionEngine> = engines.toList()
 
@@ -207,6 +249,7 @@ object SpeechRecognitionManager {
         _lastError.value = null
         resetLevels()
         activeCallbacks = onPartialOrFinal to onError
+        activeEngine = engine
 
         val listener = object : SpeechRecognitionEngine.Listener {
             override fun onReadyForSpeech() {
@@ -221,6 +264,7 @@ object SpeechRecognitionManager {
             override fun onFinal(text: String) {
                 if (text.isNotEmpty()) _recognizedText.value = text
                 onPartialOrFinal(text, true)
+                activeEngine = null
                 _state.value = RecognitionState.IDLE
                 resetLevels()
                 refreshAvailability()
@@ -228,6 +272,7 @@ object SpeechRecognitionManager {
 
             override fun onError(error: RecognitionError, message: String?) {
                 _lastError.value = error
+                activeEngine = null
                 _state.value = RecognitionState.IDLE
                 resetLevels()
                 onError(error, message)
@@ -240,6 +285,7 @@ object SpeechRecognitionManager {
         try {
             engine.start(_locale.value, listener)
         } catch (e: Throwable) {
+            activeEngine = null
             _state.value = RecognitionState.IDLE
             _lastError.value = RecognitionError.UNKNOWN
             onError(RecognitionError.UNKNOWN, e.message)
@@ -249,11 +295,17 @@ object SpeechRecognitionManager {
     fun stopRecording() {
         if (_state.value != RecognitionState.RECORDING && _state.value != RecognitionState.STARTING) return
         _state.value = RecognitionState.FINISHING
-        currentEngine()?.stop()
+        // Active instance first: currentEngine() re-resolves (and silently falls
+        // back when the selected engine degraded mid-session), so it can point at
+        // a different, never-started engine. Not nulled here — the engine is still
+        // expected to flush its final result via [SpeechRecognitionEngine.Listener],
+        // which clears the binding on the terminal callback.
+        (activeEngine ?: currentEngine())?.stop()
     }
 
     fun cancelRecording() {
-        currentEngine()?.cancel()
+        (activeEngine ?: currentEngine())?.cancel()
+        activeEngine = null
         _state.value = RecognitionState.IDLE
         _recognizedText.value = ""
     }
@@ -269,3 +321,24 @@ object SpeechRecognitionManager {
         engines.forEach { it.shutdown() }
     }
 }
+
+/**
+ * [r5f-F05] Pure staleness predicate for an asynchronous locale probe. A
+ * probe issued for one engine only applies while [SpeechRecognitionManager]
+ * would still resolve that same engine (same id ⇔ same registry instance:
+ * engines are singletons re-created together in [init], ids are distinct).
+ *
+ * The resolved-engine accessor is used on both sides on purpose: a fallback
+ * resolution (selected engine degraded) that lands back on the probed engine
+ * is not "stale" — the data still describes the engine in use. Expected
+ * verdicts are pinned by unit tests:
+ *
+ *  | probeEngineId | activeEngineId | superseded |
+ *  |---------------|----------------|------------|
+ *  | "system"      | "system"       | false      |
+ *  | "provider"    | "provider"     | false      |
+ *  | "system"      | "provider"     | true       |
+ *  | "system"      | null           | true       |
+ */
+internal fun localeProbeSuperseded(probeEngineId: String, activeEngineId: String?): Boolean =
+    activeEngineId != probeEngineId

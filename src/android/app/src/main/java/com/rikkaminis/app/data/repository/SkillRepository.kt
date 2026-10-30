@@ -40,6 +40,44 @@ import java.util.zip.ZipOutputStream
  *   - Session overrides in `session_skill_overrides` table
  *   - Prompt fragment generation for system prompt injection
  */
+
+/**
+ * [dv16-A05] Pure decision core of the sparse-clear branch in
+ * [SkillRepository.setSessionOverride]. When the requested value equals the
+ * CURRENT global default, the override row is DELETED instead of pinned — so
+ * a later flip of the global default propagates to the session (a
+ * permanently-pinned row would leave the session stuck at the old value).
+ * `null` global (unknown / not-yet-loaded skill) conservatively keeps the
+ * row (write). Mirrors [MCPRepository.setSessionOverride]'s three branches —
+ * same shape, same precedence; the twin keeps its own copy only because its
+ * SQL names differ (mcp_session_overrides), the decision itself is this
+ * function.
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps.
+ */
+internal fun shouldDeleteSessionSkillOverride(globalEnabled: Boolean?, requestedEnabled: Boolean): Boolean =
+    globalEnabled != null && requestedEnabled == globalEnabled
+
+/**
+ * [dv22-B4] Pure merge core of [SkillRepository.sessionEnablementMap] — the
+ * batched read that replaced one [SkillRepository.isEnabledForSession]
+ * rawQuery PER SKILL in the slash menu (N queries per keystroke → one per
+ * list). Precedence is IDENTICAL to [SkillRepository.isEnabledForSession]:
+ * session override row → global `isEnabled` → absent (false).
+ *
+ * Top-level (not a member) so the precedence is JVM-testable with zero
+ * Android deps, and so a counting fake can prove the merge itself issues no
+ * queries: [overrideRows] is the result of ONE batched SELECT, [globalEnabled]
+ * reads the in-memory `_skills` list.
+ */
+internal fun mergeSessionSkillEnablement(
+    ids: List<String>,
+    overrideRows: Map<String, Boolean>,
+    globalEnabled: (id: String) -> Boolean?,
+): Map<String, Boolean> = ids.associateWith { id ->
+    overrideRows[id] ?: globalEnabled(id) ?: false
+}
+
 class SkillRepository(private val context: Context) {
 
     companion object {
@@ -52,7 +90,21 @@ class SkillRepository(private val context: Context) {
         // 3-tier priority below is unchanged. Upgrade path if skills > 40:
         // keyword prefilter -> embedding retrieval (see backlog §38-A).
         private const val MAX_SKILLS_IN_PROMPT = 40
-        private const val MAX_SKILL_DESC_LENGTH = 200
+        // [s39] 200 -> 400: 2 of 31 shipped skills were cut mid-sentence
+        // (tierflow-key-harvest 243 / rikkaminis-dev-methodology 206), and the
+        // cut tail is always the trigger clause — exactly the part the agent
+        // needs to decide whether to read the skill at all. Truncation happens
+        // at render time in [skillPromptFragment], never on the stored row, so
+        // no migration is involved. 400 covers the longest shipped description
+        // with headroom; revisit (sentence-boundary cut) only if a real
+        // description exceeds it.
+        private const val MAX_SKILL_DESC_LENGTH = 400
+        /** [dv22-B4] Ids per batched `IN (…)` SELECT in
+         *  [sessionEnablementMap]. SQLITE_MAX_VARIABLE_NUMBER is 999 on older
+         *  SQLite builds; 400 leaves rom for the session id and keeps the
+         *  query count constant (a skill list this long is already an
+         *  anomaly, not a path to optimise). */
+        private const val SESSION_OVERRIDE_QUERY_CHUNK = 400
         private const val RECENT_WINDOW_MS = 7L * 24 * 3600 * 1000
         private const val RECENT_SLOTS = 10
         private const val NORMALIZE_THRESHOLD = 1000.0
@@ -72,6 +124,18 @@ class SkillRepository(private val context: Context) {
          * keys); unmanaged keys are carried through verbatim. When [existing] has no
          * frontmatter, a fresh 3-key block is emitted — identical to the pre-fix
          * behaviour for that case.
+         *
+         * [F-06] Both sides now speak YAML block scalars: `key: |` / `key: >` (with
+         * any chomping indicator) opens a block whose blank-or-indented lines belong
+         * to that key. [parseSkillMd] has resolved those blocks into real newlines
+         * since T151, so a document carrying `description: |` reaches this function
+         * with a MULTI-LINE value — writing it raw put the continuation lines at
+         * column 0 inside the frontmatter, where the next read treated them as keys
+         * (a description line `version: 9.9` silently rewrote the version) and
+         * dropped the rest (the description came back truncated to its first line).
+         * Contract: a managed value is emitted as `key: <value>` when it is a single
+         * line and as `key: |` + 2-space-indented lines otherwise, and a managed key
+         * that arrived as a block is emitted with its old BODY removed.
          */
         internal fun mergeFrontmatter(
             existing: String?,
@@ -92,19 +156,31 @@ class SkillRepository(private val context: Context) {
                 }
             }
             // No frontmatter to preserve: emit the canonical 3-key block.
+            // [F-06] Through the same emitter — a description carrying newlines
+            // needs the block form here too, or the very first write of a new skill
+            // puts its continuation lines at column 0 inside the frontmatter.
             if (frontmatterEnd < 0) {
                 return buildString {
                     appendLine("---")
-                    appendLine("name: $name")
-                    appendLine("description: $description")
-                    appendLine("version: $version")
+                    for (entry in frontmatterEntry("name", name)) appendLine(entry)
+                    for (entry in frontmatterEntry("description", description)) appendLine(entry)
+                    for (entry in frontmatterEntry("version", version)) appendLine(entry)
                     appendLine("---")
                     append(body)
                 }
             }
             // Walk the frontmatter, swapping the managed keys in place and
             // passing every other line (comments, subagent, max_turns,
-            // allowed_tools, ...) through verbatim.
+            // allowed_tools, ...) through verbatim. [fix/da1023-E] The walk
+            // starts at line 1: line 0 is the OPENING `---` delimiter, and
+            // emitting it again below doubled the delimiter on every rewrite
+            // whose base already carried a block — `---\n---\nname: …` — which
+            // parseSkillMd reads as a 2-line frontmatter with no `name:` key
+            // and returns null for, and extractFrontmatterBlock truncates to
+            // `---\n---`, dropping every extended key. In other words the
+            // first in-app rewrite of any skill used to corrupt its SKILL.md
+            // into an unparsable document — the exact class of silent
+            // frontmatter loss this branch exists to close.
             val managed = mapOf(
                 "name" to name,
                 "description" to description,
@@ -112,13 +188,24 @@ class SkillRepository(private val context: Context) {
             )
             val seen = mutableSetOf<String>()
             val fm = mutableListOf<String>()
-            for (i in 0 until frontmatterEnd) {
+            // [F-06] A managed BLOCK SCALAR loses its body together with its
+            // header: the value is rebuilt from [managed] below, so keeping the
+            // old `  line one` / `  line two` lines left them behind under a now
+            // single-line key — stale text that never goes away on its own, and
+            // that a strict YAML reader folds back into the value
+            // ("fresh desc line one line two"). [blockBodyUntil] is the first
+            // line after the block that is NOT part of it.
+            var blockBodyUntil = -1
+            for (i in 1 until frontmatterEnd) {
+                if (i < blockBodyUntil) continue
                 val line = src[i]
-                val colon = line.indexOf(':')
-                val key = if (colon > 0) line.substring(0, colon).trim().lowercase() else null
+                val key = frontmatterKey(line)
                 val newValue = if (key != null) managed[key] else null
                 if (key != null && newValue != null) {
-                    fm.add("$key: $newValue")
+                    if (isBlockScalarHeader(line.substringAfter(':').trim())) {
+                        blockBodyUntil = blockScalarBodyEnd(src, i + 1, frontmatterEnd)
+                    }
+                    for (entry in frontmatterEntry(key, newValue)) fm.add(entry)
                     seen.add(key)
                 } else {
                     fm.add(line)
@@ -126,7 +213,7 @@ class SkillRepository(private val context: Context) {
             }
             // Managed keys absent from the original block still need to exist.
             for ((key, value) in managed) {
-                if (key !in seen) fm.add("$key: $value")
+                if (key !in seen) for (entry in frontmatterEntry(key, value)) fm.add(entry)
             }
             return buildString {
                 appendLine("---")
@@ -134,6 +221,206 @@ class SkillRepository(private val context: Context) {
                 appendLine("---")
                 append(body)
             }
+        }
+
+        /**
+         * The frontmatter KEY a line declares, or null when the line declares no
+         * key at all.
+         *
+         * [F-06] Keys are recognized only at column 0. The pre-fix rule
+         * (`line.indexOf(':') > 0`, then `trim()`) counted an INDENTED line as a
+         * key, which made a `description: |` body line like `  name: x` look like
+         * a second managed key and clobbered nested mappings — while a body line
+         * without a colon was silently ignored. Column 0 is also YAML's own rule,
+         * and it is what lets [mergeFrontmatter] tell a block body from a key.
+         */
+        private fun frontmatterKey(line: String): String? {
+            if (line.isEmpty() || line[0].isWhitespace()) return null
+            val colon = line.indexOf(':')
+            if (colon <= 0) return null
+            return line.substring(0, colon).trim().lowercase().ifEmpty { null }
+        }
+
+        /**
+         * `|`, `>`, `>-`, `|+`, `>2`, … — a YAML block-scalar header (the marker
+         * followed only by a chomping indicator and/or an explicit indentation
+         * digit). [parseSkillMd] resolves both markers into real newlines, so the
+         * writer has to recognize the same set ([F-06]).
+         */
+        private fun isBlockScalarHeader(value: String): Boolean {
+            if (value.isEmpty() || (value[0] != '|' && value[0] != '>')) return false
+            return value.drop(1).all { it.isDigit() || it == '-' || it == '+' }
+        }
+
+        /**
+         * First line index at or after [from] that is NOT part of the block scalar
+         * opened one line earlier: the body runs while lines are blank or indented,
+         * the same rule [parseSkillMd] applies — so the writer and the reader agree
+         * on where a block ends.
+         */
+        private fun blockScalarBodyEnd(src: List<String>, from: Int, limit: Int): Int {
+            var j = from
+            while (j < limit && (src[j].isEmpty() || src[j][0].isWhitespace())) j++
+            return j
+        }
+
+        /**
+         * Emit one managed key: `key: value` for a single-line value, the block form
+         * `key: |` + 2-space-indented lines when the value carries newlines.
+         *
+         * The block form is not cosmetic ([F-06]): [parseSkillMd] resolves a block
+         * into a value WITH newlines, so an imported document hands that value back
+         * here on the next write. Emitting it raw put its continuation lines at
+         * column 0 inside the frontmatter — the next read then took them for keys
+         * (`version: 9.9` rewrote the version) and the value itself came back
+         * truncated to its first line.
+         */
+        private fun frontmatterEntry(key: String, value: String): List<String> {
+            if (!value.contains('\n')) return listOf("$key: $value")
+            // A trailing newline needs chomping juggling the reader does not model
+            // (it trims the resolved block anyway), so the canonical form is a plain
+            // `|` with every line indented.
+            val lines = value.lines().map { it.trimEnd('\r') }
+            return buildList {
+                add("$key: |")
+                for (line in lines) add(if (line.isEmpty()) "" else "  $line")
+            }
+        }
+
+        /**
+         * [fix/da1023-E] Which frontmatter block a SKILL.md rewrite merges
+         * into — the single exit for that decision, and it is memory-first:
+         *
+         *  - a caller-supplied block (the NEW value being landed: an import,
+         *    a URL / file update, a bundled upgrade) wins whenever it is
+         *    non-blank, so remote `subagent` / `max_turns` / `allowed_tools`
+         *    changes actually reach the disk;
+         *  - otherwise the on-disk document is the base, so a caller that only
+         *    touches a managed key (rename, metadata edit) preserves every
+         *    extended key exactly as the disk holds it — including edits made
+         *    outside the app (`file_write` / a shell `sed` in the sandbox);
+         *  - both absent → `null`, and [mergeFrontmatter] emits the canonical
+         *    3-key block.
+         *
+         * The pre-fix call site read `existing ?: skill.frontmatter`, i.e. disk
+         * first: as soon as a SKILL.md existed, the caller's block was ignored
+         * entirely — the opposite of what [mergeFrontmatter]'s own seeding note
+         * and the bundled-upgrade KDoc ("writeSkillMd merges against this
+         * field") both describe, and the reason an "Update from URL" refreshed
+         * name/description/body while silently keeping the stale extended keys.
+         *
+         * Pure nullability work (no Android deps) so the polarity itself lives
+         * under JVM tests; the `writeSkillMd` call site that must use it is
+         * pinned by `scripts/scan/skill_frontmatter_roundtrip_check.py`.
+         */
+        internal fun resolveMergeBase(
+            newFrontmatter: String?,
+            diskContent: String?,
+        ): String? = newFrontmatter?.ifBlank { null } ?: diskContent
+
+        /**
+         * [B14b] Rewrite the `name:` line inside the frontmatter block of a
+         * SKILL.md. Pure string work (no Android deps) so it is covered by JVM
+         * tests — the same split [mergeFrontmatter] uses. The previous inline
+         * full-document `replaceFirst` fired on the whole file: when the file
+         * has no frontmatter, a `name:` example line in the markdown body was
+         * silently rewritten instead of the (absent) frontmatter key.
+         *
+         * Returns the updated document, or null when there is nothing to
+         * rewrite (no frontmatter block, or a frontmatter block without a
+         * `name:` line) — callers leave the file untouched in that case.
+         *
+         * [F-09] The rewrite walks (line, terminator) pairs instead of slicing the
+         * document at a char offset. The pre-fix offset (`Σ line.length + 1`, the
+         * `+1` being the newline `String.lines()` strips) is correct for LF only:
+         * on a CRLF document every line contributes one char more than assumed, so
+         * the split point drifted INTO the block — with four frontmatter lines it
+         * landed inside the `name:` value, the head ended mid-value, and the rename
+         * produced `name: new` immediately followed by the old value's leftover
+         * tail (`name: newx`). Splitting per line keeps every terminator byte for
+         * byte, so mixed `\r\n` / `\n` documents survive untouched too.
+         */
+        internal fun renameFrontmatterName(md: String, newName: String): String? {
+            val parts = splitKeepingLineEndings(md).toMutableList()
+            if (parts.isEmpty() || !parts[0].first.trimStart().startsWith("---")) return null
+            var frontmatterEnd = -1
+            for (i in 1 until parts.size) {
+                if (parts[i].first.trim() == "---") {
+                    frontmatterEnd = i
+                    break
+                }
+            }
+            if (frontmatterEnd <= 0) return null
+            for (i in 1 until frontmatterEnd) {
+                val (content, terminator) = parts[i]
+                if (!content.startsWith("name:")) continue
+                parts[i] = "name: $newName" to terminator
+                val rebuilt = buildString {
+                    for ((line, eol) in parts) {
+                        append(line)
+                        append(eol)
+                    }
+                }
+                return if (rebuilt == md) null else rebuilt
+            }
+            return null
+        }
+
+        /**
+         * Split [text] into (line content, its own terminator) pairs, so a rewrite
+         * can rejoin the document byte-for-byte apart from what it meant to change.
+         * Terminators can differ line by line (`\r\n`, `\n`, `\r`) — each is kept
+         * exactly as it arrived ([F-09]).
+         */
+        private fun splitKeepingLineEndings(text: String): List<Pair<String, String>> {
+            val out = mutableListOf<Pair<String, String>>()
+            var start = 0
+            var i = 0
+            while (i < text.length) {
+                val c = text[i]
+                if (c == '\n' || c == '\r') {
+                    val end = if (c == '\r' && i + 1 < text.length && text[i + 1] == '\n') i + 2 else i + 1
+                    out.add(text.substring(start, i) to text.substring(i, end))
+                    start = end
+                    i = end
+                } else {
+                    i++
+                }
+            }
+            if (start < text.length) out.add(text.substring(start) to "")
+            return out
+        }
+
+        /**
+         * [F-10] The files a skill directory must give up after a manifest-backed
+         * sync: everything present locally that the incoming manifest does NOT list,
+         * except the top-level SKILL.md (owned by [writeSkillMd], never a sibling).
+         *
+         * Both landing paths only ever WROTE files — an overwrite import
+         * ([importFromArchive]) or an "Update from URL" ([updateFromURL]) re-fetched
+         * what upstream still ships and left everything upstream had DELETED on
+         * disk, so a skill kept running a script its source no longer has while the
+         * UI reported a completed update.
+         *
+         * Deleting is the destructive half of a sync, so the caller has to hand over
+         * a manifest it can prove COMPLETE (every entry written / downloaded). An
+         * empty manifest yields no deletions at all: an empty directory listing is
+         * indistinguishable from a truncated response, and guessing wrong wipes the
+         * skill's payload.
+         */
+        internal fun planStaleSiblingDeletions(
+            existingRelPaths: Collection<String>,
+            keepRelPaths: Collection<String>,
+        ): List<String> {
+            if (keepRelPaths.isEmpty()) return emptyList()
+            fun normalize(path: String): String =
+                path.replace('\\', '/').trimStart('/').removePrefix("./")
+            val keep = keepRelPaths.mapTo(mutableSetOf()) { normalize(it) }
+            return existingRelPaths
+                .map { normalize(it) }
+                .filter { it.isNotEmpty() && it !in keep && !it.equals("SKILL.md", ignoreCase = true) }
+                .distinct()
+                .sorted()
         }
     }
 
@@ -207,6 +494,19 @@ class SkillRepository(private val context: Context) {
     private val _skills = MutableStateFlow<List<Skill>>(emptyList())
     val skills: StateFlow<List<Skill>> = _skills.asStateFlow()
 
+    /**
+     * [dv22-B4] Bumped by every write to `session_skill_overrides`
+     * ([setSessionOverride] / [clearSessionOverrides] /
+     * [renameSessionOverrides]). The overrides table is the only part of the
+     * session-scoped enablement that does NOT flow through [_skills], so
+     * before this counter the two had no shared invalidation channel: the
+     * slash menu memo keyed on `.skills` and never re-ran after a toggle
+     * inside the SAME session (B-04). Collectors re-read the table when this
+     * moves — it is a pure revision number, never an enablement value.
+     */
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
+
     /** Lock serializing the check-then-act sequence in [add] so concurrent
      *  calls with the same id don't create duplicate DB rows / SKILL.md
      *  files or lose updates to the _skills StateFlow. */
@@ -246,8 +546,24 @@ class SkillRepository(private val context: Context) {
         // `max_turns`, `allowed_tools`) survive the first landing — see
         // writeSkillMd, which seeds its merge with this when the skill is new.
         frontmatter: String = "",
+        // [fix/da1021-A] The caller's already-resolved id. Callers that
+        // resolved the landing id through [SkillRestorePolicy.resolveImportId]
+        // (importFromContent's preferredId parameter, installBundledSkill's
+        // assets dirName) pass it through: without this the add branch below
+        // recomputed `slugify(name)` and dropped the resolved id — a renamed
+        // skill (pure-CJK name → blank slug → add returned null) was silently
+        // lost, or landed under a fresh slug while its backup payload and
+        // session_skill_overrides still pointed at the old id (dir split).
+        // Null keeps the legacy slugify behavior for callers that have no
+        // preferred id. Unsafe values (blank, `/`, `\`, `..`) are rejected
+        // inside resolveImportId — they fall back to the name slug.
+        preferredId: String? = null,
     ): Skill? {
-        val id = slugify(name)
+        // [fix/da1021-A] Never recompute the landing id here: a caller with an
+        // already-resolved id (backup restore / bundled dirName) must land
+        // under it. resolveImportId rejects unsafe values and falls back to
+        // the name slug, so an illegal preferredId can't be adopted verbatim.
+        val id = SkillRestorePolicy.resolveImportId(preferredId, slugify(name))
         if (id.isBlank()) return null
 
         return synchronized(addLock) {
@@ -280,6 +596,16 @@ class SkillRepository(private val context: Context) {
         description: String? = null,
         body: String? = null,
         version: String? = null,
+        // [fix/da1023-E] The frontmatter block carried by the landing document.
+        // updateFromURL / update-from-file pass it so remote `subagent` /
+        // `max_turns` / `allowed_tools` changes reach the disk instead of being
+        // shadowed by the old block (writeSkillMd merges memory-first now).
+        // `null` — or a blank block, fail-closed — keeps the pre-fix behaviour
+        // for every existing caller: the copy re-seeds from the on-disk
+        // SKILL.md, so the merge base still resolves to the disk block and a
+        // plain rename preserves extended keys, including edits made outside
+        // the app while it was running.
+        frontmatter: String? = null,
     ): Boolean {
         val current = _skills.value.find { it.id == id } ?: return false
         val updated = current.copy(
@@ -287,6 +613,8 @@ class SkillRepository(private val context: Context) {
             description = description ?: current.description,
             body = body ?: current.body,
             version = version ?: current.version,
+            frontmatter = frontmatter?.ifBlank { null }
+                ?: readSkillMdFrontmatter(id).ifBlank { current.frontmatter },
             updatedAt = System.currentTimeMillis(),
         )
 
@@ -315,6 +643,30 @@ class SkillRepository(private val context: Context) {
         }
     }
 
+    /**
+     * [fix/audit-1015-b2b] Restore usage metadata (installedAt/updatedAt/
+     * useCount) carried by a backup. Export wrote all three but import never
+     * read them back: a restore reset useCount to 0 and re-stamped both
+     * timestamps, silently losing usage history. Only fields the backup
+     * actually carries (>0) are applied — see [SkillRestorePolicy.restoreUsage].
+     */
+    fun restoreUsageMetadata(id: String, installedAt: Long, updatedAt: Long, useCount: Double) {
+        val current = _skills.value.find { it.id == id } ?: return
+        val restored = SkillRestorePolicy.restoreUsage(
+            current = SkillRestorePolicy.Usage(current.installedAt, current.updatedAt, current.useCount),
+            backup = SkillRestorePolicy.Usage(installedAt, updatedAt, useCount),
+        )
+        db.execSQL(
+            "UPDATE skills SET installed_at=?, updated_at=?, use_count=? WHERE id=?",
+            arrayOf<Any>(restored.installedAt, restored.updatedAt, restored.useCount, id)
+        )
+        _skills.value = _skills.value.map {
+            if (it.id == id) {
+                it.copy(installedAt = restored.installedAt, updatedAt = restored.updatedAt, useCount = restored.useCount)
+            } else it
+        }
+    }
+
     // -- Session Overrides --
 
     fun isEnabledForSession(skillId: String, sessionId: String): Boolean {
@@ -328,15 +680,68 @@ class SkillRepository(private val context: Context) {
         return _skills.value.find { it.id == skillId }?.isEnabled ?: false
     }
 
+    /**
+     * [dv22-B4] Batched twin of [isEnabledForSession]: ONE `IN (…)` SELECT for
+     * the whole id list (chunked at [SESSION_OVERRIDE_QUERY_CHUNK] to stay
+     * under SQLITE_MAX_VARIABLE_NUMBER) instead of one rawQuery per skill —
+     * the slash menu walks the full list on every keystroke, so the per-item
+     * shape cost N synchronous queries per producer run (B-04). Precedence
+     * identical: session override row → global `isEnabled` → absent (false),
+     * via the pure [mergeSessionSkillEnablement] core.
+     */
+    fun sessionEnablementMap(sessionId: String, ids: List<String>): Map<String, Boolean> {
+        if (ids.isEmpty()) return emptyMap()
+        val overrideRows = mutableMapOf<String, Boolean>()
+        ids.chunked(SESSION_OVERRIDE_QUERY_CHUNK).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val cursor = db.rawQuery(
+                "SELECT skill_id, is_enabled FROM session_skill_overrides WHERE session_id=? AND skill_id IN ($placeholders)",
+                arrayOf(sessionId) + chunk.toTypedArray(),
+            )
+            if (cursor.moveToFirst()) {
+                do {
+                    overrideRows[cursor.getString(0)] = cursor.getInt(1) == 1
+                } while (cursor.moveToNext())
+            }
+            cursor.close()
+        }
+        val globals = _skills.value.associate { it.id to it.isEnabled }
+        return mergeSessionSkillEnablement(ids, overrideRows) { id -> globals[id] }
+    }
+
+    /**
+     * [dv16-A05] Sparse-clear, mirroring [MCPRepository.setSessionOverride]:
+     * when [enabled] equals the skill's CURRENT global enabled, DELETE the
+     * override row instead of pinning it — so a later flip of the global
+     * default propagates to this session (a permanently-pinned row would
+     * leave the session stuck at the old value after the user toggles the
+     * switch back to the global default in [SessionSkillsSheet]). Only store
+     * a row when the session value genuinely diverges from the global
+     * default. Read precedence (override → global → false) in
+     * [isEnabledForSession] is unchanged, and an unknown / not-yet-loaded
+     * skill (`globalEnabled == null`) still writes the row.
+     */
     fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
-        db.execSQL(
-            "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
-            arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
-        )
+        val globalEnabled = _skills.value.find { it.id == skillId }?.isEnabled
+        if (shouldDeleteSessionSkillOverride(globalEnabled, enabled)) {
+            db.execSQL(
+                "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
+                arrayOf(sessionId, skillId)
+            )
+        } else {
+            db.execSQL(
+                "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
+                arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
+            )
+        }
+        // [dv22-B4] The table moved — publish the revision so async consumers
+        // (the slash menu's producer) re-query without polling.
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     fun clearSessionOverrides(sessionId: String) {
         db.execSQL("DELETE FROM session_skill_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     /**
@@ -355,6 +760,7 @@ class SkillRepository(private val context: Context) {
             "UPDATE OR REPLACE session_skill_overrides SET session_id=? WHERE session_id=?",
             arrayOf<Any>(toReal, fromDraft),
         )
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     // -- Prompt Fragment --
@@ -447,7 +853,12 @@ class SkillRepository(private val context: Context) {
         // read the pre-bump snapshot → both write useCount+1 → memory drifts
         // one behind the DB, and normalizeUseCounts later persists a value
         // derived from that stale snapshot.
-        val next = synchronized(addLock) {
+        // [da1029-C] The write-back itself now happens INSIDE the lock too:
+        // computing `mapped` under the lock while publishing it after the
+        // release left a window where a concurrent recordSkillUse read the
+        // pre-publish snapshot (one increment lost) and a concurrent add()
+        // appended to a list that our stale publish then overwrote.
+        synchronized(addLock) {
             val current = _skills.value.find { it.id == skillId } ?: return
             val bumped = current.copy(useCount = current.useCount + 1.0)
             db.execSQL(
@@ -458,9 +869,8 @@ class SkillRepository(private val context: Context) {
             if (bumped.useCount > NORMALIZE_THRESHOLD) {
                 mapped = normalizeUseCounts(mapped)
             }
-            mapped
+            _skills.value = mapped
         }
-        _skills.value = next
     }
 
     private fun normalizeUseCounts(list: List<Skill>): List<Skill> {
@@ -530,9 +940,15 @@ class SkillRepository(private val context: Context) {
         preferredId: String? = null,
     ): Skill? {
         val parsed = parseSkillMd(content) ?: return null
-        val id = preferredId
-            ?.takeIf { it.isNotBlank() && _skills.value.any { s -> s.id == it } }
-            ?: slugify(parsed.name)
+        // [fix/audit-1015-b2c] A backup restore is a trusted, user-initiated
+        // flow: the exported id is the user's own, so any non-blank,
+        // directory-name-safe id is adopted verbatim. The old check required
+        // the skill to already exist — on a clean install `_skills` was empty,
+        // the preferred id was silently dropped, and a renamed skill came back
+        // under a fresh slugify id, breaking session_skill_overrides and
+        // /var/minis/skills/<id>/ references. Existence is still checked in
+        // the replace/add branch below.
+        val id = SkillRestorePolicy.resolveImportId(preferredId, slugify(parsed.name))
         if (id.isNotBlank() && _skills.value.any { it.id == id }) {
             // Replace existing: update in place so URL updates refresh contents.
             val current = _skills.value.first { it.id == id }
@@ -547,12 +963,14 @@ class SkillRepository(private val context: Context) {
                 // [fix/subagent-frontmatter-newskill] Refresh the in-memory
                 // frontmatter from the incoming content so frontmatter-only
                 // keys (`subagent: true`) the caller edited land without
-                // waiting for the next full loadAll. Keep the previous block
-                // when the incoming document has none — the on-disk merge
-                // below preserves it, and a blank here would shadow it until
-                // the next reload.
-                frontmatter = SubagentSkill.extractFrontmatterBlock(content)
-                    .ifBlank { current.frontmatter },
+                // waiting for the next full loadAll. [fix/da1023-E] This block is
+                // no longer merely a cache of the incoming document: it IS the
+                // merge base now (writeSkillMd resolves memory-first), so a
+                // paste / restore / file import replaces the extended keys
+                // wholesale — including dropping a `subagent: true` the incoming
+                // document removed. Keep the previous block when the incoming
+                // document has none: a blank resolves to the disk anyway.
+                frontmatter = parsed.frontmatter.ifBlank { current.frontmatter },
             )
             db.execSQL(
                 "UPDATE skills SET name=?, description=?, version=?, import_source=?, source_url=?, updated_at=? WHERE id=?",
@@ -576,8 +994,17 @@ class SkillRepository(private val context: Context) {
             // [fix/subagent-frontmatter-newskill] Carry the incoming block so
             // a brand-new skill keeps its `subagent: true` / max_turns /
             // allowed_tools on the first landing (writeSkillMd seeds its merge
-            // with this when no on-disk file exists).
-            frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+            // with this when no on-disk file exists). [fix/da1023-E] The block
+            // now travels on ParsedSkill — one extraction per document instead
+            // of every frontmatter-aware call site re-running
+            // extractFrontmatterBlock over the raw content.
+            frontmatter = parsed.frontmatter,
+            // [fix/da1021-A] Pass the resolved id through to the add branch:
+            // on a clean install this is the add path, and without it the id
+            // resolved above (backup's exported id) was recomputed as
+            // slugify(parsed.name) — renamed skills came back under a fresh
+            // slug, splitting the dir from their payload and overrides.
+            preferredId = id,
         )
     }
 
@@ -594,7 +1021,17 @@ class SkillRepository(private val context: Context) {
      * bundled sibling files (scripts/, references/, assets/, etc.) are extracted
      * alongside it into `skillsDir/<id>/`.
      */
-    fun importFromArchive(input: InputStream, preferredId: String? = null): Skill? {
+    fun importFromArchive(
+        input: InputStream,
+        preferredId: String? = null,
+        // [fix/audit-1015-b2a] ConfigBackup's archive branch carries the
+        // exported importSource/sourceURL. Hard-coding FILE here rewrote every
+        // restored skill's source to "file": a URL-imported skill then failed
+        // updateFromURL's importSource != URL guard and permanently lost its
+        // online updates. Defaults keep direct zip imports unchanged.
+        source: ImportSource = ImportSource.FILE,
+        sourceURL: String? = null,
+    ): Skill? {
         val entries = try { readZipEntries(input) } catch (e: Exception) {
             Log.w(TAG, "Failed to read zip archive: ${e.message}")
             return null
@@ -610,7 +1047,12 @@ class SkillRepository(private val context: Context) {
         val skillContent = try { String(skillMdEntry.data, Charsets.UTF_8) } catch (_: Exception) { return null }
         if (skillContent.isBlank()) return null
 
-        val skill = importFromContent(skillContent, ImportSource.FILE, preferredId = preferredId) ?: return null
+        val skill = importFromContent(
+            skillContent,
+            source,
+            preferredId = preferredId,
+            sourceURL = sourceURL,
+        ) ?: return null
 
         val prefix = if (skillMdEntry.name == "SKILL.md") "" else skillMdEntry.name.dropLast("SKILL.md".length)
         val skillDir = File(skillsDir, skill.id)
@@ -623,6 +1065,11 @@ class SkillRepository(private val context: Context) {
         // so any escape lands outside rootPrefix and is dropped.
         val rootCanonical = skillDir.canonicalPath
         val rootPrefix = rootCanonical + File.separator
+        // [F-10] The archive is the skill's FULL manifest, so what it no longer
+        // ships has to leave the directory as well — the pre-fix loop only wrote,
+        // and a script dropped upstream kept sitting in `scripts/` forever.
+        val writtenRelPaths = mutableSetOf<String>()
+        var writeFailures = 0
 
         for (entry in entries) {
             if (entry.isDirectory) continue
@@ -639,9 +1086,22 @@ class SkillRepository(private val context: Context) {
                 continue
             }
             destFile.parentFile?.mkdirs()
-            try { destFile.writeBytes(entry.data) } catch (e: Exception) {
+            try {
+                destFile.writeBytes(entry.data)
+                writtenRelPaths.add(relativePath.replace('\\', '/'))
+            } catch (e: Exception) {
+                writeFailures++
                 Log.w(TAG, "Failed to write $relativePath: ${e.message}")
             }
+        }
+        // [F-10] Only after a clean write of a non-empty manifest: a partial
+        // extraction means our idea of "what this skill ships" is incomplete, and
+        // a SKILL.md-only archive says nothing about the payload (deleting on that
+        // evidence would wipe a skill's scripts on a paste-shaped import).
+        if (writeFailures == 0 && writtenRelPaths.isNotEmpty()) {
+            deleteStaleSiblingFiles(skillDir, writtenRelPaths)
+        } else if (writeFailures > 0) {
+            Log.w(TAG, "importFromArchive: $writeFailures write failure(s) — skipped stale cleanup")
         }
         return skill
     }
@@ -701,11 +1161,22 @@ class SkillRepository(private val context: Context) {
     /**
      * Download SKILL.md from a GitHub URL and recursively download sibling files
      * from the same directory. Mirrors iOS SkillStore.importFromGitHub.
+     *
+     * [dv22-B6 §1042-B-07] `preferredId` routes the import to the
+     * replace-in-place branch of [importFromContent] under an EXISTING local
+     * id. Without it the landing id was always `slugify(name)`: importing a
+     * catalogue entry whose local record sits under a different id (renamed
+     * skill, custom id) silently created a duplicate record instead of
+     * refreshing the installed one, and the re-import of an already-installed
+     * skill reported "imported" although the repository had replaced it.
+     * The replace branch refreshes name / description / version / body /
+     * frontmatter / importSource / sourceURL in place, so the sibling
+     * recursion below lands in the existing skill's directory.
      */
-    suspend fun importFromGitHub(urlString: String): Skill? = withContext(Dispatchers.IO) {
+    suspend fun importFromGitHub(urlString: String, preferredId: String? = null): Skill? = withContext(Dispatchers.IO) {
         val rawURL = githubToRawURL(urlString) ?: return@withContext null
         val content = httpGetString(rawURL) ?: return@withContext null
-        val skill = importFromContent(content, ImportSource.URL, sourceURL = urlString) ?: return@withContext null
+        val skill = importFromContent(content, ImportSource.URL, sourceURL = urlString, preferredId = preferredId) ?: return@withContext null
 
         val ghInfo = parseGitHubURL(urlString) ?: return@withContext skill
         val skillDir = File(skillsDir, skill.id)
@@ -790,12 +1261,19 @@ class SkillRepository(private val context: Context) {
         val parsed = parseSkillMd(content)
             ?: return@withContext UpdateResult.Failure("Downloaded SKILL.md is not valid (missing YAML frontmatter or 'name:' field)")
 
+        // [fix/da1023-E] The remote document's frontmatter has to travel with
+        // the managed fields. Without it update() kept the old block, so an
+        // "Update from URL" refreshed name / description / body / version while
+        // `subagent`, `max_turns` and `allowed_tools` stayed whatever the disk
+        // already said — a catalogue that changed those keys under an installed
+        // skill never caught up, and nothing was ever reported.
         val ok = update(
             id = skillId,
             name = parsed.name,
             description = parsed.description,
             body = parsed.body,
             version = parsed.version,
+            frontmatter = parsed.frontmatter.ifBlank { null },
         )
         if (!ok) return@withContext UpdateResult.Failure("Failed to write updated skill")
 
@@ -932,17 +1410,77 @@ class SkillRepository(private val context: Context) {
      * name. Used by the Skill detail UI to enumerate bundled scripts.
      */
     fun listSkillFiles(skillId: String): List<String> {
-        val dir = File(skillsDir, skillId)
-        if (!dir.isDirectory) return emptyList()
-        val rootLen = dir.absolutePath.length + 1
-        val files = dir.walkTopDown()
-            .filter { it.isFile && !it.name.startsWith(".") }
-            .map { it.absolutePath.substring(rootLen) }
-            .toList()
+        val files = listFilesUnder(File(skillsDir, skillId))
         return files.sortedWith(compareBy(
             { if (it.equals("SKILL.md", ignoreCase = true)) 0 else 1 },
             { it },
         ))
+    }
+
+    /**
+     * Recursively list [root]'s files as `/`-separated paths relative to it.
+     * Hidden entries are skipped (dotted files are host bookkeeping — `.DS_Store`,
+     * editor swap files — never skill payload). Empty when [root] is not a
+     * directory, which is how every caller distinguishes "no skill dir" from "an
+     * empty one".
+     */
+    private fun listFilesUnder(root: File): List<String> {
+        if (!root.isDirectory) return emptyList()
+        val rootPath = root.absolutePath
+        // `absolutePath` of a directory has no trailing separator, except for "/".
+        val prefixLen = if (rootPath.endsWith(File.separator)) rootPath.length else rootPath.length + 1
+        return root.walkTopDown()
+            .filter { it.isFile && !it.name.startsWith(".") }
+            .map { it.absolutePath.substring(prefixLen) }
+            .toList()
+    }
+
+    /**
+     * [F-10] Delete the files [planStaleSiblingDeletions] flags under [root], then
+     * prune the directories they leave empty (an empty `scripts/` still reads as
+     * "this skill ships scripts" in the file browser). Returns how many files were
+     * removed; a delete failure is logged, never thrown — a stale file must not turn
+     * an otherwise successful sync into a failure.
+     *
+     * Callers must only reach here with a manifest they can prove complete; the
+     * decision itself lives in the pure planner.
+     */
+    private fun deleteStaleSiblingFiles(root: File, keepRelPaths: Collection<String>): Int {
+        val stale = planStaleSiblingDeletions(listFilesUnder(root), keepRelPaths)
+        if (stale.isEmpty()) return 0
+        val rootCanonical = runCatching { root.canonicalPath }.getOrNull() ?: return 0
+        var deleted = 0
+        for (rel in stale) {
+            val target = File(root, rel)
+            // The same containment rule the sibling writers apply: a manifest path
+            // never escapes the skill directory (a `..` entry must not delete
+            // somebody else's file).
+            val canonical = runCatching { target.canonicalPath }.getOrNull() ?: continue
+            if (!canonical.startsWith(rootCanonical + File.separator)) {
+                Log.w(TAG, "[F-10] refusing to delete out-of-tree path $rel")
+                continue
+            }
+            if (runCatching { target.delete() }.getOrDefault(false)) {
+                deleted++
+                pruneEmptyParents(target.parentFile, root)
+            } else {
+                Log.w(TAG, "[F-10] could not delete stale $rel")
+            }
+        }
+        if (deleted > 0) Log.i(TAG, "[F-10] removed $deleted stale file(s) under ${root.name}")
+        return deleted
+    }
+
+    /** Delete [dir] and its ancestors while they are empty; never touches [root]. */
+    private fun pruneEmptyParents(dir: File?, root: File) {
+        val rootCanonical = runCatching { root.canonicalPath }.getOrNull() ?: return
+        var current = dir ?: return
+        while (runCatching { current.canonicalPath }.getOrNull() != rootCanonical) {
+            val children = current.list()
+            if (children == null || children.isNotEmpty()) return
+            if (!current.delete()) return
+            current = current.parentFile ?: return
+        }
     }
 
     /**
@@ -955,12 +1493,19 @@ class SkillRepository(private val context: Context) {
         val current = _skills.value.find { it.id == skillId } ?: return null
         val file = File(File(skillsDir, skillId), "SKILL.md")
         if (!file.exists()) return null
-        val parsed = parseSkillMd(file.readText()) ?: return null
+        val raw = file.readText()
+        val parsed = parseSkillMd(raw) ?: return null
+        // [B14b] Refresh the frontmatter snapshot alongside name/description/...
+        // — SKILL.md edits (agent writeSkillFile, user) ride through here, and
+        // dropping the block from the copy() emptied the in-memory frontmatter,
+        // so SubagentSkill lost frontmatter-only keys (subagent, max_turns,
+        // allowed_tools) after the first rescan.
         val refreshed = current.copy(
             name = parsed.name,
             description = parsed.description,
             version = parsed.version,
             body = parsed.body,
+            frontmatter = SubagentSkill.extractFrontmatterBlock(raw),
             updatedAt = System.currentTimeMillis(),
         )
         db.execSQL(
@@ -983,8 +1528,15 @@ class SkillRepository(private val context: Context) {
         val file = File(File(skillsDir, skillId), "SKILL.md")
         if (file.exists()) {
             val original = file.readText()
-            val updated = original.replaceFirst(Regex("(?m)^name:\\s*.*$"), "name: $trimmed")
-            if (updated != original) file.writeText(updated)
+            // [B14b] Only rewrite the `name:` line inside the frontmatter block —
+            // the previous full-document replaceFirst fired on the whole file, so
+            // when a SKILL.md has no frontmatter a `name:` example line in the
+            // markdown body was silently rewritten. Pure string work lives in the
+            // companion so JVM tests exercise the real code (same split as
+            // [mergeFrontmatter]). null → file left untouched.
+            renameFrontmatterName(original, trimmed)?.let { updated ->
+                if (updated != original) file.writeText(updated)
+            }
         }
         val refreshed = current.copy(name = trimmed, updatedAt = System.currentTimeMillis())
         db.execSQL(
@@ -1048,6 +1600,14 @@ class SkillRepository(private val context: Context) {
             outcome = agg,
         )
         val finalReason = agg.firstReason
+        // [F-10] Upstream-removed files leave the directory too — but only on a walk
+        // we can prove COMPLETE (no failed download, no bail-out before listing) and
+        // only with a non-empty manifest. A truncated listing is indistinguishable
+        // from "upstream has nothing", and acting on that guess would delete the
+        // skill's whole payload.
+        if (agg.filesFailed == 0 && finalReason == null && agg.seenRelPaths.isNotEmpty()) {
+            deleteStaleSiblingFiles(destDir, agg.seenRelPaths)
+        }
         Log.i(TAG, "[siblings] done skill=${skill.id} written=${agg.filesWritten} failed=${agg.filesFailed} reason=${finalReason ?: "(none)"}")
         return SiblingDownloadOutcome(agg.filesWritten, agg.filesFailed, finalReason)
     }
@@ -1062,6 +1622,12 @@ class SkillRepository(private val context: Context) {
         var filesWritten = 0
         var filesFailed = 0
         var firstReason: String? = null
+        /**
+         * [F-10] Every skill-relative path the walk actually landed (written or
+         * byte-identical), i.e. the manifest upstream currently ships. Consumed by
+         * [downloadSiblingFiles] to drop files upstream no longer has.
+         */
+        val seenRelPaths = mutableSetOf<String>()
         fun recordFailure(reason: String) {
             filesFailed += 1
             if (firstReason == null) firstReason = reason
@@ -1152,6 +1718,7 @@ class SkillRepository(private val context: Context) {
             } else {
                 Log.i(TAG, "[siblings] kept $relPath (unchanged, ${fileData.size}B)")
             }
+            outcome.seenRelPaths.add(relPath.replace('\\', '/'))
             outcome.filesWritten += 1
         }
     }
@@ -1331,8 +1898,18 @@ class SkillRepository(private val context: Context) {
      * (semantic-memory, github-ops, cloudflare-fullright-ops) ship
      * in the app out of the box.
      *
-     * Version-gated: a skill already installed at the same-or-newer version
-     * is left untouched (preserves any user edits and skips redundant I/O).
+     * Two gates, deliberately different scopes:
+     *  - **SKILL.md / registry row** — version-gated (same-or-newer local
+     *    version is left untouched; preserves user edits and blocks silent
+     *    downgrades of a newer user-imported copy).
+     *  - **sibling payload** (`scripts/`, `*.py`, `*.pkl`, …) — content-hash
+     *    gated via [SkillAssetSync]'s manifest, so a script-only fix ships
+     *    without anyone bumping the version string. See that file for the
+     *    2026-10-14 incident this fixes.
+     *  - **row source label** — a row we can prove is our own copy (its
+     *    declaration still equals the shipped one) is adopted to
+     *    [ImportSource.BUNDLED] even when it is labelled something else, so the
+     *    payload gate above is actually reachable. See [adoptBundledRow].
      */
     private fun installBundledSkills() {
         try {
@@ -1356,12 +1933,33 @@ class SkillRepository(private val context: Context) {
 
         val parsed = parseSkillMd(content) ?: return
         val bundledVersion = parsed.version.ifBlank { "1.0.0" }
-        val existing = _skills.value.find { it.id == dirName }
+        val rowBefore = _skills.value.find { it.id == dirName }
+
+        // [fix/bundled-row-adoption] A shipped skill's row can carry a foreign
+        // source label — the maintainer device has all four labelled `file`
+        // (「文件导入」), version equal to the shipped one, on-disk SKILL.md
+        // byte-identical to the APK's. Without this the guard inside the early
+        // return below skipped exactly those installs, so the content-hash gate
+        // never ran and script-only fixes stayed in the APK. Adopt once, then
+        // the row takes the normal BUNDLED path on every later launch.
+        val existing = if (rowBefore != null && isAdoptableBundledRow(rowBefore, parsed, bundledVersion)) {
+            adoptBundledRow(rowBefore, dirName)
+        } else {
+            rowBefore
+        }
 
         // Skip if local version is same or newer. Semantic comparison, not
         // lexical — a lexical `">="` would treat "1.10.0" as older than
         // "1.9.0" and re-downgrade a newer install on every launch.
-        if (existing != null && compareVersions(existing.version, bundledVersion) >= 0) return
+        // [fix/bundled-skill-asset-hash-gate] The early return only covers the
+        // SKILL.md/row update: the sibling payload is gated by a content hash
+        // inside syncBundledSiblings, so a script-only fix reaches existing
+        // installs without a version bump. Only BUNDLED-sourced rows are
+        // synced — a user-imported copy at the same version is theirs to keep.
+        if (existing != null && compareVersions(existing.version, bundledVersion) >= 0) {
+            if (existing.importSource == ImportSource.BUNDLED) syncBundledSiblings(dirName)
+            return
+        }
 
         if (existing != null) {
             val updated = existing.copy(
@@ -1369,13 +1967,31 @@ class SkillRepository(private val context: Context) {
                 version = bundledVersion,
                 body = parsed.body,
                 updatedAt = System.currentTimeMillis(),
+                // [fix/audit-1015-b2d] Refresh the frontmatter from the
+                // incoming content, mirroring the replace path in
+                // importFromContent (see [fix/subagent-frontmatter-newskill]):
+                // writeSkillMd merges against this field, and a stale block
+                // here made a version upgrade shadow frontmatter-only keys
+                // (`subagent: true`, max_turns, allowed_tools) until the next
+                // full reload. [fix/da1023-E] That sentence is only true after
+                // this batch: with the pre-fix `existing ?: skill.frontmatter`
+                // base the field was ignored whenever a SKILL.md already
+                // existed — i.e. on EVERY upgrade — so this refresh changed
+                // memory only and the disk kept the previous block. Keep the
+                // previous block when the incoming document has none.
+                // importSource is deliberately NOT touched:
+                // if the row was adopted to BUNDLED it already is; a
+                // user-imported row that reached this branch (their version is
+                // older) keeps its own source label — that is the version
+                // gate's contract, not ours to overwrite.
+                frontmatter = parsed.frontmatter.ifBlank { existing.frontmatter },
             )
             db.execSQL(
                 "UPDATE skills SET description=?, version=?, updated_at=? WHERE id=?",
                 arrayOf<Any>(updated.description, bundledVersion, updated.updatedAt, dirName)
             )
             writeSkillMd(updated)
-            extractBundledSiblings(dirName)
+            syncBundledSiblings(dirName)
             _skills.value = _skills.value.map { if (it.id == dirName) updated else it }
             Log.i(TAG, "Upgraded bundled skill: $dirName → v$bundledVersion")
         } else {
@@ -1388,52 +2004,152 @@ class SkillRepository(private val context: Context) {
                 // [fix/subagent-frontmatter-newskill] Carry the bundled block
                 // so a first install keeps `subagent: true` / max_turns /
                 // allowed_tools on disk and in memory.
-                frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+                frontmatter = parsed.frontmatter,
+                // [fix/da1021-A] A bundled skill must land under its assets
+                // dirName — the sibling payload was extracted into
+                // <dirName>/ by syncBundledSiblings. Without this, a SKILL.md
+                // whose name slugified differently from the dirName (e.g. a
+                // CJK name) landed under a different slug than the payload.
+                preferredId = dirName,
             )
-            extractBundledSiblings(dirName)
+            syncBundledSiblings(dirName)
             Log.i(TAG, "Installed bundled skill: $dirName (v$bundledVersion)")
         }
     }
 
     /**
-     * Recursively copy every sibling file under `assets/skills/<dirName>/`
-     * (scripts/, data/, .py, .pkl, requirements.json, …) into the skill's
-     * sandbox directory. SKILL.md is skipped at the top level because
-     * `add()` / `writeSkillMd()` already wrote it from the parsed body.
+     * [fix/bundled-row-adoption] Wiring half of the adoption decision — see
+     * [SkillAssetSync.isAdoptableBundledRow] for the incident (all four shipped
+     * skills labelled `file` on the maintainer device) and for why the
+     * declaration, not the file bytes, is what gets compared.
      */
-    private fun extractBundledSiblings(dirName: String) {
-        val destDir = File(skillsDir, dirName)
-        destDir.mkdirs()
-        copyAssetsRecursive("skills/$dirName", destDir, skipTopLevelMd = true)
+    private fun isAdoptableBundledRow(existing: Skill, parsed: ParsedSkill, bundledVersion: String): Boolean =
+        SkillAssetSync.isAdoptableBundledRow(
+            storedSource = existing.importSource.value,
+            bundledSource = ImportSource.BUNDLED.value,
+            stored = SkillAssetSync.Declaration(existing.name, existing.description, existing.version),
+            bundled = SkillAssetSync.Declaration(parsed.name, parsed.description, bundledVersion),
+        )
+
+    /**
+     * Relabel a row we have proven to be our own copy of a shipped skill.
+     *
+     * Only the source column moves: the declaration already equals the shipped
+     * one (that is what the caller proved) and [syncBundledSiblings] owns the
+     * payload. `updated_at` is deliberately left alone — adoption is not a
+     * content change, and stamping it would erase the row's provenance in the
+     * skills UI.
+     */
+    private fun adoptBundledRow(existing: Skill, dirName: String): Skill {
+        val adopted = existing.copy(importSource = ImportSource.BUNDLED)
+        db.execSQL(
+            "UPDATE skills SET import_source=? WHERE id=?",
+            arrayOf<Any>(adopted.importSource.value, dirName)
+        )
+        _skills.value = _skills.value.map { if (it.id == dirName) adopted else it }
+        Log.i(TAG, "Adopted mislabeled bundled skill: $dirName (source was ${existing.importSource.value})")
+        return adopted
     }
 
-    private fun copyAssetsRecursive(assetPath: String, destDir: File, skipTopLevelMd: Boolean) {
-        try {
-            val entries = context.assets.list(assetPath) ?: return
-            for (entry in entries) {
-                if (skipTopLevelMd && entry == "SKILL.md") continue
-                val childAsset = "$assetPath/$entry"
-                val childFile = File(destDir, entry)
-                // A path under assets that lists child entries is a directory.
-                val isDir = try {
-                    val sub = context.assets.list(childAsset)
-                    !(sub == null || sub.isEmpty())
-                } catch (_: Exception) { false }
-                if (isDir) {
-                    childFile.mkdirs()
-                    copyAssetsRecursive(childAsset, childFile, skipTopLevelMd = false)
-                } else {
-                    try {
-                        context.assets.open(childAsset).use { input ->
-                            childFile.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to extract $childAsset: ${e.message}")
+    /** Sidecar manifest recording the payload hash of the last extraction. */
+    private val bundledAssetManifest: File
+        get() = File(skillsDir, SkillAssetSync.MANIFEST_NAME)
+
+    /**
+     * Sync the sibling payload under `assets/skills/<dirName>/` (scripts/,
+     * data/, *.py, *.pkl, requirements.json, …) into the skill's sandbox
+     * directory — but only when the payload actually changed.
+     *
+     * [fix/bundled-skill-asset-hash-gate] Content-hash gated (see
+     * [SkillAssetSync]): the manifest holds the hash of what we last wrote, so
+     * a script-only fix in a new APK is picked up even when nobody bumped the
+     * SKILL.md version. Conversely, user edits to a bundled script survive
+     * every launch (and every version bump) whose payload matches the one we
+     * extracted. SKILL.md is skipped at the top level — the version-gated path
+     * (`writeSkillMd`) owns that file.
+     */
+    private fun syncBundledSiblings(dirName: String) {
+        val entries = collectAssetEntries("skills/$dirName", relPrefix = "", skipTopLevelMd = true)
+        val current = SkillAssetSync.payloadHash(entries)
+        val stored = readBundledAssetHashes()[dirName]
+        if (!SkillAssetSync.needsExtraction(stored, current)) return
+
+        val destDir = File(skillsDir, dirName)
+        destDir.mkdirs()
+        var written = 0
+        for (e in entries) {
+            val target = File(destDir, e.path)
+            target.parentFile?.mkdirs()
+            try {
+                target.writeBytes(e.bytes)
+                written++
+            } catch (ex: Exception) {
+                Log.w(TAG, "Failed to extract ${e.path}: ${ex.message}")
+            }
+        }
+        if (written != entries.size) {
+            // A partial extraction (disk full, kill mid-write) must not be
+            // frozen as "current": leaving the manifest untouched makes the
+            // next launch retry instead of shipping a half-written script.
+            Log.w(TAG, "Bundled sibling sync for $dirName incomplete ($written/${entries.size} files); retrying next launch")
+            return
+        }
+        recordBundledAssetHash(dirName, current)
+        Log.i(TAG, "Synced bundled siblings for $dirName ($written files, hash=${current.take(12)})")
+    }
+
+    /** Read the sibling payload of a bundled skill into memory as (relPath, bytes). */
+    private fun collectAssetEntries(
+        assetPath: String,
+        relPrefix: String,
+        skipTopLevelMd: Boolean,
+    ): List<SkillAssetSync.Entry> {
+        val out = mutableListOf<SkillAssetSync.Entry>()
+        val entries = try {
+            context.assets.list(assetPath) ?: return out
+        } catch (e: Exception) {
+            Log.w(TAG, "list($assetPath): ${e.message}")
+            return out
+        }
+        for (entry in entries) {
+            if (relPrefix.isEmpty() && skipTopLevelMd && entry == "SKILL.md") continue
+            val childAsset = "$assetPath/$entry"
+            val rel = if (relPrefix.isEmpty()) entry else "$relPrefix/$entry"
+            // A path under assets that lists child entries is a directory.
+            val isDir = try {
+                val sub = context.assets.list(childAsset)
+                !(sub == null || sub.isEmpty())
+            } catch (_: Exception) { false }
+            if (isDir) {
+                out += collectAssetEntries(childAsset, relPrefix = rel, skipTopLevelMd = false)
+            } else {
+                try {
+                    context.assets.open(childAsset).use { input ->
+                        out += SkillAssetSync.Entry(rel, input.readBytes())
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read $childAsset: ${e.message}")
                 }
             }
+        }
+        return out
+    }
+
+    private fun readBundledAssetHashes(): Map<String, String> = try {
+        val f = bundledAssetManifest
+        if (f.exists()) SkillAssetSync.parseManifest(f.readText()) else emptyMap()
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to read ${SkillAssetSync.MANIFEST_NAME}: ${e.message}")
+        emptyMap()
+    }
+
+    private fun recordBundledAssetHash(dirName: String, hash: String) {
+        try {
+            val merged = readBundledAssetHashes() + (dirName to hash)
+            bundledAssetManifest.parentFile?.mkdirs()
+            bundledAssetManifest.writeText(SkillAssetSync.renderManifest(merged))
         } catch (e: Exception) {
-            Log.w(TAG, "copyAssetsRecursive($assetPath): ${e.message}")
+            Log.w(TAG, "Failed to write ${SkillAssetSync.MANIFEST_NAME}: ${e.message}")
         }
     }
 
@@ -1673,7 +2389,17 @@ class SkillRepository(private val context: Context) {
         // re-imported. Seed the merge with the caller's frontmatter block:
         // mergeFrontmatter swaps the three managed keys in place and carries
         // every other key verbatim.
-        val mergeBase = existing ?: skill.frontmatter.ifBlank { null }
+        //
+        // [fix/da1023-E] But seeding only worked while no file existed: the
+        // pre-fix base was `existing ?: skill.frontmatter`, so the disk
+        // shadowed the caller's block on EVERY path that already had a file —
+        // updateFromURL / update-from-file refreshed name/description/body
+        // while silently keeping the old extended keys, and an editor save
+        // couldn't delete a `subagent: true` the user had just removed.
+        // The base now resolves memory-first through [resolveMergeBase]
+        // (one exit for the rule; callers without a fresh block re-seed from
+        // disk, so plain renames keep disk-wins semantics there).
+        val mergeBase = resolveMergeBase(skill.frontmatter, existing)
         val content = mergeFrontmatter(
             existing = mergeBase,
             name = skill.name,
@@ -1715,6 +2441,13 @@ class SkillRepository(private val context: Context) {
         val description: String,
         val version: String = "1.0.0",
         val body: String,
+        // [fix/da1023-E] Raw frontmatter block of the parsed document (`---`
+        // delimiters included), "" when it has none. [body] is
+        // frontmatter-STRIPPED, so every frontmatter-only key rides on this
+        // field — without it, the callers that only get a ParsedSkill
+        // (updateFromURL, update-from-file) had no way to hand the NEW block
+        // to writeSkillMd, and the landing kept the old extended keys.
+        val frontmatter: String = "",
     )
 
     /**
@@ -1826,7 +2559,16 @@ class SkillRepository(private val context: Context) {
             lines.subList(bodyStartLine, lines.size).joinToString("\n").trim('\n')
         } else ""
 
-        return ParsedSkill(name, description, version, body)
+        // [fix/da1023-E] Hand the raw block to the caller too (see
+        // ParsedSkill.frontmatter) so update paths can seed writeSkillMd's
+        // memory-first merge base with the NEW frontmatter.
+        return ParsedSkill(
+            name,
+            description,
+            version,
+            body,
+            frontmatter = SubagentSkill.extractFrontmatterBlock(trimmed),
+        )
     }
 
     private fun slugify(name: String): String =

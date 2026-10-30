@@ -50,12 +50,13 @@ import java.util.regex.PatternSyntaxException
  *   minis-fastio tar -xf <a.tar> [-C dir]   write: unpack (tar-slip guarded)
  *
  * The read-only primitives (`du` / `find` / `grep`) are NOT gated — they grant
- * nothing the agent's `file_read` does not already have. Every WRITE primitive
- * is gated by [OffloadGate] under its own permission row (ASK_ONCE by default):
- * `fastio_rm`, `fastio_cp`, `fastio_mv`, `fastio_tar` — one row per write tool,
- * so a user who trusts deletion does not thereby authorise overwriting, and
- * neither of them silently authorises writing an archive out (or expanding one
- * in).
+ * nothing the agent's `file_read` does not already have. The WRITE primitives
+ * are gated by [OffloadGate] under their own rows (`fastio_rm`, `fastio_cp`,
+ * `fastio_mv`, `fastio_tar` — one row per write tool so a per-tool override
+ * stays possible), but their default is BYPASS: [GuestPathMapper] limits their
+ * reachable set to the app's own sandbox, which the guest shell already
+ * reaches unrestricted, so asking per delete bought nothing a shell `rm -rf`
+ * does not already allow. A user who WANTS a prompt can still downgrade a row.
  *
  * ## Guards on the destructive / write paths
  *
@@ -77,11 +78,15 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val rawArgv = request.argv.drop(1)
-        // The subcommand is the first token. `normalizeTarShorts` already
-        // depends on that convention (its own `firstOrNull() != "tar"` guard),
-        // so this predicate is deliberately the SAME expression — the expander
-        // and the flag set below can never drift apart.
-        val isTarCommand = rawArgv.firstOrNull() == "tar"
+        // [da1020-C] The subcommand token is found PAST any leading options —
+        // the global output flags (`--compact` / `-q` / `--quiet`) take no
+        // value, so `--compact tar -cf a.tar x` still names `tar` as the
+        // subcommand. `normalizeTarShorts` calls the SAME helper for its own
+        // guard, so the expander and the flag set below can never drift apart
+        // (they used to be two copies of `firstOrNull() == "tar"`, which broke
+        // whenever a global output flag preceded the subcommand: the tar verbs
+        // went undeclared and the `-cf` expansion never ran).
+        val isTarCommand = firstSubcommandToken(rawArgv) == "tar"
         val args = OffloadArgs(
             // `find`-style single-dash long options (`-name`, `-type`, `-limit`)
             // are rewritten to their `--` spelling first: OffloadArgs reads any
@@ -90,28 +95,9 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // path. Rewriting here leaves the parser shared by all ~46 handlers
             // untouched.
             normalizeLongOptionSpelling(normalizeTarShorts(rawArgv)),
-            // `--recursive` / `--force` / `--ignore-case` are booleans, not
-            // `--key value` pairs. Without this declaration OffloadArgs consumes
-            // the NEXT token as the option's value, so `rm --recursive /tmp/x`
-            // lost the path and reported "missing <path>" instead of deleting
-            // anything.
-            //
-            // The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
-            // modes too, but they are declared ONLY for `tar`. The parser turns
-            // any UNKNOWN `--key` into a `--key value` pair, so declaring them
-            // for every subcommand made `du --create btree` treat `--create` as
-            // a flag and silently walk `btree` (exit 0), where the intended
-            // behaviour is the parser's own "missing <path>" (exit 2). Scope —
-            // not acceptance — is the contract.
-            booleanFlags = if (isTarCommand) {
-                setOf(
-                    "recursive", "force", "ignore-case",
-                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
-                    "create", "extract", "gzip", "verbose",
-                )
-            } else {
-                setOf("recursive", "force", "ignore-case")
-            },
+            // Declared booleans — see [fastioBooleanFlags] for why the tar
+            // verbs are scoped to `tar` only.
+            booleanFlags = fastioBooleanFlags(isTarCommand),
         )
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 
@@ -142,6 +128,14 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val bindings = bindingsFor(request)
         val maxEntries = (args.getLong("max-entries") ?: DEFAULT_MAX_ENTRIES)
             .coerceIn(1L, HARD_MAX_ENTRIES)
+        // [meta1028-B05 F-11] ONE entry budget for the whole command, as
+        // DEFAULT_MAX_ENTRIES documents ("one entry budget for the whole
+        // command, not per path"). Handing `maxEntries` to every root made a
+        // `du a b c d e` call bound 5 × 2,000,000 entries — the flag read as a
+        // per-path cap while `tar` spent the same flag once per command, so the
+        // same number meant two different amounts of work. [entryBudget] is
+        // decremented by what each root actually visited.
+        var entryBudget = maxEntries
         val startedNs = System.nanoTime()
 
         val results = JSONArray()
@@ -166,7 +160,8 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         entry.put("error", "not_found")
                     } else {
                         val totals = WalkTotals()
-                        walkForSize(path, totals, maxEntries)
+                        walkForSize(path, totals, entryBudget)
+                        entryBudget = (entryBudget - totals.visited).coerceAtLeast(0)
                         entry.put("files", totals.files)
                             .put("dirs", totals.dirs)
                             .put("bytes", totals.bytes)
@@ -328,6 +323,9 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val limit = (args.getInt("limit") ?: DEFAULT_FIND_LIMIT).coerceIn(1, HARD_MATCH_LIMIT)
         val maxEntries = (args.getLong("max-entries") ?: DEFAULT_MAX_ENTRIES)
             .coerceIn(1L, HARD_MAX_ENTRIES)
+        // [meta1028-B05 F-11] see `du`: one budget for the whole command, spent
+        // as the roots are walked rather than granted anew to each.
+        var entryBudget = maxEntries
         val bindings = bindingsFor(request)
         val startedNs = System.nanoTime()
 
@@ -354,7 +352,8 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         entry.put("error", "not_found")
                     } else {
                         val outcome = FindOutcome()
-                        findTree(path, resolution.guestPath, matcher, typeFilter, remaining, maxEntries, outcome)
+                        findTree(path, resolution.guestPath, matcher, typeFilter, remaining, entryBudget, outcome)
+                        entryBudget = (entryBudget - outcome.visited).coerceAtLeast(0)
                         val matches = JSONArray()
                         for (match in outcome.matches) {
                             matches.put(
@@ -435,12 +434,16 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val bindings = bindingsFor(request)
         val startedNs = System.nanoTime()
 
+        // [meta1028-B05 F-11] see `du`: one budget for the whole command.
+        var entryBudget = maxEntries
+
         val results = JSONArray()
         var totalMatches = 0L
         var totalScanned = 0L
         var totalBinary = 0L
         var totalLarge = 0L
         var totalLinks = 0L
+        var totalSpecial = 0L
         var totalBytes = 0L
         var truncated = false
         var capped = false
@@ -461,7 +464,8 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         entry.put("error", "not_found")
                     } else {
                         val outcome = GrepOutcome()
-                        grepTree(path, resolution.guestPath, regex, remaining, maxEntries, outcome)
+                        grepTree(path, resolution.guestPath, regex, remaining, entryBudget, outcome)
+                        entryBudget = (entryBudget - outcome.visited).coerceAtLeast(0)
                         val matches = JSONArray()
                         for (match in outcome.matches) {
                             matches.put(
@@ -476,6 +480,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                             .put("files_skipped_binary", outcome.filesSkippedBinary)
                             .put("files_skipped_large", outcome.filesSkippedLarge)
                             .put("files_skipped_link", outcome.filesSkippedLink)
+                            .put("files_skipped_special", outcome.filesSkippedSpecial)
                             .put("bytes_scanned", outcome.bytesScanned)
                         if (outcome.truncated) entry.put("truncated", true)
                         if (outcome.matchesCapped) entry.put("matches_capped", true)
@@ -488,6 +493,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         totalBinary += outcome.filesSkippedBinary
                         totalLarge += outcome.filesSkippedLarge
                         totalLinks += outcome.filesSkippedLink
+                        totalSpecial += outcome.filesSkippedSpecial
                         totalBytes += outcome.bytesScanned
                         truncated = truncated || outcome.truncated
                         capped = capped || outcome.matchesCapped
@@ -508,6 +514,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                     .put("files_skipped_binary", totalBinary)
                     .put("files_skipped_large", totalLarge)
                     .put("files_skipped_link", totalLinks)
+                    .put("files_skipped_special", totalSpecial)
                     .put("bytes_scanned", totalBytes),
             )
             .put("engine", "java.util.regex")
@@ -666,7 +673,12 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
         val archiveResolution = GuestPathMapper.resolve(archiveRaw, request.cwd, bindings)
         if (archiveResolution is GuestPathMapper.Resolution.Denied) {
-            return finishTar(deniedEntry(archiveRaw, archiveResolution), false, startedNs, args)
+            // A refused archive path means NO archive was written, so the exit
+            // code must say so: `false` here returned 0 with an error object in
+            // the body, which `set -e` and `&&` chains read as success. Matches
+            // the destination-denied branch in tarExtractFrom (same shape, true).
+            // (deep-audit-1019 ISSUE-03)
+            return finishTar(deniedEntry(archiveRaw, archiveResolution), true, startedNs, args)
         }
         val archive = archiveResolution as GuestPathMapper.Resolution.Ok
         val archivePath = Paths.get(archive.hostPath)
@@ -741,12 +753,23 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             )
         }
 
+        // [dv15-A2] A-04: the archive path's LAST segment is deliberately left
+        // unresolved by GuestPathMapper (that is what keeps `rm <link>` working),
+        // so a symbolic link sitting here would make newOutputStream WRITE
+        // THROUGH it to whatever host path it names — `--force` is what made that
+        // reachable. Refuse the link itself (exit 2). Without `--force` a link is
+        // already refused above as `already_exists`; this guard is what stops the
+        // `--force` write-through.
+        if (Files.isSymbolicLink(archivePath)) {
+            return refuseLinkedArchive(entry, "write", startedNs, args)
+        }
+
         val outcome = TarCreateOutcome()
         try {
             Files.createDirectories(archivePath.parent)
             val raw = Files.newOutputStream(archivePath)
             val sink = if (gzip) java.util.zip.GZIPOutputStream(raw) else raw
-            sink.use { tarCreate(it, members, tarEntryBudget(args), outcome) }
+            sink.use { tarCreate(it, members, tarEntryBudget(args), outcome, archivePath) }
         } catch (e: Exception) {
             outcome.errors.add("${entry.getString("archive")}: ${e.message}")
         }
@@ -757,6 +780,13 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         if (outcome.skippedSpecial > 0) {
             entry.put("skipped_special", outcome.skippedSpecial)
             entry.put("skipped_names", JSONArray(outcome.skippedNames))
+        }
+        // [§6 F8] The archive was inside the tree it packs, so the walk met it.
+        // Reported, not silent: the member list of the written archive genuinely
+        // does not contain `a.tar` even though `a.tar` was named by the root.
+        if (outcome.skippedSelf > 0) {
+            entry.put("skipped_self", outcome.skippedSelf)
+            entry.put("skipped_self_names", JSONArray(outcome.skippedSelfNames))
         }
         if (outcome.truncated) entry.put("truncated", true)
         val archiveBytes = try {
@@ -815,6 +845,14 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             )
         }
 
+        // [dv15-A2] A-04: the two checks above are NOFOLLOW, so a link passes
+        // both of them; openArchive's newInputStream is NOT NOFOLLOW, so it would
+        // READ THROUGH the link to whatever host path it names. Same boundary as
+        // the write side — refuse the link instead of following it.
+        if (Files.isSymbolicLink(archivePath)) {
+            return refuseLinkedArchive(entry, "read", startedNs, args)
+        }
+
         val destPath = Paths.get(dest.hostPath)
         val budget = tarEntryBudget(args)
         val validation = TarExtractOutcome()
@@ -839,6 +877,12 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             .put("dirs", outcome.dirs)
             .put("symlinks", outcome.symlinks)
             .put("bytes", outcome.bytes)
+        // [§6 F2] LNKTYPE members are materialised by copy, so `files` already
+        // counts them; `hard_links` says how many of those files came from a
+        // link rather than from a payload. `skipped_hardlink` now means "the
+        // target named by the link was never unpacked" (an error, not a
+        // limitation) and appears next to `errors`.
+        if (outcome.hardLinked > 0) entry.put("hard_links", outcome.hardLinked)
         if (outcome.skippedHardlink > 0) entry.put("skipped_hardlink", outcome.skippedHardlink)
         if (outcome.skippedSpecial > 0) entry.put("skipped_special", outcome.skippedSpecial)
         if (outcome.paxHeaders > 0) entry.put("pax_headers", outcome.paxHeaders)
@@ -861,12 +905,51 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         failed: Boolean,
         startedNs: Long,
         args: OffloadArgs,
+    ): NativeOffloadResult = finishTarWith(entry, if (failed) 1 else 0, startedNs, args)
+
+    /**
+     * [dv15-A2] A-04: [finishTar] with an explicit exit code and the same body
+     * shape, because "the archive path itself is unusable" is a usage error
+     * (exit 2) and not the plain failure (exit 1) the boolean can express.
+     */
+    private fun finishTarWith(
+        entry: JSONObject,
+        exitCode: Int,
+        startedNs: Long,
+        args: OffloadArgs,
     ): NativeOffloadResult {
         val body = JSONObject()
             .put("results", JSONArray().put(entry))
             .put("elapsed_ms", (System.nanoTime() - startedNs) / 1_000_000)
-        return NativeOffloadResult(if (failed) 1 else 0, OffloadOutput.formatBody(body.toString(2), args) + "\n")
+        return NativeOffloadResult(exitCode, OffloadOutput.formatBody(body.toString(2), args) + "\n")
     }
+
+    /**
+     * [dv15-A2] A-04: the archive path is a symbolic link. GuestPathMapper leaves
+     * the LAST segment of a guest path unresolved on purpose (that is what keeps
+     * `rm <link>` working), so the archive path is a host path whose final
+     * component may be a link to ANY host file: `newOutputStream` would write
+     * through it (create, reachable with `--force`) and `newInputStream` would
+     * read through it (extract). That crosses the guest/host boundary this
+     * handler exists to enforce. The link itself is refused (exit 2) rather than
+     * resolved or deleted — resolving would lose `rm <link>` semantics, and
+     * deleting would clobber a path the caller never named.
+     */
+    private fun refuseLinkedArchive(
+        entry: JSONObject,
+        verb: String,
+        startedNs: Long,
+        args: OffloadArgs,
+    ): NativeOffloadResult = finishTarWith(
+        entry.put("error", "unsafe_archive_path").put(
+            "detail",
+            "'${entry.getString("archive")}' is a symbolic link; fastio tar refuses to $verb through it. " +
+                "Remove the link first, or name a path whose last segment is a real file.",
+        ),
+        2,
+        startedNs,
+        args,
+    )
 
     /**
      * Write-path policy, applied AFTER translation and BEFORE the target is
@@ -946,7 +1029,20 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             .put("detail", denied.detail)
 
     private fun usage(reason: String, args: OffloadArgs): String =
-        OffloadOutput.formatBody("minis-fastio: $reason\n$HELP", args) + "\n"
+        // [da1034-A4] ISSUE-08: every caller is an exit-2 usage error, so the
+        // payload is the JSON envelope the error paths use — prose (plus a
+        // bare HELP dump) passed through formatBody untouched and broke a
+        // `jq` / `json.loads` reader. `help` keeps the full HELP text
+        // reachable; `--quiet` now returns just the `error` field, like every
+        // other envelope in this repo.
+        OffloadOutput.formatBody(
+            JSONObject()
+                .put("error", "usage")
+                .put("message", reason)
+                .put("help", HELP)
+                .toString(),
+            args,
+        ) + "\n"
 
     /**
      * Refuse an option this subcommand does not implement. Without this a typo
@@ -1007,6 +1103,122 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         )
 
         /**
+         * [da1020-C] Boolean flags the shared parser must declare, keyed by
+         * whether the invocation is a `tar` command. Kept pure so both arms
+         * stay testable off-device:
+         *
+         * `--recursive` / `--force` / `--ignore-case` are booleans, not
+         * `--key value` pairs. Without this declaration OffloadArgs consumes
+         * the NEXT token as the option's value, so `rm --recursive /tmp/x`
+         * lost the path and reported "missing <path>" instead of deleting
+         * anything.
+         *
+         * The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
+         * modes too, but they are declared ONLY for `tar`. The parser turns
+         * any UNKNOWN `--key` into a `--key value` pair, so declaring them
+         * for every subcommand made `du --create btree` treat `--create` as
+         * a flag and silently walk `btree` (exit 0), where the intended
+         * behaviour is "missing <path>" (exit 2). Scope — not acceptance —
+         * is the contract.
+         */
+        internal fun fastioBooleanFlags(isTarCommand: Boolean): Set<String> =
+            if (isTarCommand) {
+                setOf(
+                    "recursive", "force", "ignore-case",
+                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
+                    "create", "extract", "gzip", "verbose",
+                )
+            } else {
+                setOf("recursive", "force", "ignore-case")
+            }
+
+        /**
+         * [da1020-C] The subcommand is the first token that is not part of a
+         * leading option cluster. Mirrors OffloadArgs' own token rule so the
+         * raw-argv scan and the shared parse agree:
+         *   - global output flags (`--compact` / `-q` / `--quiet`, see
+         *     [OffloadOutput.OUTPUT_FLAGS]) and short flags take no value;
+         *   - a `--key value` pair consumes the next token, exactly as an
+         *     UNKNOWN `--key` does in OffloadArgs;
+         *   - `--key=value` is self-contained;
+         *   - the first non-option token names the subcommand.
+         * `isTarCommand` and [normalizeTarShorts] both call this, so the flag
+         * set and the expander can never drift apart.
+         */
+        internal fun firstSubcommandToken(rawArgv: List<String>): String? {
+            // [dv14-A1] ISSUE-04: the "takes no value" set must mirror the ONE
+            // the shared parse will actually use. OffloadArgs treats every name
+            // in `effectiveBooleanFlags` (declared `booleanFlags` +
+            // [OffloadOutput.OUTPUT_FLAGS]) as a bare flag, so this scan must
+            // too: [fastioBooleanFlags] is passed `isTarCommand = true` — the
+            // superset — because this scan runs BEFORE the subcommand is known.
+            // It used to know only about OUTPUT_FLAGS, so a leading `--force` /
+            // `--verbose` / `--create` swallowed `tar` as if it were that
+            // option's value: `isTarCommand` came out false, [normalizeTarShorts]
+            // bailed out, and both the `-cf`/`-xf` expansion and the tar-only
+            // boolean verbs went missing (`minis-fastio --force tar -xf a.tar`
+            // failed with exit 2).
+            //
+            // The `find`-style single-dash longs ([SHORT_LONG_OPTIONS]) are
+            // modelled too: [normalizeLongOptionSpelling] rewrites them to their
+            // `--` spelling before the parse, so `-limit 10 tar …` names `tar`
+            // here even though the raw token still carries one dash.
+            //
+            // [dv18-A A-01b] The same "which raw spelling will consume a value"
+            // question applies to the raw single-dash shorts that
+            // [normalizeTarShorts] turns into a value-taking long form
+            // ([SHORT_VALUE_OPTIONS]): `-C /tmp tar -xf a.tar` used to read `-C`
+            // as a bare switch, take `/tmp` for the subcommand and answer
+            // `unknown subcommand '/tmp'` — with `isTarCommand` false, the tar
+            // verbs went undeclared and the `-C`/`-xf` expansion never ran.
+            val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)
+            var i = 0
+            while (i < rawArgv.size) {
+                val token = rawArgv[i]
+                if (!token.startsWith("-") || token == "-") return token
+                // `--key` and a rewritten `-limit` share the key namespace: the
+                // rewrite produces `--limit`, so the value decision is the same
+                // "is the long name a boolean flag" test for both spellings.
+                val key = when {
+                    token.startsWith("--") && !token.contains('=') -> token.substring(2)
+                    token in SHORT_LONG_OPTIONS && !token.contains('=') -> token.substring(1)
+                    else -> null
+                }
+                val nextToken = rawArgv.getOrNull(i + 1)
+                val hasValue = nextToken != null && !nextToken.startsWith("-")
+                val consumesValue = when {
+                    token in SHORT_VALUE_OPTIONS -> hasValue
+                    key != null -> key !in noValue && hasValue
+                    else -> false
+                }
+                i += if (consumesValue) 2 else 1
+            }
+            return null
+        }
+
+        /**
+         * [dv18-A A-01b] Raw single-dash tokens that take a VALUE, i.e. the raw
+         * spellings [normalizeTarShorts] rewrites into a value-taking long form:
+         * `-C <dir>` becomes `--directory <dir>`.
+         *
+         * `-f` is deliberately NOT here, and neither is any other letter: the
+         * expander maps `f` to *nothing* (the archive must stay a positional, as
+         * [normalizeTarShorts] documents) and every other group reads `-f` as
+         * the boolean `--force` alias, so it never consumes the next token in
+         * the parse this scan mirrors. The single-dash LONG spellings are not
+         * here either — they already take a value by the [SHORT_LONG_OPTIONS]
+         * rule above.
+         *
+         * ponytail: only the exact `-C` token is modelled, not a cluster that
+         * carries `C` (`-Cf dir`). | 天花板: an invocation whose value-taking
+         * short option sits inside a cluster AND before the subcommand. |
+         * 升级触发: the first real invocation that does — widen to the cluster
+         * letters the expander knows (`c`/`x`/`z`/`v` take no value, so only `C`
+         * would still qualify).
+         */
+        private val SHORT_VALUE_OPTIONS = setOf("-C")
+
+        /**
          * Single-dash long options an agent types out of `find`/`grep` habit,
          * rewritten to the `--` spelling OffloadArgs reads as `key value`.
          * Exact matches only, so a path that merely contains a dash is safe.
@@ -1015,7 +1227,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             "-name", "-type", "-limit", "-max-entries", "-ignore-case",
         )
 
-        private fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
+        internal fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
             argv.map { if (it in SHORT_LONG_OPTIONS) "-$it" else it }
 
         /**
@@ -1031,8 +1243,11 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
          * cluster leaves the whole token untouched, so the caller reports it
          * as an unknown option instead of silently dropping it.
          */
-        private fun normalizeTarShorts(argv: List<String>): List<String> {
-            if (argv.firstOrNull() != "tar") return argv
+        internal fun normalizeTarShorts(argv: List<String>): List<String> {
+            // [da1020-C] The guard calls the SAME helper as `isTarCommand` —
+            // `firstOrNull() != "tar"` broke whenever a global output flag
+            // (`--compact` / `-q` / `--quiet`) preceded the subcommand.
+            if (firstSubcommandToken(argv) != "tar") return argv
             val out = ArrayList<String>(argv.size)
             for (token in argv) {
                 if (token.length < 2 || token[0] != '-' || token.startsWith("--")) {
@@ -1078,8 +1293,10 @@ Usage:
   minis-fastio mv <src> <dst>          Write: rename (copy+delete only across filesystems).
   minis-fastio tar -cf <a.tar> <path>...   Write: pack into a POSIX ustar archive (-czf to gzip).
   minis-fastio tar -xf <a.tar> [-C dir]    Write: unpack (-xzf to gunzip; -C defaults to the current directory).
-  Every write primitive asks for permission first (Settings → Permissions), each under its
-  own row: minis-fastio (delete) / (copy) / (move) / (archive).
+  The write primitives still pass through OffloadGate (one row each:
+  minis-fastio (delete) / (copy) / (move) / (archive)) so a per-tool override
+  stays possible, but their default level is BYPASS — the reachable set is the
+  app's own sandbox, which the guest shell already writes to unrestricted.
 
 Options:
   -r, --recursive    (rm/cp) descend into directories. `-rf` / `-fr` work too; for `rm`, `-f`
@@ -1090,13 +1307,18 @@ Options:
                      refused with "already_exists" — an accidental overwrite has no undo.
   --name GLOB        (find) match the entry NAME (shell-style glob, e.g. '*.log'). `-name` works.
   --type f|d|l       (find) only regular files / directories / symlinks. `-type` works.
+                     A hit's `type` is f (regular file) / d / l / o — `o` is anything else
+                     (named pipe, socket, device), reported but never opened.
   -i, --ignore-case  (grep) case-insensitive match.
   -c, -x             (tar) create / extract. -f <archive> then names the archive; -C <dir> sets the
                      extraction directory. Clustered forms work: -cf, -czf, -xf, -xzf.
   -z, --gzip         (tar) gzip the archive (also accepted as the -z inside a cluster).
   --limit N          (find/grep) max hits to LIST (find default $DEFAULT_FIND_LIMIT, grep default $DEFAULT_GREP_LIMIT).
-                     Totals are still counted over the whole tree.
+                     Totals are still counted over the whole tree. The budget is ONE per command across
+                     every path: a later root that arrives with nothing left lists nothing and is walked
+                     no further (grep's scan stops at the cap; find's walk keeps counting totals).
   --max-entries N    Entry budget for the traversal (default $DEFAULT_MAX_ENTRIES); over budget → "truncated": true
+                     ONE budget per COMMAND, spent across every path argument — not per path.
   --compact, -q      Standard output shaping (see other minis-* tools)
 
 Notes:
@@ -1110,8 +1332,9 @@ Notes:
   - `find`/`grep` emit COMPACT json (the hit list is the payload); `du`/`rm`/`cp`/`mv` emit indented
     json. "truncated": true means the output is incomplete — either the hit budget was reached
     ("matches_capped": true, the scan/list stops there) or the traversal budget ran out.
-  - `grep` skips symlinks, binary files (NUL in the first 8 KiB) and files larger than 8 MiB; the
-    per-file skip counts are reported so an empty result is diagnosable.
+  - `grep` skips symlinks, binary files (NUL in the first 8 KiB), files larger than 8 MiB and
+    special files (named pipe / socket / device — never opened: a writer-less FIFO blocks in
+    open(2)); the per-file skip counts are reported so an empty result is diagnosable.
   - `cp`/`mv` copy a symlink as a LINK (never followed), refuse to overwrite without --force,
     refuse a target inside its own source, and treat an existing directory `dst` as "copy into it"
     (`cp -r a dir` → `dir/a`), like the shell.
@@ -1119,8 +1342,10 @@ Notes:
     directions (verified, including names too long for the 100-byte field: ustar prefix split,
     and GNU `L` long-name entries beyond 155+100). Symlinks are stored as links; device nodes,
     fifos and sockets cannot be represented and are SKIPPED — the count and up to 20 names are
-    reported under "skipped_special" so an archive that lacks them says so. Hard links are not
-    materialised on extract ("skipped_hardlink"): the file itself is still unpacked.
+    reported under "skipped_special" so an archive that lacks them says so. An archive that is
+    itself inside the packed tree is skipped and counted ("skipped_self"), never read while it
+    grows. Hard links are materialised on extract by COPYING the already-unpacked regular file
+    ("hard_links"): the target appears as an independent file, not a link.
     Member names follow the ARGUMENT as spelled (`-cf a.tar src` stores `src/...`, NOT the
     resolved `/var/minis/workspace/src/...`), exactly as GNU/busybox do — with a leading `/`
     and leading `../` dropped the way both of them drop them — so whoever extracts the archive

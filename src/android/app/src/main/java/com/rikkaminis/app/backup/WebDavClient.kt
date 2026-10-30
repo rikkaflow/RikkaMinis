@@ -50,6 +50,27 @@ class WebDavException(
     val statusCode: Int,
 ) : IOException(message)
 
+/**
+ * [fix/p1-webdav-propf] The server answered a request with a 2xx status but
+ * the body is not a WebDAV document — a captive portal, a reverse-proxy error
+ * page or an SSO login page served in place of the DAV reply.
+ *
+ * Deliberately NOT a [WebDavException]: that type carries an HTTP status that
+ * callers translate ("404 → the folder does not exist yet", see
+ * [WebDavSync.listBackupFiles]), and a login page answered with 200 must
+ * never be flattenable into "the server has no backups". [statusCode] is kept
+ * for diagnostics only; the message is what the user sees (it reaches them
+ * through the IOException branch of the backup screens' error mapper).
+ *
+ * [fix/webdav-method-judgement] The same 2xx-but-not-DAV shape is now judged
+ * on PUT/GET/DELETE too (a login page in place of the upload/download/delete
+ * answer), not just on PROPFIND — see [assertNotPortalBody].
+ */
+class WebDavNonDavResponse(
+    message: String,
+    val statusCode: Int,
+) : IOException(message)
+
 /** One entry returned by a PROPFIND. */
 data class WebDavResourceInfo(
     val href: String,
@@ -184,6 +205,45 @@ class WebDavClient(
     private inline fun <T> Response.useSafe(block: (Response) -> T): T =
         use(block)
 
+    /**
+     * [fix/webdav-method-judgement] Shared body judge for PUT/GET/DELETE — the
+     * same seam [parsePropfind] guards for PROPFIND. A captive portal, a
+     * reverse-proxy error page or an SSO login page answers 2xx with an HTML
+     * page; judging only the status code made PUT report "backup uploaded"
+     * with nothing on the server, handed GET's login page to
+     * [ConfigBackup.import] (a misleading JSON parse error downstream), and
+     * reported DELETEs that never happened.
+     *
+     * Judge by the FIRST bytes only, deliberately conservative: a JSON backup
+     * payload starts with `{`/`[` (after an optional BOM/whitespace), never
+     * with `<`, so a body that OPENS with `<!DOCTYPE` or `<html` is certainly
+     * not what we asked for. A body that merely CONTAINS "<html" deeper in
+     * (user message content inside a real backup) passes untouched — that is
+     * why this is not a substring scan. `<?xml` is deliberately NOT judged:
+     * a legitimate DELETE may answer 207 with a multistatus document, and
+     * misclassifying a real DAV server as a portal would be the worse error.
+     * The client layer does not validate JSON (that is the importer's job) —
+     * this only refuses the one shape that is definitely not a DAV answer.
+     */
+    private fun assertNotPortalBody(code: Int, body: ByteArray, what: String) {
+        if (body.isEmpty()) return
+        var start = if (body.size >= 3 &&
+            body[0] == 0xEF.toByte() && body[1] == 0xBB.toByte() && body[2] == 0xBF.toByte()
+        ) 3 else 0
+        while (start < body.size) {
+            val b = body[start].toInt()
+            if (b == 0x20 || b == 0x0A || b == 0x0D || b == 0x09) start++ else break
+        }
+        val head = String(body, start, minOf(body.size - start, 256), Charsets.UTF_8).lowercase()
+        val isHtml = head.startsWith("<!doctype") || head.startsWith("<html")
+        if (!isHtml) return
+        throw WebDavNonDavResponse(
+            "$what returned HTTP $code but the body is an HTML page (a Wi-Fi " +
+                "login portal or a proxy page), not a WebDAV/backup response.",
+            code,
+        )
+    }
+
     // ── Operations ─────────────────────────────────────────────────────────
 
     /** PROPFIND [path] (default: the backup directory) at [depth]. */
@@ -201,7 +261,27 @@ class WebDavClient(
                 throw WebDavException("PROPFIND failed (HTTP $code)", code)
             }
             val xml = response.body?.string().orEmpty()
-            return parsePropfind(xml, url)
+            // [fix/p1-webdav-propf] `isSuccessful` is NOT permission to read
+            // the body as DAV. A captive portal, a reverse-proxy error page
+            // and an SSO login page all answer PROPFIND with 200 + HTML; the
+            // old code accepted that, the parser found zero <response>
+            // elements, and the caller rendered an EMPTY BACKUP LIST — the
+            // user was told "the server has no backups" by a server we never
+            // actually talked to, while testConnection() (same path, depth 0)
+            // reported success. The body is the authority: a genuine answer is
+            // an XML multistatus document (RFC 4918 §13), so its absence is a
+            // failure even on 200/207. Content-Type is NOT the judge — plenty
+            // of DAV servers omit it or send it wrong.
+            return parsePropfind(xml, url) ?: throw WebDavNonDavResponse(
+                if (code == 207) {
+                    "Server returned an unreadable WebDAV response (HTTP 207): " +
+                        "the body is not a multistatus document."
+                } else {
+                    "Server returned a non-WebDAV response (HTTP $code) — " +
+                        "possibly a Wi-Fi login portal or a proxy page."
+                },
+                code,
+            )
         }
     }
 
@@ -228,8 +308,16 @@ class WebDavClient(
             .build()
 
         client.newCall(request).execute().useSafe { response ->
-            if (response.isSuccessful) return
             val code = response.code
+            if (response.isSuccessful) {
+                // [fix/webdav-method-judgement] 200 is NOT permission to claim
+                // the upload landed: a captive portal answers PUT with 200 + an
+                // HTML login page and nothing is stored. An empty body and a
+                // JSON body both pass — legitimate servers answer PUT with
+                // either.
+                assertNotPortalBody(code, response.body?.bytes() ?: ByteArray(0), "Upload")
+                return
+            }
             if (code != 409 && code != 404) {
                 throw WebDavException("Upload failed (HTTP $code)", code)
             }
@@ -248,32 +336,69 @@ class WebDavClient(
             ensureCollectionExists(*parentSegs.toTypedArray())
         }
         client.newCall(request).execute().useSafe { response ->
+            val code = response.code
             if (!response.isSuccessful) {
-                throw WebDavException("Upload failed (HTTP ${response.code})", response.code)
+                throw WebDavException("Upload failed (HTTP $code)", code)
             }
+            // Same body judge on the retry path: the portal answers both
+            // attempts identically, so only one of them getting the check
+            // would leave the hole open.
+            assertNotPortalBody(code, response.body?.bytes() ?: ByteArray(0), "Upload")
         }
     }
 
-    /** Download [path] as raw bytes. */
+    /**
+     * Download [path] as raw bytes. Callers feed this to
+     * [ConfigBackup.import], so the body is judged, not just the status:
+     * [fix/webdav-method-judgement] a captive portal answers GET with 200 +
+     * an HTML login page (redirects land there too), and the old code handed
+     * that page to the importer, which reported a misleading JSON parse
+     * error. An empty 200 body is refused as well — a real backup document
+     * is never zero bytes, so an empty answer means the server did not
+     * actually serve the file.
+     */
     fun get(path: String): ByteArray {
         val url = buildUrl(path)
         val request = Request.Builder().url(url).get().auth().build()
         client.newCall(request).execute().useSafe { response ->
+            val code = response.code
             if (!response.isSuccessful) {
-                throw WebDavException("Download failed (HTTP ${response.code})", response.code)
+                throw WebDavException("Download failed (HTTP $code)", code)
             }
-            return response.body?.bytes() ?: ByteArray(0)
+            val bytes = response.body?.bytes() ?: ByteArray(0)
+            if (bytes.isEmpty()) {
+                throw WebDavNonDavResponse(
+                    "Download returned HTTP $code with an empty body — the " +
+                        "server did not actually serve a backup file.",
+                    code,
+                )
+            }
+            assertNotPortalBody(code, bytes, "Download")
+            return bytes
         }
     }
 
-    /** Delete [path]. */
+    /**
+     * Delete [path]. 204 (or 200) with an empty body is the normal success; a
+     * portal answering 200 + HTML is refused like PUT/GET
+     * ([fix/webdav-method-judgement]) — the old code reported a deletion that
+     * never happened.
+     *
+     * Registered residual, not fixed here: a legitimate 207 multistatus
+     * listing failed entries still reads as success (a 207 is 2xx). Seeing
+     * inside it needs a status-level parse the current parser does not do;
+     * single-file DELETEs rarely answer 207, so this stays a registered
+     * residual rather than a second parser.
+     */
     fun delete(path: String) {
         val url = buildUrl(path)
         val request = Request.Builder().url(url).delete().auth().build()
         client.newCall(request).execute().useSafe { response ->
+            val code = response.code
             if (!response.isSuccessful) {
-                throw WebDavException("Delete failed (HTTP ${response.code})", response.code)
+                throw WebDavException("Delete failed (HTTP $code)", code)
             }
+            assertNotPortalBody(code, response.body?.bytes() ?: ByteArray(0), "Delete")
         }
     }
 
@@ -303,7 +428,15 @@ class WebDavClient(
     }
 
     /** Verify the server answers: PROPFIND depth 0 on the backup directory.
-     *  Throws [WebDavException] on any failure. */
+     *  Throws [WebDavException] on any failure.
+     *
+     *  [fix/p1-webdav-propf] A 2xx answer that is not a WebDAV document
+     *  (captive portal / login page / proxy error page) propagates as
+     *  [WebDavNonDavResponse] instead of being swallowed here: the connection
+     *  test must fail exactly when the backup list fails, otherwise the user
+     *  gets "connection OK" and "no backups on the server" from the same
+     *  broken link. Only a genuine 404 is tolerated (it means "the folder
+     *  does not exist yet", which upload creates). */
     fun testConnection() {
         try {
             propfind(depth = 0)
@@ -318,7 +451,38 @@ class WebDavClient(
 
     // ── PROPFIND response parsing ──────────────────────────────────────────
 
-    private fun parsePropfind(xml: String, requestUrl: HttpUrl): List<WebDavResourceInfo> {
+    /**
+     * [fix/p1-webdav-propf] Parse a PROPFIND body, returning `null` when it is
+     * not a WebDAV multistatus document at all — HTML login page, an error
+     * page echoing the word "multistatus" back at us, truncated garbage,
+     * unparsable XML. An EMPTY LIST keeps its old meaning: a genuine
+     * multistatus with zero `<response>` elements, i.e. a legitimately empty
+     * folder.
+     *
+     * Two independent signals, both required, no Content-Type:
+     *  1. the body mentions `multistatus` (case-insensitive) — an HTML page
+     *     from a portal does not, so the XML machinery never starts;
+     *  2. the DOCUMENT ROOT, as actually parsed, is `multistatus` (namespace
+     *     prefix ignored) — a page that merely contains the word fails here.
+     */
+    private fun parsePropfind(xml: String, requestUrl: HttpUrl): List<WebDavResourceInfo>? {
+        if (!xml.contains("multistatus", ignoreCase = true)) return null
+        return try {
+            parseMultistatus(xml, requestUrl)
+        } catch (e: Exception) {
+            // XmlPullParserException / IOException / anything else: "we could
+            // not read the answer" is not "the folder is empty". Swallowed
+            // here so the caller gets one type (null) from the seam.
+            null
+        }
+    }
+
+    /** Strict multistatus parse: `null` when the root element is not
+     *  `multistatus`, the resource list otherwise (possibly empty). */
+    private fun parseMultistatus(
+        xml: String,
+        requestUrl: HttpUrl,
+    ): List<WebDavResourceInfo>? {
         val factory = XmlPullParserFactory.newInstance()
         factory.isNamespaceAware = true
         val parser = factory.newPullParser()
@@ -328,19 +492,59 @@ class WebDavClient(
         val resources = mutableListOf<WebDavResourceInfo>()
 
         var inResponse = false
-        var statusOk = true
+        // [R5-B2 F-07①] Fail-closed: a response whose status was never written
+        // is not a success. It used to start at `true`, so a malformed answer
+        // (no `<status>` at all) was read as "200 OK" and its properties were
+        // committed.
+        var statusOk = false
         var href: String? = null
         var displayName: String? = null
         var contentLength = 0L
         var lastModified: Instant? = null
         var isCollection = false
         var lastTag: String? = null
+        var rootSeen = false
+        // [FIX-R3-D / F-10] RFC 4918 allows a <response> to carry SEVERAL
+        // <propstat> blocks, each with its own <status>: servers put the
+        // properties they could answer in the 200 group and the missing
+        // optional ones in a second group with 404. The parser kept ONE
+        // `statusOk` for the whole response, so that second group's
+        // "HTTP/1.1 404 Not Found" overwrote the 200 and the resource was
+        // dropped — a folder that lists fine in every other client came back
+        // empty here ("you have no remote backups" over a folder full of
+        // them). Properties are now staged per <propstat> and committed only
+        // when that group is 2xx; the response survives if ANY group was.
+        var inPropstat = false
+        var sawPropstat = false
+        var acceptedPropstat = false
+        // [R5-B2 F-07①] Fail-closed, same reason as `statusOk`: a `<propstat>`
+        // without a `<status>` (or with an empty one) used to be committed as
+        // if it had answered 200.
+        var propstatOk = false
+        var stagedDisplayName: String? = null
+        var stagedContentLength: Long? = null
+        var stagedLastModified: Instant? = null
+        var stagedIsCollection = false
+        // Signal 3: how many elements are still open. XmlPullParser (kxml2)
+        // is forgiving — a body that ends mid-element simply reports
+        // END_DOCUMENT instead of failing — so "the document was complete"
+        // has to be counted, not assumed. A truncated multistatus must not be
+        // read as "the folder happens to be empty".
+        var openElements = 0
 
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
             when (event) {
                 XmlPullParser.START_TAG -> {
                     val name = parser.name
+                    openElements++
+                    if (!rootSeen) {
+                        rootSeen = true
+                        // Signal 2: a body whose ROOT is <html> (or anything
+                        // else) is not a DAV answer, no matter what words it
+                        // contains further down.
+                        if (!"multistatus".equals(name, ignoreCase = true)) return null
+                    }
                     when (name) {
                         "response" -> {
                             inResponse = true
@@ -350,8 +554,32 @@ class WebDavClient(
                             contentLength = 0
                             lastModified = null
                             isCollection = false
+                            inPropstat = false
+                            sawPropstat = false
+                            acceptedPropstat = false
+                            propstatOk = true
+                            stagedDisplayName = null
+                            stagedContentLength = null
+                            stagedLastModified = null
+                            stagedIsCollection = false
                         }
-                        "collection" -> if (inResponse) isCollection = true
+                        // [FIX-R3-D / F-10] A new property group starts clean:
+                        // its status decides whether what follows it counts.
+                        "propstat" -> if (inResponse) {
+                            inPropstat = true
+                            sawPropstat = true
+                            // [R5-B2 F-07①] A new group starts as FAILED: only
+                            // an explicit 2xx `<status>` may arm it again.
+                            propstatOk = false
+                            stagedDisplayName = null
+                            stagedContentLength = null
+                            stagedLastModified = null
+                            stagedIsCollection = false
+                        }
+                        "collection" -> when {
+                            inPropstat -> stagedIsCollection = true
+                            inResponse -> isCollection = true
+                        }
                     }
                     lastTag = name
                 }
@@ -360,30 +588,95 @@ class WebDavClient(
                         val text = parser.text?.trim().orEmpty()
                         if (text.isNotEmpty()) {
                             when (lastTag) {
-                                "href" -> href = text
-                                "displayname" -> displayName = text
-                                "getcontentlength" -> contentLength = text.trim('"').toLongOrNull() ?: 0
-                                "getlastmodified" -> lastModified = parseLastModified(text)
-                                "status" -> statusOk = text.contains(" 200")
+                                // [R5-B2 F-07②] An `<href>` inside a
+                                // `<propstat>` (lockdiscovery, or a 404 group
+                                // that echoes one) is a property value, not the
+                                // response's resource path: committing it
+                                // overwrote the real file path and every later
+                                // consumer (list / dedupe / filename) read the
+                                // wrong resource.
+                                "href" -> if (!inPropstat) href = text
+                                "status" -> if (inPropstat) {
+                                    // [R5-B2 F-07①] Explicit 2xx, not `" 200"`:
+                                    // the substring missed 201/204 and would
+                                    // also have matched inside other text.
+                                    propstatOk = isSuccessStatus(text)
+                                } else {
+                                    // Response-level status (an error response
+                                    // with no propstat at all): still the whole
+                                    // answer.
+                                    statusOk = isSuccessStatus(text)
+                                }
+                                "displayname" -> if (inPropstat) {
+                                    stagedDisplayName = text
+                                } else {
+                                    displayName = text
+                                }
+                                "getcontentlength" -> {
+                                    val bytes = text.trim('"').toLongOrNull() ?: 0L
+                                    if (inPropstat) stagedContentLength = bytes
+                                    else contentLength = bytes
+                                }
+                                "getlastmodified" -> if (inPropstat) {
+                                    stagedLastModified = parseLastModified(text)
+                                } else {
+                                    lastModified = parseLastModified(text)
+                                }
                             }
                         }
                     }
                 }
                 XmlPullParser.END_TAG -> {
                     val name = parser.name
+                    openElements--
+                    if (name == "propstat" && inPropstat) {
+                        inPropstat = false
+                        // Commit only the group that actually answered; the
+                        // 404 group's (absent) values must not erase what the
+                        // 200 group already established.
+                        if (propstatOk) {
+                            acceptedPropstat = true
+                            stagedDisplayName?.let { displayName = it }
+                            stagedContentLength?.let { contentLength = it }
+                            stagedLastModified?.let { lastModified = it }
+                            if (stagedIsCollection) isCollection = true
+                        }
+                    }
                     if (name == "response" && inResponse) {
                         inResponse = false
                         val h = href
-                        if (h != null && statusOk && hrefPath(h) != requestPath) {
-                            resources.add(
-                                WebDavResourceInfo(
-                                    href = h,
-                                    displayName = displayName ?: decodeHrefSegment(h),
-                                    contentLength = contentLength,
-                                    lastModified = lastModified,
-                                    isCollection = isCollection,
+                        // [FIX-R3-D / F-10] With propstat groups present, the
+                        // resource exists iff one group was 2xx; without them
+                        // the response-level status is the only evidence.
+                        val ok = if (sawPropstat) acceptedPropstat else statusOk
+                        if (h != null) {
+                            val self = hrefPath(h) == requestPath
+                            if (self) {
+                                // [R5-B2 F-07③] The requested collection is
+                                // itself in the multistatus (depth-0 always,
+                                // depth-1 usually). Dropping it silently was
+                                // safe only while "no entries" meant "the
+                                // folder is empty": a server that answers 207
+                                // with `<status>404</status>` /
+                                // `403` for the collection made this parse
+                                // return an EMPTY LIST, which
+                                // `ensureCollectionExists` read as "the folder
+                                // exists" (no MKCOL, the following PUT fails)
+                                // and `testConnection` read as "connected".
+                                // Fail closed instead: the caller's null path
+                                // throws, so a failure is reported as one.
+                                if (!ok) return null
+                            } else if (ok) {
+                                resources.add(
+                                    WebDavResourceInfo(
+                                        href = h,
+                                        displayName = displayName ?: decodeHrefSegment(h),
+                                        contentLength = contentLength,
+                                        lastModified = lastModified,
+                                        isCollection = isCollection,
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                     lastTag = null
@@ -391,7 +684,32 @@ class WebDavClient(
             }
             event = parser.next()
         }
+        // Unbalanced elements at end of document = truncated body. Reading it
+        // as "zero responses ⇒ empty folder" is exactly the class of lie this
+        // seam exists to prevent.
+        if (openElements != 0) return null
+        // No element at all (plain text that happened to contain the word):
+        // not a document either.
+        if (!rootSeen) return null
         return resources
+    }
+
+    /** [R5-B2 F-07①] A `<status>` line is a success only when the status code it
+     *  carries is 2xx.
+     *
+     *  The old criterion was `text.contains(" 200")` — it missed every other
+     *  2xx (201/204 in a multistatus, which RFC 4918 allows) and, being a
+     *  substring test, it also had to be read as "contains the word 200" rather
+     *  than "is 200". The code is the first 3-digit token, so
+     *  `HTTP/1.1 207 Multi-Status`, `HTTP/2 200` and a bare `200 OK` all read
+     *  correctly. Anything else (empty, truncated, non-numeric) is NOT a
+     *  success — the callers now default to false, so an unreadable status
+     *  must never be armed by a guess. */
+    private fun isSuccessStatus(statusLine: String): Boolean {
+        val code = statusLine.split(' ', '\t')
+            .firstOrNull { token -> token.length == 3 && token.all { it.isDigit() } }
+            ?: return false
+        return code[0] == '2'
     }
 
     /** Normalize an href (absolute URL or server path) to a bare path. */

@@ -3,9 +3,12 @@ package com.rikkaminis.app.provider
 import android.content.Context
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.effectiveEntryModel
+import com.rikkaminis.app.data.model.legacyProviderNames
+import com.rikkaminis.app.data.model.modelsDevProviderIds
 import com.rikkaminis.app.provider.thinking.GatewayEffortTruth
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -27,6 +30,14 @@ object ModelsDevApi {
     private const val CACHE_TTL_MS = 48 * 3600 * 1000L // 48 hours
 
     // Provider-key mapping for enrichment lookups (matches iOS)
+    //
+    // [ARCH-03] The explicit literals below are kept verbatim (static gates and
+    // reviewers read this text) and are MERGED with the exhaustive
+    // `ProviderType` metadata tables — displayName, enum constant name, and the
+    // legacy catalog short names all map to the family's models.dev provider
+    // ids. A future vendor added to `ProviderType` therefore lands in this map
+    // automatically; it cannot be forgotten here the way xAI / kimiCode were
+    // (F-212) or the displayName keys were (1026 ISSUE-04).
     private val providerKeyMap = mapOf(
         "Anthropic" to listOf("anthropic"),
         "Google" to listOf("google", "google-vertex"),
@@ -43,7 +54,23 @@ object ModelsDevApi {
         // models.dev provider ids, same shape as the entries above.
         "xAI" to listOf("xai"),
         "Kimi" to listOf("moonshotai", "moonshotai-cn"),
-    )
+        // [da1026-D] Custom-model adds persist ProviderType.displayName, not
+        // the short key above (provider.models.add, AddCustomModelScreen and
+        // now ModelsCollection.add all write the displayName). The Gemini /
+        // xAI / Kimi displayNames diverge from their models.dev ids, so those
+        // rows missed this map entirely and fell through to the
+        // order-dependent all-providers scan — the exact F-212 failure this
+        // map exists to prevent. Keep the short keys: built-in catalog rows
+        // and historical data still carry them.
+        "Google Gemini" to listOf("google", "google-vertex"),
+        "xAI (Grok)" to listOf("xai"),
+        "Kimi Code" to listOf("moonshotai", "moonshotai-cn"),
+    ) + ProviderType.values().flatMap { type ->
+        val ids = type.modelsDevProviderIds
+        (listOf(type.displayName, type.name) + type.legacyProviderNames)
+            .distinct()
+            .map { key -> key to ids }
+    }.toMap()
 
     private var cachedRegistry: Map<String, ProviderEntry>? = null
     private var cacheTimestamp: Long = 0L
@@ -152,6 +179,25 @@ object ModelsDevApi {
             model
         }
     }
+
+    // MARK: - Public: Effective model of a ModelEntry
+
+    /**
+     * The model a [ModelEntry] really resolves to — **enrich the base model
+     * first, then apply the user's overrides** ([effectiveEntryModel] holds the
+     * ordering contract).
+     *
+     * This is the single entry point for every surface that answers "what can
+     * this model do" (the `minis-model-use` filter/guards, the config
+     * collection's `modalities` / `supportsTools`, and the agent-facing
+     * `minis-model-use list` payload). Each of them used to re-derive it, and
+     * they disagreed: the list enriched AFTER applying overrides (so the
+     * registry overwrote explicit user choices) while the other two skipped
+     * enrichment entirely (so all 39 built-in models, whose modality fields are
+     * null by construction, reported no modalities at all).
+     */
+    fun effectiveModel(entry: ModelEntry): LLMModel =
+        effectiveEntryModel(entry, ::enrichModel)
 
     /**
      * [T-sensenova-effort-enum] Replace the declared effort tiers with the gateway's

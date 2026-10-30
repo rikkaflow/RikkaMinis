@@ -3,11 +3,15 @@ package com.rikkaminis.app.sandbox.offload
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * `minis-fastio cp` / `mv` engines ([T-minis-fastio] phase 2).
@@ -223,5 +227,144 @@ class FastioCopyTest {
             out.errors[0].contains("non-empty directory"),
         )
         assertTrue(Files.exists(src))
+    }
+
+    // ── B16: cross-device (EXDEV) move via the copy+delete fallback ──────────
+    //
+    // The old code called a bare non-atomic `Files.move` first; on a
+    // cross-mount non-empty directory the JDK's internal fallback created the
+    // dst directory and then failed rmdir on the source
+    // (DirectoryNotEmptyException pointing at SRC), leaving a half-empty dst —
+    // and the fallback at the bottom of moveTree was unreachable. Deleting
+    // ATOMIC_MOVE from moveTree's first attempt must not change these two.
+
+    @Test
+    fun `copyDeleteFallback moves a tree and deletes the source`() {
+        val srcDir = Files.createTempDirectory("fastio-fallback-src")
+        val dstDir = Files.createTempDirectory("fastio-fallback-dst")
+        val sub = Files.createDirectory(srcDir.resolve("sub"))
+        Files.write(sub.resolve("a.txt"), "aa".toByteArray())
+        val out = MoveOutcome()
+
+        copyDeleteFallback(srcDir.resolve("sub"), dstDir.resolve("moved"), force = true, out = out)
+
+        assertEquals("copy+delete", out.method)
+        assertTrue(out.counted)
+        assertFalse(Files.exists(srcDir.resolve("sub")))
+        assertEquals("aa", Files.readAllBytes(dstDir.resolve("moved/a.txt")).decodeToString())
+        assertTrue(out.errors.isEmpty())
+    }
+
+    @Test
+    fun `copyDeleteFallback cleans up a half-copied target it created`() {
+        // Needs a mid-copy failure: an unreadable source subdirectory trips
+        // visitFileFailed, which is exactly the case the residue cleanup
+        // recovers from. Not reproducible as root (root reads through 000),
+        // so the assume skips there — CI's non-root runner drives this.
+        org.junit.Assume.assumeTrue(System.getProperty("user.name") != "root")
+        val srcDir = Files.createTempDirectory("fastio-fail-src")
+        val dstDir = Files.createTempDirectory("fastio-fail-dst")
+        val top = Files.createDirectory(srcDir.resolve("top"))
+        Files.write(top.resolve("a.txt"), "aa".toByteArray())
+        val locked = Files.createDirectory(top.resolve("locked"))
+        Files.write(locked.resolve("b.txt"), "bb".toByteArray())
+        Files.setPosixFilePermissions(
+            locked,
+            java.nio.file.attribute.PosixFilePermissions.fromString("---------"),
+        )
+        val out = MoveOutcome()
+
+        copyDeleteFallback(top, dstDir.resolve("moved"), force = true, out = out)
+
+        assertTrue("the unreadable subtree must make the copy fail", out.errors.isNotEmpty())
+        assertFalse("the half-copied dst must be cleaned up, not left behind",
+            Files.exists(dstDir.resolve("moved")))
+        assertTrue("the source must survive a failed move", Files.exists(top))
+    }
+
+    // ── [dv23-A6] §1043-A-07: a special file is refused, never opened ───────
+    //
+    // `Files.copy` opens the source with O_RDONLY: on a writer-less FIFO that
+    // never returns (measured on this JVM). The entry is recorded as an ERROR
+    // rather than skipped, because `copyDeleteFallback` (cross-device `mv`)
+    // deletes the source only when the copy reported none — a silent skip would
+    // make `mv` drop the pipe for good.
+
+    private fun mkfifo(dir: Path, name: String): Path? {
+        val fifo = dir.resolve(name)
+        return try {
+            val ok = ProcessBuilder("mkfifo", fifo.toString())
+                .redirectErrorStream(true)
+                .start()
+                .waitFor() == 0
+            if (ok && Files.exists(fifo, LinkOption.NOFOLLOW_LINKS)) fifo else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Bounded call: blocking in `open(2)` must fail the case, not hang the JVM. */
+    private fun <T> completesWithin(seconds: Long, block: () -> T): T {
+        val pool = Executors.newSingleThreadExecutor { r -> Thread(r).also { it.isDaemon = true } }
+        try {
+            return pool.submit(block).get(seconds, TimeUnit.SECONDS)
+        } catch (e: TimeoutException) {
+            throw AssertionError("the engine did not return within ${seconds}s — a special file was opened")
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `copy refuses a named pipe instead of blocking on it`() {
+        val dir = Files.createTempDirectory("fastio-cp-fifo")
+        val src = Files.createDirectory(dir.resolve("src"))
+        Files.write(src.resolve("a.txt"), "abc".toByteArray())
+        val fifo = mkfifo(src, "pipe")
+        Assume.assumeTrue("mkfifo is not available on this platform", fifo != null)
+        val out = CopyOutcome()
+
+        completesWithin(30) { copyTree(src, dir.resolve("dst"), force = false, out = out) }
+
+        assertEquals("exactly the pipe is refused", 1, out.errors.size)
+        assertTrue(
+            "the reason must be readable and name the kind of entry",
+            out.errors[0].contains("special file"),
+        )
+        assertEquals(1L, out.files)         // a.txt only
+        assertEquals(3L, out.bytes)
+        assertEquals("abc", Files.readAllBytes(dir.resolve("dst/a.txt")).decodeToString())
+        assertFalse(
+            "the pipe must not be re-created (or opened) at the target",
+            Files.exists(dir.resolve("dst/pipe"), LinkOption.NOFOLLOW_LINKS),
+        )
+        assertTrue("the source tree is untouched", Files.exists(fifo, LinkOption.NOFOLLOW_LINKS))
+    }
+
+    @Test
+    fun `a cross-device move keeps the source when a special file cannot be copied`() {
+        val srcDir = Files.createTempDirectory("fastio-fifo-mv-src")
+        val dstDir = Files.createTempDirectory("fastio-fifo-mv-dst")
+        val top = Files.createDirectory(srcDir.resolve("top"))
+        Files.write(top.resolve("a.txt"), "aa".toByteArray())
+        val fifo = mkfifo(top, "pipe")
+        Assume.assumeTrue("mkfifo is not available on this platform", fifo != null)
+        val out = MoveOutcome()
+
+        completesWithin(30) {
+            copyDeleteFallback(top, dstDir.resolve("moved"), force = true, out = out)
+        }
+
+        assertTrue("the refusal has to reach the move, not stop at the copy", out.errors.isNotEmpty())
+        assertTrue(
+            "a failed move must never delete the source (the pipe would be gone for good)",
+            Files.exists(top.resolve("a.txt")),
+        )
+        assertTrue("the pipe must still be in the source", Files.exists(fifo, LinkOption.NOFOLLOW_LINKS))
+        assertFalse(
+            "the half-copied target this call created must be cleaned up",
+            Files.exists(dstDir.resolve("moved")),
+        )
+        assertFalse(out.counted)
     }
 }

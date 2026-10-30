@@ -328,6 +328,9 @@
     <string name="skill_import_error_no_url">URL eingeben</string>
     <string name="skill_import_error_invalid">Ungültige SKILL.md oder Skill existiert bereits</string>
     <string name="skill_import_error_format">Ungültige SKILL.md. YAML-Frontmatter mit \'name:\'-Feld prüfen.</string>
+    <string name="skill_file_error_read">Die ausgewählte Datei konnte nicht gelesen werden</string>
+    <string name="skill_file_error_archive">Ungültiges Skill-Archiv: keine SKILL.md enthalten</string>
+    <string name="skill_file_error_detail">Import fehlgeschlagen: %1$s</string>
     <string name="skill_import_in_progress">Importiert…</string>
     <string name="skill_import_submit">Importieren</string>
     <string name="skill_detail_label_name">Name</string>
@@ -540,6 +543,9 @@
     <string name="browser_history_clear">Löschen</string>
     <string name="browser_history_done">Fertig</string>
     <string name="browser_history_search">Verlauf durchsuchen</string>
+    <string name="browser_history_today">Heute</string>
+    <string name="browser_history_yesterday">Gestern</string>
+    <string name="browser_history_results">Ergebnisse</string>
     <string name="browser_history_empty_title">Kein Browserverlauf</string>
     <string name="browser_history_empty_subtitle">Verlauf wird 7 Tage aufbewahrt</string>
     <string name="browser_history_clear_dialog_title">Browserverlauf löschen?</string>
@@ -1080,9 +1086,10 @@
     <string name="browser_viewport_width">Breite</string>
     <string name="browser_viewport_height">Höhe</string>
     <string name="common_loading">Laden…</string>
+    <string name="settings_secret_unreadable">Der gespeicherte Wert konnte nicht gelesen werden — es wurde nichts gespeichert. Formular schließen und erneut öffnen.</string>
     <string name="rootfs_reset_button">Zurücksetzen</string>
     <string name="session_title_label">Titel</string>
-    <string name="backup_import_too_large">Backupdatei ist zu groß (%1$d MB, max. %2$d MB) – es wurde nichts importiert.</string>
+    <string name="backup_import_too_large">Backupdatei ist zu groß (%1$d MB, max. %2$d MB) – es wurde nichts importiert. Verkürze das Chat-Verlaufsfenster (oder schalte es ab), exportiere erneut und importiere die neue Datei.</string>
     <string name="backup_export_incomplete">Warnung: %1$d Feld(er) konnten nicht gelesen werden – dieses Backup ist möglicherweise unvollständig.</string>
     <string name="code_expand">%1$d Zeilen erweitern</string>
     <string name="code_collapse">Einklappen</string>
@@ -1105,6 +1112,7 @@
     <string name="sysmsg_compact_failed">Komprimierung fehlgeschlagen: %1$s</string>
     <string name="sysmsg_context_full_hint">Der Kontext wird voll (%1$d / %2$d Tokens). Führen Sie /compact aus, um ältere Turns in eine Zusammenfassung zu falten.</string>
     <string name="sysmsg_wait_compact">Warten Sie, bis die aktuelle Komprimierung abgeschlossen ist, bevor Sie senden.</string>
+    <string name="sysmsg_edit_wait_stream">Sie bearbeiten gerade eine Nachricht. Beenden Sie zuerst die laufende Antwort - eine Bearbeitung ersetzt die alte Nachricht und kann nicht in die Warteschlange.</string>
     <string name="sysmsg_context_trimmed">Kontext hat das Limit %1$d erreicht; die ältesten %2$d Nachrichten wurden entfernt, um fortzufahren.</string>
     <string name="sysmsg_compact_no_provider">Kein Provider konfiguriert. Komprimierung nicht möglich.</string>
     <string name="sysmsg_compact_empty_session">Nichts zu komprimieren — die Sitzung ist leer.</string>
@@ -1647,9 +1655,43 @@
     <string name="scheduled_delete_title">Geplante Aufgabe löschen?</string>
     <string name="scheduled_delete_body">„%1$s“ wird endgültig gelöscht.</string>
     <string name="scheduled_fuse_notification_title">Geplante Aufgabe pausiert</string>
+    <string name="scheduled_edit_missing_body">Diese Aufgabe existiert nicht mehr. Möglicherweise wurde sie gelöscht, während dieser Bildschirm geöffnet war.</string>
     <string name="scheduled_fuse_notification_body">„%1$s“ ist %2$d-mal hintereinander fehlgeschlagen und wurde deaktiviert. In den Einstellungen fortsetzbar.</string>
 
     <string name="backup_passphrase_title">Verschlüsseltes Backup</string>
     <string name="backup_passphrase_body">Dieses OpenMinis-Paket ist verschlüsselt (minisbak-enc/1). Geben Sie die beim Export verwendete Passphrase ein.</string>
     <string name="backup_passphrase_label">Passphrase</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">Link zu %1$s</string>
+    <string name="tts_spoken_bare_link">Link</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Auto-Genehmigung</string>
+    <string name="perm_auto_approve_title">Auto-Genehmigungsmodus</string>
+    <string name="perm_auto_approve_desc">Übliche Einstellungsänderungen ohne Nachfrage anwenden. Sensible und destruktive Änderungen können weiterhin bestätigt werden.</string>
+    <string name="perm_auto_approve_sensitive">Sensible Einstellungen einschließen</string>
+    <string name="perm_auto_approve_sensitive_desc">Auch Anbieter-Zugangsdaten (API-Schlüssel, Basis-URLs) ohne Nachfrage anwenden. Der Agent könnte sie stillschweigend umleiten.</string>
+    <string name="perm_auto_approve_privileged">Privilegierte Tools erlauben</string>
+    <string name="perm_auto_approve_privileged_desc">Dem Agenten die Bedienung der Bedienungshilfen- und Shizuku-Kommandozeilen erlauben (sie steuern andere Apps und lesen den Bildschirm).</string>
+    <string name="perm_auto_approve_footer">Standardmäßig aus. Wenn aktiviert, erscheint für normale Schreibvorgänge kein Bestätigungsdialog mehr, und Tool-Berechtigungsabfragen entfallen. Alle Änderungen werden weiterhin unter Protokolle → Konfigurationsänderungen protokolliert.</string>
+    <string name="perm_auto_approve_confirm_title">Auto-Genehmigung aktivieren?</string>
+    <string name="perm_auto_approve_confirm_text">Übliche Einstellungsänderungen werden ohne Nachfrage angewendet, und Tool-Berechtigungsabfragen entfallen. Sensible Einstellungen (Anbieter-API-Schlüssel) und destruktive Änderungen werden weiterhin bestätigt. Jederzeit deaktivierbar.</string>
+    <string name="perm_auto_approve_confirm_on">Aktivieren</string>
+    <string name="perm_section_runtime_batch">Systemberechtigungen</string>
+    <string name="perm_runtime_batch_desc">Android fragt diese Berechtigungen einzeln bei der Nutzung ab. Jetzt alle auf einmal gewähren, damit sie später nicht stören.</string>
+    <string name="perm_runtime_batch_title">Alle Systemberechtigungen gewähren</string>
+    <string name="perm_runtime_batch_sub">Kalender, Kontakte, Standort, Fotos, Mikrofon, Kamera, Benachrichtigungen</string>
+    <string name="perm_runtime_batch_all_granted">Alle Systemberechtigungen sind bereits gewährt.</string>
+    <string name="perm_runtime_batch_partial">%1$d Berechtigung(en) noch nicht gewährt — Android hat abgelehnt oder du hast übersprungen.</string>
+    <string name="mirror_section_title">Externe Kopie</string>
+    <string name="mirror_section_footer">Eine fortlaufend aktualisierte Kopie außerhalb des App-Speichers. Beim Löschen der App-Daten bleibt sie erhalten und ist mit jedem Dateimanager lesbar.</string>
+    <string name="mirror_enable">Externer Spiegel</string>
+    <string name="mirror_enable_sub">Download/RikkaMinis/backup – automatisch aktualisiert</string>
+    <string name="mirror_last_sync">Letzte Synchronisierung: %1$s</string>
+    <string name="mirror_never">Noch nicht synchronisiert</string>
+    <string name="mirror_pending_count">%1$d Datei(en) warten auf Sync</string>
+    <string name="mirror_diag_stale">Synchronisierung überfällig: %1$d Datei(en) ausstehend (%2$d Min. seit dem letzten Schreiben)</string>
+    <string name="mirror_diag_failed">Letzte Synchronisierung fehlgeschlagen</string>
+    <string name="mirror_diag_unavailable">Kein nutzbarer Speicherort</string>
+    <string name="mirror_retry">Erneut versuchen</string>
 </resources>

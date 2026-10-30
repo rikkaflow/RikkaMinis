@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedWriter
 import java.io.File
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -76,6 +77,13 @@ class PersistentShell(
     /** Pending command callback — only one command at a time. */
     @Volatile
     private var pendingCallback: CommandCallback? = null
+
+    /**
+     * [audit-1015 BUG-07] Staging slot for env broadcasts that land while a
+     * command is mid-flight on this shell. Flushed — one atomic write under
+     * [writerLock] — right before the next command body in [executeCommand].
+     */
+    private val pendingEnvironment = PendingEnvironmentUpdate()
 
     /**
      * [fix/audit-s4h3] True while a command is mid-flight on this shell
@@ -218,8 +226,16 @@ class PersistentShell(
      * single-writer usage of [CommandCallback].
      */
     private class StallGuardState(var lastProgressMs: Long) {
-        /** Output length at the previous tick (growth == progress). */
-        var lastOutputLen: Int = 0
+        /**
+         * [CommandCallback.totalCharsReceived] at the previous tick — GROWTH
+         * means output progress.
+         *
+         * [meta-audit-1028 E3 / F-09] Deliberately NOT `output.length`: that
+         * value freezes once the byte budget is exhausted, so a command still
+         * streaming output past `shellOutputKb` was indistinguishable from a
+         * silent one and got killed by the stall guard.
+         */
+        var lastReceivedChars: Long = 0L
 
         /** Tree CPU jiffies at the previous CPU sample. */
         var lastCpuJiffies: Long = -1L
@@ -243,7 +259,6 @@ class PersistentShell(
          */
         val lineCallback: ((String, Boolean) -> Unit)?,
         var onComplete: ((String, Int, Boolean) -> Unit)? = null,
-        var truncated: Boolean = false,
         /** Unterminated tail carried across read chunks (see [feedLines]). */
         var pendingPartial: String = "",
     ) {
@@ -261,6 +276,54 @@ class PersistentShell(
         // atomic compare-and-set so exactly one thread wins; the loser is a
         // benign no-op (the shell is gone, the command already reported).
         private val completeOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * [audit-1015 PERF-01] Incremental UTF-8 byte budget for [output].
+         * Each chunk measures ONLY the incoming text; the old path recomputed
+         * [TerminalSanitizer.utf8Length] over the whole buffer (as a
+         * `toString()` copy) on every 4 KB read — O(N²) over a run's output.
+         * The ceiling is read per append so a live `shellOutputKb` change
+         * still applies mid-command, exactly as before.
+         */
+        val byteBudget = IncrementalUtf8Budget { AgentRuntimeLimitsPrefs.shellOutputKb() * 1024 }
+
+        /** Whether any appended chunk was clipped or skipped. */
+        val truncated: Boolean get() = byteBudget.truncated
+
+        /**
+         * [meta-audit-1028 E3 / F-09] Monotonic count of characters the reader
+         * handed to this callback, INDEPENDENT of the output budget.
+         *
+         * [output]/[truncated] both stop moving once the command's cumulative
+         * output reaches `shellOutputKb` — [internalTruncateOutputDetailed]
+         * returns `appendedUtf8Bytes = 0` for every later chunk. The stall
+         * guard used `output.length` as its progress signal, so a command that
+         * kept streaming past the ceiling looked frozen: 180 s later it was
+         * SIGINT'd (then SIGKILL'd) while the UI was still scrolling its output.
+         * This counter advances for every delivered chunk, clipped or not, so
+         * "bytes arrived from the child" stays observable after the capture
+         * buffer is full.
+         *
+         * Atomic (not Int): written on the reader thread, read on the monitor
+         * coroutine.
+         */
+        private val receivedChars = java.util.concurrent.atomic.AtomicLong(0L)
+
+        val totalCharsReceived: Long get() = receivedChars.get()
+
+        /**
+         * Append one reader chunk to [output] (clipped to the byte budget) and
+         * record it as received. Single entry point on purpose: the received
+         * counter and the buffer must never disagree about what arrived.
+         */
+        fun appendOutput(text: String) {
+            if (text.isEmpty()) return
+            receivedChars.addAndGet(text.length.toLong())
+            // [audit-1015 PERF-01] The byte accumulator lives in
+            // [IncrementalUtf8Budget] (pure + JVM-tested) — each chunk measures
+            // ONLY the incoming text, never a full recompute over [output].
+            byteBudget.appendTo(output, text)
+        }
 
         /** Signal completion, but only the first caller wins. Returns whether
          *  THIS caller won (used by the stall guard: if the command completed on
@@ -345,6 +408,26 @@ class PersistentShell(
 
         val env = processBuilder.environment()
         env["PROOT_TMP_DIR"] = PRootKernel.getProotTmpDir(context).absolutePath
+        // [feat/storage-budget-loop L0] TMPDIR/TMP must be a GUEST path.
+        //
+        // PROOT_TMP_DIR above is correct as a host path: proot itself runs on
+        // the host and needs a real directory. TMPDIR is NOT — it is read by
+        // the tools INSIDE the rootfs (python tempfile, mktemp, gcc, pip …).
+        // Inherited from the app process it resolved to
+        // `/data/user/0/<pkg>/cache`, which inside the rootfs happens to be a
+        // real (empty, app-created) directory tree — so every temp-write landed
+        // INSIDE `files/alpine-rootfs` as permanent junk instead of in the
+        // swept guest /tmp. Measured 2026-10-27: 17,213 stale fixture dirs /
+        // 3.26 GiB under `<rootfs>/data/user/0/<pkg>/cache`, i.e. ~25% of the
+        // app's whole "user data" footprint, invisible to the /tmp sweeper.
+        // The guest /tmp is tmpfs + age-swept (60 min, `.minis-keep` sentinel),
+        // which is exactly the lifecycle temp files want.
+        //
+        // [meta-audit-1028 E3 / F-14] The two assignments themselves live at the
+        // END of this function, after the `customEnvironment` merge — the
+        // ordering is the whole point (a per-instance invariant must be the
+        // final word), and the interactive PTY pins the same pair in
+        // TerminalSession.buildTermuxEnv, which cannot inherit this one.
         if (PRootKernel.nativeLibDir.isNotEmpty()) {
             env["LD_LIBRARY_PATH"] = PRootKernel.nativeLibDir
         }
@@ -361,15 +444,43 @@ class PersistentShell(
         // and now.
         env["TZ"] = PRootKernel.posixTz()
         if (debugOffload) env["MINIS_NOFF_DEBUG"] = "1"
-        // T340: forward the chat session id to native_offload handlers via
-        // proot env. NativeOffloadServer reads this off `request.env` and
-        // hands it to OffloadPermissionManager so ASK_ONCE grants/denials
-        // are scoped per chat session, not globally.
-        env["MINIS_CHAT_SESSION_ID"] = sessionId
-
         for ((key, value) in PRootKernel.customEnvironment) {
             env[key] = value
         }
+
+        // [T340] forward the chat session id to native_offload handlers via
+        // proot env. NativeOffloadServer reads this off `request.env` and
+        // hands it to OffloadPermissionManager so ASK_ONCE grants/denials
+        // are scoped per chat session, not globally.
+        //
+        // [meta-audit-1028 E3 / F-14] Set AFTER the process-global
+        // [PRootKernel.customEnvironment] merge: "last write wins" is the
+        // convention the other PRoot entry points already document (see
+        // TerminalSession.buildTermuxEnv: the session id is applied last so a
+        // process-global map can never point two sessions at one chat). The
+        // same ordering argument is why the guest-tmp pin below is here too —
+        // a per-instance invariant must be the final word, not the first.
+        env["MINIS_CHAT_SESSION_ID"] = sessionId
+
+        // [F-14] Guest temp dir, applied LAST: `TMPDIR`/`TMP` are read by the
+        // tools INSIDE the rootfs (python tempfile, mktemp, gcc, pip …) and must
+        // therefore be a GUEST path. Inherited from the app process they point
+        // at `/data/user/0/<pkg>/cache`, which inside the rootfs is a real,
+        // unswept directory tree — measured 2026-10-27 as 17 213 stale fixture
+        // dirs / 3.26 GiB under `<rootfs>/data/user/0/<pkg>/cache`, ~25 % of the
+        // app's user-data footprint and invisible to the guest /tmp sweeper.
+        // Sitting after the [PRootKernel.customEnvironment] merge makes the
+        // invariant the final word: a process-global `TMPDIR` added there later
+        // cannot silently re-point guest temp writes at a host path.
+        //
+        // [meta-audit-1028 E3 / F-14] The interactive PTY pins the SAME pair in
+        // TerminalSession.buildTermuxEnv (it cannot inherit this one — Termux
+        // execs with an explicit env array). Both must stay in sync; the
+        // remaining PRoot entry points (RootfsManager's host-side `apk`
+        // children, the deprecated ShellExecutor) are registered as residuals
+        // rather than changed here.
+        env["TMPDIR"] = "/tmp"
+        env["TMP"] = "/tmp"
 
         val p = processBuilder.start()
         process = p
@@ -413,12 +524,25 @@ class PersistentShell(
         // re-scan them combined with the next chunk.
         var tail: String = ""
         try {
-            val buffer = ByteArray(4096)
-            val stream = p.inputStream
+            // [verify-1015 BUG-01] Decode through a Reader, NOT
+            // `String(bytes, 0, n, UTF_8)` per chunk. The chunked form decodes
+            // every read() independently, so a multi-byte character that
+            // straddles a read boundary becomes TWO U+FFFD — and this is not a
+            // rare edge: 4096 % 3 == 1, so for 3-byte CJK text the alignment
+            // advances one byte per read and EVERY boundary splits a character.
+            // Reproduced on-device 2026-10-15: 12 KB of Chinese written by a
+            // shell command came back with `中文测试中���测试`, i.e. the agent's
+            // own file/log reading path was corrupted, not just the terminal UI.
+            // InputStreamReader carries the decoder's leftover bytes across
+            // reads, so a split character is reassembled instead of mangled.
+            // Buffer is 4096 chars now (was 4096 bytes) — both far exceed the
+            // marker length, and the tail window below is unchanged.
+            val buffer = CharArray(4096)
+            val reader = InputStreamReader(p.inputStream, StandardCharsets.UTF_8)
             while (true) {
-                val n = stream.read(buffer)
+                val n = reader.read(buffer)
                 if (n < 0) break
-                val text = String(buffer, 0, n, StandardCharsets.UTF_8)
+                val text = String(buffer, 0, n)
 
                 // [audit-0917] Only the CURRENT process's reader may consume
                 // output: stop() + restart leaves this thread draining a dead
@@ -440,7 +564,9 @@ class PersistentShell(
                         tail = ""
                     } else {
                         // Keep the trailing window — the marker (or its
-                        // start) may be split across this chunk boundary.
+                        // start, or an `_EXIT_<n>__` split by the chunk
+                        // boundary — [fix/da1017-marker-boundary]) may be
+                        // split across this chunk boundary.
                         tail = scan.keptTail
                     }
                 } else {
@@ -517,17 +643,12 @@ class PersistentShell(
      * afterwards. Counting `String.length` here made a 128 KB setting hold
      * 384 KB of CJK.
      */
-    private fun CommandCallback.appendOutput(text: String) {
-        if (internalTruncateOutput(output, text, AgentRuntimeLimitsPrefs.shellOutputKb() * 1024)) {
-            truncated = true
-        }
-    }
-
     /**
      * Execute a command in the persistent shell and wait for completion.
      *
-     * Wraps the command with a unique marker to detect output boundaries:
-     *   {command}; echo "__MINIS_DONE_{marker}_EXIT_$?__"
+     * The command body runs inside an isolated subshell with a unique
+     * completion marker (see [internalBuildShellCommand]):
+     *   ( <command> ); echo "__MINIS_DONE_{marker}_EXIT_$?__"
      *
      * @return Pair of (output, exitCode)
      */
@@ -566,17 +687,10 @@ class PersistentShell(
         // delimiter so the shell performs ZERO expansion on the command body.
         // Single quotes, double quotes, backslashes, dollar signs, backticks
         // all pass through literally — no escape nesting, no quoting hell.
-        // Exit code is captured via $? immediately after eval.
-        val heredocDelimiter = "ENDOFMINISCMD_${marker}"
-        val wrappedCommand = buildString {
-            append("eval \"\$(cat <<'$heredocDelimiter'\n")
-            append(command)
-            if (!command.endsWith('\n')) append('\n')
-            append("$heredocDelimiter\n")
-            append(")\"\n")
-            append("RET=\$?\n")
-            append("echo \"__MINIS_DONE_${marker}_EXIT_\${RET}__\"\n")
-        }
+        // [fix/sweep1014-shell] The wrapping itself (subshell isolation +
+        // EXIT-trap cwd persistence) lives in the pure function
+        // [internalBuildShellCommand] so it is JVM-testable.
+        val wrappedCommand = internalBuildShellCommand(command, marker)
 
         return withContext(Dispatchers.IO) {
             val cb = CommandCallback(marker = marker, lineCallback = lineCallback)
@@ -608,10 +722,14 @@ class PersistentShell(
                         // cleared the pending callback) — never signal or kill a
                         // shell that is simply between commands.
                         if (pendingCallback !== cb) continue
-                        // Output progress: the callback accumulates every chunk
-                        // (including partials), so a length change is progress.
-                        if (cb.output.length != stall.lastOutputLen) {
-                            stall.lastOutputLen = cb.output.length
+                        // Output progress: the callback counts EVERY chunk the
+                        // reader delivered (including partials, including
+                        // chunks the byte budget clipped), so growth here means
+                        // bytes really arrived — see [CommandCallback.totalCharsReceived]
+                        // for why `output.length` could not be used ([F-09]).
+                        val received = cb.totalCharsReceived
+                        if (received != stall.lastReceivedChars) {
+                            stall.lastReceivedChars = received
                             stall.lastProgressMs = now
                         }
                         // CPU progress, sampled less often (the scan is the
@@ -703,6 +821,17 @@ class PersistentShell(
                         // [audit-0917] Under writerLock: see its KDoc — an env
                         // broadcast must not interleave with the command body.
                         synchronized(writerLock) {
+                            // [audit-1015 BUG-07] Flush any env update staged
+                            // while the PREVIOUS command was mid-flight, BEFORE
+                            // the new command body: the shell is back at top
+                            // level here, so top-level `export` lines are safe
+                            // (a mid-flight write would be read by the running
+                            // child as stdin). One atomic write, then the body.
+                            val stagedScript = internalBuildEnvironmentScript(pendingEnvironment.drain())
+                            if (stagedScript.isNotEmpty()) {
+                                writer.write(stagedScript)
+                                writer.flush()
+                            }
                             writer.write(wrappedCommand)
                             writer.flush()
                         }
@@ -745,7 +874,19 @@ class PersistentShell(
             if (result == null) {
                 // Timeout — cancel pending, but don't kill the shell
                 pendingCallback = null
-                CommandResult("[Command timed out after ${timeout / 1000}s]", TIMEOUT_EXIT_CODE)
+                // [meta-audit-1028 E3 / F-10] Keep what the command already
+                // printed. This branch used to return the bare notice, so a
+                // build/log command that hung after dumping its last 50 lines
+                // came back as ONE line: the user (and the model) lost every
+                // clue about where it stopped. The stall branch above has
+                // always appended its notice to the captured output; a timeout
+                // is the same situation (we simply stopped waiting, the PTY
+                // produced no completion marker).
+                CommandResult(
+                    internalTimeoutOutput(cb.output.toString(), timeout),
+                    TIMEOUT_EXIT_CODE,
+                    cb.truncated,
+                )
             } else if (stall.intSentAtMs != 0L && stallAfterMs > 0L && result.exitCode != STALL_EXIT_CODE) {
                 // Stage 1 succeeded: the SIGINT killed the command and the wrapped
                 // trailing lines produced a normal completion. Tell the agent why
@@ -782,16 +923,25 @@ class PersistentShell(
                 // [audit-0917] One atomic block: the unset+export sequence must
                 // reach the PTY intact (see writerLock), otherwise a half-applied
                 // snapshot can leave the shell with a mix of old and new vars.
+                // [audit-1015 BUG-07] A broadcast that lands while a command is
+                // mid-flight (pendingCallback != null) used to write top-level
+                // `export` lines into the PTY input stream BENEATH the running
+                // command: the foreground child read them as its own stdin and
+                // the PTY ECHOed them into the command's captured output. Stage
+                // instead — executeCommand flushes the staged update right
+                // before the next command body, when the shell is back at top
+                // level.
                 synchronized(writerLock) {
-                    for (key in previousKeys - envVars.keys) {
-                        writer.write("unset $key\n")
+                    if (pendingCallback != null) {
+                        pendingEnvironment.merge(envVars, previousKeys)
+                        Log.i(TAG, "Command in flight — staged env broadcast (${envVars.size} key(s)) for the next command")
+                    } else {
+                        val entries = LinkedHashMap<String, String?>()
+                        for (key in previousKeys - envVars.keys) entries[key] = null
+                        for ((key, value) in envVars) entries[key] = value
+                        writer.write(internalBuildEnvironmentScript(entries))
+                        writer.flush()
                     }
-                    for ((key, value) in envVars) {
-                        // Escape single quotes in values
-                        val escaped = value.replace("'", "'\\''")
-                        writer.write("export $key='$escaped'\n")
-                    }
-                    writer.flush()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to apply env vars: ${e.message}")
@@ -838,6 +988,158 @@ class PersistentShell(
 }
 
 /**
+ * Pure function: build the `unset`/`export` lines for an environment update.
+ * A `null` value means `unset [key]`. Values containing single quotes are
+ * escaped with the POSIX end-quote idiom (`'` → `'\''`), byte-identical to
+ * the format the direct broadcast path has always written.
+ *
+ * [audit-1015 BUG-07] Shared by the direct broadcast path
+ * ([PersistentShell.applyEnvironment]) and the staged update drained before
+ * the next command body — one format for both, so a staged flush is
+ * indistinguishable from an immediate apply.
+ *
+ * Extracted as a top-level function so both paths and their tests are
+ * JVM-testable without loading [PersistentShell].
+ */
+internal fun internalBuildEnvironmentScript(entries: Map<String, String?>): String = buildString {
+    for ((key, value) in entries) {
+        if (value == null) {
+            append("unset $key\n")
+        } else {
+            append("export $key='")
+            append(internalPosixSingleQuote(value))
+            append("'\n")
+        }
+    }
+}
+
+/**
+ * [meta-audit-1028 E3 / F-13] The POSIX single-quote idiom, as ONE function.
+ *
+ * Inside `'…'` every byte is literal, so the only character that can end the
+ * string early is `'` itself; closing the quote, emitting an escaped quote and
+ * re-opening (`'\''`) is the portable escape. Extracted because there are now
+ * two writers of `export KEY='…'` — this file (agent shell, `\n`-terminated)
+ * and [TerminalSession] (interactive PTY, `\r`-terminated). Their line
+ * endings differ by contract, their quoting must not.
+ */
+internal fun internalPosixSingleQuote(value: String): String = value.replace("'", "'\\''")
+
+/**
+ * [meta-audit-1028 E3 / F-10] Text for a timed-out command: everything the
+ * command printed, then the timeout notice as its own final line.
+ *
+ * The notice stays byte-identical to the historical single-line result when no
+ * output was captured, so callers that recognise the timeout by its text (the
+ * coordinator deliberately adds no `(exit code: N)` trailer for 124) keep
+ * working; when there IS captured output the notice is appended rather than
+ * substituted, which is the whole point of the fix.
+ *
+ * Pure + JVM-testable.
+ */
+internal fun internalTimeoutOutput(captured: String, timeoutMs: Long): String {
+    val notice = "[Command timed out after ${timeoutMs / 1000}s]"
+    if (captured.isEmpty()) return notice
+    return if (captured.endsWith("\n")) captured + notice else captured + "\n" + notice
+}
+
+/**
+ * [audit-1015 BUG-07] Staging slot for environment broadcasts that land while
+ * a command is mid-flight on the shell. A broadcast must NOT write top-level
+ * `export` lines into the PTY while a foreground child owns stdin — the child
+ * reads them as its own input and the PTY echoes them into the command's
+ * captured output. Staged updates merge PER KEY (a later broadcast overrides
+ * an earlier one for the same key; a `null` entry means `unset` — per-key
+ * last-write-wins is exactly the sequential-application semantics) and are
+ * drained in one atomic [internalBuildEnvironmentScript] write right before
+ * the next command body, when the shell is back at top level.
+ *
+ * Pure + JVM-testable (no Android dependencies).
+ */
+internal class PendingEnvironmentUpdate {
+    private val pending = LinkedHashMap<String, String?>()
+
+    /** Merge [envVars] (with [previousKeys] unsets) into the staged update. */
+    @Synchronized
+    fun merge(envVars: Map<String, String>, previousKeys: Set<String>) {
+        for (key in previousKeys - envVars.keys) pending[key] = null
+        for ((key, value) in envVars) pending[key] = value
+    }
+
+    /** Remove and return all staged entries (key -> value; null = unset). */
+    @Synchronized
+    fun drain(): Map<String, String?> {
+        if (pending.isEmpty()) return emptyMap()
+        val out = LinkedHashMap(pending)
+        pending.clear()
+        return out
+    }
+
+    /** Whether any update is currently staged. */
+    @Synchronized
+    fun isEmpty(): Boolean = pending.isEmpty()
+}
+
+/**
+ * Pure function: build the command line sent to the persistent shell's stdin
+ * for [command], using [marker] for the completion marker.
+ *
+ * Shape (validated against BusyBox ash, see sweep-1014 FIX-1):
+ * ```
+ * __MINIS_CWD='/tmp/.minis_cwd_{marker}'
+ * ( trap 'pwd > "$__MINIS_CWD"' EXIT
+ * eval "$(cat <<'ENDOFMINISCMD_{marker}'
+ * {command}
+ * ENDOFMINISCMD_{marker}
+ * )" )
+ * RET=$?
+ * set +e
+ * [ -f "$__MINIS_CWD" ] && cd "$(cat "$__MINIS_CWD")" 2>/dev/null
+ * rm -f "$__MINIS_CWD"
+ * echo "__MINIS_DONE_{marker}_EXIT_${RET}__"
+ * ```
+ *
+ * [fix/sweep1014-shell] The body runs inside a SUBSHELL. `eval` is a POSIX
+ * Special Built-in, so a body that calls `exit`, hits a syntax error, or arms
+ * `set -e` used to kill the WHOLE persistent shell at top level — the marker
+ * echo never ran, and ExecutionCoordinator misread the dead shell as
+ * "OOM/后台被杀" and auto-retried the command (non-idempotent side effects ×2).
+ * The subshell contains all three failure modes; the parent's `RET=$?` /
+ * `set +e` / marker lines are always reached.
+ *
+ * [fix/sweep1014-shell] Because a subshell would also contain `cd`, the
+ * EXIT trap records the body's final working directory to a marker-named
+ * file and the parent `cd`s back into it — preserving the cross-command cwd
+ * persistence that top-level execution used to provide for free. If the
+ * subshell is killed before the trap runs (SIGKILL/OOM), the file is absent
+ * and the parent keeps its current cwd — matching the "shell died and was
+ * recycled" semantics. A body that installs its own EXIT trap replaces ours
+ * and cwd persistence falls back the same way.
+ *
+ * The env broadcast ([PersistentShell.applyEnvironment]) writes top-level
+ * `export` lines directly and does NOT go through this wrapper — exports must
+ * persist in the parent shell, a subshell's would be discarded.
+ */
+internal fun internalBuildShellCommand(command: String, marker: String): String {
+    val heredocDelimiter = "ENDOFMINISCMD_${marker}"
+    val cwdFile = "/tmp/.minis_cwd_${marker}"
+    return buildString {
+        append("__MINIS_CWD='$cwdFile'\n")
+        append("( trap 'pwd > \"\$__MINIS_CWD\"' EXIT\n")
+        append("eval \"\$(cat <<'$heredocDelimiter'\n")
+        append(command)
+        if (!command.endsWith('\n')) append('\n')
+        append("$heredocDelimiter\n")
+        append(")\" )\n")
+        append("RET=\$?\n")
+        append("set +e\n")
+        append("[ -f \"\$__MINIS_CWD\" ] && cd \"\$(cat \"\$__MINIS_CWD\")\" 2>/dev/null\n")
+        append("rm -f \"\$__MINIS_CWD\"\n")
+        append("echo \"__MINIS_DONE_${marker}_EXIT_\${RET}__\"\n")
+    }
+}
+
+/**
  * Pure function: parse the exit code from a `__MINIS_DONE_{marker}_EXIT_{code}__`
  * marker string. Returns -1 when no valid code is found.
  *
@@ -867,18 +1169,89 @@ internal fun internalParseMinisExitCode(text: String, marker: String): Int {
  *
  * A chunk that would cross the ceiling is truncated at the last code-point
  * boundary that fits, so the buffer can never end on a lone surrogate.
+ *
+ * [audit-1015 PERF-01] Production callers pass [currentUtf8Bytes] — the
+ * incrementally-maintained byte total of [output] (see
+ * [PersistentShell.appendOutput]) — so no full recompute runs per chunk. The
+ * legacy 3-arg form keeps the old behaviour for callers/tests without an
+ * accumulator.
  */
-internal fun internalTruncateOutput(output: StringBuilder, text: String, maxBytes: Int): Boolean {
-    val remaining = maxBytes - TerminalSanitizer.utf8Length(output.toString())
-    if (remaining <= 0) return true
+internal fun internalTruncateOutput(output: StringBuilder, text: String, maxBytes: Int): Boolean =
+    internalTruncateOutputDetailed(output, text, maxBytes, TerminalSanitizer.utf8Length(output)).truncated
+
+internal data class TruncateResult(
+    val truncated: Boolean,
+    /** UTF-8 bytes actually appended to [output] by this call. */
+    val appendedUtf8Bytes: Int,
+)
+
+internal fun internalTruncateOutputDetailed(
+    output: StringBuilder,
+    text: String,
+    maxBytes: Int,
+    currentUtf8Bytes: Int,
+): TruncateResult {
+    val remaining = maxBytes - currentUtf8Bytes
+    if (remaining <= 0) return TruncateResult(truncated = true, appendedUtf8Bytes = 0)
     val fitted = TerminalSanitizer.byteSafePrefixLength(text, remaining)
     if (fitted < text.length) {
         output.append(text, 0, fitted)
-        return true
+        return TruncateResult(
+            truncated = true,
+            appendedUtf8Bytes = TerminalSanitizer.utf8Length(text.subSequence(0, fitted)),
+        )
     }
     output.append(text)
-    return false
+    return TruncateResult(truncated = false, appendedUtf8Bytes = TerminalSanitizer.utf8Length(text))
 }
+
+/**
+ * [audit-1015 PERF-01] Incremental UTF-8 byte budget for a growing output
+ * buffer (the shell's per-command capture). Replaces the old per-chunk
+ * `utf8Length(output.toString())` recompute, which copied + scanned the whole
+ * accumulated output on every 4 KB read → O(N²) over a run's total output.
+ *
+ * The accumulator is advanced by the number of bytes [internalTruncateOutputDetailed]
+ * ACTUALLY appended (not by the incoming chunk's length), so a clipped or
+ * skipped chunk cannot drift the total.
+ *
+ * Pure + JVM-testable (no Android dependencies); the ceiling is supplied by a
+ * provider so a live `shellOutputKb` change applies mid-command.
+ */
+internal class IncrementalUtf8Budget(private val maxBytesProvider: () -> Int) {
+
+    /** Running UTF-8 byte total. Invariant: equals the buffer's encoded size. */
+    var byteLength: Int = 0
+        private set
+
+    /** Set once any chunk was clipped or skipped entirely. */
+    var truncated: Boolean = false
+        private set
+
+    /** Append [text] to [output], clipped to the remaining byte budget. */
+    fun appendTo(output: StringBuilder, text: String) {
+        val result = internalTruncateOutputDetailed(output, text, maxBytesProvider(), byteLength)
+        if (result.truncated) truncated = true
+        byteLength += result.appendedUtf8Bytes
+    }
+}
+
+/**
+ * [fix/da1017-marker-boundary] Upper bound on the pending-marker window that
+ * may be withheld across reads once a `__MINIS_DONE_<marker>_EXIT_` prefix has
+ * been seen without its closing `__`.
+ *
+ * A legitimately split marker is at most the 27-char prefix (13 chars of
+ * `__MINIS_DONE_` + the 8-char marker + 6 chars of `_EXIT_`) plus a few
+ * exit-code digits plus `__`, so 64 leaves roughly 2x headroom for any real
+ * marker — the marker is a fresh random token per command, so a stream that
+ * keeps the prefix open for 64+ chars is garbled or hostile output. Dropping
+ * the window there keeps the reader's memory bounded (the withheld tail is
+ * never counted against the output budget, which is capped separately) and the
+ * command still converges through the existing stall-guard / timeout / EOF
+ * paths in [PersistentShell.readLoop].
+ */
+internal const val MAX_PENDING_MARKER_CHARS = 64
 
 /**
  * Cross-chunk scan for the completion marker. `text` is the latest chunk
@@ -887,10 +1260,15 @@ internal fun internalTruncateOutput(output: StringBuilder, text: String, maxByte
  *
  * Hit  → [MarkerScanResult.beforeMarker] = all output before the marker,
  *        [MarkerScanResult.exitCode] = parsed exit code, `keptTail` empty.
+ *        A hit requires the FULL `_EXIT_<n>__` to have arrived: the prefix
+ *        alone is not a completion.
  * Miss → [MarkerScanResult.beforeMarker] = output safe to flush now,
  *        [MarkerScanResult.keptTail] = last (markerPattern.length - 1)
  *        chars that could be a split marker prefix (must be re-scanned with
- *        the next chunk).
+ *        the next chunk), or — [fix/da1017-marker-boundary] — the whole
+ *        pending marker (prefix + partial exit code) when the read boundary
+ *        fell between `_EXIT_` and the closing `__`, capped by
+ *        [MAX_PENDING_MARKER_CHARS].
  *
  * Extracted as a pure function so the split-marker behaviour is JVM-testable
  * without Android deps (see [internalParseMinisExitCode]).
@@ -906,21 +1284,43 @@ internal fun internalScanMarker(tail: String, text: String, marker: String): Mar
     val markerPattern = "__MINIS_DONE_${marker}_EXIT_"
     val combined = if (tail.isEmpty()) text else tail + text
     val idx = combined.indexOf(markerPattern)
-    return if (idx >= 0) {
-        MarkerScanResult(
-            hit = true,
-            beforeMarker = combined.substring(0, idx),
-            exitCode = internalParseMinisExitCode(combined.substring(idx), marker),
-            keptTail = "",
-        )
-    } else {
-        val keepLen = (markerPattern.length - 1).coerceAtMost(combined.length)
-        val flushEnd = combined.length - keepLen
-        MarkerScanResult(
-            hit = false,
-            beforeMarker = combined.substring(0, flushEnd),
-            exitCode = -1,
-            keptTail = combined.substring(flushEnd),
-        )
+    if (idx >= 0) {
+        val exitCode = internalParseMinisExitCode(combined.substring(idx), marker)
+        if (exitCode >= 0) {
+            return MarkerScanResult(
+                hit = true,
+                beforeMarker = combined.substring(0, idx),
+                exitCode = exitCode,
+                keptTail = "",
+            )
+        }
+        // [fix/da1017-marker-boundary] Prefix present, closing `_EXIT_<n>__`
+        // not (yet): the read boundary fell inside the marker line. Reporting a
+        // hit here (the old behaviour) declared the command complete with
+        // `exitCode = -1` — the "shell died" code, which makes
+        // ExecutionCoordinator rebuild the shell and RE-RUN the command — and
+        // discarded every byte of the marker line that had not arrived yet.
+        // Flush what is safely output and carry the rest for the next chunk.
+        val pending = combined.substring(idx)
+        if (pending.length <= MAX_PENDING_MARKER_CHARS) {
+            return MarkerScanResult(
+                hit = false,
+                beforeMarker = combined.substring(0, idx),
+                exitCode = -1,
+                keptTail = pending,
+            )
+        }
+        // Too long to be a real split marker (see [MAX_PENDING_MARKER_CHARS]):
+        // fall through and treat it as ordinary output, i.e. flush all but the
+        // usual trailing window. Nothing is lost, and a complete marker that
+        // arrives in a later chunk is still found by the scan above.
     }
+    val keepLen = (markerPattern.length - 1).coerceAtMost(combined.length)
+    val flushEnd = combined.length - keepLen
+    return MarkerScanResult(
+        hit = false,
+        beforeMarker = combined.substring(0, flushEnd),
+        exitCode = -1,
+        keptTail = combined.substring(flushEnd),
+    )
 }

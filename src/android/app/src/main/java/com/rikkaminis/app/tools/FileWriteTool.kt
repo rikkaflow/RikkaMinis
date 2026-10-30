@@ -25,13 +25,9 @@ object FileWriteTool {
     )
 
     fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
-        // [fix/audit-0917-b9] Resolve the title BEFORE the try: it used to be
-        // a try-scoped val, so the catch arm had no title to report (the
-        // compiler rejected the reference outright — CI 35198111318). A
-        // malformed argsJson falls back to NAME, which is what optString's
-        // default did anyway.
-        val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title", NAME) }
-            .getOrDefault(NAME)
+    // [fix/da1025-G] fallback 单源化：inline runCatching 副本换 resolveToolTitle
+    // 调用（与 ToolTitleResolver.kt 同一实现；行为逐字等价 —— 畸形 JSON 回退 NAME）。
+    val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
@@ -100,14 +96,11 @@ object FileWriteTool {
             // was unreachable and gave a false sense that the write was
             // validated. Use an encoder configured to REPORT malformed input,
             // which does reject unpaired surrogates.
-            try {
-                Charsets.UTF_8.newEncoder()
-                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-                    .encode(java.nio.CharBuffer.wrap(effectiveContent))
-            } catch (e: java.nio.charset.CharacterCodingException) {
+            // [deep-audit-1047 A-08] file_edit now takes the same check
+            // (UnencodableContentGuard) instead of a third inline copy.
+            if (isUnpairedSurrogateFailure(effectiveContent)) {
                 return ToolExecutionResult(
-                    "Error: Content contains unpaired surrogates and cannot be encoded as UTF-8",
+                    UNENCODABLE_CONTENT_MESSAGE,
                     false,
                     toolTitle = toolTitle,
                 )

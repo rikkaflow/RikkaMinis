@@ -9,17 +9,13 @@ import com.termux.view.TerminalView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.lang.ref.WeakReference
-import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -29,10 +25,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * stack with industry-standard ANSI/CSI/OSC parsing, TUI compatibility, and
  * mature keyboard / text-selection handling.
  *
- * Output is delivered as raw bytes through [outputBytes]; consumers that still
- * feed a legacy TerminalEmulator can continue to use this same Flow. The new
- * Termux-backed TerminalScreen (Layer 4) reads directly from the Termux
+ * The Termux-backed TerminalScreen (Layer 4) reads directly from the Termux
  * TerminalView, which is driven by the [termuxSession] below.
+ *
+ * [sweep1014-B18] The legacy raw-byte delta flow (`outputBytes`) was removed:
+ * a repo-wide grep found no consumer of it (the `outputBytes` hits in
+ * LLMProvider / ProviderRssProbe are unrelated token-usage fields), and
+ * `lastTranscriptLength` — kept "so we can emit delta bytes on text changes" —
+ * was assigned but never read. Dead code that implied a live output bridge
+ * that no longer exists.
  */
 class TerminalSession(private val context: Context) {
 
@@ -40,6 +41,24 @@ class TerminalSession(private val context: Context) {
         private const val TAG = "TerminalSession"
         const val DEFAULT_COLS = 80
         const val DEFAULT_ROWS = 24
+
+        /**
+         * [meta-audit-1028 E3 / F-13] How often a deferred env broadcast
+         * re-checks whether the shell is back at an idle prompt. One /proc
+         * children read per second is negligible next to a terminal running.
+         */
+        private const val ENV_BROADCAST_POLL_MS = 1_000L
+
+        /**
+         * [meta-audit-1028 E3 / F-13] Longest a broadcast may be deferred.
+         * A TUI/build can legitimately own the PTY for hours; typing into it
+         * is unacceptable at any point, so past this budget the update is
+         * dropped and logged instead.
+         */
+        private const val ENV_BROADCAST_MAX_DEFER_MS = 10 * 60 * 1000L
+
+        /** 0x15 — Ctrl-U, "kill the current input line" in readline / ash. */
+        private const val CTRL_U: Byte = 0x15
 
         /**
          * Weak-reference registry of live sessions so the Application can push
@@ -76,13 +95,6 @@ class TerminalSession(private val context: Context) {
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
 
-    /** Raw PTY output bytes — delta stream for legacy consumers not using Termux TerminalView. */
-    private val _outputBytes = MutableSharedFlow<ByteArray>(
-        extraBufferCapacity = 64,
-        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-    )
-    val outputBytes: SharedFlow<ByteArray> = _outputBytes.asSharedFlow()
-
     /** Counter bumped on every clearOutput() — lets UI wipe emulator state. */
     private val _clearVersion = MutableStateFlow(0)
     val clearVersion: StateFlow<Int> = _clearVersion.asStateFlow()
@@ -99,10 +111,6 @@ class TerminalSession(private val context: Context) {
 
     /** Marshals output-redraw callbacks from the emulator thread to the UI thread. */
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    /** Track last transcript length so we can emit delta bytes on text changes. */
-    @Volatile
-    private var lastTranscriptLength: Int = 0
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -131,6 +139,18 @@ class TerminalSession(private val context: Context) {
      * executable with the same args the legacy [buildInteractiveCommand] built.
      */
     fun start(sessionId: String? = null, initialCols: Int = DEFAULT_COLS, initialRows: Int = DEFAULT_ROWS) {
+        // [meta1028 D3-F02] A RUNNING PTY whose rootfs was deleted and
+        // re-extracted underneath it (`RootfsManager.reset()` → hook →
+        // `bootGate.invalidate()`) has to be torn down, not kept: its whole
+        // process tree is bound to the tree that no longer exists, and the
+        // early return just below would leave it there until the app restarts.
+        // `!isBooted` is the only signal for "the tree changed under you" — it
+        // is true for every PTY that started normally, so this cannot fire on a
+        // healthy session.
+        if (_state.value == State.RUNNING && !PRootKernel.isBooted) {
+            Log.i(TAG, "rootfs rebuilt under a running PTY — restarting the terminal")
+            stop()
+        }
         if (_state.value == State.RUNNING) return
         _state.value = State.BOOTING
         cols = initialCols
@@ -138,6 +158,14 @@ class TerminalSession(private val context: Context) {
         val myGeneration = startGeneration.incrementAndGet()
 
         scope.launch {
+            // [1042-A-03] The PTY THIS attempt created, if it got that far.
+            // Declared outside the try so the failure handler can compare the
+            // slot against a value captured at creation time. The old handler
+            // self-bound the comparison (`termuxSession?.let { s -> if
+            // (termuxSession === s) … }`), which is a tautology: `s` IS
+            // `termuxSession`, so the "ownership" test always passed and the
+            // handler killed a newer attempt's PTY and cleared its state.
+            var createdSession: com.termux.terminal.TerminalSession? = null
             try {
                 PRootKernel.boot(context)
 
@@ -178,43 +206,123 @@ class TerminalSession(private val context: Context) {
                     2_000, // scrollback rows — match RikkaHub default
                     client,
                 )
+                createdSession = session
                 session.updateSize(cols, rows)
 
+                // [1044-A02] Superseded before attach: reap the PTY and NOTHING
+                // else. The bump that just invalidated this attempt was made by
+                // the party that now owns `_state` — stop() publishes STOPPED,
+                // a newer start() publishes BOOTING — so any write here lands on
+                // top of the newer attempt's state and pins the screen to
+                // STOPPED while a fresh PTY is booting (the reported symptom).
+                // There is nothing else to settle at this checkpoint either: the
+                // slot is not assigned yet (below) and liveSessions holds no
+                // entry for this attempt.
                 if (myGeneration != startGeneration.get()) {
                     Log.i(TAG, "start() superseded before attach — killing PTY")
                     killTermuxProcessTree(session)
-                    _state.value = State.STOPPED
                     return@launch
                 }
 
                 termuxSession = session
-                lastTranscriptLength = 0
-                _state.value = State.RUNNING
                 liveSessions.add(WeakReference(this@TerminalSession))
                 Log.i(TAG, "Termux PTY started: cols=$cols rows=$rows sessionId=$sessionId")
 
                 // If a session is active, cd into its workspace so the user lands
                 // in a familiar directory (mirrors legacy behaviour).
+                //
+                // [da1032-D] This preamble MUST reach the PTY before anything
+                // else is typed into it, so it is written while the state is
+                // still BOOTING. It used to run 300 ms *after*
+                // `_state.value = State.RUNNING`, while the screen prefilled
+                // `initCommand` a fixed 500 ms after start(): only 200 ms of
+                // margin against `PRootKernel.boot()`. Whenever boot overran
+                // that, the prefill bytes were queued FIRST and the two writes
+                // coalesced into a single input line —
+                // `<prefill>cd /var/minis && clear` + CR — which the interactive
+                // shell then EXECUTED as one command (the prefill is only ever
+                // supposed to be visible text, never a command), and `clear`
+                // wiped the screen on top of that. Sanitising the prefill
+                // cannot prevent this: the CR that submits the line belongs to
+                // this very write.
                 if (sessionId != null) {
                     kotlinx.coroutines.delay(300)
                     val initCmd = "cd /var/minis && clear\r".toByteArray()
                     session.write(initCmd, 0, initCmd.size) // (text, offset, length)
                 }
+
+                // [da1032-D] RUNNING is published only NOW, so its meaning
+                // upgrades from "the PTY process exists" to "the PTY is ready —
+                // the optional cd/clear preamble has been injected". Consumers
+                // gate on it before typing (the screen's prefill, the
+                // AndroidView attach), which is what makes the preamble the
+                // first thing the shell reads instead of racing it.
+                //
+                // The generation is re-checked first for the same reason as the
+                // two earlier guards: stop() cannot cancel this coroutine, so a
+                // teardown (or a newer start()) during the 300 ms delay above
+                // must not resurrect an already-killed PTY as RUNNING.
+                // [1044-A02] Same rule, plus one: the shared slot and the
+                // registry are released ONLY while they still point at the PTY
+                // THIS attempt created. An unguarded `termuxSession = null` here
+                // clears whatever a newer start() has already installed — that
+                // newer attempt writes the slot before this checkpoint can run
+                // again — which orphans a live bash tree the UI can neither
+                // write to nor resize, and strands its liveSessions entry. Same
+                // ownership rule as the catch handler below and
+                // onSessionFinished (compare against a value captured at
+                // creation, never against the slot itself).
+                //
+                // No `_state` write for the reason spelled out at the checkpoint
+                // above: the generation bumper published the state.
+                if (myGeneration != startGeneration.get()) {
+                    Log.i(TAG, "start() superseded before RUNNING — killing PTY")
+                    killTermuxProcessTree(session)
+                    if (termuxSession === session) {
+                        termuxSession = null
+                        liveSessions.removeAll {
+                            it.get() === this@TerminalSession || it.get() == null
+                        }
+                    }
+                    return@launch
+                }
+                _state.value = State.RUNNING
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to start Termux PTY session", t)
-                _outputBytes.emit("Error: ${t.message}\r\n".toByteArray())
                 // [audit-0917] Kill and release a PTY that was already assigned
                 // before the failure. The exception can come from the cd-write
                 // or the delay above, i.e. AFTER termuxSession was set — the
                 // old handler only flipped the state, orphaning a live shell
                 // process that nothing would ever reap.
-                termuxSession?.let { s ->
-                    termuxSession = null
+                //
+                // [1042-A-03] Reaping stays keyed on the PTY THIS attempt
+                // created (`createdSession`), not on the slot: a newer start()
+                // can already have installed its own PTY while this coroutine
+                // was failing, and killing what the slot points at (which the
+                // old `termuxSession?.let { s -> if (termuxSession === s) … }`
+                // self-bound form did — `s` IS `termuxSession`, so the guard
+                // was a tautology) would kill the NEW session.
+                //
+                // The shared-state settlement (slot null, liveSessions
+                // unregister, STOPPED publish) is gated the same way: only the
+                // owner of the current slot may touch it. `null === null`
+                // covers "this attempt never attached and the slot is still
+                // empty"; the `else if` covers "this attempt died before
+                // attaching, the slot is empty, and nobody has superseded it"
+                // (a newer start()/stop() bumps startGeneration, so an
+                // unchanged generation means this attempt is still the one
+                // responsible for settling the BOOTING state it published).
+                createdSession?.let { s ->
                     runCatching { killTermuxProcessTree(s) }
                         .onFailure { Log.w(TAG, "cleanup after start failure: ${it.message}") }
                 }
-                liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
-                _state.value = State.STOPPED
+                if (termuxSession === createdSession) {
+                    termuxSession = null
+                    liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+                    _state.value = State.STOPPED
+                } else if (termuxSession == null && startGeneration.get() == myGeneration) {
+                    _state.value = State.STOPPED
+                }
             }
         }
     }
@@ -231,6 +339,9 @@ class TerminalSession(private val context: Context) {
         }
         if (_state.value != State.STOPPED) _state.value = State.STOPPED
         liveSessions.removeAll { it.get() === this || it.get() == null }
+        // [F-13] A staged broadcast belongs to the PTY that just died; start()
+        // re-derives TZ/proxy from their single sources.
+        synchronized(pendingEnv) { pendingEnv.clear() }
         Log.i(TAG, "TerminalSession stopped")
     }
 
@@ -251,19 +362,28 @@ class TerminalSession(private val context: Context) {
         val out = mutableListOf<Int>()
         fun walk(p: Int) {
             if (!seen.add(p)) return
-            try {
-                val taskDir = File("/proc/$p/task")
-                val children = taskDir.listFiles()?.flatMap { tidDir ->
-                    runCatching {
-                        File(tidDir, "children").readText().trim()
-                            .split(Regex("\\s+")).filter { it.isNotEmpty() }.map { it.toInt() }
-                    }.getOrElse { emptyList() }
-                } ?: emptyList()
-                for (c in children) { out.add(c); walk(c) }
-            } catch (_: Throwable) { }
+            for (c in readChildPids(p)) { out.add(c); walk(c) }
         }
         walk(pid)
         return out
+    }
+
+    /**
+     * Direct children of [p], read from every `/proc/<p>/task/<tid>/children`.
+     *
+     * [meta-audit-1028 E3 / F-13] Extracted from [collectDescendants] so the
+     * prompt-state probe ([internalTerminalPromptState]) walks the SAME way the
+     * kill path does — one reader, two consumers, no second dialect of /proc.
+     */
+    private fun readChildPids(p: Int): List<Int> = try {
+        File("/proc/$p/task").listFiles()?.flatMap { tidDir ->
+            runCatching {
+                File(tidDir, "children").readText().trim()
+                    .split(Regex("\\s+")).filter { it.isNotEmpty() }.map { it.toInt() }
+            }.getOrElse { emptyList() }
+        } ?: emptyList()
+    } catch (_: Throwable) {
+        emptyList()
     }
 
     /**
@@ -389,19 +509,125 @@ class TerminalSession(private val context: Context) {
     //  Env broadcasts
     // ──────────────────────────────────────────────
 
-    private fun applyTimezone(tz: String) {
-        val line = "export TZ='${tz.replace("'", "'\\''")}'\r"
-        sendRawBytes(line.toByteArray(Charsets.UTF_8))
+    // [meta-audit-1028 E3 / F-13] A broadcast is a top-level `export` block
+    // typed INTO the PTY. Writing it unconditionally — what this class used to
+    // do — corrupts whatever owns the terminal at that instant:
+    //   * a half-typed command at the prompt (`git commit -m "…`): the export
+    //     text is appended to it and the injected `\r` SUBMITS the joined
+    //     line, so a command the user never wrote runs;
+    //   * `vim` / `nano` / a REPL: the export lines are keyboard input and land
+    //     in the file buffer or the interpreter.
+    // [PersistentShell] hit the same defect ([audit-1015 BUG-07]) and stages the
+    // update until no command is in flight. A terminal has no command boundary
+    // to hook, so the equivalent is two guards:
+    //   1. DEFER while a foreground child owns the PTY; an unknowable state also
+    //      defers (fail closed — never inject blind);
+    //   2. once the shell IS at a prompt, send Ctrl-U first so a partially
+    //      typed line is discarded instead of being executed together with the
+    //      export block.
+    // Escaping was never the broken half (the POSIX `'\''` idiom was already
+    // here); this is about WHEN the bytes are written.
+
+    /** Broadcasts waiting for an idle prompt; per-key last-write-wins. */
+    private val pendingEnv = LinkedHashMap<String, String>()
+
+    /** One pump coroutine at a time — coalesces a burst of broadcasts. */
+    private var envPumpRunning = false
+
+    private fun applyTimezone(tz: String) = queueEnvUpdate(mapOf("TZ" to tz))
+
+    private fun applyEnvMap(env: Map<String, String>) = queueEnvUpdate(env)
+
+    private fun queueEnvUpdate(entries: Map<String, String>) {
+        if (entries.isEmpty()) return
+        synchronized(pendingEnv) { pendingEnv.putAll(entries) }
+        startEnvPump()
     }
 
-    private fun applyEnvMap(env: Map<String, String>) {
-        if (env.isEmpty()) return
-        val sb = StringBuilder()
-        for ((k, v) in env) {
-            val escaped = v.replace("'", "'\\''")
-            sb.append("export ").append(k).append("='").append(escaped).append("'\r")
+    private fun startEnvPump() {
+        val start = synchronized(pendingEnv) {
+            if (envPumpRunning || pendingEnv.isEmpty()) {
+                false
+            } else {
+                envPumpRunning = true
+                true
+            }
         }
-        sendRawBytes(sb.toString().toByteArray(Charsets.UTF_8))
+        if (start) scope.launch { pumpEnvUpdates() }
+    }
+
+    private fun drainPendingEnv(): Map<String, String>? = synchronized(pendingEnv) {
+        if (pendingEnv.isEmpty()) {
+            null
+        } else {
+            val out = LinkedHashMap(pendingEnv)
+            pendingEnv.clear()
+            out
+        }
+    }
+
+    /**
+     * Apply the staged broadcast as soon as the shell is back at a prompt.
+     *
+     * Bounded by [ENV_BROADCAST_MAX_DEFER_MS]: a terminal can sit inside a
+     * long-running TUI/build for hours, and dropping the update is the lesser
+     * evil compared to typing six `export` lines into it. Dropping is logged
+     * (`Log.w`) — and it degrades to "the running terminal keeps the previous
+     * TZ/proxy" which the next session start repairs, because
+     * [buildTermuxEnv] re-derives both from their single sources.
+     */
+    private suspend fun pumpEnvUpdates() {
+        try {
+            var waitedMs = 0L
+            while (true) {
+                if (_state.value == State.STOPPED) {
+                    // PTY gone: start() rebuilds the whole env array anyway.
+                    synchronized(pendingEnv) { pendingEnv.clear() }
+                    return
+                }
+                if (isRunning && shellPromptState() == TerminalPromptState.IDLE_AT_PROMPT) {
+                    val entries = drainPendingEnv() ?: return
+                    val script = internalBuildTerminalEnvScript(entries)
+                    if (script.isNotEmpty()) {
+                        // Ctrl-U: kill the line the user may have half typed
+                        // (see the block comment above). Only reached when the
+                        // shell provably has no foreground child, so this
+                        // cannot reach an editor's insert buffer.
+                        sendRawBytes(byteArrayOf(CTRL_U))
+                        sendRawBytes(script.toByteArray(Charsets.UTF_8))
+                        Log.i(TAG, "Env broadcast applied at prompt: ${entries.size} key(s)")
+                    }
+                    return
+                }
+                if (waitedMs >= ENV_BROADCAST_MAX_DEFER_MS) {
+                    Log.w(
+                        TAG,
+                        "Env broadcast dropped after ${ENV_BROADCAST_MAX_DEFER_MS}ms without an idle " +
+                            "prompt: ${pendingEnv.size} key(s) withheld (the PTY owns a foreground " +
+                            "program; injecting there would be read as keyboard input)",
+                    )
+                    synchronized(pendingEnv) { pendingEnv.clear() }
+                    return
+                }
+                kotlinx.coroutines.delay(ENV_BROADCAST_POLL_MS)
+                waitedMs += ENV_BROADCAST_POLL_MS
+            }
+        } finally {
+            // Re-arm under the same lock the queue takes: an entry that landed
+            // while the last block was being written must not be stranded.
+            val restart = synchronized(pendingEnv) {
+                envPumpRunning = false
+                pendingEnv.isNotEmpty()
+            }
+            if (restart) startEnvPump()
+        }
+    }
+
+    /** Prompt state of the live PTY (semantics: [internalTerminalPromptState]). */
+    private suspend fun shellPromptState(): TerminalPromptState = withContext(Dispatchers.IO) {
+        val s = termuxSession ?: return@withContext TerminalPromptState.UNKNOWN
+        val pid = termuxShellPid(s) ?: return@withContext TerminalPromptState.UNKNOWN
+        internalTerminalPromptState(pid) { p -> readChildPids(p) }
     }
 
     // ──────────────────────────────────────────────
@@ -447,10 +673,15 @@ class TerminalSession(private val context: Context) {
         if (sessionId != null) {
             val sessionBase = File(context.filesDir, "minis-sessions/$sessionId")
             for (subdir in listOf("attachments", "offloads", "workspace", "browser")) {
-                val hostDir = File(sessionBase, subdir)
-                if (hostDir.exists()) {
-                    mounts["/var/minis/$subdir"] = hostDir.absolutePath
-                }
+                // [sweep1014-B18] mkdirs + mount unconditionally (mirrors
+                // ExecutionCoordinator's agent-shell bind, the same pattern).
+                // The old `if (hostDir.exists())` guard silently fell back to
+                // the global map when the session subdir had never been written
+                // (session subdirs are lazy — created on first write), so a
+                // fresh session's terminal bound /var/minis/workspace to
+                // ANOTHER session's directory.
+                val hostDir = File(sessionBase, subdir).also { it.mkdirs() }
+                mounts["/var/minis/$subdir"] = hostDir.absolutePath
             }
         }
         for ((linuxPath, hostPath) in mounts) {
@@ -497,6 +728,27 @@ class TerminalSession(private val context: Context) {
         envMap["LC_ALL"] = "C.UTF-8"
         envMap["TZ"] = PRootKernel.posixTz()
         for ((k, v) in PRootKernel.customEnvironment) envMap[k] = v
+        // [meta-audit-1028 E3 / F-14] Guest temp dir, pinned explicitly — the
+        // same pair PersistentShell.startProcess writes, for the same reason
+        // (full measurement there: 17 213 stale dirs / 3.26 GiB of permanent
+        // junk under `<rootfs>/data/user/0/<pkg>/cache`, 2026-10-27).
+        //
+        // Two things this placement buys:
+        //  * after the [PRootKernel.customEnvironment] merge, so a
+        //    process-global value can never re-point guest temp writes at a
+        //    HOST path — the exact regression the pin exists to prevent;
+        //  * before the user env-var repository, so a user who deliberately
+        //    sets `TMPDIR=/var/minis/tmp` still wins. PersistentShell behaves
+        //    the same way (its per-command [PersistentShell.applyEnvironment]
+        //    export lands after the process env).
+        //
+        // It is written here at all because this entry point can NOT inherit
+        // the PersistentShell pin: Termux execs PRoot with an explicit env
+        // ARRAY, not the inherited ProcessBuilder environment, so what the
+        // guest sees depends on Termux's JNI rather than on anything in this
+        // repo. Pinning makes the contract explicit instead of accidental.
+        envMap["TMPDIR"] = "/tmp"
+        envMap["TMP"] = "/tmp"
         ExecutionCoordinator.envVarRepository?.allAsDict()?.forEach { (k, v) -> envMap[k] = v }
         // [T-minis-fastio] The PTY's own proot `-b` table is session-scoped
         // (buildTermuxArgs above), so an offload handler that rebuilds that
@@ -509,17 +761,13 @@ class TerminalSession(private val context: Context) {
     }
 
     // ──────────────────────────────────────────────
-    //  TermuxSessionClient — callbacks → outputBytes
+    //  TermuxSessionClient — Termux callbacks
     // ──────────────────────────────────────────────
 
     /**
-     * Bridges Termux terminal events into the legacy [outputBytes] flow so
-     * existing consumers (logging, the legacy TerminalEmulator path) keep
-     * receiving output deltas.
-     *
-     * In the new TerminalScreen (Layer 4) the Termux TerminalView reads
-     * directly from the [termuxSession]; this client exists only for
-     * backward-compatible side channels.
+     * Termux terminal event callbacks. In the TerminalScreen (Layer 4) the
+     * Termux TerminalView reads directly from the [termuxSession];
+     * onTextChanged drives the view redraw (the only live output path).
      */
     private inner class TermuxSessionClient : TerminalSessionClient {
         override fun onTextChanged(changedSession: com.termux.terminal.TerminalSession) {
@@ -559,10 +807,28 @@ class TerminalSession(private val context: Context) {
             // `termuxSession` and the liveSessions entry pointing at a dead
             // session — later attach()/sendInput() calls then targeted a
             // finished process instead of starting a fresh one.
-            startGeneration.incrementAndGet()
-            termuxSession = null
-            if (_state.value != State.STOPPED) _state.value = State.STOPPED
-            liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+            //
+            // [1042-A-03] The WHOLE settlement is ownership-gated, not just the
+            // slot clear. This callback can land after a newer start() installed
+            // its own PTY (the screen was re-entered while the old shell was
+            // exiting). Ungated, the stale callback did three things to a live
+            // session it no longer owned:
+            //   · bumped startGeneration — aborting the newer boot coroutine at
+            //     its next `myGeneration != startGeneration.get()` checkpoint,
+            //     i.e. a fresh PTY that dies before it is ever usable;
+            //   · published STOPPED — the screen rendered the new session dead;
+            //   · removed this object's liveSessions entry — the live shell
+            //     stopped receiving timezone/proxy broadcasts.
+            // All four lines are one decision about one slot: if the slot is no
+            // longer ours, the only thing left for this callback to do is log.
+            if (termuxSession === changedSession) {
+                startGeneration.incrementAndGet()
+                termuxSession = null
+                if (_state.value != State.STOPPED) _state.value = State.STOPPED
+                liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+            } else {
+                Log.i(TAG, "stale session-finished callback ignored — a newer PTY owns the slot")
+            }
         }
         override fun onBell(session: com.termux.terminal.TerminalSession) {}
         override fun onColorsChanged(changedSession: com.termux.terminal.TerminalSession) {}
@@ -614,4 +880,95 @@ internal fun internalNormalizeLineEndings(text: String): String {
         i++
     }
     return sb.toString()
+}
+
+/**
+ * [meta-audit-1028 E3 / F-13] Where is the interactive PTY?
+ *
+ * Termux execs PRoot as the session process, so the pid we see is the PRoot
+ * tracer: depth 1 is the guest login shell, depth 2+ is whatever that shell is
+ * running (vim, a REPL, a build). An empty depth-1 list means the /proc walk
+ * saw nothing — the process is gone, or `task/<tid>/children` is not readable
+ * on this kernel. That is reported as [TerminalPromptState.UNKNOWN] so callers
+ * fail CLOSED (defer the broadcast) instead of typing into an unknown
+ * foreground.
+ *
+ * [childrenOf] is injected so this stays pure and JVM-testable; the caller
+ * supplies the /proc reader ([TerminalSession.readChildPids]).
+ */
+internal fun internalTerminalPromptState(
+    tracerPid: Int,
+    childrenOf: (Int) -> List<Int>,
+): TerminalPromptState {
+    if (tracerPid <= 0) return TerminalPromptState.UNKNOWN
+    val shellLevel = childrenOf(tracerPid)
+    if (shellLevel.isEmpty()) return TerminalPromptState.UNKNOWN
+    // Background jobs also land here (they are children of the shell). That is
+    // deliberate: a shell with a job attached is not a clean prompt to type a
+    // six-line block into, and deferring is the cheap direction to be wrong in.
+    for (shellPid in shellLevel) {
+        if (childrenOf(shellPid).isNotEmpty()) return TerminalPromptState.FOREGROUND_RUNNING
+    }
+    return TerminalPromptState.IDLE_AT_PROMPT
+}
+
+internal enum class TerminalPromptState {
+    /** Could not tell — treat as busy: never inject blind. */
+    UNKNOWN,
+
+    /** Guest shell with no children: a broadcast may be typed into it. */
+    IDLE_AT_PROMPT,
+
+    /** A foreground program (or a background job) owns the shell. */
+    FOREGROUND_RUNNING,
+}
+
+/**
+ * [meta-audit-1028 E3 / F-13] Build the CR-terminated `export` block an env
+ * broadcast types into the interactive PTY: one `export KEY='value'\r` per
+ * entry, in iteration order.
+ *
+ * Values are quoted with the shared POSIX idiom
+ * ([internalPosixSingleQuote], the same one the agent shell path uses), and
+ * C0 control characters are stripped first: each line is SUBMITTED by its
+ * trailing `\r`, so a raw `\n` inside a value would submit a half-written
+ * `export KEY='…` line and leave the shell in a continuation prompt. A newline
+ * cannot be represented on a TTY input line at all, and no legitimate TZ /
+ * proxy value contains one.
+ *
+ * Keys are not validated: the only producers are [PRootKernel.posixTz]'s `TZ`
+ * and the fixed `http_proxy` / `https_proxy` / `no_proxy` names from
+ * [PRootKernel.systemProxyEnv].
+ *
+ * Pure + JVM-tested ([TerminalSessionEnvScriptTest]) — [TerminalSession] itself
+ * imports Android classes and cannot be loaded on a desktop JVM.
+ */
+internal fun internalBuildTerminalEnvScript(entries: Map<String, String>): String {
+    if (entries.isEmpty()) return ""
+    val sb = StringBuilder()
+    for ((key, value) in entries) {
+        sb.append("export ").append(key).append("='")
+        sb.append(internalPosixSingleQuote(internalStripControlChars(value)))
+        sb.append("'\r")
+    }
+    return sb.toString()
+}
+
+/**
+ * [meta-audit-1028 E3 / F-13] Drop C0 control characters and DEL.
+ *
+ * Returns [value] itself when it is already clean (the overwhelmingly common
+ * case: every proxy URL and POSIX TZ string), so the broadcast path allocates
+ * nothing extra.
+ */
+internal fun internalStripControlChars(value: String): String {
+    var clean = true
+    for (ch in value) {
+        if (ch.code < 0x20 || ch.code == 0x7F) {
+            clean = false
+            break
+        }
+    }
+    if (clean) return value
+    return value.filter { it.code >= 0x20 && it.code != 0x7F }
 }

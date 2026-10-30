@@ -2,8 +2,12 @@ package com.rikkaminis.app.ui.settings
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
-import android.provider.Settings
+import android.content.pm.PackageManager
+import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -31,10 +35,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
-import com.rikkaminis.app.accessibility.MinisAccessibilityService
 import com.rikkaminis.app.accessibility.RestrictedSettingsManager
+import com.rikkaminis.app.config.AutoApproveStore
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.offload.OffloadPermissionManager
+import com.rikkaminis.app.offload.RuntimePermissionBatch
 import com.rikkaminis.app.offload.ShizukuManager
 import com.rikkaminis.app.power.PowerOptimizationManager
 import com.rikkaminis.app.ui.components.MinisMenu
@@ -63,9 +68,53 @@ fun OffloadPermissionScreen(
 
     val configEnabled by com.rikkaminis.app.config.MinisConfigPermissionStore.enabled.collectAsState()
 
+    // [auto-approve] User's opt-in "免确认模式": routine config writes skip the
+    // dialog, and ASK_ONCE tool permissions behave as BYPASS. All three flags
+    // are UI-only (not reachable through minis-config).
+    val autoApproveEnabled by AutoApproveStore.enabled.collectAsState()
+    val autoApproveSensitive by AutoApproveStore.sensitiveEnabled.collectAsState()
+    val autoApprovePrivileged by AutoApproveStore.privilegedToolsEnabled.collectAsState()
+    // Turning the master switch ON is the one action with a blast radius the
+    // user can't infer from a toggle, so it goes through an explicit dialog
+    // that lists what stops being asked. Turning it OFF is one tap.
+    var showAutoApproveConfirm by remember { mutableStateOf(false) }
+
     val context = LocalContext.current
 
-    var a11yEnabled by remember { mutableStateOf(isA11yServiceEnabled(context)) }
+    // [auto-approve] One-shot batch grant for the runtime permissions the
+    // android-* handlers check at call time. Android has no "remember my
+    // answer" API for a batch, so this can only reduce the number of separate
+    // moments the system asks — never eliminate the system dialog itself.
+    //
+    // The launcher's result map is not trusted on its own (several Android
+    // versions return an empty map for already-granted entries); the toast
+    // re-queries the live state, which is what actually matters.
+    val runtimePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        val all = RuntimePermissionBatch.permissionsFor(Build.VERSION.SDK_INT)
+        val missing = all.count {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        val message = if (missing == 0) {
+            context.getString(R.string.perm_runtime_batch_all_granted)
+        } else {
+            context.getString(R.string.perm_runtime_batch_partial, missing)
+        }
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        AppLogger.info(
+            "PermissionsScreen",
+            "runtime permission batch finished: granted=${all.size - missing} missing=$missing",
+        )
+    }
+
+    // [dv15-B2 / B-08] One classification drives all three a11y states (see
+    // A11yStatus). "Ready" now means the service is actually bound, so a
+    // listed-but-killed service reports DEGRADED instead of reporting
+    // "enabled" and hiding both rescue cards below.
+    var a11yEnabled by remember { mutableStateOf(a11yStatusOf(context) == A11yStatus.READY) }
+    var a11yDegraded by remember { mutableStateOf(false) }
+    var a11yRevoked by remember { mutableStateOf(false) }
     // [T-android-restricted-settings] Android 13+ refuses to arm the
     // accessibility toggle for installs flagged as restricted; surfaced below
     // so the "Open accessibility settings" action doesn't dead-end.
@@ -77,7 +126,15 @@ fun OffloadPermissionScreen(
         // Re-poll once a second so coming back from system Accessibility
         // settings flips the row without a manual refresh.
         while (true) {
-            a11yEnabled = isA11yServiceEnabled(context) || MinisAccessibilityService.getInstance() != null
+            // [dv15-B2 / B-08] Was `isA11yServiceEnabled(context) || getInstance() != null`,
+            // which reported a listed-but-killed service as enabled (the ROM kills
+            // the process while Settings.Secure keeps the entry) — that hid the
+            // settings entry point and the two rescue cards. The connected fallback
+            // survives inside classifyA11yStatus.
+            val status = a11yStatusOf(context)
+            a11yEnabled = status == A11yStatus.READY
+            a11yDegraded = status == A11yStatus.DEGRADED
+            a11yRevoked = status == A11yStatus.REVOKED
             // Re-probed each tick so the section disappears by itself once the
             // user allows restricted settings and returns.
             a11yRestricted = !a11yEnabled && RestrictedSettingsManager.isRestricted(context)
@@ -95,6 +152,75 @@ fun OffloadPermissionScreen(
             }
         },
     ) {
+        // [auto-approve] Mode first: it changes how every row below behaves.
+        SettingsSection(
+            header = stringResource(R.string.perm_section_auto_approve),
+            footer = stringResource(R.string.perm_auto_approve_footer),
+        ) {
+            SettingsSwitchRow(
+                title = stringResource(R.string.perm_auto_approve_title),
+                subtitle = stringResource(R.string.perm_auto_approve_desc),
+                checked = autoApproveEnabled,
+                onCheckedChange = { enabled ->
+                    if (enabled) {
+                        // Enabling asks once, explicitly; disabling is instant
+                        // and also clears the two sub-flags (see disableAll).
+                        showAutoApproveConfirm = true
+                    } else {
+                        AutoApproveStore.disableAll()
+                    }
+                },
+                showDivider = autoApproveEnabled,
+            )
+            if (autoApproveEnabled) {
+                SettingsSwitchRow(
+                    title = stringResource(R.string.perm_auto_approve_sensitive),
+                    subtitle = stringResource(R.string.perm_auto_approve_sensitive_desc),
+                    checked = autoApproveSensitive,
+                    onCheckedChange = { AutoApproveStore.setSensitiveEnabled(it) },
+                )
+                SettingsSwitchRow(
+                    title = stringResource(R.string.perm_auto_approve_privileged),
+                    subtitle = stringResource(R.string.perm_auto_approve_privileged_desc),
+                    checked = autoApprovePrivileged,
+                    onCheckedChange = { AutoApproveStore.setPrivilegedToolsEnabled(it) },
+                    showDivider = false,
+                )
+            }
+        }
+
+        // [auto-approve] Platform-level counterpart: Android cannot be told
+        // "always allow" in advance, so the best available reduction is asking
+        // for every runtime permission in one sitting instead of one capability
+        // at a time mid-task.
+        SettingsSection(
+            header = stringResource(R.string.perm_section_runtime_batch),
+            footer = stringResource(R.string.perm_runtime_batch_desc),
+        ) {
+            SettingsRow(
+                icon = Icons.Outlined.LockOpen,
+                title = stringResource(R.string.perm_runtime_batch_title),
+                subtitle = stringResource(R.string.perm_runtime_batch_sub),
+                onClick = {
+                    val all = RuntimePermissionBatch.permissionsFor(Build.VERSION.SDK_INT)
+                    val notGranted = all.filter {
+                        ContextCompat.checkSelfPermission(context, it) !=
+                            PackageManager.PERMISSION_GRANTED
+                    }
+                    if (notGranted.isEmpty()) {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.perm_runtime_batch_all_granted),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    } else {
+                        runtimePermissionLauncher.launch(notGranted.toTypedArray())
+                    }
+                },
+                showDivider = false,
+            )
+        }
+
         // T-config: master switch for the minis-config CLI surface.
         SettingsSection(
             header = stringResource(R.string.perm_section_config_tool),
@@ -204,6 +330,16 @@ fun OffloadPermissionScreen(
             }
         }
 
+        // [dv15-B2 / B-08] The two self-rescue cards used to exist ONLY in
+        // SystemPermissionsScreen, which has no navigation entry point — so a
+        // user whose grant was force-stopped, or whose ROM killed the service,
+        // reached this screen and found no way to repair it.
+        A11yRevokedRepairSection(
+            revoked = a11yRevoked,
+            shizukuReady = shizukuSnap.state == ShizukuManager.State.READY,
+        )
+        A11yOemKeepAliveSection(degraded = a11yDegraded)
+
         IntegrationSection(
             iconVector = Icons.Outlined.Shield,
             iconTint = Color(0xFFAF52DE),
@@ -225,6 +361,28 @@ fun OffloadPermissionScreen(
         )
 
         Spacer(Modifier.height(16.dp))
+    }
+
+    if (showAutoApproveConfirm) {
+        AlertDialog(
+            onDismissRequest = { showAutoApproveConfirm = false },
+            title = { Text(stringResource(R.string.perm_auto_approve_confirm_title)) },
+            text = { Text(stringResource(R.string.perm_auto_approve_confirm_text)) },
+            confirmButton = {
+                MinisTextButton(onClick = {
+                    showAutoApproveConfirm = false
+                    AutoApproveStore.setEnabled(true)
+                    AppLogger.info("PermissionsScreen", "auto-approve mode enabled by user")
+                }) {
+                    Text(stringResource(R.string.perm_auto_approve_confirm_on))
+                }
+            },
+            dismissButton = {
+                MinisTextButton(onClick = { showAutoApproveConfirm = false }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
+            },
+        )
     }
 
     if (showResetConfirm) {
@@ -342,7 +500,14 @@ private fun AgentPolicyRow(
     toolName: String,
     showDivider: Boolean,
 ) {
-    var currentLevel by remember { mutableStateOf(OffloadPermissionManager.getLevel(toolName)) }
+    // [fix/da1024-H] The level lives in SharedPreferences and is written both by
+    // this row's menu and by "Reset All" in the toolbar — neither is a Compose
+    // state read, so a keyless `remember` froze the first-composition value and
+    // Reset All left every chip on the old level until the screen was reopened.
+    // Keying on the manager's revision re-reads getLevel() after every mutation;
+    // currentLevel stays a local echo for this row's own selection.
+    val revision by OffloadPermissionManager.revision.collectAsState()
+    var currentLevel by remember(toolName, revision) { mutableStateOf(OffloadPermissionManager.getLevel(toolName)) }
     var expanded by remember { mutableStateOf(false) }
 
     Box {
@@ -388,7 +553,9 @@ private fun PermissionRow(
     tool: OffloadPermissionManager.ToolPermissionInfo,
     showDivider: Boolean,
 ) {
-    var currentLevel by remember { mutableStateOf(OffloadPermissionManager.getLevel(tool.toolName)) }
+    // [fix/da1024-H] Same refresh key as AgentPolicyRow — see the note there.
+    val revision by OffloadPermissionManager.revision.collectAsState()
+    var currentLevel by remember(tool.toolName, revision) { mutableStateOf(OffloadPermissionManager.getLevel(tool.toolName)) }
     var expanded by remember { mutableStateOf(false) }
 
     Box {
@@ -476,27 +643,6 @@ private fun levelColor(level: OffloadPermissionManager.PermissionLevel): Color =
     OffloadPermissionManager.PermissionLevel.NOT_ALLOWED -> MaterialTheme.colorScheme.error
 }
 
-private fun isA11yServiceEnabled(context: Context): Boolean =
-    com.rikkaminis.app.accessibility.A11yState.isServiceEnabled(context)
-
-private fun openAccessibilitySettings(context: Context) {
-    try {
-        context.startActivity(
-            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        )
-    } catch (_: Throwable) {
-        try {
-            context.startActivity(
-                Intent(Settings.ACTION_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            )
-        } catch (_: Throwable) {}
-    }
-}
-
 // [T-android-restricted-settings] "Allow restricted settings" lives in the
 // overflow menu of RikkaMinis' own App info page, so App info is the only route
 // the OS offers for that gate. Reuses PowerOptimizationManager's helper, which
@@ -519,13 +665,4 @@ private fun shizukuActionTitleRes(state: ShizukuManager.State): Int = when (stat
     ShizukuManager.State.NOT_RUNNING -> R.string.shizuku_open_btn
     ShizukuManager.State.NEED_PERMISSION -> R.string.shizuku_grant_btn
     ShizukuManager.State.READY -> 0  // never displayed (systemReady=true)
-}
-
-private fun performShizukuAction(context: Context, state: ShizukuManager.State) {
-    when (state) {
-        ShizukuManager.State.NOT_INSTALLED -> ShizukuManager.openInstallPage(context)
-        ShizukuManager.State.NOT_RUNNING -> ShizukuManager.openShizukuApp(context)
-        ShizukuManager.State.NEED_PERMISSION -> ShizukuManager.requestPermission()
-        ShizukuManager.State.READY -> {} // no-op; row never rendered
-    }
 }

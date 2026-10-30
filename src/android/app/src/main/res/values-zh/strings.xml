@@ -421,6 +421,9 @@
     <string name="skill_import_error_no_url">请输入 URL</string>
     <string name="skill_import_error_invalid">SKILL.md 无效或 skill 已存在</string>
     <string name="skill_import_error_format">SKILL.md 无效。请确认包含 \'name:\' 字段的 YAML frontmatter。</string>
+    <string name="skill_file_error_read">无法读取所选文件</string>
+    <string name="skill_file_error_archive">技能包无效：其中未找到 SKILL.md</string>
+    <string name="skill_file_error_detail">导入失败：%1$s</string>
     <string name="skill_import_in_progress">导入中…</string>
     <string name="skill_import_submit">导入</string>
     <string name="skill_detail_label_name">名称</string>
@@ -472,6 +475,7 @@
     <string name="storage_clear_confirm_text">这将删除 %1$s 的文件。此操作无法撤销。</string>
     <string name="storage_section_orphans">可回收空间</string>
     <string name="storage_orphan_banner">来自已删除会话的 %1$d 个残留项 — 共 %2$s</string>
+    <string name="storage_orphan_banner_blocked">%1$d 个项（共 %2$s）看似残留，但数据库中当前没有任何会话记录。为避免删除应用已看不到的数据，清理已被阻止。</string>
     <string name="storage_reclaim_button">回收</string>
     <string name="storage_reclaim_confirm_title">回收残留文件？</string>
     <string name="storage_reclaim_confirm_text">这将永久删除已删除会话遗留的 %1$d 个残留项（%2$s）。其余对话不受影响。此操作无法撤销。</string>
@@ -546,6 +550,7 @@
     <string name="webpreview_close">关闭</string>
     <string name="webpreview_stop">停止加载</string>
     <string name="webpreview_reload">重新加载</string>
+    <string name="webpreview_renderer_gone">页面渲染进程已被系统终止，预览无法继续显示。</string>
     <string name="webpreview_open_external">在外部浏览器中打开</string>
     <string name="webpreview_open_fullscreen">全屏打开</string>
     <string name="webpreview_more">更多</string>
@@ -644,6 +649,9 @@
     <string name="browser_history_clear">清除</string>
     <string name="browser_history_done">完成</string>
     <string name="browser_history_search">搜索历史</string>
+    <string name="browser_history_today">今天</string>
+    <string name="browser_history_yesterday">昨天</string>
+    <string name="browser_history_results">搜索结果</string>
     <string name="browser_history_empty_title">没有浏览历史</string>
     <string name="browser_history_empty_subtitle">历史记录保留 7 天</string>
     <string name="browser_history_clear_dialog_title">清除浏览历史？</string>
@@ -737,6 +745,8 @@
     <string name="modeldetail_capabilities_footer">上下文窗口和最大输出 Token 数（以 tokens 计）。留空使用服务商默认值。对支持扩展推理的模型启用思考模式。</string>
     <string name="modeldetail_provider_default">服务商默认</string>
     <string name="modeldetail_max_tokens_exceeds_warning">超过服务商上报的上限（%1$d）。值已保存，但可能导致请求失败。</string>
+    <string name="modeldetail_error_model_id_exists">"%1$s" 已被该服务商的另一个模型使用。请换一个模型 ID。</string>
+    <string name="add_custom_model_error_model_id_exists">"%1$s" 在该服务商下已存在。请换一个模型 ID。</string>
     <string name="modeldetail_section_input_modality">输入模态</string>
     <string name="modeldetail_image_input">图片输入</string>
     <string name="modeldetail_pdf_input">PDF 输入</string>
@@ -1376,9 +1386,10 @@
     <string name="browser_viewport_width">宽度</string>
     <string name="browser_viewport_height">高度</string>
     <string name="common_loading">加载中…</string>
+    <string name="settings_secret_unreadable">无法读取已存储的值——未保存任何内容。请关闭并重新打开此表单。</string>
     <string name="rootfs_reset_button">重置</string>
     <string name="session_title_label">标题</string>
-    <string name="backup_import_too_large">备份文件太大（%1$d MB，上限 %2$d MB）— 未导入任何内容。</string>
+    <string name="backup_import_too_large">备份文件太大（%1$d MB，上限 %2$d MB）— 未导入任何内容。请把「聊天历史窗口」调短或关掉后重新导出，再导入新文件。</string>
     <string name="backup_export_incomplete">警告：有 %1$d 个字段无法读取 — 此备份可能不完整。</string>
     <string name="code_expand">展开 %1$d 行</string>
     <string name="code_collapse">收起</string>
@@ -1401,6 +1412,7 @@
     <string name="sysmsg_compact_failed">压缩失败：%1$s</string>
     <string name="sysmsg_context_full_hint">上下文即将占满（%1$d / %2$d tokens），可运行 /compact 将较早的对话折叠为摘要。</string>
     <string name="sysmsg_wait_compact">请等待当前压缩完成后再发送。</string>
+    <string name="sysmsg_edit_wait_stream">正在编辑消息。请先停止当前回复——编辑会替换原消息，不能排队发送。</string>
     <string name="sysmsg_context_trimmed">上下文已达 %1$d 限制，已自动裁剪 %2$d 条最老的对话以继续任务。</string>
     <string name="sysmsg_compact_no_provider">未配置模型提供商，无法压缩。</string>
     <string name="sysmsg_compact_empty_session">没有可压缩的内容——会话为空。</string>
@@ -1670,9 +1682,43 @@
     <string name="scheduled_delete_title">删除定时任务？</string>
     <string name="scheduled_delete_body">「%1$s」将被永久删除。</string>
     <string name="scheduled_fuse_notification_title">定时任务已挂起</string>
+    <string name="scheduled_edit_missing_body">该任务已不存在，可能是在本页打开期间被删除的。</string>
     <string name="scheduled_fuse_notification_body">「%1$s」连续失败 %2$d 次，已自动停用。可在设置中恢复。</string>
 
     <string name="backup_passphrase_title">加密备份包</string>
     <string name="backup_passphrase_body">此 OpenMinis 备份包已加密（minisbak-enc/1）。请输入导出时设置的密码。</string>
     <string name="backup_passphrase_label">密码</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">链接到%1$s</string>
+    <string name="tts_spoken_bare_link">链接</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">免确认模式</string>
+    <string name="perm_auto_approve_title">免确认模式</string>
+    <string name="perm_auto_approve_desc">常规设置变更直接生效，不再询问。敏感与破坏性变更仍可保留确认。</string>
+    <string name="perm_auto_approve_sensitive">包含敏感配置</string>
+    <string name="perm_auto_approve_sensitive_desc">敏感配置（服务商 API 密钥、接口地址）也直接生效，不再询问。智能体可能静默改动它们。</string>
+    <string name="perm_auto_approve_privileged">允许特权工具</string>
+    <string name="perm_auto_approve_privileged_desc">允许智能体使用无障碍与 Shizuku 命令行（它们能驱动其他应用、读取屏幕内容）。</string>
+    <string name="perm_auto_approve_footer">默认关闭。开启后，常规写入不再弹出确认框，工具调用不再弹权限询问。所有变更仍会记录在 日志 → 配置变更。</string>
+    <string name="perm_auto_approve_confirm_title">开启免确认模式？</string>
+    <string name="perm_auto_approve_confirm_text">常规设置变更将直接生效，不再弹确认框；工具调用也不再弹权限询问。敏感配置（服务商 API 密钥）与破坏性变更仍会确认。随时可以关掉。</string>
+    <string name="perm_auto_approve_confirm_on">开启</string>
+    <string name="perm_section_runtime_batch">系统权限</string>
+    <string name="perm_runtime_batch_desc">Android 会在你使用对应功能时逐个询问这些权限。现在一次性全部授予，之后就不会反复打断。</string>
+    <string name="perm_runtime_batch_title">一次授予全部系统权限</string>
+    <string name="perm_runtime_batch_sub">日历、联系人、位置、照片、麦克风、相机、通知</string>
+    <string name="perm_runtime_batch_all_granted">全部系统权限均已授予。</string>
+    <string name="perm_runtime_batch_partial">仍有 %1$d 项权限未授予 —— Android 拒绝或你跳过了。</string>
+    <string name="mirror_section_title">外部冗余副本</string>
+    <string name="mirror_section_footer">应用存储之外的一份持续更新的副本。清空应用数据不会影响它，任意文件管理器都能直接读取。</string>
+    <string name="mirror_enable">外部冗余副本</string>
+    <string name="mirror_enable_sub">Download/RikkaMinis/backup —— 自动更新</string>
+    <string name="mirror_last_sync">上次同步：%1$s</string>
+    <string name="mirror_never">尚未同步</string>
+    <string name="mirror_pending_count">待同步 %1$d 个文件</string>
+    <string name="mirror_diag_stale">同步已逾期：%1$d 个文件待写入（距上次写入已 %2$d 分钟）</string>
+    <string name="mirror_diag_failed">上次同步失败</string>
+    <string name="mirror_diag_unavailable">没有可用的存储目标</string>
+    <string name="mirror_retry">重试</string>
 </resources>

@@ -32,13 +32,38 @@ import java.io.File
  * invocation); "recent" ordering falls back to recent-add (createdAt desc),
  * which is the best signal Android has locally.
  */
+/**
+ * [dv22-B4] Pure merge core of [MCPRepository.sessionEnablementMap] — mirrors
+ * [mergeSessionSkillEnablement] (the twin keeps its own copy because its SQL
+ * names differ; the decision itself is this function). Precedence identical
+ * to [MCPRepository.isEnabledForSession]: session override row → global
+ * `enabled` → absent (false).
+ */
+internal fun mergeSessionMcpEnablement(
+    ids: List<String>,
+    overrideRows: Map<String, Boolean>,
+    globalEnabled: (id: String) -> Boolean?,
+): Map<String, Boolean> = ids.associateWith { id ->
+    overrideRows[id] ?: globalEnabled(id) ?: false
+}
+
 class MCPRepository(private val context: Context) {
 
     companion object {
         private const val TAG = "MCPRepository"
         private const val DB_NAME = "mcp.db"
+        /**
+         * On-disk config file name, single-sourced because TWO processes write it
+         * (this repository and the in-guest `minis-mcp-cli`); see [ServersJsonIo]
+         * for the staging/publish contract they share.
+         */
+        private const val SERVERS_FILE_NAME = "servers.json"
         private const val DB_VERSION = 1
         private const val MAX_MCPS_IN_PROMPT = 20
+        /** [dv22-B4] Ids per batched `IN (…)` SELECT in
+         *  [sessionEnablementMap] — same chunking rationale as
+         *  [SkillRepository] (SQLITE_MAX_VARIABLE_NUMBER = 999). */
+        private const val SESSION_OVERRIDE_QUERY_CHUNK = 400
         // Reuse the skill description cap so MCP notes truncate identically.
         private const val MAX_NOTE_LENGTH = 200
 
@@ -60,6 +85,18 @@ class MCPRepository(private val context: Context) {
             }
             return "imported-mcp"
         }
+
+        /**
+         * [da1024-D] Pure: does [server] get PERSISTED as a URL transport
+         * (HTTP / SSE)? Mirrors [entryToJson]'s branch order — a non-blank
+         * command wins and the entry is written as STDIO, so an entry carrying
+         * both is a STDIO server as far as the guest (and its OAuth
+         * credentials) are concerned. A blank-transport entry is not a URL
+         * server either. Extracted so the OAuth-reconcile rule is testable
+         * without a Context (see MCPOAuthLifecycleTest).
+         */
+        internal fun persistsAsUrlTransport(server: MCPServerConfig): Boolean =
+            !server.isStdio && !server.url.isNullOrBlank()
     }
 
     /** Truncation cap for MCP notes shown in list rows / prompt fragments.
@@ -118,6 +155,18 @@ class MCPRepository(private val context: Context) {
     private val _servers = MutableStateFlow<List<MCPServerConfig>>(emptyList())
     val servers: StateFlow<List<MCPServerConfig>> = _servers.asStateFlow()
 
+    /**
+     * [dv22-B4] Bumped by every write to `mcp_session_overrides`
+     * ([setSessionOverride] / [clearSessionOverrides] /
+     * [renameSessionOverrides]) — the overrides table is not mirrored by
+     * [servers], so before this channel a session toggle re-emitted nothing
+     * and the slash menu kept a stale server list (B-04). Pure revision
+     * number: collectors re-read the table when this moves, no polling.
+     * Mirrors [SkillRepository.sessionOverridesRevision].
+     */
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
+
     private val db: SQLiteDatabase by lazy {
         McpDbHelper(context).writableDatabase
     }
@@ -127,7 +176,7 @@ class MCPRepository(private val context: Context) {
         get() = File(context.filesDir, "minis-global/mcp-servers")
 
     private val serversFile: File
-        get() = File(mcpDir, "servers.json")
+        get() = File(mcpDir, SERVERS_FILE_NAME)
 
     init {
         load()
@@ -236,19 +285,25 @@ class MCPRepository(private val context: Context) {
         }
         val root = JSONObject().put("mcpServers", mcpServers)
         try {
-            // [F-227] Write to a sibling temp file and rename over the target so
-            // a process death / storage-full mid-write can never leave a
-            // truncated servers.json behind — a truncated file used to parse as
-            // "zero servers" and then got persisted as the truth.
-            val tmp = File(mcpDir, "servers.json.tmp")
-            tmp.writeText(root.toString(2))
-            if (!tmp.renameTo(serversFile)) {
-                // Some filesystems refuse rename onto an existing path.
-                serversFile.writeText(root.toString(2))
-                tmp.delete()
+            // [F-227] Publish through a staging file so a process death /
+            // storage-full mid-write can never leave a truncated servers.json
+            // behind — a truncated file used to parse as "zero servers" and then
+            // got persisted as the truth.
+            //
+            // [meta-audit-1028 E2 / B07 F-14] The staging name is NOT a constant
+            // any more. `minis-mcp-cli` inside the guest writes this same file
+            // (utils/config.py::save_config) and used the very same
+            // `servers.json.tmp`, so an agent running `minis-mcp-cli add …`
+            // while the user saved the form had two writers truncating one
+            // staging file: one rename could publish the other's bytes, and the
+            // loser fell back to rewriting the live file non-atomically. Both
+            // sides now stage under a unique name and publish with one atomic
+            // rename; see [ServersJsonIo].
+            if (!ServersJsonIo.writeAtomic(mcpDir, SERVERS_FILE_NAME, root.toString(2))) {
+                Log.e(TAG, "Failed to write $SERVERS_FILE_NAME: no rename path succeeded")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write servers.json: ${e.message}")
+            Log.e(TAG, "Failed to write $SERVERS_FILE_NAME: ${e.message}")
         }
     }
 
@@ -351,6 +406,7 @@ class MCPRepository(private val context: Context) {
         if (server.id.isBlank()) return false
         _servers.value = _servers.value.filter { it.id != server.id } + server
         save()
+        reconcileOAuth(server)
         Log.i(TAG, "Added MCP server: ${server.id}")
         return true
     }
@@ -359,7 +415,38 @@ class MCPRepository(private val context: Context) {
         if (_servers.value.none { it.id == server.id }) return false
         _servers.value = _servers.value.map { if (it.id == server.id) server else it }
         save()
+        reconcileOAuth(server)
         return true
+    }
+
+    /**
+     * [da1024-D] Bring [server]'s stored OAuth state (encrypted secret/tokens +
+     * the in-guest bridge file) in line with the config that was just
+     * persisted. Called from every write path — [add], [update], [importJSON] —
+     * so the invariant "credentials exist iff the saved config is a configured
+     * URL-transport OAuth server" holds for the form, a pasted JSON import and
+     * a backup restore alike, without each caller remembering which partial
+     * cleanup verb to run.
+     *
+     * Ordering: servers.json first, credentials second. If the credential
+     * reconcile fails, the saved config is still the truth (so the next save
+     * retries) instead of having purged credentials for a config that never
+     * landed. Best-effort by design — a credential-store hiccup must not fail
+     * the save that already succeeded. Credentials are never logged (the server
+     * name is the whole message).
+     */
+    private fun reconcileOAuth(server: MCPServerConfig) {
+        runCatching {
+            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.reconcileForServer(
+                context = context,
+                server = server.id,
+                urlTransport = persistsAsUrlTransport(server),
+                oauth = server.oauth,
+                serverUrl = server.url,
+            )
+        }.onFailure {
+            Log.w(TAG, "OAuth reconcile failed for '${server.id}': ${it.message}")
+        }
     }
 
     fun delete(id: String) {
@@ -402,6 +489,34 @@ class MCPRepository(private val context: Context) {
     }
 
     /**
+     * [dv22-B4] Batched twin of [isEnabledForSession]: ONE `IN (…)` SELECT for
+     * the whole id list (chunked at [SESSION_OVERRIDE_QUERY_CHUNK]) instead of
+     * one rawQuery per server — the slash menu walks the full list on every
+     * keystroke, so the per-item shape cost M synchronous queries per producer
+     * run (B-04). Precedence identical via the pure [mergeSessionMcpEnablement]
+     * core. Mirrors [SkillRepository.sessionEnablementMap].
+     */
+    fun sessionEnablementMap(sessionId: String, ids: List<String>): Map<String, Boolean> {
+        if (ids.isEmpty()) return emptyMap()
+        val overrideRows = mutableMapOf<String, Boolean>()
+        ids.chunked(SESSION_OVERRIDE_QUERY_CHUNK).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val cursor = db.rawQuery(
+                "SELECT mcp_id, is_enabled FROM mcp_session_overrides WHERE session_id=? AND mcp_id IN ($placeholders)",
+                arrayOf(sessionId) + chunk.toTypedArray(),
+            )
+            if (cursor.moveToFirst()) {
+                do {
+                    overrideRows[cursor.getString(0)] = cursor.getInt(1) == 1
+                } while (cursor.moveToNext())
+            }
+            cursor.close()
+        }
+        val globals = _servers.value.associate { it.id to it.enabled }
+        return mergeSessionMcpEnablement(ids, overrideRows) { id -> globals[id] }
+    }
+
+    /**
      * [T-mcp-review-fixes-android] FIX 3: sparse-clear to match iOS. When the
      * chosen [enabled] equals the server's CURRENT global enabled, DELETE the
      * override row instead of pinning it — so a later flip of the global
@@ -423,10 +538,14 @@ class MCPRepository(private val context: Context) {
                 arrayOf<Any>(sessionId, mcpId, if (enabled) 1 else 0)
             )
         }
+        // [dv22-B4] The table moved — publish the revision so async consumers
+        // (the slash menu's producer) re-query without polling.
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     fun clearSessionOverrides(sessionId: String) {
         db.execSQL("DELETE FROM mcp_session_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     /**
@@ -444,6 +563,7 @@ class MCPRepository(private val context: Context) {
             "UPDATE OR REPLACE mcp_session_overrides SET session_id=? WHERE session_id=?",
             arrayOf<Any>(toReal, fromDraft),
         )
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     // -- JSON Import (4 format variants, last-write-wins on name) --
@@ -472,6 +592,13 @@ class MCPRepository(private val context: Context) {
         _servers.value = _servers.value.filter { it.id !in incomingIds } + parsed
         _servers.value = _servers.value.sortedByDescending { it.createdAt }
         save()
+        // [da1024-D] An import overwrites same-id entries last-write-wins, so an
+        // entry that used to be an authorized HTTP server can be replaced by a
+        // STDIO / OAuth-less one — the old tokens, client secret and plaintext
+        // bridge file would survive the overwrite untouched. Reconcile every
+        // imported entry (a fresh entry is a no-op: no credentials are stored
+        // under an id that was never authorized).
+        for (s in parsed) reconcileOAuth(s)
         Log.i(TAG, "Imported ${parsed.size} MCP server(s)")
         return parsed
     }

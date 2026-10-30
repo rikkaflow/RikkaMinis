@@ -8,9 +8,12 @@ import com.rikkaminis.app.data.model.LLMError
 import com.rikkaminis.app.data.model.parseRetryAfterMs
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.provider.LegacyMediaPlan
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.sanitizeToolPairing
+import com.rikkaminis.app.provider.hasWirePayload
+import com.rikkaminis.app.provider.sseDataPayload
 import com.rikkaminis.app.provider.anthropicUsageAccounting
 import com.rikkaminis.app.data.model.LLMResponse
 import com.rikkaminis.app.data.model.LLMStreamChunk
@@ -44,8 +47,11 @@ import com.rikkaminis.app.sandbox.offload.FirstChunkTimeoutPolicy
 import java.util.concurrent.TimeUnit
 import com.rikkaminis.app.provider.causeChainSummary
 import com.rikkaminis.app.provider.failOnSilentEmptyCompletion
+import com.rikkaminis.app.provider.nonStreamCeilingCutLogLine
+import com.rikkaminis.app.provider.nonStreamOutputCeilingCut
 import com.rikkaminis.app.provider.asConsumerSideCancellation
 import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.StreamCancelBridge
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.visionPlaceholder
 
@@ -89,8 +95,17 @@ class AnthropicProvider(
             if (enhancedCache) put("ttl", "1h")
         }
 
-    /** Use Bearer auth for custom (non-Anthropic) base URLs or OAuth. */
-    private val isCustomEndpoint: Boolean = basePath != "https://api.anthropic.com"
+    /**
+     * Use Bearer auth for custom (non-Anthropic) base URLs or OAuth.
+     *
+     * [R5-E F-07] Host-based, not string-equality: `effectiveBaseURL` appends
+     * `/v1`, so a user who pastes the public endpoint into the custom-base
+     * field arrives here as `https://api.anthropic.com/v1` — the old
+     * `basePath != "https://api.anthropic.com"` test called that a relay and
+     * sent `Authorization: Bearer`, which the official endpoint rejects
+     * (401) in favour of `x-api-key`.
+     */
+    private val isCustomEndpoint: Boolean = !isOfficialAnthropicHost(basePath)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -132,7 +147,43 @@ class AnthropicProvider(
             }
 
             val json = JSONObject(responseBody)
-            parseResponse(json)
+            // [FIX-FW-NONSTREAM C1] A 2xx is not the same thing as a successful
+            // Messages call: relays and edge hops answer `200 {"type":"error",
+            // "error":{…}}`, and a body with neither `content` nor a
+            // `stop_reason` (truncated relay payload, empty object) carries no
+            // answer at all. Both used to fall through parseResponse — which
+            // only ever reads `content[].text` — into `LLMResponse("", null)`,
+            // i.e. an EMPTY ANSWER REPORTED AS A CLEAN SUCCESS: the caller
+            // persisted a fabricated empty turn and never retried. Verdict is
+            // pure and unit-tested (AnthropicNonStreamVerdictTest +
+            // AnthropicNonStreamingWireTest); see anthropicNonStreamVerdict for
+            // why "no message" throws instead of returning a stop reason the
+            // app cannot interpret.
+            when (val verdict = anthropicNonStreamVerdict(json)) {
+                AnthropicNonStreamVerdict.Ok -> Unit
+                is AnthropicNonStreamVerdict.HttpError ->
+                    // Same mapping the streaming arm uses for a mid-stream
+                    // error frame (anthropicStreamErrorStatus + mapHttpError),
+                    // so a rate limit is RateLimited and a revoked key is
+                    // InvalidApiKey on both paths.
+                    throw mapHttpError(verdict.status, responseBody)
+                is AnthropicNonStreamVerdict.EmptyMessage ->
+                    throw LLMError.ProviderError(verdict.describe())
+            }
+            val parsed = parseResponse(json)
+            // [FIX-FW-NONSTREAM C2] The turn was cut at the output ceiling.
+            // Deliberately NOT an exception: retrying with the same max_tokens
+            // hits the same ceiling, so a throw would only produce a pointless
+            // retry loop. The signal is a structured log line (no body text, no
+            // credentials) so a "why is the answer half a sentence" report is
+            // answerable from the log.
+            if (nonStreamOutputCeilingCut(parsed.stopReason)) {
+                android.util.Log.w(
+                    name,
+                    nonStreamCeilingCutLogLine(name, parsed.stopReason, parsed.text.length),
+                )
+            }
+            parsed
         }
     }
 
@@ -191,6 +242,31 @@ class AnthropicProvider(
                 call.cancel()
             }
         }
+        // [fix/audit2-cancelbridge-1015, placement corrected by audit3 F-05]
+        // Cancellation bridge, registered BEFORE the first blocking call —
+        // which is `call.execute()` immediately below, then `reader.readLine()`
+        // in the loop. The position is load-bearing, not stylistic: `execute()`
+        // itself blocks while the connection is established and the response
+        // headers are awaited, and a blocking socket read is NOT interruptible
+        // by coroutine cancellation. With the bridge registered AFTER
+        // `execute()` (where audit2 first put it) a user cancel landing in that
+        // connect/header window had no handler to reach, so the coroutine ran
+        // on until the headers arrived or the TTFB watchdog
+        // (StreamTimeouts.TTFB_TIMEOUT_MS) fired. Measured: with the bridge
+        // after execute a cancel during a silent connect window is still parked
+        // in the socket read past the 10s probe bound; with it before, the call
+        // is torn down in milliseconds (see the connect-window arm of
+        // ProviderCancelBridgeAnthropicGeminiTest).
+        //
+        // Without any bridge at all, a cancel during the body read leaves this
+        // coroutine parked until the upstream speaks or the generation
+        // readTimeout (30 min, FirstChunkTimeoutPolicy) fires — measured against
+        // a silently wedged server: the outer job, the inner job, a wrapping
+        // coroutineScope and a withTimeoutOrNull each still ran the full budget,
+        // socket still open. OpenAIProvider registers it in exactly this spot.
+        // See [com.rikkaminis.app.provider.StreamCancelBridge] for the three
+        // semantics and the OpenAI arm's numbers.
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         val response = try {
             call.execute()
         } catch (e: IOException) {
@@ -268,6 +344,15 @@ class AnthropicProvider(
         // retried instead of silently saved as complete.
         var contentChars = 0
         var sawClearFinish = false
+        // [B11] Accumulated tool-call activity, tracked separately from
+        // [contentChars] so a pure-tool turn (no text/thinking at all) still
+        // signals truncation. [dv29 A-01] Fed from ALL THREE protocol
+        // lifecycle points via AnthropicStreamSignals — the block
+        // announcement, the argument deltas and the block completion. Feeding
+        // it from the deltas alone left a cut between the announcement and the
+        // first non-empty delta looking like an empty stream, so the orphan
+        // flush below emitted a complete-with-{} call that the executor ran.
+        var toolChars = 0
         // [FIX-1 / F-190] The Messages protocol splits usage across two events:
         // `message_start` carries the FULL accounting (input_tokens,
         // cache_read_input_tokens, cache_creation_input_tokens) and
@@ -293,10 +378,12 @@ class AnthropicProvider(
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 val l = line ?: continue
-                if (!l.startsWith("data: ")) continue
+                // [r3-b08 F-13] Same tolerance as OpenAI/Gemini: the space after
+                // `data:` is optional per the SSE spec, and a relay that omits it
+                // lost every frame → silent empty stream / watchdog timeout.
+                val payload = sseDataPayload(l)?.trim() ?: continue
                 firstDataArrived.set(true)
                 firstDataWatchdog.cancel()
-                val payload = l.removePrefix("data: ")
                 if (payload == "[DONE]") break
 
                 val event = try { JSONObject(payload) } catch (_: Exception) { continue }
@@ -320,6 +407,14 @@ class AnthropicProvider(
                             toolInputBuffer.clear()
                             lastLoggedInputChars = -1 // [T-toolinput-sample-1012] reset sampling state
                             android.util.Log.d("ToolChain[Provider]", "→ ToolUseStart id=$currentToolId name=$currentToolName")
+                            // [dv29 A-01] The announcement is already tool-call
+                            // progress: a stream that dies before the first
+                            // argument delta must still be read as truncated,
+                            // otherwise a pure-tool turn (contentChars == 0)
+                            // looks like a fully empty stream here and the
+                            // orphan flush hands an argument-less call to the
+                            // executor.
+                            toolChars += toolUseStartActivityChars(currentToolId!!, currentToolName!!)
                             send(LLMStreamChunk.ToolUseStart(currentToolId!!, currentToolName!!))
                         }
                     }
@@ -344,6 +439,11 @@ class AnthropicProvider(
                                 val partial = delta.safeOptString("partial_json", "")
                                 if (partial.isNotEmpty() && currentToolId != null) {
                                     toolInputBuffer.append(partial)
+                                    // [B11] Tool input bytes count as stream activity: a
+                                    // pure-tool turn that is cut mid input_json_delta must
+                                    // still trip the truncated-Finished below instead of
+                                    // looking like a clean, empty reply.
+                                    toolChars += toolInputDeltaActivityChars(partial)
                                     // [T-toolinput-sample-1012] Sampled like the OpenAI paths:
                                     // first delta + one per TOOL_LOG_INPUT_STEP_CHARS of growth
                                     // (per-fragment lines measured 74% of the worker's daily file).
@@ -366,6 +466,12 @@ class AnthropicProvider(
                             }
                             android.util.Log.d("ToolChain[Provider]", "→ ToolCallComplete id=$currentToolId name=$currentToolName args=${args.toString().take(300)}")
                             send(LLMStreamChunk.ToolCallComplete(currentToolId!!, currentToolName!!, args))
+                            // [dv29 A-01] Defence in depth for a completed tool
+                            // block that never streamed a delta (zero-argument
+                            // call): a stream cut between this block and the
+                            // terminal message_delta must still read as
+                            // truncated rather than as a clean no-finish EOF.
+                            toolChars += toolUseStopActivityChars(currentToolId!!, currentToolName!!)
                             currentToolId = null
                             currentToolName = null
                             toolInputBuffer.clear()
@@ -418,20 +524,47 @@ class AnthropicProvider(
                             "Stream error event: ${event.toString().take(500)}",
                         )
                         throw mapHttpError(
-                            if (errType == "overloaded_error") 529 else 400,
+                            anthropicStreamErrorStatus(errType),
                             event.toString(),
                         )
                     }
                 }
+            }
+            // [B11] Flush a tool_use block that never got its content_block_stop
+            // before the stream ended (server closes mid input_json_delta). Without
+            // this the tool call silently vanished: failOnSilentEmptyCompletion only
+            // fires on a fully empty stream, so the agent loop saw a non-empty
+            // stream with no ToolCallComplete and exited as a clean no-tool turn.
+            // Mirrors OpenAIProvider's responses-API drain (:1384-1401, T248) —
+            // the incomplete JSON is handed to ToolJsonRepair/preflight downstream
+            // instead of dropped. currentToolId is null here on the normal path
+            // (content_block_stop already completed it), so this only fires on the
+            // orphan case.
+            if (currentToolId != null && currentToolName != null) {
+                val args = try {
+                    JSONObject(toolInputBuffer.toString())
+                } catch (_: Exception) {
+                    JSONObject()
+                }
+                com.rikkaminis.app.logging.AppLogger.warning(
+                    "AnthropicProvider",
+                    "Stream ended mid-tool-call id=$currentToolId name=$currentToolName argsLen=${toolInputBuffer.length} — flushing as ToolCallComplete (B11)",
+                )
+                send(LLMStreamChunk.ToolCallComplete(currentToolId!!, currentToolName!!, args))
+                currentToolId = null
+                currentToolName = null
+                toolInputBuffer.clear()
             }
             // [RC2-truncated-detection] Loop exited by EOF / [DONE] before any
             // message_delta (server cut mid-stream after text/thinking deltas but
             // before the terminal event). Without this, ChatViewModel would see no
             // Finished, treat it as a clean finish, and silently save a partial
             // answer. Signal truncated so the turnTruncated retry owns it. Gated on
-            // accumulated content — a fully empty EOF is handled by
-            // failOnSilentEmptyCompletion and must not be flagged.
-            if (!sawClearFinish && contentChars > 0) {
+            // accumulated content (text/thinking [contentChars] or tool-call
+            // activity [toolChars], the latter fed from the block announcement,
+            // the argument deltas AND the block completion) — a fully empty EOF is
+            // handled by failOnSilentEmptyCompletion and must not be flagged.
+            if (!sawClearFinish && (contentChars > 0 || toolChars > 0)) {
                 send(LLMStreamChunk.Finished(null, truncated = true))
             }
         } catch (e: Exception) {
@@ -440,6 +573,13 @@ class AnthropicProvider(
             // (user tapped stop), not that the stream broke. Classifying it as
             // a stream error made a cancel look like a provider failure.
             val consumerCancel = e.asConsumerSideCancellation()
+                // [fix/audit2-cancelbridge-1015] The bridge closes the socket, so
+                // this catch sees `SocketException: Socket closed` — which says
+                // the socket closed, not *why*. Re-ask the bridge for the reason
+                // (the same second door OpenAIProvider uses), so a user cancel
+                // keeps landing in the INFO branch below instead of being logged
+                // as a stream error.
+                ?: cancelBridge.consumerCancellationCause?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "AnthropicProvider",
@@ -452,7 +592,11 @@ class AnthropicProvider(
         } finally {
             reader.close()
             response.close()
+            // The body left the read loop under its own power: a later scope
+            // cancellation is teardown, not "this stream was cancelled".
+            cancelBridge.markStreamCompleted()
         }
+        cancelBridge.dispose()
         channel.close()
         awaitClose()
         // [fix/provider-stream-flowon] Same starvation as OpenAIProvider: the
@@ -497,7 +641,17 @@ class AnthropicProvider(
         // Defense-in-depth clamp: upstream dynamicMaxTokens() is already in
         // range; this guards out-of-band callers (sub-agent budgets, synthesized
         // requests) from a deterministic 400 on over-range max_tokens.
-        body.put("max_tokens", clampOutboundMaxTokens(maxTokens, effectiveMaxOutputTokens(model)))
+        //
+        // [deep-audit-1046 S-03] ONE value, TWO readers. `budget_tokens` is
+        // defined *relative to* `max_tokens` (Anthropic 400s with
+        // "thinking.budget_tokens must be less than max_tokens"), so the budget
+        // must be derived from the number actually put on the wire. It used to
+        // read the RAW request value while this field wrote the clamped one —
+        // any out-of-band caller above the model ceiling (sub-agent budget,
+        // synthesized request) emitted e.g. max_tokens=8192 with
+        // budget_tokens=65536 and got a deterministic 400.
+        val cappedMaxTokens = clampOutboundMaxTokens(maxTokens, effectiveMaxOutputTokens(model))
+        body.put("max_tokens", cappedMaxTokens)
         body.put("stream", stream)
 
         if (temperature != null && !thinkingLevel.isEnabled && !modelRejectsTemperature(model.id)) {
@@ -545,8 +699,15 @@ class AnthropicProvider(
                     put("effort", thinkingEffort(thinkingLevel))
                 })
             } else {
-                val budgetTokens = thinkingBudget(maxTokens, thinkingLevel)
-                if (budgetTokens > 0) {
+                // [deep-audit-1046 S-03] Budget off the WIRE value, and only
+                // emit the field when the pair is actually legal: a budget that
+                // is 0 or >= max_tokens is a deterministic 400 (maxTokens==1
+                // leaves no room for any budget at all), and a thinking block
+                // with no usable budget is worse than no thinking block — the
+                // legacy path's default is "no thinking", so omitting it is the
+                // honest degradation.
+                val budgetTokens = thinkingBudget(cappedMaxTokens, thinkingLevel)
+                if (budgetTokens > 0 && budgetTokens < cappedMaxTokens) {
                     body.put("thinking", JSONObject().apply {
                         put("type", "enabled")
                         put("budget_tokens", budgetTokens)
@@ -648,15 +809,31 @@ class AnthropicProvider(
         // tool_results) to also drop orphan tool_use — an assistant tool_use
         // with no matching tool_result in the immediately following user
         // message is an equally deterministic 400.
-        val messages = sanitizeToolPairing(rawMessages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(rawMessages) { detail ->
             android.util.Log.i("AnthropicProvider", detail)
         }
+        // [deep-audit-1045 A-03] Same pre-filter index as the two OpenAI
+        // builders: the request-level `imageParts` attach to the LAST user turn
+        // (the `isLastUser` arm below), so a media-only turning point must not
+        // be filtered out before that arm can see it.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val messages = sanitizedRaw
             // Drop messages that became empty (orphan-only removed). An empty
             // content array is itself a 400 on Anthropic. Pristine empty
             // messages (e.g. empty USER text) are handled by the serializer
             // below — they reach here only if a call site sent them, and this
             // filter is the last defense against empty content arrays.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            //
+            // [deep-audit-1045 A-03] "Empty" must mean no TEXT, not no
+            // payload — see OpenAIProvider's twin filter. Without the media
+            // arms a `minis-model-use` turn carrying only an image or audio
+            // block was deleted here and the model never saw the bytes.
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         // [T-android-anthropic-thinking-echo] (issue #70) Compute once — the
         // gate depends only on the model + endpoint, not the message.
         val echoThinking = shouldEchoInterleavedThinking()
@@ -673,6 +850,15 @@ class AnthropicProvider(
 
             if (msg.contentParts.isNotEmpty()) {
                 val contentArray = JSONArray()
+                // [R5-E F-06] Did this turn already put an image on the wire (as an
+                // image block, or as the [§27a] text placeholder for a non-vision
+                // model)? Both carriers — the request-level [imageParts] list and the
+                // message's own [msg.imageParts] — hold the SAME bytes the
+                // contentParts ImageData part holds, so the answer gates whether the
+                // leftover carriers may be appended below: appending them when the
+                // contentParts branch already emitted the image would send every
+                // attached screenshot twice.
+                var emittedImage = false
                 // [T-android-anthropic-thinking-echo] (issue #70) Prepend the
                 // synthesized thinking block FIRST so it precedes text/tool_use
                 // (Anthropic requires the thinking block to lead the assistant
@@ -692,10 +878,17 @@ class AnthropicProvider(
                 for (part in msg.contentParts) {
                     when (part) {
                         is AgentContentPart.Text -> {
-                            contentArray.put(JSONObject().apply {
-                                put("type", "text")
-                                put("text", part.text)
-                            })
+                            // [r3-b08 F-09] An empty text block is a hard 400 on
+                            // the Messages API ("text content blocks must be
+                            // non-empty"). hasWirePayload now drops a message
+                            // whose ONLY part is Text(""), but one that survives
+                            // next to a tool_use block still reaches here.
+                            if (part.text.isNotEmpty()) {
+                                contentArray.put(JSONObject().apply {
+                                    put("type", "text")
+                                    put("text", part.text)
+                                })
+                            }
                         }
                         is AgentContentPart.ToolUse -> {
                             // Anthropic requires tool ids to match ^[a-zA-Z0-9_-]+$.
@@ -710,10 +903,23 @@ class AnthropicProvider(
                         }
                         is AgentContentPart.ToolResult -> {
                             val resultContent = JSONArray()
-                            resultContent.put(JSONObject().apply {
-                                put("type", "text")
-                                put("text", part.content)
-                            })
+                            // [R5-E C-07①] An empty text block is a hard 400 inside
+                            // tool_result too ("text content blocks must be non-empty"
+                            // — same block type the [r3-b08 F-09] guard below already
+                            // refuses for plain text). Reachable producers: restored /
+                            // imported history rows whose persisted tool output is ""
+                            // (ChatStreamToolHelpers hands parts_json straight through)
+                            // and `minis-model-use` wire tool_result parts with no
+                            // `content` key (ModelExecutionService parses absent as "").
+                            // The live executor path is guarded by per-tool "never
+                            // empty" conventions (shell emits "(no output)", file_read
+                            // emits a header, …) — conventions, not invariants.
+                            if (part.content.isNotEmpty()) {
+                                resultContent.put(JSONObject().apply {
+                                    put("type", "text")
+                                    put("text", part.content)
+                                })
+                            }
                             if (part.imageData != null && part.imageMimeType != null) {
                                 val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
                                 if (visionText != null) {
@@ -742,6 +948,20 @@ class AnthropicProvider(
                                     })
                                 }
                             }
+                            // [R5-E C-07①] A tool_result whose content array ends up
+                            // EMPTY (no text, no image) is the same 400 one level out.
+                            // Single-space carrier, matching GeminiProvider's
+                            // `part.content.ifEmpty { " " }`: it is the minimal
+                            // non-empty text block, keeps `content` PRESENT on every
+                            // tool_result (uniform wire shape — omitting the key is
+                            // legal but some relays reject it), and makes a
+                            // cross-provider replay of one history byte-comparable.
+                            if (resultContent.length() == 0) {
+                                resultContent.put(JSONObject().apply {
+                                    put("type", "text")
+                                    put("text", " ")
+                                })
+                            }
                             contentArray.put(JSONObject().apply {
                                 put("type", "tool_result")
                                 put("tool_use_id", sanitizeToolId(part.id))
@@ -750,6 +970,10 @@ class AnthropicProvider(
                             })
                         }
                         is AgentContentPart.ImageData -> {
+                            // [R5-E F-06] Both sub-arms represent the image (block,
+                            // or placeholder for a non-vision model) — either way the
+                            // message's own carriers are already on the wire.
+                            emittedImage = true
                             val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
                             if (visionText != null) {
                                 // [§27a] Non-vision model — placeholder instead of
@@ -777,13 +1001,86 @@ class AnthropicProvider(
                         }
                     }
                 }
+                // [R5-E F-06 / C-07③] The two image carriers that live OUTSIDE
+                // contentParts were read only in the `else` branch, so any turn whose
+                // contentParts was non-empty dropped them. Two shapes that mattered:
+                //  · `minis-model-use` turns, where the wire carries the bytes in
+                //    `image_parts` and the messages as plain text parts — the model
+                //    answered a question about a screenshot it never received;
+                //  · a turn whose contentParts held nothing serializable (every part
+                //    Text("") — the terminal-error bubble shape), which produced
+                //    `content: []` — a hard 400 — while `msg.imageParts` passed
+                //    `hasWirePayload` on the brand-new turn.
+                // Same carrier set and same assembly as the else branch below, gated
+                // on "this turn emitted no image of its own" (see [emittedImage]).
+                if (!emittedImage) {
+                    val isLastUser = msg.role == LLMMessage.Role.USER &&
+                        index == messages.indexOfLast { it.role == LLMMessage.Role.USER }
+                    // ONE carrier, not the concatenation. Every producer populates
+                    // both lists from the same `prepared.imageParts` (ChatViewModel
+                    // passes the request-level list and stores the same parts on the
+                    // message), so adding them the way the else branch does would put
+                    // every attached screenshot on the wire twice — the very cost this
+                    // gate exists to avoid. The request-level list is authoritative
+                    // for the turn it belongs to (last user turn); otherwise the
+                    // message's own carrier wins.
+                    val legacyImages = if (isLastUser && imageParts.isNotEmpty()) {
+                        imageParts
+                    } else {
+                        msg.imageParts
+                    }
+                    for (part in legacyImages) {
+                        val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
+                        if (visionText != null) {
+                            contentArray.put(JSONObject().apply {
+                                put("type", "text")
+                                put("text", visionText)
+                            })
+                        } else {
+                            val safeBytes = ImageBudget.compressUnderBudget(part.data)
+                            val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
+                            contentArray.put(JSONObject().apply {
+                                put("type", "image")
+                                put("source", JSONObject().apply {
+                                    put("type", "base64")
+                                    put("media_type", safeMime)
+                                    put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
+                                })
+                            })
+                        }
+                    }
+                }
+                // [R5-E C-07③] Last line of defence: whatever combination of parts
+                // and carriers arrived, an EMPTY content array is a hard 400 ("at
+                // least one content block required") — the same failure as an empty
+                // text block, one level out. Placed after every arm so it observes
+                // all of them; a single space is the minimal legal block (same
+                // literal as the tool_result carrier above and GeminiProvider's).
+                if (contentArray.length() == 0) {
+                    contentArray.put(JSONObject().apply {
+                        put("type", "text")
+                        put("text", " ")
+                    })
+                }
                 obj.put("content", contentArray)
             } else {
                 val isLastUser = msg.role == LLMMessage.Role.USER &&
                     index == messages.indexOfLast { it.role == LLMMessage.Role.USER }
-                if (isLastUser && imageParts.isNotEmpty()) {
+                // [deep-audit-1047 A-03] `msg.imageParts` is a per-message carrier the
+                // payload predicate already weighs (`hasWirePayload`), so it needs a
+                // serializer here too. The request-level list keeps its contract
+                // (last user turn only); the message's own parts stay on its own turn.
+                // No producer feeds this in production today, so every live path is
+                // byte-identical to before.
+                val legacyImages = (if (isLastUser) imageParts else emptyList()) + msg.imageParts
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = isLastUser,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0) {
                     val contentArray = JSONArray()
-                    for (part in imageParts) {
+                    for (part in legacyImages) {
                         val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
                         if (visionText != null) {
                             // [§27a] Non-vision model — placeholder, mirrors the
@@ -810,10 +1107,16 @@ class AnthropicProvider(
                             })
                         }
                     }
-                    contentArray.put(JSONObject().apply {
-                        put("type", "text")
-                        put("text", msg.content)
-                    })
+                    // [deep-audit-1045 A-03] A media-only last user turn now
+                    // survives the empty filter, so the text part must be
+                    // skipped when the turn carries no text — Anthropic
+                    // rejects an empty text block.
+                    if (msg.content.isNotEmpty()) {
+                        contentArray.put(JSONObject().apply {
+                            put("type", "text")
+                            put("text", msg.content)
+                        })
+                    }
                     obj.put("content", contentArray)
                 } else if (echoThinking && msg.role == LLMMessage.Role.ASSISTANT) {
                     // [T-android-anthropic-thinking-echo] (issue #70) Assistant
@@ -834,7 +1137,11 @@ class AnthropicProvider(
                     }
                     obj.put("content", contentArray)
                 } else {
-                    obj.put("content", msg.content)
+                    // [R5-E C-07③] `content: ""` is the STRING form of the same
+                    // "text must be non-empty" rule the array arms guard: the turn
+                    // survived the payload filter (last-user + request images, or a
+                    // restored row) so it must reach the wire with something legal.
+                    obj.put("content", msg.content.ifEmpty { " " })
                 }
             }
 
@@ -883,6 +1190,17 @@ class AnthropicProvider(
                     contentBlocks.addAll(other)
                     contentBlocks.addAll(toolUse)
                 }
+                // [R5-E C-07②] Two same-role messages that each carried nothing
+                // serializable used to merge into `content: []` (a hard 400) — the
+                // merge itself is mandatory (Anthropic alternates roles), so keep the
+                // turn and give it the minimal legal block instead. Same literal as
+                // the empty-text carriers in buildMessages.
+                if (contentBlocks.isEmpty()) {
+                    contentBlocks.add(JSONObject().apply {
+                        put("type", "text")
+                        put("text", " ")
+                    })
+                }
                 val merged = JSONObject().apply {
                     put("role", role)
                     put("content", JSONArray(contentBlocks.map { it }))
@@ -906,10 +1224,16 @@ class AnthropicProvider(
                 }
             }
             is String -> {
-                out.add(JSONObject().apply {
-                    put("type", "text")
-                    put("text", content)
-                })
+                // [R5-E C-07②] A merged turn re-materialises the string form into a
+                // text block, so an empty string became {"type":"text","text":""} —
+                // the same hard 400 the array arms already guard against. Dropped
+                // here (the caller refills an all-empty merge, see below).
+                if (content.isNotEmpty()) {
+                    out.add(JSONObject().apply {
+                        put("type", "text")
+                        put("text", content)
+                    })
+                }
             }
         }
     }
@@ -999,7 +1323,15 @@ class AnthropicProvider(
             return major > 4 || major == 4 || (major == 3 && minor >= 7)
         }
 
-        /** Calculate thinking budget tokens based on level (legacy <=4.5 protocol). */
+        /**
+         * Calculate thinking budget tokens based on level (legacy <=4.5 protocol).
+         *
+         * [deep-audit-1046 S-03] `maxTokens` MUST be the value actually written
+         * to the request's `max_tokens` (the clamped one), never the raw
+         * caller-supplied figure: budget_tokens is defined relative to
+         * max_tokens on the wire, so deriving it from a different number
+         * produces the illegal pair the API rejects outright.
+         */
         fun thinkingBudget(maxTokens: Int, level: ThinkingLevel): Int {
             val cap = when (level) {
                 ThinkingLevel.OFF -> 0
@@ -1075,12 +1407,22 @@ class AnthropicProvider(
         // claude-code-20250219 there because those signal Claude-Code-only
         // surface and get rejected on plain API-key auth.
         val betaFlags = mutableListOf<String>()
+        // [deep-audit-1046 S-03] Three-way, not two-way. The body carries three
+        // distinct thinking types and each has its own beta story:
+        //   adaptive → effort-2025-11-24 (4.6+ effort knob)
+        //   enabled  → interleaved-thinking-2025-05-14 (legacy budget_tokens)
+        //   disabled → NONE. `disabled` is the explicit "do not think" switch we
+        //              send on adaptive models (their default is to think); the
+        //              beta header advertises the very capability the body just
+        //              asked to switch off. Harmless noise at api.anthropic.com,
+        //              a 400 on relays that validate the pairing.
         if (body.has("thinking")) {
-            val isAdaptive = body.optJSONObject("thinking")?.optString("type") == "adaptive"
-            if (isAdaptive) {
-                betaFlags.add("effort-2025-11-24")
-            } else {
-                betaFlags.add("interleaved-thinking-2025-05-14")
+            when (body.optJSONObject("thinking")?.optString("type")) {
+                "adaptive" -> betaFlags.add("effort-2025-11-24")
+                "enabled" -> betaFlags.add("interleaved-thinking-2025-05-14")
+                // Explicit off-switch — and, by the same fail-closed shape, any
+                // type this gate does not know yet: announce nothing.
+                "disabled" -> Unit
             }
         }
         // [T-android-enhanced-cache] The 1-hour cache TTL requires this flag.
@@ -1184,4 +1526,120 @@ class AnthropicProvider(
         if (error is java.io.IOException) return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
     }
+}
+
+/**
+ * [deep-audit-1045 A-04] HTTP status for an Anthropic mid-stream `error` event,
+ * derived from the event's `error.type`.
+ *
+ * Why this exists: the stream branch used to send everything except
+ * `overloaded_error` as 400. Anthropic's Messages protocol reports a rate limit
+ * as `type: "rate_limit_error"`, and 400 lands in `mapHttpError`'s fallthrough
+ * (ProviderError — NOT retryable), while the same condition reported over HTTP
+ * as 429 lands in RateLimited (retryable with backoff). The mid-stream form
+ * therefore turned a retryable upstream condition into a hard failure.
+ *
+ * The table mirrors Anthropic's documented error types:
+ *  - `overloaded_error`  → 529 (kept verbatim: 529 is in `mapHttpError`'s
+ *    transient set, so it stays a retryable TransientError);
+ *  - `api_error`         → 500 (also transient);
+ *  - `rate_limit_error`  → 429 (RateLimited);
+ *  - `authentication_error` → 401, `permission_error` → 403 (both
+ *    InvalidApiKey in `mapHttpError`);
+ *  - `not_found_error`   → 404, `request_too_large` → 413;
+ *  - `invalid_request_error` → 400;
+ *  - anything else (including a blank type) → 400, i.e. the previous
+ *    behaviour for unknown types.
+ *
+ * Pure + top-level so the mapping is directly unit-testable
+ * (AnthropicStreamErrorStatusTest) instead of being buried in the SSE loop.
+ */
+internal fun anthropicStreamErrorStatus(errType: String?): Int = when (errType) {
+    "overloaded_error" -> 529
+    "api_error" -> 500
+    "rate_limit_error" -> 429
+    "authentication_error" -> 401
+    "permission_error" -> 403
+    "not_found_error" -> 404
+    "request_too_large" -> 413
+    "invalid_request_error" -> 400
+    else -> 400
+}
+
+/**
+ * [FIX-FW-NONSTREAM C1] Verdict for a NON-STREAMING Messages body that arrived
+ * with a 2xx status.
+ *
+ * ## The defect it closes
+ * [parseResponse] reads `content[].text` and nothing else, so two shapes reached
+ * the callers as `LLMResponse("", null)` — an empty answer reported as a clean
+ * success, persisted as an assistant turn and never retried:
+ *  • `200 {"type":"error","error":{"type":"overloaded_error",…}}` — the error
+ *    object arrives in-band (relays do this, and the streaming arm already maps
+ *    it: see the `"error" ->` SSE branch + [anthropicStreamErrorStatus]);
+ *  • a body with no `content` array and no `stop_reason` — relay truncation,
+ *    `{}`, or a proxy page that still happened to parse as JSON.
+ *
+ * ## Why "no message" THROWS instead of returning `stopReason = "error"`
+ * Mirrors [geminiGenerateContentVerdict]: nothing in the app gives an "error"
+ * stop reason any meaning (the one literal anyone compares against is the
+ * output-ceiling family — see TruncatedToolCallPolicy), and the text stays
+ * empty, so an "error" response would still be persisted as an assistant answer
+ * that says nothing. Throwing is the one classification path the callers already
+ * handle (typed [LLMError] → error card + retry), and it is where the streaming
+ * arm lands too (`mapHttpError` on an inline error frame,
+ * `failOnSilentEmptyCompletion` on a fully empty stream).
+ *
+ * A body that DOES carry content is left alone even when every block is
+ * non-text: a pure `tool_use` turn, and a thinking-only turn, are legitimately
+ * empty-text — what they mean downstream is the caller's business.
+ */
+internal sealed class AnthropicNonStreamVerdict {
+    /** A message body is present: parse it exactly as this arm always has. */
+    data object Ok : AnthropicNonStreamVerdict()
+
+    /** The body carries an error object; [status] is its HTTP class. */
+    data class HttpError(val status: Int) : AnthropicNonStreamVerdict()
+
+    /** No message at all — no `content`, no `stop_reason`. */
+    data class EmptyMessage(val errorType: String?, val detail: String?) : AnthropicNonStreamVerdict() {
+        fun describe(): String = buildString {
+            append("Anthropic returned no message content")
+            if (!errorType.isNullOrEmpty()) append(" (type: $errorType)")
+            if (!detail.isNullOrEmpty()) append(": ${detail.take(500)}")
+            append(" — refusing to report an empty answer as a completed turn")
+        }
+    }
+}
+
+internal fun anthropicNonStreamVerdict(json: JSONObject): AnthropicNonStreamVerdict {
+    // `error` may be an object (the protocol shape) or a bare string (relay
+    // shorthand). A JSON null means the same thing as an absent key.
+    when (val raw = json.opt("error")) {
+        null, JSONObject.NULL -> Unit
+        is JSONObject -> return AnthropicNonStreamVerdict.HttpError(anthropicNonStreamErrorStatus(raw))
+        else -> return AnthropicNonStreamVerdict.EmptyMessage(errorType = null, detail = raw.toString())
+    }
+    val content = json.optJSONArray("content")
+    if (content == null || content.length() == 0) {
+        // A declared stop_reason means the server did finish a message — an
+        // empty content array there is unusual but not this verdict's call.
+        if (json.safeOptString("stop_reason", "").isNotBlank()) return AnthropicNonStreamVerdict.Ok
+        return AnthropicNonStreamVerdict.EmptyMessage(
+            errorType = json.safeOptString("type", "").ifEmpty { null },
+            detail = json.safeOptString("message", "").ifEmpty { null },
+        )
+    }
+    return AnthropicNonStreamVerdict.Ok
+}
+
+/**
+ * [FIX-FW-NONSTREAM C1] HTTP class of a non-streaming Anthropic `error` object:
+ * a numeric `code` when a relay supplies one, otherwise the documented `type`
+ * table the streaming arm already uses — one classification for both paths.
+ */
+internal fun anthropicNonStreamErrorStatus(err: JSONObject): Int {
+    val code = err.optInt("code", 0)
+    if (code in 400..599) return code
+    return anthropicStreamErrorStatus(err.safeOptString("type", "").ifEmpty { null })
 }

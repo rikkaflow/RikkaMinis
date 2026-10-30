@@ -37,6 +37,23 @@ import java.io.File
  *   125  user_rejected / all_rejected
  *   126  permission_denied
  */
+
+/**
+ * [da1019-J] Pure relative→absolute join for guest paths: a relative
+ * [path] with an absolute [cwd] resolves against it (the same
+ * [B14-fix-r14] shape as ModelUseOffloadHandler.readLinuxPath).
+ * Everything else — an absolute path, or a missing / relative cwd —
+ * is returned unchanged, so the session-aware resolver stays the only
+ * gate and a path it rejects fails closed instead of being guessed
+ * onto the rootfs. Pure so both arms stay testable off-device. Top-level
+ * (not a companion member): the handler's companion is private, so a
+ * companion member would be unreferenceable from the unit test.
+ */
+internal fun resolveMaybeRelative(path: String, cwd: String?): String =
+    if (!path.startsWith("/") && !cwd.isNullOrEmpty() && cwd.startsWith("/")) {
+        if (cwd.endsWith("/")) "$cwd$path" else "$cwd/$path"
+    } else path
+
 class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler {
     private companion object {
         const val TAG = "ConfigOffload"
@@ -115,7 +132,12 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         // argv[0] is the program name; subcommand and options follow.
-        val args = OffloadArgs(request.argv.drop(1))
+        // [dv15-A1 A-02] `-f/-p/-s` are this command's declared value-taking
+        // short options (see the `get("filter", "f")` reads below): `-f pinned`
+        // used to parse as the FLAG `f` plus a stray positional `pinned`, so
+        // the filter was silently dropped and the caller got the unfiltered
+        // list with exit 0.
+        val args = OffloadArgs(request.argv.drop(1), valueShortOptions = setOf("f", "p", "s"))
         if (args.hasFlag("h", "help")) {
             return NativeOffloadResult(EXIT_OK, OffloadOutput.formatBody(HELP_TEXT, args) + "\n")
         }
@@ -204,7 +226,7 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
         // entirely. Mirrors iOS 5dcff277.
         val fileArg = args.get("file")
         val valueJSON = if (fileArg != null) {
-            readLinuxPath(fileArg, request.sessionId) ?: return errorResult(
+            readLinuxPath(fileArg, request.sessionId, request.cwd) ?: return errorResult(
                 args, EXIT_INVALID_ARGS, "INVALID_ARGS",
                 "--file: could not read value from '$fileArg'."
             )
@@ -242,7 +264,7 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val topic = args.positional.getOrNull(1)
         val fileArg = args.get("file")
         val valueJSON = if (fileArg != null) {
-            readLinuxPath(fileArg, request.sessionId) ?: return errorResult(
+            readLinuxPath(fileArg, request.sessionId, request.cwd) ?: return errorResult(
                 args, EXIT_INVALID_ARGS, "INVALID_ARGS",
                 "--file: could not read value from '$fileArg'."
             )
@@ -283,7 +305,7 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
         // exactly like `set`/`add` did (issue #36). Same fix, same reason.
         val fileArg = args.get("file")
         val raw = if (fileArg != null) {
-            readLinuxPath(fileArg, request.sessionId) ?: return errorResult(
+            readLinuxPath(fileArg, request.sessionId, request.cwd) ?: return errorResult(
                 args, EXIT_INVALID_ARGS, "INVALID_ARGS",
                 "--file: could not read batch from '$fileArg'."
             )
@@ -356,15 +378,26 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     /**
      * [T-android-minis-config-set-shell-escape] Read a file's text by its
-     * guest (Linux) path, resolving it to the host path through the rootfs /
-     * bind mounts. Same helper shape as ModelUseOffloadHandler.readLinuxPath —
-     * used by `set --file` so the value-json never transits the shell. Returns
-     * null when the path can't be resolved, doesn't exist, or read fails.
+     * guest (Linux) path, resolving it to the host path through the session
+     * (when [sessionId] is known) or the rootfs / bind mounts. Same helper
+     * shape as ModelUseOffloadHandler.readLinuxPath — used by `set --file` so
+     * the value-json never transits the shell. Returns null when the path can't
+     * be resolved, doesn't exist, or read fails.
+     * [audit3 F-08] The session-vs-global choice lives in
+     * [PRootKernel.resolvePathForSession]; a path the session resolver rejects
+     * is not re-resolved globally any more.
+     * [da1019-J] A relative path resolves against the guest cwd first
+     * ([resolveMaybeRelative]) — the native_offload protocol forwards the
+     * shell's cwd ([NativeOffloadRequest.cwd]), so `--file ./payload.json`
+     * inherits it instead of failing to resolve. The joined path still goes
+     * through the same session-aware guard below (canonicalize + prefix check
+     * + fail-closed), so a hostile cwd string gets the same containment as an
+     * agent-supplied absolute path.
      */
-    private fun readLinuxPath(linuxPath: String, sessionId: String?): String? {
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath) ?: return null
+    private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
+        val resolved = resolveMaybeRelative(linuxPath, cwd)
+        val hostFile: File = PRootKernel.resolvePathForSession(sessionId, resolved, context)
+            ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
     }

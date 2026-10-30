@@ -3,13 +3,17 @@ package com.rikkaminis.app.data.repository
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.db.ProviderConfigDao
 import com.rikkaminis.app.data.db.ProviderConfigMetaKeys
+import com.rikkaminis.app.data.db.ProviderConfigMetaEntity
 import com.rikkaminis.app.data.db.ProviderConfigSnapshot
 import com.rikkaminis.app.data.db.ProviderDatabase
 import com.rikkaminis.app.data.db.ProviderThinkingRuleEntity
 import com.rikkaminis.app.data.db.compositeEntryKey
+import com.rikkaminis.app.data.db.restoreFrozenBlobs
 import com.rikkaminis.app.data.db.toProviderConfig
+import com.rikkaminis.app.data.db.toProviderConfigWithDiagnostics
 import com.rikkaminis.app.data.db.toSnapshot
 import com.rikkaminis.app.data.model.ImageEndpointMode
 import com.rikkaminis.app.data.model.LLMModel
@@ -19,6 +23,7 @@ import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderCredential
 import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.model.SystemVoiceIds
@@ -29,6 +34,7 @@ import com.rikkaminis.app.data.model.hasAudioOutput
 import com.rikkaminis.app.data.model.hasVoiceModality
 import com.rikkaminis.app.data.model.isVoiceTemplateSeedShape
 import com.rikkaminis.app.data.model.withInferredVoiceModality
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.registerModelListProviders
 import com.rikkaminis.app.provider.thinking.ThinkingRule
 import com.rikkaminis.app.provider.thinking.ThinkingRuleCoding
@@ -280,6 +286,44 @@ class ProviderRepository(private val context: Context) {
             Thread(r, "ProviderConfig-Persist").apply { isDaemon = true }
         }
 
+    /**
+     * [fix/p1028-provider-corrupt-row] `provider_model_entries.id` values the
+     * last DB load could not decode, and which the in-memory [ProviderConfig]
+     * therefore does not contain. Kept here so every save can hand them to
+     * [ProviderConfigDao.syncAllIncremental] as "known rows" — its delete set is
+     * `NOT IN (ids I was given)`, so without this an unrelated write (rename a
+     * provider, reorder models) physically deletes the unreadable row. The
+     * legacy JSON mirror never carried those models, so nothing else can bring
+     * the bytes back.
+     *
+     * Recomputed on every load (and only then): the row keeps failing to decode
+     * until a build that can read it arrives, so the protection has to stay in
+     * place for the whole process lifetime.
+     */
+    @Volatile
+    private var quarantinedEntryRowIds: Set<String> = emptySet()
+
+    /**
+     * [fix/meta1028-d1 F-02] Entry ids whose row is IN the in-memory config (so
+     * it shows and behaves normally with DEFAULT overrides) but whose stored
+     * `overrides_json` could not be decoded. Same lifetime rule as
+     * [quarantinedEntryRowIds]: recomputed on load, kept for the process
+     * lifetime, because the persist path has to hand the STORED blob back
+     * instead of re-encoding the placeholder (see [restoreFrozenBlobs]).
+     */
+    @Volatile
+    private var unreadableOverridesEntryIds: Set<String> = emptySet()
+
+    /**
+     * [fix/meta1028-d1 F-02] Group ids whose stored `member_entry_ids_json`
+     * could not be decoded; their in-memory member list is a placeholder (empty).
+     * Two consumers: the persist path substitutes the stored blob, and
+     * [removeInstance] refuses to treat them as "became empty" (deleting the
+     * group would delete the only copy of its real member list).
+     */
+    @Volatile
+    private var unreadableMemberGroupIds: Set<String> = emptySet()
+
     private fun loadConfig(): ProviderConfig = runBlocking { loadConfigSuspending() }
 
     /**
@@ -323,7 +367,46 @@ class ProviderRepository(private val context: Context) {
                 )
                 val dbMs = (System.nanoTime() - tDb) / 1_000_000
                 val tAssemble = System.nanoTime()
-                val cfg = snapshot.toProviderConfig(json)
+                // [fix/p1028-provider-corrupt-row] Load through the diagnostics
+                // overload: rows whose base_model_json won't decode are skipped
+                // from the in-memory config (unchanged display behaviour) but
+                // their ids are remembered so the sync path keeps them in the
+                // delete-set. Skipping without this bookkeeping = deletion on
+                // the next save, which is exactly what THIS function used to do.
+                val loaded = snapshot.toProviderConfigWithDiagnostics(json)
+                val cfg = loaded.config
+                quarantinedEntryRowIds = loaded.quarantinedEntryRowIds
+                unreadableOverridesEntryIds = loaded.unreadableOverridesEntryIds
+                unreadableMemberGroupIds = loaded.unreadableMemberGroupIds
+                if (loaded.quarantinedEntryRowIds.isNotEmpty()) {
+                    android.util.Log.w(
+                        "ProviderRepo",
+                        "[ProviderStore] ${loaded.quarantinedEntryRowIds.size} provider model " +
+                            "entries undecodable — rows preserved in provider.db (kept out of the " +
+                            "model list; NOT deleted by the next sync): " +
+                            loaded.quarantinedEntryRowIds.take(5).joinToString(","),
+                    )
+                }
+                // [fix/meta1028-d1 F-02] Undecodable BLOBS on otherwise-readable
+                // rows. They stay visible with placeholder values; the stored
+                // bytes are handed back on every save until a build can read them.
+                if (loaded.unreadableOverridesEntryIds.isNotEmpty()) {
+                    android.util.Log.w(
+                        "ProviderRepo",
+                        "[ProviderStore] ${loaded.unreadableOverridesEntryIds.size} model " +
+                            "entries have undecodable overrides — showing defaults, stored blobs " +
+                            "preserved: ${loaded.unreadableOverridesEntryIds.take(5).joinToString(",")}",
+                    )
+                }
+                if (loaded.unreadableMemberGroupIds.isNotEmpty()) {
+                    android.util.Log.w(
+                        "ProviderRepo",
+                        "[ProviderStore] ${loaded.unreadableMemberGroupIds.size} model groups " +
+                            "have undecodable member lists — rendering empty, stored blobs preserved " +
+                            "(and protected from the removeInstance empty-group cascade): " +
+                            loaded.unreadableMemberGroupIds.take(5).joinToString(","),
+                    )
+                }
                 val assembleMs = (System.nanoTime() - tAssemble) / 1_000_000
                 android.util.Log.i(
                     "ProviderPerf",
@@ -348,11 +431,23 @@ class ProviderRepository(private val context: Context) {
             val liveHash = rawJson?.let(::hashJsonMirror)
             val hashMs = (System.nanoTime() - tHash) / 1_000_000
             android.util.Log.i("ProviderPerf", "hashJsonMirror: ${hashMs}ms (jsonLen=${rawJson?.length})")
-            if (liveHash == dbHashStored) {
+            // [fix/meta1028-d1 F-01] The hash gate is now a pure decision
+            // ([decideConfigSource]) so that it is unit-tested TOGETHER with the
+            // write order that makes it sound ([persistMirrorThenDb]). The
+            // decision itself is unchanged; what changed is that the mirror can
+            // no longer be older than the DB (see persistToDbAndMirror), which
+            // is the premise "mismatch ⇒ the mirror is fresher" rests on.
+            val source = decideConfigSource(
+                hasDbConfig = true,
+                hasMirror = rawJson != null,
+                liveHashMatchesStored = liveHash != null && liveHash == dbHashStored,
+            )
+            if (source == ConfigLoadSource.DB) {
                 return dbConfig
             }
-            // Hash mismatch: JSON has been written by an older build during
-            // a downgrade window. Re-import JSON → reseed DB so DB catches
+            // Hash mismatch: the JSON mirror was written behind the DB's back
+            // (an older build during a downgrade window, or a hand-edited /
+            // restored prefs file). Re-import JSON → reseed DB so DB catches
             // up to the user's actual current config.
             android.util.Log.i(
                 "ProviderRepo",
@@ -436,6 +531,12 @@ class ProviderRepository(private val context: Context) {
      * round-trip). Callers should treat the return value as the new
      * authoritative state — using the in-memory pre-call object would
      * leak the legacy uuid form into [_config.value].
+     *
+     * [fix/dv22-a1 §1042-A-01] Degraded mode: if the DB write fails
+     * (provider.db unavailable), the failure is logged and the JSON mirror
+     * is STILL written — with the DB down, prefs is the only surviving
+     * store. The next launch's hash-mismatch re-import reseeds the DB from
+     * the mirror once the DB opens again.
      */
     private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
         // First serialize without the hash so the meta row reflects the
@@ -444,48 +545,168 @@ class ProviderRepository(private val context: Context) {
         val t0 = System.nanoTime()
         val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
         val serializeMs = (System.nanoTime() - t0) / 1_000_000
+        // [fix/dv22-a1 §1042-A-01] A provider.db that fails to open (migration
+        // abort — ProviderDatabase has no fallbackToDestructiveMigration, see
+        // MIGRATION_9_10's KDoc) would throw out of the sync below and stop the
+        // mirror write from ever running: with the DB down, prefs is the only
+        // surviving store, so the user's change was lost ENTIRELY. The DAO call
+        // is therefore wrapped and its failure logged, leaving the mirror write
+        // reachable — provider_import_id_roundtrip_check arm 10 pins that shape
+        // (envelope around the DAO call, mirror OUTSIDE it).
+        //
+        // The sync token is hashed from the string we are ABOUT to commit, because
+        // the DB write needs a value now. That makes it a CLAIM, not a fact —
+        // [fix/meta1028-d1 F-01] repairs it to the truth right after commit()
+        // answers, see the block below the sync. (The mirror hash sees the string
+        // we put into prefs, not a hash of itself.)
         val mirrorHash = hashJsonMirror(mirrorStr)
-        val snapshot = config.toSnapshot(json, jsonSyncHash = mirrorHash)
-        val t1 = System.nanoTime()
-        providerDao.syncAllIncremental(
-            instances = snapshot.instances,
-            entries = snapshot.entries,
-            groups = snapshot.groups,
-            loopIds = snapshot.loopIds,
-            meta = snapshot.meta,
+        // [fix/meta1028-d1 F-02] Rows whose blob we could not decode on load now
+        // carry a PLACEHOLDER in the config (default overrides / empty member
+        // list). Re-encoding the placeholder would make the damage permanent, so
+        // the stored blob is substituted back before the snapshot is written.
+        // Costs one extra row read, and only while such a row exists.
+        val storedEntriesForFrozen =
+            if (unreadableOverridesEntryIds.isEmpty()) emptyList()
+            else runCatching { providerDao.loadEntries() }
+                .onFailure {
+                    android.util.Log.w(
+                        "ProviderRepo",
+                        "[ProviderStore] could not re-read entry rows to preserve " +
+                            "${unreadableOverridesEntryIds.size} undecodable override blobs; " +
+                            "they will be rewritten with defaults: ${it.message}",
+                    )
+                }
+                .getOrDefault(emptyList())
+        val storedGroupsForFrozen =
+            if (unreadableMemberGroupIds.isEmpty()) emptyList()
+            else runCatching { providerDao.loadGroups() }
+                .onFailure {
+                    android.util.Log.w(
+                        "ProviderRepo",
+                        "[ProviderStore] could not re-read group rows to preserve " +
+                            "${unreadableMemberGroupIds.size} undecodable member lists; " +
+                            "they will be rewritten empty: ${it.message}",
+                    )
+                }
+                .getOrDefault(emptyList())
+        val snapshot = restoreFrozenBlobs(
+            snapshot = config.toSnapshot(json, jsonSyncHash = mirrorHash),
+            storedEntries = storedEntriesForFrozen,
+            storedGroups = storedGroupsForFrozen,
+            frozenEntryIds = unreadableOverridesEntryIds,
+            frozenGroupIds = unreadableMemberGroupIds,
         )
+        val t1 = System.nanoTime()
+        val dbWrite = runCatching {
+            providerDao.syncAllIncremental(
+                instances = snapshot.instances,
+                entries = snapshot.entries,
+                groups = snapshot.groups,
+                loopIds = snapshot.loopIds,
+                meta = snapshot.meta,
+                // [fix/p1028-provider-corrupt-row] The delete-set is derived from
+                // `entries`, and quarantined rows are absent from it by
+                // construction — hand them over explicitly so an unrelated save
+                // (rename / reorder / refresh) doesn't physically drop the row
+                // that the load path only meant to SKIP.
+                preserveEntryIds = quarantinedEntryRowIds,
+            )
+        }
+        dbWrite.onFailure { e ->
+            android.util.Log.e(
+                "ProviderRepo",
+                "[ProviderStore] DB incremental sync failed (provider.db unavailable?); " +
+                    "the JSON mirror already carries this write — DB stale until the next " +
+                    "launch re-imports it: ${e.message}",
+                e,
+            )
+        }
+
+        // commit() not apply(): apply() queues the disk write and returns. If the
+        // process dies before it flushes, the next launch sees
+        // DB(hash=new) + JSON-on-disk(content=old) → the hash-mismatch path reads
+        // that as "an old build wrote during a downgrade" and re-imports the stale
+        // JSON. commit() blocks the persist thread (~5–30ms) and makes "did it
+        // land" observable, which the repair below depends on.
+        val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
+        if (!mirrorWritten) {
+            // Order-aware on purpose: with the DB write first, "the save is lost"
+            // would be a lie whenever provider.db accepted the rows — the repair
+            // below then keeps the two stores in step and the DB carries the save.
+            android.util.Log.w(
+                "ProviderRepo",
+                if (dbWrite.isSuccess) {
+                    "[ProviderStore] prefs mirror commit() returned false — provider.db has " +
+                        "this save; json_sync_hash is repaired to name the mirror that " +
+                        "exists, so the two stores stay in step (disk full? prefs corruption?)"
+                } else {
+                    "[ProviderStore] prefs mirror commit() returned false — the JSON mirror " +
+                        "still holds the previous config (disk full? prefs corruption?)"
+                },
+            )
+        }
+        // [fix/meta1028-d1 F-01] `meta.json_sync_hash` must be a FACT about the
+        // mirror, not a claim about the string we tried to write. The cold-start
+        // rule is "mismatch ⇒ the mirror is fresher, re-import it", so a hash
+        // naming a mirror that never landed makes the load path mistake a rejected
+        // commit for a downgrade and back-fill the OLD JSON over the rows the user
+        // just saved.
+        //
+        // The mirror cannot be written before the DB (provider_import_id_roundtrip
+        // arm 10 pins that order), so the token is repaired after the fact: read
+        // back what prefs actually holds and, when it disagrees with what the DB
+        // was told, rewrite the single meta row to name the mirror that exists.
+        //
+        // This one block covers BOTH ways the claim can be wrong — a rejected
+        // commit(), and a prefs store that reports success but hands back the old
+        // string — because both make `truthfulHash != mirrorHash`. It is skipped
+        // when the DB write failed: then nothing was told a hash, and the stale
+        // hash still names the mirror that is actually on disk.
+        val liveMirror: String? = prefs.getString("config", null)
+        val truthfulHash = decideSyncHash(intendedMirror = mirrorStr, liveMirror = liveMirror)
+        if (dbWrite.isSuccess && truthfulHash != mirrorHash) {
+            runCatching {
+                if (truthfulHash == null) {
+                    providerDao.deleteMetaKey(ProviderConfigMetaKeys.JSON_SYNC_HASH)
+                } else {
+                    providerDao.upsertMeta(
+                        listOf(
+                            ProviderConfigMetaEntity(
+                                ProviderConfigMetaKeys.JSON_SYNC_HASH,
+                                truthfulHash,
+                            ),
+                        ),
+                    )
+                }
+            }.onFailure { e ->
+                // Best-effort: it cannot make the save durable, only stop a rejected
+                // commit from being read as a downgrade. Name the remaining risk.
+                android.util.Log.w(
+                    "ProviderRepo",
+                    "[ProviderStore] could not repair json_sync_hash after a rejected mirror " +
+                        "write — the next cold start may re-import the previous mirror over " +
+                        "these rows: ${e.message}",
+                )
+            }
+        }
         val dbMs = (System.nanoTime() - t1) / 1_000_000
+        // [fix/dv22-a1 §1042-A-01] dbOk makes "did the DB row-set actually
+        // land" judgeable from the log line itself, instead of inferring it
+        // from the absence of a follow-up error. mirrorOk is new with the
+        // order swap (§meta1028-d1): a save is fully durable only when BOTH
+        // bits are true.
         android.util.Log.i(
             "ProviderPerf",
             "persistToDbAndMirror: entries=${snapshot.entries.size} " +
                 "instances=${snapshot.instances.size} groups=${snapshot.groups.size} " +
-                "mirror=${mirrorStr.length / 1024}KB serialize=${serializeMs}ms db=${dbMs}ms",
+                "mirror=${mirrorStr.length / 1024}KB serialize=${serializeMs}ms db=${dbMs}ms " +
+                "dbOk=${dbWrite.isSuccess} mirrorOk=$mirrorWritten",
         )
-        // commit() not apply(): the json_sync_hash we just stored to DB is
-        // a hash of THIS mirror string. If apply() queues the disk write
-        // and the process dies before it flushes, the next launch sees
-        // DB(hash=new) + JSON-on-disk(content=old) → the hash-mismatch
-        // path interprets it as "old build wrote during downgrade" and
-        // re-imports the stale JSON, blowing away the write that the DB
-        // already persisted synchronously. commit() blocks the writer
-        // (~5–30ms) but guarantees DB and JSON land together.
-        //
-        // commit() returns false (no exception) on disk-full / permission
-        // failure / corrupted prefs XML. We log so the situation is
-        // observable; the DB already holds the new state authoritatively,
-        // and a subsequent successful save will resync the mirror + hash.
-        // The downside if the next save never comes: a hash mismatch on
-        // next cold-start would try to re-import the stale mirror — but
-        // the dbConfig-fallback at the end of loadConfigSuspending keeps
-        // the DB rows when re-import fails or is rejected, so the user's
-        // data is not lost.
-        val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
-        if (!mirrorWritten) {
+        if (!dbWrite.isSuccess && !mirrorWritten) {
             android.util.Log.w(
                 "ProviderRepo",
-                "[ProviderStore] mirror commit() returned false — DB updated " +
-                    "but JSON write rejected (disk full? prefs corruption?); " +
-                    "DB remains authoritative",
+                "[ProviderStore] DB sync FAILED as well (see the incremental-sync error " +
+                    "above) — neither store took this write, in-memory state only",
             )
         }
         // Return canonicalized form so the caller's _config.value reflects
@@ -556,7 +777,19 @@ class ProviderRepository(private val context: Context) {
                 )
                 config
             }
-            _config.value = canonical.copy(
+            // [fix/dv20-a2 A-04] Publish AND persist the same object. The
+            // persist face serializes whatever it is handed
+            // ([persistToDbAndMirror] step 1: `json.encodeToString(config)` →
+            // the prefs mirror string, plus the mirror hash stored in DB meta),
+            // so passing the pre-canonicalization `config` wrote the legacy
+            // shape to the mirror while `_config.value` carried the composite
+            // shape — two readers of the same save disagreed (downgrade
+            // reader / mirror-fallback load vs. the live UI), and the mirror's
+            // entry ids + group/agent-loop references stayed in the legacy
+            // form. [persistToDbAndMirror]'s own KDoc already required this
+            // pairing ("using the in-memory pre-call object would leak the
+            // legacy uuid form into [_config.value]").
+            val published = canonical.copy(
                 instances = canonical.instances.toMutableList(),
                 modelEntries = canonical.modelEntries.toMutableList(),
                 modelGroups = canonical.modelGroups.toMutableList(),
@@ -569,9 +802,10 @@ class ProviderRepository(private val context: Context) {
                 // callers see the new value.
                 revision = config.revision + 1,
             )
+            _config.value = published
             persistExecutor.execute {
                 try {
-                    runBlocking { persistToDbAndMirror(config) }
+                    runBlocking { persistToDbAndMirror(published) }
                 } catch (e: Exception) {
                     // In-memory state is already emitted; the next successful
                     // save resyncs mirror + DB (same contract as the old
@@ -653,6 +887,26 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * [da1024-C] Clear the prefs-held secondary references an entry removal
+     * orphans: `lastUsedEntryId` and the voice input/output overrides. They are
+     * per-device SharedPreferences values, so [saveConfig]'s idMap translation
+     * cannot heal them the way it heals the in-config group / agent-loop refs.
+     *
+     * The compact pin is deliberately NOT handled here — every call site goes
+     * through the shared [decideCompactPinCleanup] predicate (one rule, four
+     * sites) rather than a second copy of "is the pin dangling".
+     */
+    private fun clearStaleSecondaryRefs(removedEntryIds: Collection<String>) {
+        if (decideStaleRefCleanup(lastUsedEntryId, removedEntryIds)) lastUsedEntryId = null
+        if (decideStaleRefCleanup(voiceInputOverrideEntryId, removedEntryIds)) {
+            voiceInputOverrideEntryId = null
+        }
+        if (decideStaleRefCleanup(voiceOutputOverrideEntryId, removedEntryIds)) {
+            voiceOutputOverrideEntryId = null
+        }
+    }
+
+    /**
      * [T-android-provider-voice] Reconcile voice-template seed entries on every
      * launch: add template models a previous build didn't know, remove RETIRED
      * seeds, and heal corrupted modality. Straight port of iOS
@@ -688,9 +942,30 @@ class ProviderRepository(private val context: Context) {
                 .map { it.baseModel.id }
                 .filter { it !in templateById }
             if (staleSeedIds.isNotEmpty()) {
+                // [da1031-A] The stale-seed ids are bare baseModel.id values, but
+                // every secondary reference hangs off the entry id (uuid,
+                // canonicalized to the composite "{instanceId}/{modelId}" shape
+                // by toSnapshot). Comparing bare ids against entry ids made the
+                // whole cascade below a no-op.
+                val staleEntryIds = instanceEntries
+                    .filter { it.baseModel.isVoiceTemplateSeedShape }
+                    .filter { it.baseModel.id !in templateById }
+                    .map { it.id }
                 config.modelEntries.removeAll {
                     it.providerInstanceId == instance.id && it.baseModel.id in staleSeedIds
                 }
+                // [da1024-C] Full secondary-reference cascade for the ids just
+                // dissolved (mirrors replaceEntries' prune branch): group
+                // members, agent-loop pins, the compact pin and the per-device
+                // lastUsed / voice references.
+                for (group in config.modelGroups) {
+                    group.memberEntryIds.removeAll { it in staleEntryIds }
+                }
+                config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }
+                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleEntryIds)) {
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+                }
+                clearStaleSecondaryRefs(staleEntryIds)
                 changed = true
                 android.util.Log.i("ProviderRepo", "[VoiceTemplateMigrate] ${instance.label}: removed stale voice entries: ${staleSeedIds.sorted()}")
             }
@@ -787,13 +1062,39 @@ class ProviderRepository(private val context: Context) {
         config.instances.removeAll { it.id == instanceId }
         config.modelEntries.removeAll { it.providerInstanceId == instanceId }
 
+        // [fix/meta1028-d1 F-02] Which groups must be deleted: only the ones
+        // THIS removal emptied. The pre-fix code scanned every group with an
+        // empty member list, which also matched (a) a group that was already
+        // empty before this call, and (b) a group whose member list merely
+        // failed to DECODE on load (the placeholder is empty) — deleting those
+        // removes the only copy of their member list from provider.db.
+        val emptiedGroupIds = LinkedHashSet<String>()
         if (removedEntryIds.isNotEmpty()) {
+            val touchedGroupIds = config.modelGroups
+                .filter { group -> group.memberEntryIds.any { it in removedEntryIds } }
+                .map { it.id }
+                .toSet()
             for (group in config.modelGroups) {
                 group.memberEntryIds.removeAll { it in removedEntryIds }
             }
+            emptiedGroupIds.addAll(
+                decideEmptiedGroupIds(
+                    groups = config.modelGroups.map { it.id to it.memberEntryIds.toList() },
+                    touchedGroupIds = touchedGroupIds,
+                    unreadableGroupIds = unreadableMemberGroupIds,
+                ),
+            )
             config.agentLoopModelEntryIds.removeAll { it in removedEntryIds }
+            // [da1023-C] Same compact-pin cleanup as removeEntry, applied to
+            // the whole removed set — removeInstance cascades on its own and
+            // would otherwise leave the pin dangling on a vanished instance.
+            if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), removedEntryIds)) {
+                AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+            }
+            // [da1024-C] ...and the per-device refs the same removal orphans.
+            clearStaleSecondaryRefs(removedEntryIds)
         }
-        val emptyGroupIds = config.modelGroups.filter { it.memberEntryIds.isEmpty() }.map { it.id }.toSet()
+        val emptyGroupIds = emptiedGroupIds
         if (emptyGroupIds.isNotEmpty()) {
             config.modelGroups.removeAll { it.id in emptyGroupIds }
             if (config.defaultPrimaryGroupId in emptyGroupIds) config.defaultPrimaryGroupId = null
@@ -933,8 +1234,16 @@ class ProviderRepository(private val context: Context) {
                 existing.add(0, ThinkingRuleCoding.toEntity(rule, ruleId, instanceId, 0))
             }
             val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }
-            persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, renumbered)
+            // [fix/dv23-a1 A-01] Assigned ONLY AFTER the DAO write returned.
+            // Before, this assignment sat in front of replaceThinkingRules: a
+            // write that threw (disk full / SQLite lock / IO error) left
+            // persistedRules non-null, so republishThinkingCache took the
+            // "persisted" fast path and published rules that never reached
+            // provider.db into ThinkingRuleResolver + bumped
+            // customRulesRevision. Null ⇒ the no-arg overload re-reads the
+            // DB, so the cache can only ever hold disk truth.
+            persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] saveThinkingRule persistence failed ($instanceId/$ruleId)", e)
         }
@@ -951,8 +1260,11 @@ class ProviderRepository(private val context: Context) {
             val survivors = providerDao.loadThinkingRules(instanceId)
                 .sortedBy { it.sortOrder }
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
-            persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, survivors)
+            // [fix/dv23-a1 A-01] assigned only after the DAO write returned —
+            // see the note in saveThinkingRule. A failed write leaves
+            // persistedRules null ⇒ the cache is re-read from provider.db.
+            persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] deleteThinkingRule persistence failed ($instanceId/$id)", e)
         }
@@ -969,8 +1281,10 @@ class ProviderRepository(private val context: Context) {
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
             // Keep any id the caller omitted (defensive against a partial list) appended.
             val omitted = byId.values.filter { it.id !in orderedIds }.map { it }
-            persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, reordered + omitted)
+            // [fix/dv23-a1 A-01] assigned only after the DAO write returned —
+            // see the note in saveThinkingRule.
+            persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] reorderThinkingRules persistence failed ($instanceId)", e)
         }
@@ -1010,9 +1324,11 @@ class ProviderRepository(private val context: Context) {
     /**
      * Replace [instanceId]'s custom rules with the rows from a backup,
      * preserving each rule's id and sort_order. Returns the number of rules
-     * restored (0 when [rows] is empty or malformed). A backup section that
-     * carries no rules for this instance is a no-op — restore must never wipe
-     * rules just because an older backup predates the section.
+     * restored (0 when [rows] is empty or malformed, or when persistence
+     * failed — failures are logged, not thrown; [fix/dv22-a1 §1042-A-01]).
+     * A backup section that carries no rules for this instance is a no-op —
+     * restore must never wipe rules just because an older backup predates
+     * the section.
      */
     fun restoreThinkingRules(instanceId: String, rows: org.json.JSONArray): Int = runBlocking {
         val entities = ArrayList<ProviderThinkingRuleEntity>()
@@ -1037,7 +1353,24 @@ class ProviderRepository(private val context: Context) {
             )
         }
         if (entities.isEmpty()) return@runBlocking 0
-        providerDao.replaceThinkingRules(instanceId, entities)
+        // [fix/dv22-a1 §1042-A-01] Same bare-DAO hardening as the nine
+        // sibling functions above ([audit-0909 T4-H1]): a provider.db that
+        // failed to open threw here straight into the backup importer.
+        // Failure is logged and reported as 0 rules restored — the truth:
+        // no rows landed. The republish below only runs on success, so the
+        // resolver cache keeps matching what is actually on disk (on
+        // failure the DB still holds the pre-restore rows).
+        val persisted = runCatching {
+            providerDao.replaceThinkingRules(instanceId, entities)
+        }.onFailure { e ->
+            android.util.Log.e(
+                "ProviderRepo",
+                "[ProviderStore] restoreThinkingRules persistence failed " +
+                    "($instanceId, ${entities.size} rules) — reporting 0 restored: ${e.message}",
+                e,
+            )
+        }.isSuccess
+        if (!persisted) return@runBlocking 0
         republishThinkingCache(instanceId)
         entities.size
     }
@@ -1121,6 +1454,36 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * [deep-audit-1044 A-01] A [ModelEntry]'s model **as the registry knows it**
+     * — the only legitimate source for a capability / modality decision in this
+     * file.
+     *
+     * [ModelEntry.model] is nothing but `baseModel.withOverrides(overrides)`: it
+     * never consults models.dev. All 39 built-in models declare null modality
+     * lists by construction (see [LLMModel.isTextOutput]'s KDoc, and the
+     * "absent modality list means text in / text out" convention), so the raw
+     * property answered "no audio / yes text" for models the registry declares
+     * multimodal. Consequences on the voice side were user-visible: a
+     * multimodal model with audio input was dropped from the Voice Input
+     * candidates → recording failed with "No provider voice-input model
+     * configured"; the same read in [hasVoiceModels] painted every Voice
+     * Services row as "0 models"; and [newestProviderNewestTextEntry] offered a
+     * pure image generator as the new-chat default.
+     *
+     * [ModelsDevApi.effectiveModel] is the repo-wide single entry point (the
+     * `minis-model-use` surface, the config collection, the Debug RPCs,
+     * `ThinkingLevelCatalog` and `ModelEntryPicker` all ride on it): it enriches
+     * [ModelEntry.baseModel] FIRST and applies the user's overrides SECOND, so
+     * an explicit `overrides.inputModalities` / `outputModalities` still wins
+     * over the registry row. Do **not** re-derive it as `enrichModel(entry.model)`
+     * — that order hands the registry value back over the user's choice.
+     *
+     * Read-only: the enriched model must never be written back into
+     * `baseModelJson` / `overridesJson` (see [toSnapshot]).
+     */
+    private fun effectiveEntryModel(entry: ModelEntry): LLMModel = ModelsDevApi.effectiveModel(entry)
+
+    /**
      * [T-newchat-default-model-fallback-android] Final-tier default for a new
      * chat: the newest text-output model from the newest-added enabled
      * provider. "Newest provider" = max [ProviderInstance.createdAt]; "newest
@@ -1140,7 +1503,7 @@ class ProviderRepository(private val context: Context) {
             .sortedByDescending { it.createdAt }
         for (instance in enabledProviders) {
             val textEntry = config.modelEntries
-                .filter { it.providerInstanceId == instance.id && !it.isHidden && it.model.isTextOutput }
+                .filter { it.providerInstanceId == instance.id && !it.isHidden && effectiveEntryModel(it).isTextOutput }
                 .lastOrNull()
             if (textEntry != null) return textEntry
         }
@@ -1165,6 +1528,27 @@ class ProviderRepository(private val context: Context) {
         val config = _config.value
         val enabledIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
         return group.memberEntryIds.mapNotNull { entryId ->
+            // [deep-audit-1043 B-06] DELIBERATE: System voice entries are
+            // resolved elsewhere and must NOT appear in this list.
+            //
+            // This is the CHAT selection list — both callers
+            // (`ChatSessionLifecycle.resolveGroupModel`, `ChatModelRouting`
+            // load-balance rotation) immediately require
+            // `instance(entry.providerInstanceId)` + `loadApiKey(...)`, and a
+            // System entry's instance is synthesized, never persisted, so
+            // `instance()` returns null. Admitting one would make
+            // `GroupRouter.select` hand back an id that the very next line
+            // rejects — a mixed Voice group (System ASR + a cloud STT entry)
+            // would then fail to bind at all, where today it binds the cloud
+            // member. Display surfaces want the opposite answer and use
+            // `SystemVoiceEntries.isEnabledGroupMember` instead.
+            //
+            // The exclusion used to be INCIDENTAL (System ids simply aren't in
+            // `modelEntries`). Stated here because the obvious "fix" — route
+            // this through `resolveIn` like the display readers — is a
+            // regression, and the next reader should not have to rediscover
+            // that from the call sites.
+            if (SystemVoiceEntries.isSystemEntryId(entryId)) return@mapNotNull null
             val entry = config.modelEntries.find { it.id == entryId }
             if (entry != null && entry.providerInstanceId in enabledIds) entry else null
         }
@@ -1334,6 +1718,14 @@ class ProviderRepository(private val context: Context) {
                 if (agentRemoved > 0) {
                     android.util.Log.i("ProviderRepo", "[ModelList] replaceEntries pruned $agentRemoved stale agent-loop entry pins")
                 }
+                // [da1024-C] Same cascade for the references that live OUTSIDE
+                // ProviderConfig, which saveConfig's idMap cannot translate:
+                // the compact pin and the per-device lastUsed / voice refs.
+                // Inside the non-suspicious-shrink branch, like the two above.
+                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), prunedEntryIds)) {
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+                }
+                clearStaleSecondaryRefs(prunedEntryIds)
             }
         }
 
@@ -1355,27 +1747,138 @@ class ProviderRepository(private val context: Context) {
 
     // --- Model Entry management ---
 
-    fun addEntry(entry: ModelEntry) = synchronized(configLock) {
+    fun addEntry(entry: ModelEntry): String = synchronized(configLock) {
         ensureConfigLoaded()
         val config = mutationSnapshot(_config.value)
-        if (!entry.isCustom) {
-            val exists = config.modelEntries.any {
-                it.providerInstanceId == entry.providerInstanceId && it.baseModel.id == entry.baseModel.id
-            }
-            if (exists) return@synchronized
+        // [da1023-C] Composite-key guard, unified for custom AND API-reported
+        // entries: two rows with the same (providerInstanceId, baseModel.id)
+        // canonicalize to the same id (ProviderConfigMapping writes
+        // idMap[entry.uuid] = compositeEntryKey(...) and loads uuid = row.id),
+        // so LazyColumn `key = entry.id` crashes with "Key was already used"
+        // and one of the pair silently vanishes on reload. A duplicate is
+        // never written (fail-closed at the data layer); the agent-facing
+        // surfaces (ModelsCollection.add, provider.models.add) pre-check and
+        // translate the skip into their typed errors.
+        val decision = decideEntryAdd(
+            providerInstanceId = entry.providerInstanceId,
+            modelId = entry.baseModel.id,
+            existing = config.modelEntries.map {
+                it.id to compositeEntryKey(it.providerInstanceId, it.baseModel.id)
+            },
+        )
+        if (!decision.allowed) {
+            android.util.Log.w(
+                "ProviderRepo",
+                "[ProviderStore] addEntry skipped duplicate: " +
+                    "${entry.providerInstanceId}/${entry.baseModel.id} already exists as ${decision.persistedId}",
+            )
+            return@synchronized decision.persistedId
         }
         config.modelEntries.add(entry)
         saveConfig(config)
+        // Re-query the persisted list for the canonical id (mirrors
+        // mergeImportInstanceJSON): the uuid minted by ModelEntry's default is
+        // rewritten by saveConfig's canonicalize pass, and the re-query
+        // survives a future drift in that pass where a computed composite
+        // would not.
+        _config.value.modelEntries.firstOrNull {
+            it.providerInstanceId == entry.providerInstanceId && it.baseModel.id == entry.baseModel.id
+        }?.id ?: compositeEntryKey(entry.providerInstanceId, entry.baseModel.id)
     }
 
-    fun updateEntry(entry: ModelEntry) = synchronized(configLock) {
+    // [fix/dv21-a3 A-03] `stampUserModified` selects which meaning of "update"
+    // this write carries, and the default (true) keeps every editor / agent
+    // caller on the historical behavior:
+    //   - true  = a user edit landed → this entry IS newly modified, stamp now.
+    //   - false = a restore wrote the backup's values onto the entry → the
+    //             backup's own userModifiedAt must survive (see
+    //             [mergeImportedEntryOntoLocal]'s restore-is-restore contract).
+    // Stamping a restore with "now" quietly broke two things: the merge's no-op
+    // short-circuit (`restored == local` can never hold once the local carries
+    // t_import while the backup carries null/t_backup, so every re-import
+    // rewrote every hit), and [shadowVoiceProviders]' arbitration (restoring
+    // instance A pushed its mostRecentModified past instance B's genuine edit,
+    // stealing the voice-provider slot).
+    fun updateEntry(entry: ModelEntry, stampUserModified: Boolean = true): String? = synchronized(configLock) {
         ensureConfigLoaded()
         val config = mutationSnapshot(_config.value)
         val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
         if (idx >= 0) {
-            config.modelEntries[idx] = entry.copy(userModifiedAt = System.currentTimeMillis())
+            val existing = config.modelEntries[idx]
+            // [da1022-E] Id-rename integrity (decideEntryRename, extracted to
+            // ProviderRepositoryUtils for JVM testing): a custom model id edit
+            // changes the composite entry key. Blank ids and renames that
+            // collide with another entry of the same instance are rejected
+            // fail-closed (a collision would make upsertEntries REPLACE the
+            // existing row and silently drop the duplicate on next load).
+            val decision = decideEntryRename(
+                existingUuid = existing.id,
+                updatedInstanceId = entry.providerInstanceId,
+                updatedModelId = entry.baseModel.id,
+                others = config.modelEntries
+                    .filter { it.id != existing.id }
+                    .map { it.providerInstanceId to it.baseModel.id },
+            )
+            if (!decision.allowed) {
+                android.util.Log.w(
+                    "ProviderRepo",
+                    "[ProviderStore] updateEntry rejected: ${decision.rejectionReason}",
+                )
+                return@synchronized null
+            }
+            val renamed = decision.newKey != null
+            val newUuid = decision.newKey ?: existing.id
+            config.modelEntries[idx] = entry.copy(
+                uuid = newUuid,
+                userModifiedAt = if (stampUserModified) System.currentTimeMillis() else entry.userModifiedAt,
+            )
+            if (renamed) {
+                val oldKey = decision.oldKey
+                // Canonicalize this entry's uuid to the new composite key and
+                // sync the in-config references that hang off the old key.
+                // (saveConfig's idMap translation would heal the persisted
+                // rows either way, but only canonicalizing here keeps
+                // memory, DB and prefs consistent within the same session —
+                // lastUsedVisibleEntry() compares by string equality, so a
+                // pref rewritten ahead of the in-memory uuid would dangle
+                // until the next cold start.)
+                config.modelGroups.forEach { group ->
+                    group.memberEntryIds.replaceAll { id -> if (id == oldKey) newUuid else id }
+                }
+                config.agentLoopModelEntryIds.replaceAll { id -> if (id == oldKey) newUuid else id }
+                // KEY_LAST_USED_ENTRY (prefs) holds the entry id; the
+                // legacy-uuid rewrite at load only covers the upgrade
+                // first-launch, not in-place renames. Rewrite here so the
+                // next new chat still falls back to "the model I was just
+                // using" instead of the newest-provider fallback.
+                if (lastUsedEntryId == oldKey) lastUsedEntryId = newUuid
+                // [da1031-A] Voice overrides (prefs) are the same class of
+                // per-device secondary reference as lastUsedEntryId above —
+                // rename migrates them too.
+                if (voiceInputOverrideEntryId == oldKey) voiceInputOverrideEntryId = newUuid
+                if (voiceOutputOverrideEntryId == oldKey) voiceOutputOverrideEntryId = newUuid
+                // [da1023-C] KEY_COMPACT_MODEL_ENTRY_ID (AgentRuntimeLimitsPrefs)
+                // is a prefs-level secondary reference to this entry — same
+                // class as the lastUsedEntryId rewrite above, but it lives
+                // outside ProviderConfig, so saveConfig's idMap translation
+                // cannot heal it. Without the rewrite the pin dangles and
+                // CompactOrchestration silently follows the session chain.
+                decideCompactPinMigration(
+                    pinEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId(),
+                    oldKey = oldKey ?: existing.id,
+                    newKey = newUuid,
+                )?.let { migrated ->
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = migrated)
+                    android.util.Log.i(
+                        "ProviderRepo",
+                        "[ProviderStore] compactModelEntryId migrated: $oldKey -> $migrated",
+                    )
+                }
+            }
             saveConfig(config)
+            return@synchronized newUuid
         }
+        null
     }
 
     fun removeEntry(entryId: String) = synchronized(configLock) {
@@ -1390,6 +1893,18 @@ class ProviderRepository(private val context: Context) {
         // no longer exists. Mirrors iOS ProviderConfigStore.removeEntry
         // (Providers/ProviderConfigStore.swift L268).
         config.agentLoopModelEntryIds.removeAll { it == entryId }
+        // [da1023-C] Same compact-pin cascade as the agent-loop cleanup above:
+        // the pin is prefs-held (AgentRuntimeLimitsPrefs) and saveConfig's
+        // idMap translation cannot see it — a dangling pin makes
+        // CompactOrchestration silently follow the session chain. Reset to ""
+        // (explicit follow-session) when the pinned entry goes away.
+        if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), setOf(entryId))) {
+            AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+        }
+        // [da1024-C] Twin cascade for the per-device references: a deleted
+        // entry id can still be the last-used / voice override value, and only
+        // this path can clear it (the readers fall back silently).
+        clearStaleSecondaryRefs(setOf(entryId))
         saveConfig(config)
     }
 
@@ -1470,6 +1985,14 @@ class ProviderRepository(private val context: Context) {
 
     /** Append [entryId] to the agent-loop direct-pin list if not already there. */
     fun addAgentLoopEntry(entryId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] Every read-modify-write mutator must call
+        // ensureConfigLoaded() BEFORE reading _config.value. During the cold
+        // start async load window _config holds an empty placeholder
+        // ProviderConfig(), so reading it here would persist the empty list
+        // over the user's real pins — silent config loss. The four sibling
+        // add/remove helpers and setAgentLoop*Ids already carry this guard;
+        // these four did not (31 config mutators, 6 missing).
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
         if (entryId in cur) return@synchronized
         setAgentLoopEntryIds(cur + entryId)
@@ -1477,6 +2000,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Remove [entryId] from the agent-loop direct-pin list. No-op if absent. */
     fun removeAgentLoopEntry(entryId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
         if (entryId !in cur) return@synchronized
         setAgentLoopEntryIds(cur.filterNot { it == entryId })
@@ -1484,6 +2009,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Append [groupId] to the agent-loop group-pin list if not already there. */
     fun addAgentLoopGroup(groupId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
         if (groupId in cur) return@synchronized
         setAgentLoopGroupIds(cur + groupId)
@@ -1491,6 +2018,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Remove [groupId] from the agent-loop group-pin list. No-op if absent. */
     fun removeAgentLoopGroup(groupId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
         if (groupId !in cur) return@synchronized
         setAgentLoopGroupIds(cur.filterNot { it == groupId })
@@ -1515,15 +2044,24 @@ class ProviderRepository(private val context: Context) {
     // a background writer publishes a new config is the exact
     // ConcurrentModificationException class that mutationSnapshot() and
     // ProviderConfigSnapshotTest exist to prevent.
-    fun reorderAgentLoopEntries(newOrder: List<String>) {
+    // [fix/dv23-a1 A-02] Both reorders now read the list INSIDE configLock and
+    // call ensureConfigLoaded() first. Before, they read _config.value outside
+    // the lock and without the load guard: during the cold-start window the
+    // placeholder config was read and the reorder then persisted it — wiping
+    // the user's pins. The lock also closes the read/write asymmetry against
+    // the async loader's emit (ensureConfigLoaded is itself synchronized on
+    // configLock, so re-entering it on the same monitor is safe).
+    fun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
-        val reordered = permuteById(cur, newOrder) { it } ?: return
+        val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized
         setAgentLoopEntryIds(reordered)
     }
 
-    fun reorderAgentLoopGroups(newOrder: List<String>) {
+    fun reorderAgentLoopGroups(newOrder: List<String>) = synchronized(configLock) {
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
-        val reordered = permuteById(cur, newOrder) { it } ?: return
+        val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized
         setAgentLoopGroupIds(reordered)
     }
 
@@ -1752,7 +2290,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
             return inst to entry
         }
 
@@ -1806,7 +2344,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
             return inst to entry
         }
 
@@ -1890,7 +2428,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioOutput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioOutput) return null
             return inst to entry
         }
 
@@ -1938,7 +2476,7 @@ class ProviderRepository(private val context: Context) {
     /** True if [instanceId] has ANY model entry with an audio modality. */
     fun hasVoiceModels(instanceId: String): Boolean =
         _config.value.modelEntries.any {
-            it.providerInstanceId == instanceId && it.model.hasVoiceModality
+            it.providerInstanceId == instanceId && effectiveEntryModel(it).hasVoiceModality
         }
 
     /**
@@ -2008,8 +2546,8 @@ class ProviderRepository(private val context: Context) {
             ShadowVoiceProvider(
                 instanceId = rep.id,
                 displayName = rep.label,
-                inputModels = entries.filter { it.model.hasAudioInput },
-                outputModels = entries.filter { it.model.hasAudioOutput },
+                inputModels = entries.filter { effectiveEntryModel(it).hasAudioInput },
+                outputModels = entries.filter { effectiveEntryModel(it).hasAudioOutput },
             )
         }.sortedWith(compareBy({ it.displayName }, { it.instanceId }))
     }
@@ -2051,7 +2589,11 @@ class ProviderRepository(private val context: Context) {
                 // provider implementations directly (data→provider reverse
                 // dependency). Registry returns empty list for types without
                 // a registered fetcher.
-                ModelListProviderRegistry.fetchModels(instance, apiKey, isThirdParty, forceRefresh)
+                // [fix/da1020-models-cache] Forward our Context so the fetcher's
+                // disk cache is reachable: every *ModelsApi short-circuits on
+                // `context != null`, so dropping it here silently disabled the
+                // 7-day cache read, the 401/403 invalidate and the save alike.
+                ModelListProviderRegistry.fetchModels(instance, apiKey, isThirdParty, forceRefresh, context)
             } catch (e: Exception) {
                 android.util.Log.e("ProviderRepo", "refreshModels fetch error: ${e.message}", e)
                 emptyList()
@@ -2199,6 +2741,18 @@ class ProviderRepository(private val context: Context) {
                     entry.baseModel.maxOutputTokens?.let { put("maxOutputTokens", it) }
                     entry.baseModel.supportsReasoning?.let { put("supportsReasoning", it) }
                     entry.baseModel.interleavedReasoningField?.let { put("interleavedReasoningField", it) }
+                    // [T-fix-import-id-roundtrip] Export the reasoning-capability
+                    // pair the Room/kotlinx path already carries. Additive +
+                    // optional: readers without the keys ignore them, and the
+                    // import below reads each independently with null defaults.
+                    // Without these, a backup restore evaporates the effort-tier
+                    // list (ThinkingLevelCatalog ceiling) and the
+                    // declaresNoEffortTiers flag (xAI grok-build must NOT receive
+                    // reasoning_effort) for gateway models absent from models.dev.
+                    entry.baseModel.reasoningEffortValues?.takeIf { it.isNotEmpty() }?.let {
+                        put("reasoningEffortValues", JSONArray(it))
+                    }
+                    entry.baseModel.declaresNoEffortTiers?.let { put("declaresNoEffortTiers", it) }
                     // [T-fix-backup-field-evap] Export the user-visible ModelEntry
                     // fields that the backup/restore round-trip must preserve.
                     // These four fields (costTier, userModifiedAt, maxThinkingLevel,
@@ -2333,36 +2887,33 @@ class ProviderRepository(private val context: Context) {
             resolvedLabel = "$label ($suffix)"
         }
 
-        val customBaseURL = dict.optString("customBaseURL", "").ifEmpty { null }
-        val appendV1 = dict.optBoolean("appendV1Suffix", true)
-        val useResponsesAPI = dict.optBoolean("useResponsesAPI", false)
         // [T-provider-custom-user-agent] Additive: old exports lack the key →
         // empty → null → default UA. Field name matches iOS.
-        val customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null }
         // [RC5 / P0-pinned + GH#68] Restore the run-config fields written by
         // [exportInstanceJSON]. Each defaults to the model's own default when
         // the key is absent (old backup) so nothing crashes and a legacy
         // restore behaves exactly as before. Enum names parsed via
         // runCatching + fallback, mirroring ProviderConfigMapping — an unknown
         // enum name from a future build degrades to auto / no cache instead of
-        // throwing away the whole import. Delegated to the pure
-        // [readRunConfigFields] seam so the round-trip is JVM-testable.
-        val rc = readRunConfigFields(dict)
+        // throwing away the whole import. [fix/dv16-a A-08] The decode lives
+        // in the shared [readImportInstanceFields] seam so the merge path
+        // (same-(type,label) restore) decodes identical fields.
+        val f = readImportInstanceFields(dict)
 
         val instance = ProviderInstance(
             id = java.util.UUID.randomUUID().toString(),
             label = resolvedLabel,
             providerType = providerType,
             credentialType = credentialType,
-            customBaseURL = customBaseURL,
-            appendV1Suffix = appendV1,
-            useResponsesAPI = useResponsesAPI,
-            customUserAgent = customUserAgent,
-            isEnabled = rc.isEnabled,
-            azureMode = rc.azureMode,
-            imageEndpointMode = rc.imageEndpointMode,
-            imageEndpointResolved = rc.imageEndpointResolved,
-            pinned = rc.pinned,
+            customBaseURL = f.customBaseURL,
+            appendV1Suffix = f.appendV1Suffix,
+            useResponsesAPI = f.useResponsesAPI,
+            customUserAgent = f.customUserAgent,
+            isEnabled = f.runConfig.isEnabled,
+            azureMode = f.runConfig.azureMode,
+            imageEndpointMode = f.runConfig.imageEndpointMode,
+            imageEndpointResolved = f.runConfig.imageEndpointResolved,
+            pinned = f.runConfig.pinned,
             // [T-fix-backup-field-evap] Restore the original creation time.
             // Old backups lack the key → fall back to now() so a legacy
             // restore behaves exactly as before. Positive guard: a malformed
@@ -2440,6 +2991,19 @@ class ProviderRepository(private val context: Context) {
             val maxOutputTokens = if (m.has("maxOutputTokens")) m.optInt("maxOutputTokens").takeIf { it > 0 } else null
             val supportsReasoning = if (m.has("supportsReasoning")) m.optBoolean("supportsReasoning") else null
             val interleavedReasoningField = m.optString("interleavedReasoningField", "").ifEmpty { null }
+            // [T-fix-import-id-roundtrip] Restore the reasoning-capability pair
+            // the export side now writes. Each key is read independently with a
+            // null default when absent (old backup) — a legacy restore behaves
+            // exactly as before. Empty lists / null / explicit-null degrade to
+            // null ("unknown") instead of an empty list.
+            val reasoningEffortValues = m.optJSONArray("reasoningEffortValues")?.let { arr ->
+                (0 until arr.length())
+                    .mapNotNull { idx -> arr.optString(idx, "").takeIf { it.isNotBlank() } }
+                    .takeIf { it.isNotEmpty() }
+            }
+            val declaresNoEffortTiers = if (m.has("declaresNoEffortTiers") && !m.isNull("declaresNoEffortTiers")) {
+                m.optBoolean("declaresNoEffortTiers")
+            } else null
             // [T-fix-backup-field-evap] Restore the user-visible ModelEntry
             // metadata that the hand-written serializer previously dropped.
             // Each key is read independently with a null default when absent
@@ -2463,6 +3027,8 @@ class ProviderRepository(private val context: Context) {
                 interleavedReasoningField = interleavedReasoningField,
                 inputModalities = baseIn,
                 outputModalities = baseOut,
+                reasoningEffortValues = reasoningEffortValues,
+                declaresNoEffortTiers = declaresNoEffortTiers,
             )
             val overridesObj = m.optJSONObject("overrides")
             val overrides = if (overridesObj != null) {
@@ -2518,13 +3084,24 @@ class ProviderRepository(private val context: Context) {
      *   - the existing instance id is kept, so groups / defaults referencing
      *     the backup's entries remap onto the live instance;
      *   - models are upserted by baseModel.id: models the existing instance
-     *     lacks are added, models it already has are reused as-is (the local
-     *     overrides / customizations win);
-     *   - credentials (apiKey / OAuth / base URL) ARE written onto the
-     *     existing instance via [importInstanceCredentials] — a restore is a
-     *     restore. (An earlier revision of this doc claimed they were
-     *     deliberately NOT touched; that was stale — the code has always
-     *     written them.)
+     *     lacks are added; models it already has have the backup's values
+     *     written onto them — a restore is a restore, all the way down
+     *     [fix/dv20-a2 A-08]. The write goes through [updateEntry] (the same
+     *     whole-entry face the UI editor uses) with the existing entry's id
+     *     kept, so the entryIdMap and every reference hanging off it stays
+     *     valid; unchanged entries skip the write (local values identical to
+     *     the backup's are a no-op, and the historical "local wins" reading
+     *     of this bullet was the same stale claim the credentials bullet
+     *     below already corrected).
+     *   - credentials (the backup's apiKey — the only credential field
+     *     [importInstanceCredentials] writes) ARE written onto the existing
+     *     instance — a restore is a restore. (An earlier revision of this doc
+     *     claimed they were deliberately NOT touched; that was stale — the
+     *     code has always written them. [fix/dv16-a A-08] The instance-config
+     *     fields (customBaseURL / appendV1Suffix / useResponsesAPI /
+     *     customUserAgent + the five run-config fields) are now written too,
+     *     through the shared [applyImportInstanceFields] face — an earlier
+     *     revision dropped them on this merge path.)
      *
      * @param srcEntryIds the backup-layer `_entryIds` annotation, positionally
      *   paired with the `models` array (same append order — visible and hidden
@@ -2538,9 +3115,14 @@ class ProviderRepository(private val context: Context) {
     /**
      * [T-backup-dedup] Merge an exported provider JSON into the existing
      * instance with the same (type, label), returning its id and a source
-     * entry id → restored entry id map. The backup's credentials (apiKey /
-     * OAuth / Gemini account) are always written onto the existing instance —
-     * a restore is a restore.
+     * entry id → restored entry id map. The backup's credentials (the
+     * apiKey — the only credential field [importInstanceCredentials] writes)
+     * are always written onto the existing instance —
+     * a restore is a restore. [fix/dv16-a A-08] The instance-config fields the
+     * append path decodes are now applied too, through the shared
+     * [applyImportInstanceFields] face. [fix/dv20-a2 A-08] The model-level
+     * fields are applied the same way, through the shared whole-entry
+     * [updateEntry] face (identity pinned to the existing entry id).
      */
     fun mergeImportInstanceJSON(
         jsonStr: String,
@@ -2561,6 +3143,19 @@ class ProviderRepository(private val context: Context) {
         // label.
         importInstanceCredentials(dict, existing)
 
+        // [fix/dv16-a A-08] A restore is a restore: the instance-config fields
+        // the append path decodes (customBaseURL / appendV1Suffix /
+        // useResponsesAPI / customUserAgent + the five run-config fields) are
+        // applied onto the existing instance too — through the same shared
+        // write face ([readImportInstanceFields] / [applyImportInstanceFields]),
+        // so a same-(type,label) restore no longer drops them. Same
+        // restore-is-restore contract as the credentials above: the backup's
+        // values win over the local ones (the user's revert path is to edit
+        // the field after the restore, or to re-import after re-editing).
+        val fields = readImportInstanceFields(dict)
+        val updated = applyImportInstanceFields(existing, fields)
+        if (updated != existing) updateInstance(updated)
+
         val entries = parseImportedModelEntries(dict, existing.id)
         val entryMap = HashMap<String, String>()
         for (i in entries.indices) {
@@ -2569,9 +3164,49 @@ class ProviderRepository(private val context: Context) {
             val hit = _config.value.modelEntries.firstOrNull {
                 it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
             }
-            val resolvedEntryId = hit?.id ?: run {
+            val resolvedEntryId = if (hit != null) {
+                // [fix/dv20-a2 A-08] A restore is a restore — the same contract
+                // the instance-config fields got in dv16-a A-08 (same merge
+                // path, one level down): the backup's model-level values are
+                // written onto the existing entry instead of being dropped
+                // behind a successful-looking import. The field set and the
+                // identity rule live in [mergeImportedEntryOntoLocal] (single
+                // source, derived from ModelEntry itself — no whitelist here);
+                // the write goes through [updateEntry], the same whole-entry
+                // face the UI editor uses, so nothing can drift between the
+                // restore path and the editor path.
+                // The returned id is used as-is, not assumed == hit.id: if the
+                // existing entry still carries a legacy uuid, updateEntry's
+                // rename-integrity decision canonicalizes it to the composite
+                // key and the id map must follow. A null return means the
+                // write was rejected and the untouched existing id is still
+                // the correct mapping target. A no-op merge (imported values
+                // already identical) skips the write entirely.
+                // [fix/dv21-a3 A-03] …and the write is a RESTORE, not an edit:
+                // stampUserModified = false carries the backup's own
+                // userModifiedAt instead of "now". The baseline shape stamped
+                // it, which defeated the no-op short-circuit above on the
+                // second import (the local entry carried t_import while the
+                // backup carried null/t_backup, so `restored == local` could
+                // never hold again) and let a restore of one instance jump
+                // shadowVoiceProviders' mostRecentModified arbitration over a
+                // genuinely edited sibling.
+                val updated = mergeImportedEntryOntoLocal(hit, entry)
+                if (updated == null) hit.id else (updateEntry(updated, stampUserModified = false) ?: hit.id)
+            } else {
                 addEntry(entry)
-                entry.id
+                // [T-fix-import-id-roundtrip] addEntry 落盘后 _config.value 已被
+                // saveConfig 的 toSnapshot→toProviderConfig canonicalize 为复合键
+                // 形状（"{instanceId}/{modelId}"）——裸返 entry.id 会把一次性随机
+                // UUID 交给 entryIdMap，令模型组 / agentLoopEntries /
+                // compactModelEntryId / 会话 binding 的重映射全部悬空。Requery 返回
+                // 落盘后的真实 id；addEntry 的 exists 跳过谓词与上面的 hit 谓词
+                // 逐字相同（hit==null ⇒ 不会被跳过），但 requery 仍比裸算
+                // compositeEntryKey 更稳——若未来 skip 谓词漂移，它返回的是既有行
+                // 的真实 id 而非新算值。
+                _config.value.modelEntries.firstOrNull {
+                    it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+                }?.id ?: compositeEntryKey(existing.id, entry.baseModel.id)
             }
             if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
         }
@@ -2660,3 +3295,132 @@ internal fun readRunConfigFields(dict: org.json.JSONObject): RunConfigSnapshot {
         pinned = dict.optBoolean(RCF_PINNED, false),
     )
 }
+
+// --- [fix/dv16-a A-08] Shared instance-field decode / write face for the two
+// backup restore paths. Top-level in this file (not a ProviderRepository
+// method) so the JVM round-trip tests can drive it without a Context. ---
+
+/**
+ * Single decode point for the instance-config fields of an exported provider
+ * JSON payload — customBaseURL / appendV1Suffix / useResponsesAPI /
+ * customUserAgent + the five run-config fields ([readRunConfigFields]).
+ * Shared by [importInstanceJSON] (fresh append) and [mergeImportInstanceJSON]
+ * (same (type, label) merge) so the two restore paths cannot drift: a field
+ * decoded on the append path decodes identically on the merge path. Before
+ * this seam the merge path decoded NONE of these, so a same-(type,label)
+ * restore silently dropped the user's base URL / format toggles / run-config.
+ */
+internal data class ImportInstanceFields(
+    val customBaseURL: String?,
+    val appendV1Suffix: Boolean,
+    val useResponsesAPI: Boolean,
+    val customUserAgent: String?,
+    val runConfig: RunConfigSnapshot,
+)
+
+internal fun readImportInstanceFields(dict: org.json.JSONObject): ImportInstanceFields =
+    ImportInstanceFields(
+        customBaseURL = dict.optString("customBaseURL", "").ifEmpty { null },
+        appendV1Suffix = dict.optBoolean("appendV1Suffix", true),
+        useResponsesAPI = dict.optBoolean("useResponsesAPI", false),
+        customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null },
+        runConfig = readRunConfigFields(dict),
+    )
+
+/**
+ * Apply the decoded instance-config fields onto [base]. Copy-on-write:
+ * returns a NEW instance, never mutates the caller's object (the object the
+ * config store hands back is the live instance concurrent readers iterate).
+ * Deliberately touches ONLY the restore fields — id / label / providerType /
+ * credentialType / createdAt (the merge match key and the live instance's
+ * identity) are untouched, so the "同名同类型 ⇒ 合并" matching and the
+ * caller-resolved label stay intact.
+ */
+internal fun applyImportInstanceFields(base: ProviderInstance, f: ImportInstanceFields): ProviderInstance =
+    base.copy(
+        customBaseURL = f.customBaseURL,
+        appendV1Suffix = f.appendV1Suffix,
+        useResponsesAPI = f.useResponsesAPI,
+        customUserAgent = f.customUserAgent,
+        isEnabled = f.runConfig.isEnabled,
+        azureMode = f.runConfig.azureMode,
+        imageEndpointMode = f.runConfig.imageEndpointMode,
+        imageEndpointResolved = f.runConfig.imageEndpointResolved,
+        pinned = f.runConfig.pinned,
+    )
+
+
+/**
+ * Merge a parsed import entry into the local entry list, single-sourced so the
+ * merge path's "hit" branch is one decision point (a second copy of this logic
+ * is exactly the drift [applyImportInstanceFields] exists to prevent).
+ *
+ * Semantics — [fix/dv20-a2 A-08] a restore is a restore, one level below
+ * [applyImportInstanceFields]:
+ *  - The backup's model-level values (base model metadata / overrides /
+ *    isCustom / isHidden / costTier) are written onto the existing entry.
+ *  - The entry's identity is kept: [ModelEntry.uuid] stays the local id, so
+ *    entryIdMap / model-group members / agentLoop ids referencing it stay
+ *    valid. (providerInstanceId is equal by construction — the caller's hit
+ *    predicate matches on it.)
+ *  - [ModelEntry.userModifiedAt] rides the backup like every other field
+ *    ([fix/dv21-a3 A-03]) — it is NOT restamped with "now" by the writer. The
+ *    restored value is what makes a second import of the same backup a true
+ *    no-op (`restored == local` above), and a fresh stamp would push this
+ *    instance's [shadowVoiceProviders] arbitration past a sibling the user
+ *    really edited. The write face honors it through [updateEntry]'s
+ *    `stampUserModified = false` mode; the UI editor path keeps the default
+ *    (true).
+ *  - A no-op merge returns null: nothing to write, the caller keeps the
+ *    existing id. That is the unchanged "identical restore does not touch the
+ *    entry" behavior.
+ *
+ * The full field set rides [ModelEntry] itself rather than a hand-written
+ * whitelist here — adding a field to the data class must not need a second
+ * edit in this function (four-way-sync lesson).
+ */
+internal fun mergeImportedEntryOntoLocal(local: ModelEntry, imported: ModelEntry): ModelEntry? {
+    val restored = imported.copy(uuid = local.id)
+    return if (restored == local) null else restored
+}
+
+// --- [da1023-C] Pure entry-key / compact-pin decision helpers. Top-level in
+// this file (not ProviderRepositoryUtils.kt, which other 1023 fix branches
+// may own) to stay inside this branch's exclusive file set; same package
+// keeps them JVM-testable. ---
+
+/** [da1023-C] Outcome of the addEntry composite-key guard. */
+internal data class EntryAddDecision(
+    /** false = a live entry already owns this (instance, modelId) composite key. */
+    val allowed: Boolean,
+    /** Composite key of the new entry; the surviving entry's id on duplicate. */
+    val persistedId: String,
+)
+
+internal fun decideEntryAdd(
+    providerInstanceId: String,
+    modelId: String,
+    existing: List<Pair<String, String>>,
+): EntryAddDecision {
+    val newKey = "$providerInstanceId/$modelId"
+    val hit = existing.firstOrNull { it.second == newKey }
+    return if (hit != null) EntryAddDecision(false, hit.first) else EntryAddDecision(true, newKey)
+}
+
+/** [da1023-C] Compact-pin rewrite decision on a rename (null = no rewrite). */
+internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? =
+    if (pinEntryId.isNotEmpty() && pinEntryId == oldKey && oldKey != newKey) newKey else null
+
+/** [da1023-C] Compact-pin reset decision on removal. */
+internal fun decideCompactPinCleanup(pinEntryId: String, removedEntryIds: Collection<String>): Boolean =
+    pinEntryId.isNotEmpty() && removedEntryIds.contains(pinEntryId)
+
+/**
+ * [da1024-C] True when the prefs-held secondary reference [ref] points at an
+ * entry id that is going away. One predicate for `lastUsedEntryId` and the two
+ * voice overrides — all `String?` SharedPreferences values, so the null case
+ * (and the System voice sentinels, which never equal a provider entry id) is
+ * spelled out exactly once instead of at every removal path.
+ */
+internal fun decideStaleRefCleanup(ref: String?, removedEntryIds: Collection<String>): Boolean =
+    ref != null && removedEntryIds.contains(ref)

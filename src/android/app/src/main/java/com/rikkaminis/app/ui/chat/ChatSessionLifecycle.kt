@@ -1,46 +1,30 @@
 package com.rikkaminis.app.ui.chat
 
-import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.conversation.ContextCompactor
-import com.rikkaminis.app.conversation.appendPinnedSection
-import com.rikkaminis.app.conversation.extractPinnedUserMessages
-import com.rikkaminis.app.conversation.pinnedSectionInner
-import com.rikkaminis.app.conversation.stripPinnedSection
-import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.db.CompactMarkerEntity
 import com.rikkaminis.app.data.db.MessageEntity
 import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
-import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.LLMResponse
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.diagnostics.SessionIdAliases
 import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.provider.LLMProvider
-import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.provider.ProviderFactory
-import com.rikkaminis.app.sandbox.ExecutionCoordinator
 import com.rikkaminis.app.service.SessionActivityTracker
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import org.json.JSONArray
 import org.json.JSONObject
 import androidx.lifecycle.viewModelScope
-import com.rikkaminis.app.R
 import com.rikkaminis.app.agent.InterruptedTailDetector
 import com.rikkaminis.app.agent.InterruptedTailPartKind
 import com.rikkaminis.app.agent.InterruptedTailShape
 import com.rikkaminis.app.agent.InterruptedTailSnapshot
-import com.rikkaminis.app.agent.runtime.AgentRunEvent
-import com.rikkaminis.app.agent.runtime.AgentRunPhase
-import com.rikkaminis.app.tools.AgentTraceRecorder
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 // [FE-5 batch 5] Session lifecycle & compaction cluster extracted verbatim
 // from ChatViewModel as extension functions: session load/restore, context
@@ -235,34 +219,14 @@ internal fun ChatViewModel.effectiveAgentHistory(): List<LLMMessage> {
         // content field would be silently swallowed. Find the first USER
         // message that is NOT a tool_result-only message, and inject the
         // summary there.
-        val firstTextUserOffset = postAnchor.indexOfFirst {
-            it.role == LLMMessage.Role.USER &&
-                !it.contentParts.all { p -> p is AgentContentPart.ToolResult }
-        }
-        if (firstTextUserOffset >= 0) {
-            if (firstTextUserOffset > 0) {
-                result.addAll(postAnchor.subList(0, firstTextUserOffset))
-            }
-            val target = postAnchor[firstTextUserOffset]
-            // Prepend `<context-summary>...` to the user content. We
-            // edit `content` directly because Android LLMMessage uses
-            // `content: String` as the canonical text payload; any
-            // contentParts the message also carries get preserved.
-            val injected = target.copy(
-                content = summaryWrappedText + "\n\n" + target.content,
-            )
-            result.add(injected)
-            if (firstTextUserOffset + 1 < postAnchor.size) {
-                result.addAll(postAnchor.subList(firstTextUserOffset + 1, postAnchor.size))
-            }
-        } else {
-            // Rare: no user message after anchor (or all are tool_result-only).
-            // Append everything post-anchor (typically empty) then a standalone
-            // summary user turn. Safe — no later user follows it to break
-            // alternation.
-            result.addAll(postAnchor)
-            result.add(LLMMessage(role = LLMMessage.Role.USER, content = summaryWrappedText))
-        }
+        // [fix/audit-1015-bug01] Splice the summary into the post-anchor
+        // messages via the pure injector (extracted to ChatCompactionLogic
+        // for JVM testability). It updates BOTH `content` and `contentParts`:
+        // all four serialization exits (OpenAI/Anthropic/Gemini/Responses)
+        // ignore `content` whenever contentParts is non-empty, so editing
+        // `content` alone was silently swallowing the summary for any
+        // message that carries parts.
+        result.addAll(injectSummaryIntoPostAnchor(postAnchor, summaryWrappedText))
         // [T-compact-slice-tool-pairing] The slice (walkBack cap /
         // preAnchor prune / postAnchor splice) can split a tool round
         // across a boundary — e.g. cap lands on the tool_result user
@@ -274,7 +238,10 @@ internal fun ChatViewModel.effectiveAgentHistory(): List<LLMMessage> {
         // dangling tool message. This is the same repair that runs on
         // the full agentHistory each loop iteration — the slice is the
         // gap that previously escaped it.
-        sanitizeAgentHistoryMessages(result)
+        // [fix/r5-c1-compact-C03①] One call, not a hand-written pair: sanitize
+        // and normalize feed each other (see repairSliceShape), so the two
+        // entry points must never be invoked in a fixed order again.
+        repairSliceShape(result)
         return result
     }
 
@@ -292,7 +259,7 @@ internal fun ChatViewModel.effectiveAgentHistory(): List<LLMMessage> {
             val result1 = mutableListOf<LLMMessage>()
             result1.add(summaryHead)
             result1.addAll(agentHistory.subList(keepStart, agentHistory.size))
-            sanitizeAgentHistoryMessages(result1)
+            repairSliceShape(result1)
             return result1
         }
         // Fall through to safety net.
@@ -307,13 +274,282 @@ internal fun ChatViewModel.effectiveAgentHistory(): List<LLMMessage> {
         if (postCompactStart < agentHistory.size) {
             result2.addAll(agentHistory.subList(postCompactStart, agentHistory.size))
         }
-        sanitizeAgentHistoryMessages(result2)
+        repairSliceShape(result2)
         return result2
     }
 
     Log.w(ChatViewModel.TAG, "[Compact] effectiveAgentHistory: marker ${marker.id.take(8)} unresolvable in agentHistory (size=${agentHistory.size}); returning full history")
     return agentHistory.toList()
 }
+
+/**
+ * [FIX-R4-P F-04] Repair the two illegal role shapes the compacted slice can
+ * still produce AFTER [sanitizeAgentHistoryMessages] has run. Sanitize alone
+ * cannot fix them, because the slice guards themselves create the damage:
+ *
+ * 1. **Leading ASSISTANT** — the pre-anchor peel loop strips non-USER heads to
+ *    restore role alternation, but the boundary guard deliberately extends
+ *    `priorIdx` BACK to include the paired `tool_use` assistant (so the
+ *    tool_result keeps its parent). The peel then removes that assistant,
+ *    leaving an orphaned `tool_result` USER at the head, which sanitize drops
+ *    (no matching `tool_use` in the slice) — so the head becomes whatever came
+ *    next, typically an ASSISTANT. Strict gateways (Anthropic, and OpenAI
+ *    gateways that validate alternation) reject a conversation whose first
+ *    message is not USER with a 400.
+ * 2. **Consecutive USER** — when no plain-text USER exists post-anchor, the
+ *    summary is appended as a standalone USER turn; if the last post-anchor
+ *    entry is itself a USER (tool_result-only), that yields USER,USER. Same
+ *    for the v1 path when `agentHistory[keepStart]` is a USER.
+ *
+ * The repair MERGES same-role neighbors instead of dropping either one. That is
+ * what strict providers do implicitly (OpenAI) or accept via multi-part content
+ * (Anthropic) — and appending keeps `tool_result` blocks at the head of their
+ * USER message, which is where Anthropic requires them.
+ *
+ * Peel first (it can create a same-role pair by removing the middle message),
+ * then merge left-to-right.
+ */
+internal fun normalizeSliceRoleAlternation(messages: MutableList<LLMMessage>) {
+    // (1) First message must be USER.
+    while (messages.isNotEmpty() && messages.first().role != LLMMessage.Role.USER) {
+        messages.removeAt(0)
+    }
+    // (2) Merge same-role neighbors.
+    var i = 1
+    while (i < messages.size) {
+        val prev = messages[i - 1]
+        val cur = messages[i]
+        if (prev.role == cur.role) {
+            messages[i - 1] = mergeSameRoleNeighbors(prev, cur)
+            messages.removeAt(i)
+        } else {
+            i++
+        }
+    }
+}
+
+/**
+ * [fix/r5-c1-compact-C03①] Repair a compacted slice to a FIXPOINT: strip
+ * orphan tool blocks → normalize roles → strip again, until a whole pass
+ * changes nothing.
+ *
+ * The two repairs are not independent. [sanitizeAgentHistoryMessages] drops a
+ * tool_result whose tool_use fell outside the slice, which can expose an
+ * ASSISTANT at the head; [normalizeSliceRoleAlternation] then peels that
+ * ASSISTANT, which orphans the tool_result right after it — a NEW illegal
+ * shape produced by the repair that just ran. Running each exactly once in a
+ * fixed order therefore still left the slice head as an orphan tool_result,
+ * and strict gateways answer that with a 400 on the next request.
+ *
+ * Termination: a pass only removes messages, removes parts, or merges two
+ * messages into one. The one additive step (placeholder injection for an
+ * unmatched tool_use) is idempotent and removes itself from the equation the
+ * moment its tool_use is peeled, so message and part counts are monotonically
+ * non-increasing from the second pass on. [MAX_SLICE_REPAIR_PASSES] is a
+ * safety net for a future edit that breaks that; hitting it is logged rather
+ * than silently accepted.
+ */
+internal fun repairSliceShape(messages: MutableList<LLMMessage>) {
+    var pass = 0
+    while (pass < MAX_SLICE_REPAIR_PASSES) {
+        val before = sliceShapeSignature(messages)
+        sanitizeAgentHistoryMessages(messages)
+        normalizeSliceRoleAlternation(messages)
+        pass++
+        if (sliceShapeSignature(messages) == before) return
+    }
+    Log.w(
+        ChatViewModel.TAG,
+        "[Compact] slice repair did not stabilise after $MAX_SLICE_REPAIR_PASSES passes " +
+            "(size=${messages.size})",
+    )
+}
+
+private const val MAX_SLICE_REPAIR_PASSES = 4
+
+/**
+ * Shape fingerprint for [repairSliceShape]: exactly what the two repairs can
+ * change (roles, tool block ids, message count). Content text is deliberately
+ * out — a merge concatenates text, which shows up as a part/message count
+ * change anyway, and hashing megabytes of transcript every pass is wasteful.
+ */
+private fun sliceShapeSignature(messages: List<LLMMessage>): String {
+    val sb = StringBuilder(messages.size * 8)
+    for (m in messages) {
+        sb.append(if (m.role == LLMMessage.Role.USER) 'u' else 'a')
+        for (p in m.contentParts) {
+            when (p) {
+                is AgentContentPart.ToolUse -> sb.append("<u:").append(p.id).append('>')
+                is AgentContentPart.ToolResult -> sb.append("<r:").append(p.id).append('>')
+                else -> sb.append('.')
+            }
+        }
+        if (m.content.isEmpty()) sb.append('_')
+        sb.append('|')
+    }
+    return sb.toString()
+}
+
+/**
+ * Serialization reads [LLMMessage.contentParts] when present and ignores
+ * [LLMMessage.content] — lift a content-only message into a Text part, or a
+ * merge would silently swallow its text.
+ */
+private fun slicePartsOf(m: LLMMessage): List<AgentContentPart> =
+    if (m.contentParts.isNotEmpty()) {
+        m.contentParts
+    } else if (m.content.isNotEmpty()) {
+        listOf(AgentContentPart.Text(m.content))
+    } else {
+        emptyList()
+    }
+
+private fun mergeSameRoleNeighbors(a: LLMMessage, b: LLMMessage): LLMMessage {
+    val parts = slicePartsOf(a) + slicePartsOf(b)
+    val content = listOf(a.content, b.content).filter { it.isNotEmpty() }.joinToString("\n")
+    // [fix/r5-c1-compact-C03②] The two multimodal carriers live in their OWN
+    // fields (LLMMessage.imageParts / audioParts) — they are not contentParts,
+    // so `a.copy()` silently inherited a's and dropped b's. When the injected
+    // summary head merges with a first kept message that still carried an
+    // attachment (or two same-role turns are merged by the peel), the user's
+    // image/audio vanished from the request with no error and no trace. Both
+    // sides are concatenated in chronological order: a merge must never lose
+    // an attachment.
+    return a.copy(
+        content = content,
+        contentParts = parts,
+        imageParts = a.imageParts + b.imageParts,
+        audioParts = a.audioParts + b.audioParts,
+        reasoningContent = a.reasoningContent ?: b.reasoningContent,
+    )
+}
+
+/**
+ * [FIX-R4-P F-05] True when a cached compaction marker no longer has any
+ * anchor among the live transcript — i.e. the user rewound (Retry / Edit /
+ * Rerun) past the message the marker was pinned to.
+ *
+ * Refuses to answer for a marker with no anchor ids at all (legacy/unknown
+ * shape): "I cannot tell where this marker sits" must not be read as "it is
+ * orphaned" and silently throw away a live summary.
+ */
+internal fun compactMarkerIsOrphaned(
+    anchorIds: List<String>,
+    liveDbIds: Set<String>,
+): Boolean = anchorIds.isNotEmpty() && anchorIds.none { it in liveDbIds }
+
+/**
+ * [FIX-R4-P F-05] Drop the cached (and persisted) compaction markers when the
+ * live transcript has been rewound past their anchor.
+ *
+ * Why this is needed even though `effectiveAgentHistory()` degrades safely for
+ * the CURRENT process (an unresolvable anchor falls back to the full history):
+ * `loadSession()` runs `applyCompactMarkerGraying`, whose `createdAt` fallback
+ * RE-ANCHORS an orphaned marker to the newest surviving message and PERSISTS
+ * the rewrite (`version = 2`, fresh `lcmId`). A retry that deleted the anchored
+ * turn therefore resurrects the summary — now describing turns the user just
+ * deleted — and pins it in front of the truncated transcript from then on.
+ *
+ * Deleting the markers instead is honest: after a rewind the recap of the old
+ * history is no longer trustworthy, and the next auto-compact builds a fresh
+ * one from what actually remains.
+ */
+internal suspend fun ChatViewModel.dropCompactMarkerIfRewound(sid: String) {
+    val marker = _cachedLatestMarker ?: return
+    val anchors = listOfNotNull(
+        marker.lastCompactedMessageId?.takeIf { it.isNotEmpty() },
+        marker.firstKeptMessageId?.takeIf { it.isNotEmpty() },
+        marker.boundaryMessageId?.takeIf { it.isNotEmpty() },
+    )
+    val liveIds = agentHistory.mapNotNullTo(mutableSetOf()) {
+        it.dbMessageId?.takeIf(String::isNotEmpty)
+    }
+    if (!compactMarkerIsOrphaned(anchors, liveIds)) return
+    val deleted = runCatching { chatRepository.dao.deleteCompactMarkers(sid) }
+        .onFailure { Log.w(ChatViewModel.TAG, "[Compact] marker drop failed: ${it.message}") }
+        .isSuccess
+    _cachedLatestMarker = null
+    _compactSummary.value = null
+    // [fix/r5-c1-compact-C04③] Clearing the marker is the whole statement
+    // "this fold is gone" — the transcript must stop LOOKING folded. What this
+    // list still carries are the marker's two visible fragments: half-opacity
+    // bubbles (`isCompactedHistory`, ChatScreen's grayedMap) and the divider
+    // card, whose detail sheet offers "Revert Compact" — an affordance that now
+    // answers sysmsg_revert_nothing, because the marker it would revert from is
+    // the null written directly above. Reuse the silent-compact neutraliser
+    // (drops divider rows, clears every fade flag) for the same reason it
+    // exists there: no marker describes the current transcript any more.
+    // Unconditional, mirroring the cache writes: the in-memory truth is what
+    // the next revert/lookup reads, so the screen must not disagree with it.
+    withContext(Dispatchers.Main) {
+        _messages.value = neutralizeCompactArtifacts(_messages.value)
+    }
+    Log.w(
+        ChatViewModel.TAG,
+        "[Compact] history rewound past marker anchor (anchors=$anchors, live=${liveIds.size}, deleted=$deleted) — " +
+            "marker cleared so its summary cannot be re-injected (or re-anchored by the createdAt heal)",
+    )
+}
+
+/**
+ * [FIX-R4-P F-02] Reset every context-pressure reading that was derived from
+ * the PREVIOUS transcript. They are per-conversation state, but three entry
+ * points rewrite or replace the transcript without resetting them:
+ *
+ * - `clearChat()` (the Context-Full dialog's "Clear Chat", and the drawer's
+ *   clear action): the transcript is gone, yet `_lastTurnContextTokens` still
+ *   holds the last turn's usage, so `contextPressure()` re-derives EXHAUSTED on
+ *   the very next send and the dialog comes straight back for the new,
+ *   three-message-long conversation.
+ * - `loadSession()` when switching to a different session (or re-entering one
+ *   after a clear): the reading belongs to the session we just left. A big
+ *   session can therefore block sending in a small one.
+ * - `retryFromMessage()` / `rerunFromToolBlock()` / edit-truncate: the
+ *   transcript shrank, so the old reading is an overestimate that can trigger a
+ *   pointless auto-compact of a now-short history.
+ *
+ * `rescueAttemptedForCompact` is part of the same cluster (it is the "this
+ * transcript already burned its one rescue" latch) and is reset here for the
+ * same reason: a rewound/cleared transcript deserves a fresh rescue budget.
+ */
+internal fun ChatViewModel.resetContextPressureState() {
+    _lastTurnContextTokens.value = 0
+    contextGrowthTracker.reset()
+    lastAutoCompactAtMs = Long.MIN_VALUE
+    rescueAttemptedForCompact = false
+}
+
+/**
+ * [SYMPTOM-A F-A4] `[T-HANG-DIAG] messages-shape` 的"含工具"判据。
+ *
+ * 落盘方言是 **camelCase**：`ContentPart.Tool` 的 `@SerialName("toolUse")` 与
+ * `ContentPart.Result` 的 `@SerialName("toolResult")`（ContentPart.kt:46 / :50），
+ * 同一函数里 oversized 分支（判 `"toolUse"` / `"toolResult"`）本来就是 camel。
+ * 旧判据只查 snake，于是 `toolMessages` **恒 0** —— 10-29 的 52 行
+ * messages-shape 全是 `toolMessages=0`，其中包括 352 条消息 / 538K 字符的会话，
+ * 已经把一次取证带偏（读成"这个会话没有工具调用"）。
+ *
+ * snake 保留为兼容臂：备份**导入**同时接受两种方言
+ * （ConfigBackup.kt:2971 / :2988 的 `type == "toolUse" || type == "tool_use"`），
+ * 所以库里可能有历史/外来行。保留它只会多计不会漏计，丢掉它会把老会话算成
+ * 无工具。
+ */
+internal fun partsJsonHasToolParts(partsJson: String): Boolean =
+    partsJson.contains("\"toolUse\"") || partsJson.contains("\"toolResult\"") ||
+        partsJson.contains("\"tool_use\"") || partsJson.contains("\"tool_result\"")
+
+/**
+ * [SYMPTOM-A F-A4] `messages-shape` 的"含附件"判据。
+ *
+ * 与 [partsJsonHasToolParts] **不是一个病因**，别混着写：旧判据
+ * （`"image"` / `"attachment"`）能命中图片行（`ContentPart` 早已没有 Image
+ * 类型，但历史行与 oversized 分支仍在用 `"image"` / `"image_url"`），却完全
+ * 漏掉 `ContentPart.Media` 的真实键 `@SerialName("mediaRef")`
+ * （ContentPart.kt:42）—— 也就是**所有非图片附件在计数里消失**。
+ */
+internal fun partsJsonHasAttachmentParts(partsJson: String): Boolean =
+    partsJson.contains("\"mediaRef\"") || partsJson.contains("\"image\"") ||
+        partsJson.contains("\"attachment\"")
 
 internal fun ChatViewModel.loadSession() {
     // T-android-crash-detected-halt: when CrashFrequencyDetector
@@ -342,7 +578,12 @@ internal fun ChatViewModel.loadSession() {
     // hard ceiling. Placed AFTER the safe-mode early return above: that path
     // skips session restore entirely (crash-recovery loop) — the user never
     // actually entered a session there, so it must not re-arm the gate.
-    rescueAttemptedForCompact = false
+    // [FIX-R4-P F-02] The reset is no longer the rescue latch alone: the
+    // whole context-pressure cluster (_lastTurnContextTokens / growth tracker /
+    // last-auto-compact timestamp) belongs to the transcript we just LEFT.
+    // Keeping it across a session switch let a big session's reading block the
+    // small one we just opened (and vice versa after clearChat).
+    resetContextPressureState()
     viewModelScope.launch {
         // [T-HANG-DIAG] timing markers to localise where session entry
         // stalls. Sentinel-tagged so a single grep -v can strip them
@@ -426,31 +667,47 @@ internal fun ChatViewModel.loadSession() {
         if (!resolved) {
             val entry = findModelEntry(session.modelId)
             if (entry != null) {
-                currentModel = entry.model
-                _modelName.value = entry.model.displayName
-                _activeEntryId.value = entry.id
+                // [da1019-FIX-E] Resolve + validate BEFORE writing any state.
+                // The old order wrote currentModel / _modelName / _activeEntryId
+                // first and only then looked the instance + credential up, so a
+                // disabled provider or a missing API key left the UI reporting
+                // "model ready" while currentProvider stayed null — and handed
+                // Priority 3 a surface that already looked resolved.
                 val instance = providerRepository.instance(entry.providerInstanceId)
-                if (instance != null) {
-                    val apiKey = providerRepository.loadApiKey(instance.id)
-                    if (apiKey != null) {
-                        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
-                        _providerName.value = instance.label.ifEmpty { entry.model.provider }
-                        resolved = true
-                        // No binding row (e.g. a synced session that only
-                        // carried model_id). If the entry belongs to the
-                        // default group, adopt that group so group fallback
-                        // works — otherwise buildFallbackProviders returns
-                        // empty and provider errors never fall back. NOT
-                        // applied to an explicit "entry" binding (user pin),
-                        // which restoreFromBinding handles above. Mirrors
-                        // the iOS runAgentLoop group-discovery fix.
-                        val defaultGroupId = providerRepository.defaultPrimaryGroupId
-                        if (defaultGroupId != null &&
-                            providerRepository.group(defaultGroupId)?.memberEntryIds?.contains(entry.id) == true
-                        ) {
-                            _selectedGroupId.value = defaultGroupId
-                        }
+                val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+                val decision = decideSessionModelResolution(entry, instance, apiKey)
+                if (decision is SessionModelResolution.Use) {
+                    // [deep-audit-1044 B-03] The provider — and the `currentModel`
+                    // snapshot the whole session reads — must carry the ENRICHED
+                    // model: `entry.model` is `baseModel.withOverrides(…)`, which
+                    // never touches models.dev, so 33 of the 39 built-ins lost
+                    // their modalities / effort tiers / output cap the moment the
+                    // request crossed into `:modelservice` (a process that never
+                    // initialises ModelsDevApi).
+                    val effectiveModel = providerModelFor(entry)
+                    currentModel = effectiveModel
+                    _modelName.value = effectiveModel.displayName
+                    _activeEntryId.value = entry.id
+                    currentProvider =
+                        ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
+                    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
+                    resolved = true
+                    // No binding row (e.g. a synced session that only
+                    // carried model_id). If the entry belongs to the
+                    // default group, adopt that group so group fallback
+                    // works — otherwise buildFallbackProviders returns
+                    // empty and provider errors never fall back. NOT
+                    // applied to an explicit "entry" binding (user pin),
+                    // which restoreFromBinding handles above. Mirrors
+                    // the iOS runAgentLoop group-discovery fix.
+                    val defaultGroupId = providerRepository.defaultPrimaryGroupId
+                    if (defaultGroupId != null &&
+                        providerRepository.group(defaultGroupId)?.memberEntryIds?.contains(entry.id) == true
+                    ) {
+                        _selectedGroupId.value = defaultGroupId
                     }
+                } else if (decision is SessionModelResolution.Unusable) {
+                    logSessionModelUnusable("loadSession-priority2", entry.id, decision.reason)
                 }
             }
         }
@@ -549,10 +806,10 @@ internal fun ChatViewModel.loadSession() {
                 val len = m.partsJson.length
                 totalChars += len
                 if (len > maxChars) maxChars = len
-                if (m.partsJson.contains("\"tool_use\"") || m.partsJson.contains("\"tool_result\"")) {
+                if (partsJsonHasToolParts(m.partsJson)) {
                     withTools++
                 }
-                if (m.partsJson.contains("\"image\"") || m.partsJson.contains("\"attachment\"")) {
+                if (partsJsonHasAttachmentParts(m.partsJson)) {
                     withAttachments++
                 }
             }
@@ -868,12 +1125,39 @@ internal suspend fun ChatViewModel.applyCompactMarkerGraying(
     // ─── Resolve insertIdx ────────────────────────────────────────
     //
     // [fix/silent-auto-compact] This resolution no longer drives any
-    // rendering — graying and the divider row are both gone. What it still
-    // does is decide whether the marker RESOLVED against the loaded rows, and
-    // the branch that fails is the one that runs the createdAt self-heal
-    // (rewriting an orphaned marker as v2 and persisting it). That heal is
-    // what keeps effectiveAgentHistory() working after messages are deleted
-    // or restored from a backup, so the walk stays.
+    // rendering — graying and the divider row are both gone. `insertIdx` is
+    // the field the restore log line below prints, plus the trigger for the
+    // createdAt self-heal.
+    //
+    // [SYMPTOM-A F-A3] The self-heal branch is NOT the load-bearing mechanism
+    // this comment used to describe. Measured reality (2026-10-29 full log,
+    // corroborated in source):
+    //
+    //  - `lastCompactedMessageId` usually anchors on a role=user row that
+    //    carries only tool carriers (toolUse / toolResult parts; no visible
+    //    text, no image, no attachment). `buildChatMessagesTranscript` drops
+    //    exactly those rows — ChatTranscriptRebuild.kt:224 returns
+    //    `@mapNotNull null` through the shared predicate
+    //    `userRowHasVisibleContent` (:36-44) — so `uiIdxForDbId` below answers
+    //    -1 for an anchor that is perfectly valid in agentHistory.
+    //  - the heal candidate must then pass the SAME UI gate (:1123 requires
+    //    `healUiIdx >= 0`) ⇒ `healedMarker` stays null ⇒ nothing is persisted
+    //    ⇒ the next session open repeats the identical attempt (10-29: 12
+    //    marker restores, 9 unresolved, one marker repeated 6x).
+    //  - user-visible consequence: NONE. The summary is injected through
+    //    `effectiveAgentHistory()`, which parses the marker against
+    //    agentHistory independently (3 days: 1726 slices, 0 degradations).
+    //    The price is one WARN per open plus one bounded, wasted heal scan.
+    //
+    // Deliberately NOT relaxing the :1123 acceptance gate: accepting an anchor
+    // that is not in the UI list would turn "one WARN per open" into "one DB
+    // write per open" while the anchor stays invisible — write amplification,
+    // zero user benefit.
+    //
+    // UPGRADE TRIGGER: if any UI artefact starts depending on `insertIdx`
+    // again (divider, graying, an "already folded" marker), fix the :1123 gate
+    // FIRST — accept "present in historyDbIds" instead of "present in the UI
+    // list" — or 9 of 12 tool-heavy sessions will silently misplace it.
     //
     // Special value -1 → "unresolved": no heal candidate either.
     var insertIdx = -1
@@ -893,7 +1177,7 @@ internal suspend fun ChatViewModel.applyCompactMarkerGraying(
             insertIdx = lcmIdx + 1
         } else {
             // lcmId missing or orphaned. Try createdAt self-heal.
-            val heal = anchorByCreatedAt(rawMessages, marker.createdAt, historyDbIds)
+            val heal = healAnchorByCreatedAt(rawMessages, marker.createdAt, historyDbIds, marker.compactedCount)
             val healUiIdx = heal?.let { uiIdxForDbId(it.id) } ?: -1
             if (heal != null && healUiIdx >= 0) {
                 insertIdx = healUiIdx + 1
@@ -933,7 +1217,7 @@ internal suspend fun ChatViewModel.applyCompactMarkerGraying(
             // same path as compactAll, then divider AFTER the healed
             // anchor (treating this as an upgrade to v2 compactAll
             // semantics).
-            val heal = anchorByCreatedAt(rawMessages, marker.createdAt, historyDbIds)
+            val heal = healAnchorByCreatedAt(rawMessages, marker.createdAt, historyDbIds, marker.compactedCount)
             val healUiIdx = heal?.let { uiIdxForDbId(it.id) } ?: -1
             if (heal != null && healUiIdx >= 0) {
                 insertIdx = healUiIdx + 1
@@ -979,10 +1263,15 @@ internal suspend fun ChatViewModel.applyCompactMarkerGraying(
     // during the live session) would be a worse surprise than one shown
     // consistently, so the reload path drops it too.
     //
-    // `insertIdx` is still resolved above on purpose: the self-heal branch
-    // repairs an orphaned marker (rewriting it as v2 + persisting), which
-    // keeps effectiveAgentHistory() — the thing that actually matters —
-    // working after messages are deleted or restored from a backup.
+    // `insertIdx` is still resolved above, but not for the reason this comment
+    // used to give. [SYMPTOM-A F-A3] The self-heal does NOT keep
+    // effectiveAgentHistory() working — that path parses the marker against
+    // agentHistory on its own and never reads `insertIdx` (3 days: 1726
+    // slices, 0 degradations). For tool-heavy sessions the anchor row is
+    // invisible in the UI transcript, so the heal cannot resolve and nothing
+    // gets persisted; see the block above ("Resolve insertIdx") for the full
+    // chain and for the upgrade trigger that would make this gate load-bearing
+    // again.
     // "Revert Compact" now lives in the message long-press menu, so it no
     // longer depends on the divider row existing.
     AppLogger.info(
@@ -994,23 +1283,54 @@ internal suspend fun ChatViewModel.applyCompactMarkerGraying(
 }
 
 /**
- * createdAt self-heal: return the LAST raw message whose
- * `createdAt < markerCreatedAt` AND whose id is still represented in
- * agentHistory (filtered via [historyDbIds]). When [historyDbIds] is
- * empty (no dbIds collected — unusual), the filter degrades to "just
- * the createdAt predicate" so we still recover SOMETHING.
+ * createdAt self-heal, BOUNDED — [fix/r5-c1-compact-F02].
  *
- * Mirrors iOS AIChatViewModel+Compaction.swift:125.
+ * The marker's `createdAt` is the compact EXECUTION instant, not the anchor's:
+ * every kept-tail message that already existed when the compact ran also has
+ * `createdAt < marker.createdAt`. The old "last raw before marker.createdAt"
+ * answer therefore walked straight past the folded block into that kept tail
+ * and folded turns the summary never covered — unbounded, the self-heal could
+ * only ever DESTROY (it always over-extended, not occasionally: any compact
+ * that leaves a pre-existing tail sets the trap).
+ *
+ * The one boundary signal a marker still carries is `compactedCount` (the
+ * folded block's length). The healed anchor is taken at `compactedCount - 1`
+ * among the pre-marker candidates, which can only land AT or BEFORE the true
+ * anchor — a later-round block starts after the previous anchor, and
+ * [rawMessages] may hold rows the LLM history filters out (system/divider
+ * rows), both of which push the index earlier. The heal can only NARROW the
+ * folded range, never widen it: the worst case re-sends already-summarised
+ * text verbatim, which costs tokens, never data. [historyDbIds] keeps
+ * filtering to ids the loaded history still represents.
+ *
+ * Refusals (the caller falls back to "divider at top, no graying"):
+ *  - `compactedCount <= 0` — no block length to bound with;
+ *  - fewer pre-marker candidates than `compactedCount` while rows arrived
+ *    after the marker — the survivors are no longer provably a prefix of the
+ *    folded block, so "the last survivor is inside it" cannot be asserted;
+ *  - no candidates at all.
+ *
+ * Mirrors iOS AIChatViewModel+Compaction.swift:125, which keeps the unbounded
+ * form; this port deliberately does not — the unbounded form was falsified by
+ * meta-audit-1029 R5-C F-02.
  */
-internal fun ChatViewModel.anchorByCreatedAt(
-    rawMessages: List<com.rikkaminis.app.data.db.MessageEntity>,
+internal fun healAnchorByCreatedAt(
+    rawMessages: List<MessageEntity>,
     markerCreatedAt: Long,
     historyDbIds: Set<String>,
-    ): com.rikkaminis.app.data.db.MessageEntity? {
-    return rawMessages.lastOrNull { raw ->
+    compactedCount: Int,
+): MessageEntity? {
+    if (compactedCount <= 0) return null
+    val candidates = rawMessages.filter { raw ->
         raw.createdAt < markerCreatedAt &&
             (historyDbIds.isEmpty() || raw.id in historyDbIds)
     }
+    if (candidates.isEmpty()) return null
+    if (candidates.size >= compactedCount) return candidates[compactedCount - 1]
+    // Fewer survivors than were folded: the transcript was truncated INTO the
+    // folded block. The last survivor is inside it only when nothing arrived
+    // after the marker (no kept tail exists to be reached past).
+    return if (candidates.size == rawMessages.size) candidates.last() else null
 }
 
 /**
@@ -1042,6 +1362,79 @@ internal fun ChatViewModel.rewriteMarkerForHeal(
     )
 }
 
+/**
+ * [da1019-FIX-E] Why a session model binding could not be applied. An enum (not
+ * a string) so callers and tests assert on the exact cause.
+ */
+internal enum class UnusableModelReason { MISSING_INSTANCE, PROVIDER_DISABLED, MISSING_API_KEY }
+
+/**
+ * [da1019-FIX-E] Outcome of resolving a session's (entry, instance, credential)
+ * triple. [Use] carries the validated parts so the caller does not repeat the
+ * null checks that the decision already performed.
+ */
+internal sealed interface SessionModelResolution {
+    /** All parts present and the provider is enabled — safe to apply. */
+    data class Use(val entry: ModelEntry, val instance: ProviderInstance, val apiKey: String) :
+        SessionModelResolution
+
+    /**
+     * A precondition failed. The caller must not write any provider state —
+     * see the state-pollution note on [decideSessionModelResolution].
+     */
+    data class Unusable(val reason: UnusableModelReason) : SessionModelResolution
+}
+
+/**
+ * [da1019-FIX-E] Single decision point for the three session-model resolution
+ * sites ([restoreFromBinding]'s `"entry"` branch, [loadSession] priority 2 and
+ * [applyNewChatDefaultModel]).
+ *
+ * Enforces two contracts that used to be applied inconsistently:
+ *  1. A disabled provider is never used at runtime. This mirrors
+ *     `ProviderRepository.enabledMemberEntries` /
+ *     [resolveProviderFromGroup], whose KDoc spells out that "a member whose
+ *     provider instance is currently disabled is silently skipped". Resolving
+ *     to a disabled instance here would create a provider and send requests to
+ *     it, bypassing the enable switch entirely.
+ *  2. Missing credentials (or a missing instance) must be decided BEFORE any
+ *     state write. Writing currentModel / _modelName / _activeEntryId first
+ *     leaves the UI claiming "model ready" while currentProvider stays null or
+ *     points at an unusable provider, and it also hands a polluted surface to
+ *     the next fallback tier.
+ *
+ * Pure (no repository, no Android types beyond the two data classes) so the
+ * decision is unit-testable without a running ChatViewModel.
+ */
+internal fun decideSessionModelResolution(
+    entry: ModelEntry,
+    instance: ProviderInstance?,
+    apiKey: String?,
+): SessionModelResolution {
+    if (instance == null) return SessionModelResolution.Unusable(UnusableModelReason.MISSING_INSTANCE)
+    if (!instance.isEnabled) return SessionModelResolution.Unusable(UnusableModelReason.PROVIDER_DISABLED)
+    if (apiKey == null) return SessionModelResolution.Unusable(UnusableModelReason.MISSING_API_KEY)
+    return SessionModelResolution.Use(entry, instance, apiKey)
+}
+
+/**
+ * [da1019-FIX-E] Trace why a session-model site declined to resolve. The skip is
+ * silent by design (same as `resolveProviderFromGroup` skipping disabled
+ * members), which makes it invisible on a device — one INFO line per rejection
+ * is the only hook for 「禁用后重开会话到底走了哪条 fallback」.
+ * Ids are truncated; nothing credential-shaped is ever logged.
+ */
+internal fun ChatViewModel.logSessionModelUnusable(
+    site: String,
+    entryId: String,
+    reason: UnusableModelReason,
+) {
+    AppLogger.info(
+        ChatViewModel.TAG,
+        "[SessionModel] $site skipped entry=${entryId.take(8)} reason=$reason",
+    )
+}
+
 /** Restore provider state from a JSON binding string. Returns true if successfully resolved. */
 internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
     bindingJson ?: return false
@@ -1058,15 +1451,34 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
             "entry" -> {
                 val entryId = obj.optString("entryId").takeIf { it.isNotEmpty() } ?: return false
                 val entry = providerRepository.config.value.modelEntries.find { it.id == entryId } ?: return false
-                val instance = providerRepository.instance(entry.providerInstanceId) ?: return false
-                val apiKey = providerRepository.loadApiKey(instance.id) ?: return false
-                currentModel = entry.model
-                _modelName.value = entry.model.displayName
-                _providerName.value = instance.label.ifEmpty { entry.model.provider }
+                // [da1019-FIX-E] An explicit "entry" binding is a user pin, but
+                // it is a pin on the *entry*, not on the provider being enabled.
+                // Without the isEnabled gate, disabling a provider left the
+                // binding authoritative: reopening a session pinned to it still
+                // created a provider and dispatched requests to it, bypassing
+                // the switch. Returning false hands the session to the caller's
+                // fallback chain (default group → new-chat default), which is
+                // what resolveProviderFromGroup already does for group members.
+                val instance = providerRepository.instance(entry.providerInstanceId)
+                val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+                val decision = decideSessionModelResolution(entry, instance, apiKey)
+                if (decision !is SessionModelResolution.Use) {
+                    if (decision is SessionModelResolution.Unusable) {
+                        logSessionModelUnusable("restoreFromBinding-entry", entry.id, decision.reason)
+                    }
+                    return false
+                }
+                // [deep-audit-1044 B-03] Enriched model, same single source as
+                // every other provider-construction site (see
+                // `ChatViewModel.providerModelFor`).
+                val effectiveModel = providerModelFor(entry)
+                currentModel = effectiveModel
+                _modelName.value = effectiveModel.displayName
+                _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
                 _selectedGroupId.value = null
                 _selectedGroupName.value = ""
                 _activeEntryId.value = entry.id
-                currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+                currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
                 true
             }
             else -> false
@@ -1075,6 +1487,34 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
         false
     }
 }
+
+/**
+ * [deep-audit-1047 B-04] The members of a group that can actually serve a
+ * turn — [enabledMemberEntries] narrowed by the same single decision point
+ * every other resolution site uses ([decideSessionModelResolution]).
+ *
+ * `enabledMemberEntries` only answers "the provider instance is enabled". It
+ * does not answer "there is a credential", so a group whose FIRST member sat
+ * behind a key-less (or disabled) instance used to resolve to that member and
+ * then bail out at `loadApiKey(...) ?: return false` — the whole group looked
+ * unusable while perfectly good members sat behind it. Both group consumers
+ * ([resolveProviderFromGroup] and `ChatModelRouting.rotateForNewTurn`) now
+ * hand the router this list instead.
+ *
+ * The credential read is the same synchronous `encryptedPrefs` lookup
+ * `buildFallbackProviders` and `ConfigBuiltins.firstUsableGroupMember` already
+ * perform inside their candidate loops — this just moves it ahead of the
+ * choice instead of after it.
+ */
+internal fun ChatViewModel.usableGroupMembers(members: List<ModelEntry>): List<ModelEntry> =
+    members.filter { member ->
+        val instance = providerRepository.instance(member.providerInstanceId)
+        decideSessionModelResolution(
+            member,
+            instance,
+            instance?.let { providerRepository.loadApiKey(it.id) },
+        ) is SessionModelResolution.Use
+    }
 
 internal fun ChatViewModel.resolveProviderFromGroup(
     groupId: String,
@@ -1092,7 +1532,12 @@ internal fun ChatViewModel.resolveProviderFromGroup(
     // this entry inside the group last time"). Honor it only if the
     // entry is still enabled; otherwise fall back to the first enabled
     // member so the session can still proceed on a now-degraded group.
-    val enabledMembers = providerRepository.enabledMemberEntries(group)
+    //
+    // [deep-audit-1047 B-04] …and [usableGroupMembers] additionally drops
+    // members with no credential, so a key-less member at the head of the
+    // group can no longer sink the whole resolution (the `?: return false`
+    // two lines below now only fires when EVERY member is unusable).
+    val enabledMembers = usableGroupMembers(providerRepository.enabledMemberEntries(group))
     if (enabledMembers.isEmpty()) return false
     // Selection decision delegated to GroupRouter (pure JVM, testable) —
     // identical semantics: preferred binding first, then loadBalance
@@ -1114,12 +1559,16 @@ internal fun ChatViewModel.resolveProviderFromGroup(
     val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return false
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return false
 
-    currentModel = targetEntry.model
-    _modelName.value = targetEntry.model.displayName
-    _providerName.value = instance.label.ifEmpty { targetEntry.model.provider }
+    // [deep-audit-1044 B-03] Group-resolved turns take the same enriched path as
+    // an explicit pick — the member entry's base model alone has no capability
+    // metadata (models.dev is not reachable from `:modelservice`).
+    val effectiveModel = providerModelFor(targetEntry)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _providerName.value = instance.label.ifEmpty { effectiveModel.provider }
     _selectedGroupName.value = group.name
     _activeEntryId.value = targetEntry.id
-    currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context)
+    currentProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
     return true
 }
 
@@ -1188,14 +1637,56 @@ internal fun ChatViewModel.applyNewChatDefaultModel(): Boolean {
     val entry = providerRepository.lastUsedVisibleEntry()
         ?: providerRepository.newestProviderNewestTextEntry()
         ?: return false
-    val instance = providerRepository.instance(entry.providerInstanceId) ?: return false
-    currentModel = entry.model
-    _modelName.value = entry.model.displayName
-    _activeEntryId.value = entry.id
-    _providerName.value = instance.label.ifEmpty { entry.model.provider }
-    val apiKey = providerRepository.loadApiKey(instance.id)
-    if (apiKey != null) {
-        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    // [da1019-FIX-E] The two entry sources above already filter to enabled
+    // providers, but the credential is a separate check that used to run AFTER
+    // the state writes — so a missing API key still flipped _activeEntryId /
+    // _modelName and then reported success (`return true`) while
+    // currentProvider stayed null. Decide first, write nothing unless the
+    // triple is fully usable, and tell the caller the truth.
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) {
+        if (decision is SessionModelResolution.Unusable) {
+            logSessionModelUnusable("applyNewChatDefaultModel", entry.id, decision.reason)
+        }
+        return false
     }
+    // [deep-audit-1044 B-03/B-04] Same enriched model as every other
+    // construction site, and — [B-04] — publish it to `currentModel` too. The
+    // KDoc above promised "Sets currentModel / currentProvider / the name +
+    // activeEntry state flows" but the body never wrote `currentModel`, so a
+    // new chat with no default group left it null: `ensureSession()` then
+    // persisted `model_id = "unknown"`, `thinkingInfo()` returned null (the
+    // Token Usage "Thinking" block vanished) and `dynamicMaxTokens()` skipped
+    // the remaining-context clamp entirely.
+    val effectiveModel = providerModelFor(entry)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _activeEntryId.value = entry.id
+    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
+    // [meta-audit-1028 F-05] A direct-entry publication LEAVES group mode, so
+    // the group state has to go with it. This function is the one place that
+    // publishes a serving member without establishing it as a member of a
+    // group: every caller reaches it precisely when no group produced a model
+    // (draft load with no default group, `applyDefaultModelFallback`'s
+    // fall-through, the post-config-load retry). Without these three writes a
+    // resident view model kept the PREVIOUS group bound —
+    // `selectedGroupId` feeds the top bar, the picker highlight,
+    // `buildFallbackProviders` and `rotateForNewTurn`, so the next user turn
+    // was rotated onto a member of a group this session is not running under
+    // and the top bar named a model that was never asked.
+    //
+    // Written as the literal inverse operation (`null` / `""`) rather than from
+    // a plan value on purpose: clearing a selection is the inverse of a gated
+    // publication, and spelling it as a literal is what makes that ungated
+    // (scan: session_provider_enabled_check C-SEL-1 — a non-literal group write
+    // must be provable as "the resolution said yes", which a clear never is).
+    _selectedGroupId.value = null
+    _selectedGroupName.value = ""
+    // ...and the pending in-group member pick goes with the group: it names a
+    // member of the group that just stopped being bound.
+    pendingEntryOverride = null
+    currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
     return true
 }

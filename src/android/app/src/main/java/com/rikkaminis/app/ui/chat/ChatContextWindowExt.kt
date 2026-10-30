@@ -3,6 +3,7 @@ package com.rikkaminis.app.ui.chat
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.ContextPolicy
+import com.rikkaminis.app.conversation.CompactEffect
 import com.rikkaminis.app.conversation.ContextCompactor
 import com.rikkaminis.app.conversation.compactAll
 import com.rikkaminis.app.R
@@ -193,6 +194,11 @@ internal fun ChatViewModel.maybeTriggerAutoCompact() {
     // EXHAUSTED is already handled by checkContextBeforeSend (send blocked);
     // OK means no pressure. Both are non-AUTO_COMPACT. Only NEEDS_COMPACT
     // can possibly trigger an auto-compact, so only that path walks tail.
+    // [fix/compact-pregate-exhausted-1016] This send-entry gate deliberately
+    // does NOT adopt [ContextCompactor.loopGateOpens]: at send time EXHAUSTED
+    // means the send was already blocked and the context-full dialog owns the
+    // recovery (new session / explicit /compact). The once-only RESCUE is an
+    // agent-loop affordance (a run mid-task), not a send-entry one.
     if (policy.check(tokens, window) != ContextPolicy.CheckResult.NEEDS_COMPACT) return
     val anchorId = _cachedLatestMarker?.lastCompactedMessageId
     val tail = ContextCompactor.estimateTailTokens(agentHistory, anchorId)
@@ -267,16 +273,32 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     if (_isCompacting.value) return false
     if (contextWindow <= 0 || lastContextTokens <= 0) return false
     val policy = effectiveContextPolicy(contextWindow)
-    // Only fire while we're in the compact band (NEEDS_COMPACT), i.e. BEFORE
-    // the hard ceiling forces trimContextHistoryWindow to drop turns verbatim.
-    val inCompactBand =
-        policy.check(lastContextTokens, contextWindow) == ContextPolicy.CheckResult.NEEDS_COMPACT
+    // Only fire while the pressure verdict gives decide() something to act on,
+    // i.e. BEFORE the hard ceiling forces trimContextHistoryWindow to drop
+    // turns verbatim.
+    // [fix/compact-pregate-exhausted-1016] This gate used to open ONLY on
+    // NEEDS_COMPACT (plus the escalation exception). Because ContextPolicy
+    // answers EXHAUSTED the moment tokens >= window (rule 1) and only answers
+    // NEEDS_COMPACT while tokens < window (rule 2), the ceiling — the single
+    // state that [ContextCompactor.decide] adjudicates into RESCUE / EXHAUSTED
+    // — could never reach decide() here unless this very turn's offload pass
+    // had raised the one-shot under-delivery flag. The once-per-user-action
+    // rescue ([fix/compact-exhausted-rescue-1005]) was therefore squeezed
+    // behind that one narrow door and the EXHAUSTED branch below (the skip
+    // line that reports the rescue gate state) was dead in this caller, so
+    // an over-ceiling context fell straight through to the verbatim hard
+    // trim. The gate now opens on EXHAUSTED too; decide() stays the single
+    // adjudicator (it re-reads policy.check and still applies the debounce +
+    // tail gates), so widening cannot force a compaction decide() would
+    // refuse.
+    val verdict = policy.check(lastContextTokens, contextWindow)
+    val inCompactBand = verdict == ContextPolicy.CheckResult.NEEDS_COMPACT
     // [T-ctx-offload-escalation] This turn's offload pass may have proved it can
     // no longer shrink the context (candidate pool exhausted). Sitting in the
     // dead band between the offload line and the compact line only lets the
     // context climb, so escalate now rather than waiting for the compact line.
     val escalatedFromOffload = consumeOffloadUnderDelivery()
-    if (!inCompactBand && !escalatedFromOffload) {
+    if (!ContextCompactor.loopGateOpens(verdict, escalatedFromOffload)) {
         return false
     }
     val anchorId = _cachedLatestMarker?.lastCompactedMessageId
@@ -369,18 +391,48 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     // when it early-returns ("already compacted" with a stuck anchor, no
     // persisted anchor, empty range, budget exhausted) the history is
     // untouched, lastContextTokens stays stale, and skipping the trim makes
-    // the context grow on every turn with no fallback left. A successful
-    // compact always writes a fresh marker (new anchor id) and/or a new
-    // summary, so comparing those two is a sufficient "did it fold" signal.
-    val folded = _cachedLatestMarker?.lastCompactedMessageId != markerBefore ||
-        _compactSummary.value != summaryBefore
+    // the context grow on every turn with no fallback left.
+    //
+    // [LOOP-1030 R3] Folding is not the same as shrinking. The old signal
+    // ("marker changed ‖ summary changed") counted a compact that folded ONE
+    // message (median 174 tokens) as a success — 13 of 42 compacts on 10-29
+    // were exactly that — so the hard trim was disabled for a turn in which
+    // the history kept growing and the request gained a ~1190-char summary on
+    // top: net longer. The measurable that was already available and never
+    // compared is the projected request size (summary + tail after the
+    // anchor, i.e. exactly what [effectiveAgentHistory] feeds the provider).
+    // A compact now only unlocks the trim-skip when it shrank that projection
+    // by at least [CompactEffect.MIN_GAIN_TOKENS]; anything less keeps the
+    // ceiling fallback alive and is logged with both readings so the next
+    // audit can see the actual gain instead of a boolean.
+    val markerAfter = _cachedLatestMarker?.lastCompactedMessageId
+    val summaryAfter = _compactSummary.value
+    val compacted = markerAfter != markerBefore || summaryAfter != summaryBefore
+    val beforeProjected =
+        if (compacted) CompactEffect.projectedTokens(agentHistory, summaryBefore, markerBefore) else 0L
+    val afterProjected =
+        if (compacted) CompactEffect.projectedTokens(agentHistory, summaryAfter, markerAfter) else 0L
+    val compactEffect = CompactEffect.verdict(compacted, beforeProjected, afterProjected)
+    val folded = compactEffect == CompactEffect.Verdict.FOLDED_AND_SHRANK
     if (!folded) {
-        AppLogger.warning(
-            ChatViewModel.TAG,
-            "[AutoCompactLoop] compact attempted but folded nothing " +
-                "(anchor=${markerBefore?.take(8) ?: "nil"} summaryChars=${summaryBefore?.length ?: 0} " +
-                "historySize=${agentHistory.size}) — keeping the hard trim enabled this turn",
-        )
+        if (compactEffect == CompactEffect.Verdict.FOLDED_NO_GAIN) {
+            AppLogger.warning(
+                ChatViewModel.TAG,
+                "[AutoCompactLoop] compact folded but the context did not shrink " +
+                    "(before=${beforeProjected}tok after=${afterProjected}tok " +
+                    "gain=${beforeProjected - afterProjected}tok min=${CompactEffect.MIN_GAIN_TOKENS}tok " +
+                    "anchor=${markerBefore?.take(8) ?: "nil"}->${markerAfter?.take(8) ?: "nil"} " +
+                    "summaryChars=${summaryBefore?.length ?: 0}->${summaryAfter?.length ?: 0} " +
+                    "historySize=${agentHistory.size}) — keeping the hard trim enabled this turn",
+            )
+        } else {
+            AppLogger.warning(
+                ChatViewModel.TAG,
+                "[AutoCompactLoop] compact attempted but folded nothing " +
+                    "(anchor=${markerBefore?.take(8) ?: "nil"} summaryChars=${summaryBefore?.length ?: 0} " +
+                    "historySize=${agentHistory.size}) — keeping the hard trim enabled this turn",
+            )
+        }
         // [fix/compact-exhausted-rescue-1005] (C3) A rescue that folded nothing is
         // the load-bearing observable: it failed, yet the gate stays CLOSED (rescue
         // is once-only per user-action cycle, failure does not re-arm it) — the
@@ -388,15 +440,31 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
         // provider calls. Single-line rescue= suffix keeps grep-ability; the
         // plain-AUTO_COMPACT case still logs the bare warning, byte-identical.
         if (decision == ContextCompactor.Decision.RESCUE) {
+            // [LOOP-1030 R3] A rescue that folded a range but did not shrink the
+            // projection is a different failure than "folded nothing": it spent a
+            // provider round-trip and still left the transcript above the ceiling,
+            // so the gate stays closed for the same reason — retrying would storm.
+            val outcome =
+                if (compactEffect == CompactEffect.Verdict.FOLDED_NO_GAIN) "did not shrink the context"
+                else "folded nothing"
             AppLogger.warning(
                 ChatViewModel.TAG,
-                "[AutoCompactLoop] rescue compact folded nothing — gate stays closed until next user action; rescue=failed",
+                "[AutoCompactLoop] rescue compact $outcome — gate stays closed until next user action; rescue=failed",
             )
         }
     } else if (decision == ContextCompactor.Decision.RESCUE) {
         AppLogger.info(
             ChatViewModel.TAG,
             "[AutoCompactLoop] rescue compact folded; the storm gate stays closed until the next user action; rescue=succeeded",
+        )
+    } else {
+        // [LOOP-1030 R3] Positive reading with numbers: the previous signal was a
+        // boolean, so an audit could not tell a 4000-token fold from a 180-token one.
+        AppLogger.info(
+            ChatViewModel.TAG,
+            "[AutoCompactLoop] compact shrank the context " +
+                "(before=${beforeProjected}tok after=${afterProjected}tok " +
+                "gain=${beforeProjected - afterProjected}tok historySize=${agentHistory.size})",
         )
     }
     return folded

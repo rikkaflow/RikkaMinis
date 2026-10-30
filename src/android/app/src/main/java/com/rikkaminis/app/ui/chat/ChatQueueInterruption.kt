@@ -49,26 +49,15 @@ internal suspend fun ChatViewModel.truncateBeforeEdit(messageId: String) {
     var cutoffSortOrder = -1
     for (entity in dbMessages) {
         if (entity.role == "user") {
-            val hasText = try {
-                val arr = org.json.JSONArray(entity.partsJson)
-                (0 until arr.length()).any { i ->
-                    val o = arr.getJSONObject(i)
-                    // [T-android-retry-attachment-loss] Exclude the now-
-                    // persisted <user-attached-files> XML text part so this
-                    // "is this a visible user bubble?" count stays identical
-                    // to pre-XML-persistence behaviour. An attachments-only
-                    // turn must NOT flip to hasText just because the XML
-                    // inventory is now a text part — that would shift the
-                    // retry/edit cutoff onto the wrong message.
-                    // [T-ios-retry-anchor-synthetic-user] Likewise exclude
-                    // resume()'s synthetic stop-continue <system-reminder>
-                    // user row — it has no UI bubble, so counting it shifts
-                    // the cutoff one user message too early.
-                    o.optString("type") == "text" &&
-                        stripAttachedFilesXml(o.optString("value", "")).isNotBlank() &&
-                        !o.optString("value", "").trimStart().startsWith("<system-reminder>")
-                }
-            } catch (_: Exception) { true }
+            // [T-android-retry-attachment-loss] The XML inventory text part
+            // does NOT make a row visible; [T-ios-retry-anchor-synthetic-user]
+            // the resume() synthetic <system-reminder> row does not either.
+            // [B-05 deep-audit-1037] A mediaRef part (an attachment) DOES.
+            // One shared predicate with the retry walk (ChatViewModel
+            // retryFromMessage) — the old text-only copy disagreed with it for
+            // pure-attachment rows, so the two cutoffs landed on different
+            // rows and the truncation cut the wrong turn.
+            val hasText = userPartsJsonHasVisibleContent(entity.partsJson)
             if (hasText) {
                 if (visibleUserCount == visibleUserIndex) {
                     // ChatDao.deleteMessagesAfter is `sort_order >= <bound>` —
@@ -311,16 +300,13 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         Log.i(ChatViewModel.TAG, "📨[DRAIN] Draining ${queued.size} queued prompt(s): " +
             queued.joinToString(", ") { "${it.id}=\"${it.text.take(20)}...\"" })
 
-        // Flip isQueued=false on corresponding chat messages so they render as sent.
-        // T189: also clear queuedPromptId so a later retry of this bubble
-        // doesn't try to drop a phantom queue entry (and so the field state
-        // matches what retryFromMessage's truncate path now produces).
+        // [B-04 deep-audit-1037] The placeholder bubbles are NOT un-queued in
+        // place anymore: once the merged row is persisted they are REMOVED and
+        // replaced by the single user bubble below. The old path flipped the
+        // placeholders to isQueued=false and kept them — N rows on screen
+        // where the DB had 1 — so the retry/edit cutoff counts (which walk
+        // user rows) disagreed with the DB and truncated the wrong turn.
         val queuedIds = queued.map { it.id }.toSet()
-        _messages.value = _messages.value.map { m ->
-            if (m.queuedPromptId != null && queuedIds.contains(m.queuedPromptId)) {
-                m.copy(isQueued = false, queuedPromptId = null)
-            } else m
-        }
 
         // Build a combined user message (text + images from all queued prompts).
         // Persist as a single row.
@@ -348,9 +334,30 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         }
         prepared.attachedFilesXml?.let { combinedParts.add(AgentContentPart.Text(it)) }
 
+        // [B-04 deep-audit-1037] Empty-content guard — same shape as the twin
+        // injectQueuedPromptsAsNewTurn's guard. Every queued prompt produced
+        // no content (no text, no attachment survived prepareUserAttachments);
+        // persisting an empty user row is a deterministic provider 400. The
+        // queue was already emptied above, so the placeholder bubbles must go
+        // too (leaving them behind produced dashes with no queue entry —
+        // never drained, never withdrawable otherwise).
+        if (combinedParts.isEmpty()) {
+            AppLogger.warning(
+                ChatViewModel.TAG_STREAM,
+                "drainQueuedPrompts: ${queued.size} queued prompt(s) produced no content, skipping",
+            )
+            withContext(Dispatchers.Main) {
+                removeQueuedPlaceholders(queuedIds)
+            }
+            return null
+        }
+
         val userText = combinedText.toString()
         val userPartsJson = buildUserPartsJson(userText, prepared.mediaRefPartsJson, prepared.attachedFilesXml)
-        chatRepository.appendMessage(sid, "user", userPartsJson)
+        // [B-04 deep-audit-1037] Bind the appended entity: its id is what the
+        // user bubble and the agentHistory entry carry, so the retry/edit
+        // cutoff walk and the compaction anchors can resolve this turn.
+        val userEntity = chatRepository.appendMessage(sid, "user", userPartsJson)
 
         // [T-consecutive-user-bridge] The prior runAgentLoop may have
         // exited with agentHistory ending on user(tool_result) — e.g. the
@@ -367,7 +374,28 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
             content = userText,
             imageParts = prepared.imageParts,
             contentParts = combinedParts,
+            // [B-04 deep-audit-1037] The twin inject path's agentHistory entry
+            // carries dbMessageId — without it the compaction anchors skip this
+            // turn (isPersistedUserPrompt resolves through the id).
+            dbMessageId = userEntity.id,
         ))
+
+        // [B-04 deep-audit-1037] Converge the UI with the DB: the N queued
+        // placeholder bubbles collapse into the ONE merged user row that was
+        // just persisted (id = userEntity.id, isQueued=false by default, no
+        // queue entry to go stale). Same shape as the inject path's finalize
+        // step — on Main, placeholders dropped through the single funnel.
+        withContext(Dispatchers.Main) {
+            removeQueuedPlaceholders(queuedIds)
+            _messages.value = _messages.value + ChatMessage(
+                id = userEntity.id,
+                role = "user",
+                content = userText,
+                imageUris = prepared.imageUris,
+                attachmentNames = prepared.attachmentNames,
+                attachmentUris = prepared.nonImageUris,
+            )
+        }
 
         try {
             // [P0-fallback-reentry] Re-anchor to the class-level
@@ -418,6 +446,14 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         } catch (e: Exception) {
             Log.e(ChatViewModel.TAG, "Agent loop (queued-drain) error", e)
             reportAgentLoopError(e)
+            // [fix/da1015-sched-errorprop] Every run boundary flags the
+            // tracker, not just the send/retry/resume ones — a drain that dies
+            // here still unwinds through the same setInactive, and its
+            // completion signal must not read as a clean finish. (Idempotent
+            // with the flag set by reportAgentLoopError → setInlineError; kept
+            // explicit because this is the one boundary the audit found
+            // missing it.)
+            SessionActivityTracker.markStreamError(activeSessionId)
             break
         }
     }
@@ -573,11 +609,17 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
  *  - Case 1: any in-flight tool block is flipped to [ToolBlockStatus.CANCELLED]
  *    and a synthetic tool_result with [CANCELLED_MARKER] is persisted so
  *    tool_use/tool_result stays paired.
- *  - Case 2: if there was partial assistant text streamed (and no tool
- *    cancel), commit the partial text + a truncation `<system-reminder>`
- *    to agentHistory so the model knows the prior turn was cut short.
+ *  - Case 2: if the turn still in flight streamed partial assistant text (and
+ *    no tool cancel), commit that text + a truncation `<system-reminder>` to
+ *    agentHistory so the model knows the prior turn was cut short.
+ *    [meta-audit-1028 C2] "That text" is the in-flight turn's slice only —
+ *    every text block after the bubble's last `tool_use` — because both the
+ *    bubble's `content` and its `toolBlocks` accumulate across the run's
+ *    rounds. Slice + arm selection live in `StopCleanupPlan.kt`.
  *
- * Always sets [_canResume] = true when there is something to resume from.
+ * Every bubble it KEEPS becomes resumable ([_canResume]); the only bubble it
+ * removes is the thinking-only placeholder that carries neither text nor tool
+ * activity.
  */
 internal fun ChatViewModel.handleUserCancelledCleanup() {
     val msgs = _messages.value.toMutableList()
@@ -647,17 +689,30 @@ internal fun ChatViewModel.handleUserCancelledCleanup() {
     // exists and agentHistory does not already end with the assistant
     // turn we're on, commit the partial text + truncation marker so the
     // model sees an interrupted prior turn on the next call.
-    val partialText = buildString {
-        if (last.content.isNotEmpty()) append(last.content)
-        for (b in last.toolBlocks) {
-            if (b.kind == "text" && b.content.isNotEmpty()) {
-                if (isNotEmpty()) append('\n')
-                append(b.content)
-            }
-        }
-    }
+    // [meta-audit-1028 C2] Decide from the turn that is still in flight, not
+    // from the bubble's cross-turn carriers. Both carriers are run-scoped:
+    // `last.content` is `loopState.accumulatedText + turnText` at every flush
+    // site (accumulatedText = "cross-turn accumulated visible text of the
+    // current bubble") and `last.toolBlocks` is the run's append-only block
+    // list. Collecting them re-committed every earlier round's text as a new
+    // assistant row on each multi-round Stop (duplicate transcript + duplicate
+    // model context). The slice + the arm selection are one pure decision
+    // (`StopCleanupPlan.kt`, pinned by `StopCleanupPlanTest`) so the three
+    // shapes — multi-round tool Stop / pure-tool first round Stop / single-turn
+    // text Stop — are testable without the ViewModel.
     val historyEndsWithAssistant =
         agentHistory.lastOrNull()?.role == LLMMessage.Role.ASSISTANT
+    // [R5-C C-C-06] Distinguish "history genuinely ends with a user/tool_result
+    // turn" from "history ends with resume()'s continuation reminder". The
+    // reminder IS a USER row, so without this probe the placeholder window
+    // (stop after the reminder but before the first packet) read
+    // historyEndsWithAssistant=false for the WRONG reason and the plan kept a
+    // dead reminder row while killing _canResume. Pure predicate in
+    // StopCleanupPlan.kt, single-sourced with the writer via
+    // CONTINUATION_REMINDER_TEXT.
+    val reminderTail = agentHistory.lastOrNull()
+        ?.let { isContinuationReminderTail(it.role, it.content) } == true
+    val stopPlan = planStopCleanup(last.toolBlocks, historyEndsWithAssistant, reminderTail)
 
     // Case 0 (T-ios-stop-clear-thinking-and-partial — Android port):
     // Stop fired while still in the pre-first-chunk thinking gap (no
@@ -668,14 +723,27 @@ internal fun ChatViewModel.handleUserCancelledCleanup() {
     // instant the user taps Stop. Mirrors the iOS #566/#569 boundary:
     // a candidate WITH real text or any emitted tool_use is kept (handled
     // by Case 1 / Case 2 below); a thinking-only placeholder is not.
-    val hasAnyToolUse = last.toolBlocks.any { it.kind == "tool_use" }
-    if (partialText.isEmpty() && !hasAnyToolUse && !historyEndsWithAssistant) {
+    // The predicate itself lives in `planStopCleanup` (all three cells:
+    // text / tool_use / committed-history).
+    if (stopPlan.dropPlaceholder) {
+        // [R5-C C-C-06] The placeholder window can fire while the transcript's
+        // tail is resume()'s continuation reminder (Stop after the reminder
+        // write, before the first packet). Pre-fix that row stayed in the DB
+        // and in agentHistory — a USER turn with no answer behind it, which
+        // every future transcript read as "the user asked for a continuation
+        // that never came" — and `_canResume` stayed false, killing the Resume
+        // banner. The plan now says when the tail IS the reminder: remove the
+        // row, restore resumability (with the reminder gone the transcript is
+        // exactly the pre-resume shape), then drop the placeholder.
+        if (stopPlan.dropContinuationReminder) dropContinuationReminderTail()
+        if (stopPlan.canResume) _canResume.value = true
         msgs.removeAt(lastIdx)
         _messages.value = msgs
         return
     }
 
-    if (partialText.isNotEmpty() && !historyEndsWithAssistant) {
+    val partialText = stopPlan.persistText
+    if (partialText != null) {
         val parts = listOf<AgentContentPart>(
             AgentContentPart.Text(partialText),
             AgentContentPart.Text(
@@ -693,11 +761,60 @@ internal fun ChatViewModel.handleUserCancelledCleanup() {
             val partsJson = buildTextOnlyAssistantPartsJson(parts)
             chatRepository.appendMessage(activeSessionId, "assistant", partsJson)
         }
-        _canResume.value = true
-    } else if (historyEndsWithAssistant) {
-        // Already committed (tool cancel path above handled or prior turn
-        // wrote an assistant row). Still allow resume.
-        _canResume.value = true
+    }
+    // [meta-audit-1028 C2 defect B] Every KEPT bubble is resumable — the old
+    // chain ended with `else if (historyEndsWithAssistant)`, so the shape
+    // "round 1 was a pure tool_use round, user stopped in round 2's thinking
+    // gap" (no text of its own, tool activity present, history ending on
+    // USER(tool_result)) matched no arm at all: `_canResume` stayed false, the
+    // Resume banner never appeared and the interrupted multi-step task could
+    // not be continued. `resume()` already treats a trailing
+    // USER(tool_result) as a valid anchor ("no reminder needed"), so nothing
+    // else is required to make that shape resumable.
+    if (stopPlan.canResume) _canResume.value = true
+}
+
+/**
+ * [R5-C C-C-06] Remove the orphaned continuation reminder from the tail of
+ * `agentHistory` and from the DB.
+ *
+ * Only called from the stop-cleanup placeholder arm, and only when
+ * [planStopCleanup] matched the tail against [isContinuationReminderTail] — so
+ * the row being removed is always the one `resume()` itself wrote for the turn
+ * that just produced nothing (never a real user message: real user text can
+ * never equal [CONTINUATION_REMINDER_TEXT]).
+ *
+ * The DB delete is guarded on "this row is still the last row": if anything
+ * landed after the reminder the run was not in the pre-first-packet window
+ * after all, and a partial delete (`deleteMessagesAfter(sortOrder)`) would take
+ * the newer rows with it. In that case the row is left in place and logged —
+ * divergence between memory and disk is worse than a logged orphan.
+ */
+internal fun ChatViewModel.dropContinuationReminderTail() {
+    val tail = agentHistory.lastOrNull() ?: return
+    if (!isContinuationReminderTail(tail.role, tail.content)) return
+    val dbId = tail.dbMessageId
+    agentHistory.removeAt(agentHistory.lastIndex)
+    if (dbId.isNullOrEmpty()) return
+    val sid = activeSessionId
+    viewModelScope.launch(Dispatchers.IO) {
+        runCatching {
+            val rows = chatRepository.loadMessages(sid)
+            if (rows.lastOrNull()?.id == dbId) {
+                chatRepository.deleteMessagesAfter(sid, rows.last().sortOrder)
+                AppLogger.info(
+                    ChatViewModel.TAG,
+                    "stop-cleanup: removed orphan continuation reminder row ${dbId.take(8)}",
+                )
+            } else {
+                AppLogger.warning(
+                    ChatViewModel.TAG,
+                    "stop-cleanup: continuation reminder ${dbId.take(8)} is not the DB tail — kept (no partial delete)",
+                )
+            }
+        }.onFailure {
+            Log.w(ChatViewModel.TAG, "stop-cleanup: reminder delete failed: ${it.message}")
+        }
     }
 }
 

@@ -2,10 +2,12 @@ package com.rikkaminis.app.tools
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.AgentToolParam
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.ui.chat.decodeUriPath
+import com.rikkaminis.app.util.ImageDecoding
+import com.rikkaminis.app.util.saveOutcome
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -39,65 +41,77 @@ object ReadImageTool {
      * pipeline.
      */
     fun execute(argsJson: String, sessionId: String? = null, context: Context? = null): ToolExecutionResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val rawPath = args.optString("path", "")
-            val toolTitle = args.optString("tool_title", NAME)
 
             if (rawPath.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
             }
 
             val path = if (rawPath.startsWith("minis://")) {
-                "/var/minis/" + java.net.URLDecoder.decode(rawPath.removePrefix("minis://"), "UTF-8")
+                // [rv1014-B2] decodeUriPath = URI path semantics (decodes %XX only,
+            // leaves `+` intact, never throws on bare `%`); the previous
+            // URLDecoder.decode corrupted filenames containing `+` and threw
+            // on `100%.png`-style names.
+            "/var/minis/" + decodeUriPath(rawPath.removePrefix("minis://"))
             } else rawPath
 
-            val file = (
-                if (sessionId != null && context != null) {
-                    PRootKernel.resolveSessionHostPath(sessionId, path, context)
-                } else null
-            ) ?: PRootKernel.resolveHostPath(path)
-                ?: return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
+            // [audit3 F-08] The session-vs-global choice lives in
+            // resolvePathForSession: with a session in scope a path it rejects
+            // (escape out of the session tree) is NOT re-resolved by the global
+            // resolver — the null check below is now only "cannot resolve at
+            // all". The legacy overload (no sessionId/context) keeps the global
+            // resolver, per the KDoc above.
+            val file = when {
+                sessionId != null && context != null ->
+                    PRootKernel.resolvePathForSession(sessionId, path, context)
+                else -> PRootKernel.resolveHostPath(path)
+            }
+            if (file == null) {
+                return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
+            }
 
             if (!file.exists()) {
                 return ToolExecutionResult("Error: File not found: $path", false, toolTitle = toolTitle)
             }
 
-            val original = BitmapFactory.decodeFile(file.absolutePath)
+            // [audit2-PERF-03] Bounded two-pass decode (bounds -> inSampleSize
+            // -> decode) through the single shared entry point. The old
+            // `BitmapFactory.decodeFile(path)` with no Options allocated the
+            // full-resolution bitmap first: a 12 Mpx photo is ~48 MB (8000x6000
+            // ~192 MB) of transient ARGB_8888 against a 256-512 MB heap, and the
+            // createScaledBitmap copy landed on top of it.
+            val maxEdge = 2000
+            val decoded = ImageDecoding.decodeFileBounded(file.absolutePath, maxEdge)
                 ?: return ToolExecutionResult("Error: Cannot decode image: $path", false, toolTitle = toolTitle)
 
-            val maxEdge = 2000
-            var scaled: Bitmap? = null
-            val width: Int
-            val height: Int
+            // Source dimensions come from the bounds probe, so nothing here can
+            // repeat the [fix/audit-s6h1] failure (reading width/height off a
+            // recycled bitmap threw "Can't call getWidth() on a recycled
+            // bitmap"). Recycle the one bitmap the decoder handed us.
+            val width = decoded.sourceWidth
+            val height = decoded.sourceHeight
+            val encoded: Boolean
             val imageBytes: ByteArray
             try {
-                val s = if (original.width > maxEdge || original.height > maxEdge) {
-                    val scale = maxEdge.toFloat() / maxOf(original.width, original.height)
-                    val w = (original.width * scale).toInt()
-                    val h = (original.height * scale).toInt()
-                    Bitmap.createScaledBitmap(original, w, h, true)
-                } else {
-                    original
-                }
-                scaled = s
                 val out = ByteArrayOutputStream()
-                s.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                // [deep-audit-1048 A-02] `compress` returns false (no throw) when
+                // the encoder wrote nothing; dropped, this tool handed the model a
+                // 0-byte "image/jpeg" and reported success.
+                encoded = decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 imageBytes = out.toByteArray()
-                // [fix/audit-s6h1] original.recycle() ran BEFORE reading
-                // original.width/height for the metadata string — reading a
-                // recycled Bitmap throws IllegalStateException, so every
-                // successfully-decoded image failed with "Can't call getWidth()
-                // on a recycled bitmap". Cache the dimensions first, then recycle.
-                width = original.width
-                height = original.height
             } finally {
                 // [audit-0917] Recycle on the error path too: a throw between the
-                // decode and the old explicit recycles used to leak both bitmaps
-                // until GC (native memory). recycle() is idempotent, so the
-                // success path is unchanged.
-                scaled?.let { if (it !== original) it.recycle() }
-                original.recycle()
+                // decode and the old explicit recycles used to leak the bitmap
+                // until GC (native memory). recycle() is idempotent.
+                decoded.bitmap.recycle()
+            }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                return ToolExecutionResult("Error: Cannot encode image: $path", false, toolTitle = toolTitle)
             }
             val metadata = "[$path | ${width}x${height} | ${file.length()} bytes]"
             ToolExecutionResult(
@@ -111,7 +125,7 @@ object ReadImageTool {
                 imageFilePath = file.absolutePath,
             )
         } catch (e: Exception) {
-            ToolExecutionResult("Error reading image: ${e.message}", false)
+            ToolExecutionResult("Error reading image: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 }

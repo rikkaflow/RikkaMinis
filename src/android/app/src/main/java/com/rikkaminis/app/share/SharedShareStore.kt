@@ -43,16 +43,62 @@ object SharedShareStore {
             .edit().remove(KEY_PENDING_SHARE).apply()
     }
 
-    /** Remove all staged binary attachments. Call after consumption or on stale buffer. */
+    /**
+     * Delete staged files that nothing is waiting for, and account for the
+     * rest.
+     *
+     * [FIX-R3-E F-14] This used to walk the whole staging directory and delete
+     * EVERY file, then zero the byte counter. Two things were wrong with that:
+     *
+     *  1. **It deleted files a newer share had just staged.** The consumer's
+     *     `cleanSharedFiles` runs after the previous share is injected, while
+     *     the next share's `ShareReceiverActivity` may already have written
+     *     its files. The keep set is therefore two-part: the pending share's
+     *     references PLUS [StagedInFlightFiles], the names a live producer has
+     *     claimed but not yet handed off ([R5-A3 F-07] — the pending-share
+     *     reference alone still left the whole copy/dialog window unprotected).
+     *     Everything outside both sets is an orphan from an earlier share and
+     *     goes.
+     *  2. **It zeroed the ledger unconditionally**, which under-counted the
+     *     bytes that survive — the counter is process-lifetime and the keep
+     *     set keeps occupying the budget. The ledger is now reconciled to the
+     *     summed size of what is actually left on disk (see
+     *     [StagedBytesLedger.set]), so neither direction can drift.
+     */
     fun cleanSharedFiles(context: Context) {
         val dir = sharedFileDirectory(context)
-        dir.listFiles()?.forEach { runCatching { it.delete() } }
-        // [fix/audit-s7m2] the staging byte counter in ShareReceiverActivity is
-        // process-lifetime cumulative (survives Activity recreation) but was
-        // never decremented when files were actually deleted. A long-lived
-        // process that staged+consumed many shares would trip the 500MB cap
-        // with NOTHING on disk. Since cleanSharedFiles deletes the entire
-        // staged set, the counter resets to zero here.
-        ShareReceiverActivity.resetStagedBytes()
+        // [R5-A3 F-07] List FIRST, then snapshot the keep sets. A producer
+        // claims its staged name before it creates the file, so every name that
+        // appears in this listing is already visible to the in-flight snapshot
+        // taken below. Reading the listing afterwards would leave a window where
+        // a file created in between is deleted while its producer is still
+        // copying into it.
+        val listed = dir.listFiles().orEmpty()
+        val referenced = loadPendingShare(context)?.items.orEmpty()
+            .filter { it.kind == PendingShare.Item.Kind.ATTACHMENT }
+            .map { it.value }
+            .toSet()
+        // Files a live producer is still writing (or wrote but has not handed
+        // off yet). They are NOT orphans — see [StagedInFlightFiles].
+        val inFlight = StagedInFlightFiles.snapshot()
+        var keptBytes = 0L
+        var deleted = 0
+        for (f in listed) {
+            if (shouldKeepStagedFile(f.name, referenced, inFlight)) {
+                // Only referenced files are counted: an in-flight file's bytes
+                // are either already in the process-lifetime ledger (a restored
+                // staged set) or will be credited when its copy completes —
+                // adding the partial length here would double-count them.
+                if (f.name in referenced) keptBytes += f.length()
+            } else if (runCatching { f.delete() }.getOrDefault(false)) {
+                deleted++
+            }
+        }
+        ShareReceiverActivity.setStagedBytes(keptBytes)
+        AppLogger.info(
+            TAG,
+            "cleaned $deleted stale staged file(s); kept ${referenced.size} referenced + " +
+                "${inFlight.size} in flight, ${keptBytes}B accounted on disk",
+        )
     }
 }

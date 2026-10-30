@@ -1,0 +1,67 @@
+name: Scan Gate (main push / apparatus-only branches)
+
+# Two triggers, one purpose: run the 112 static gates + their fixture self-test
+# WITHOUT Gradle, NDK, signing or a release asset. ~7 min instead of ~20-27 min.
+#
+# 1. `push` to main touching scripts/** — those paths are outside
+#    build-apk.yml's `on.push.paths`, so a scanner-only commit used to land on
+#    main with no automated witness at all (backlog §2604, measured 2026-10-27).
+# 2. `workflow_dispatch` on a BRANCH, for fixes whose diff is apparatus-only
+#    (scanners, gate fixtures, diag scripts, reports, docs). Measured 10-12..10-27:
+#    123 apparatus-only branch runs burned 2,356 CI minutes (20% of all CI) at a
+#    19.7 min median, while 12/12 sampled runs were green on every single step
+#    outside the scan gate — the build was compiling code those branches never
+#    touched, i.e. ~13 of those 20 minutes carried no branch-specific evidence.
+#
+# Using this as a stop node is legitimate ONLY for apparatus-only diffs; the
+# "Guard" step below enforces that mechanically (fails closed otherwise, naming
+# the offending paths). For anything touching src/**, deps/**, gradle files or
+# other workflows, dispatch build-apk.yml — that is the only channel that can
+# produce build/unit-test evidence.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'scripts/scan/**'
+      - 'scripts/diag/**'
+      - '.github/workflows/scan-gate-push.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: scan-gate-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # Branch dispatches must prove the diff is apparatus-only before any
+      # evidence is produced. Exit 1 = non-apparatus paths (dispatch
+      # build-apk.yml instead); exit 2 = cannot prove (also red, by design).
+      # Skipped on main push: there the diff IS the scanners themselves.
+      - name: Guard (apparatus-only diff)
+        if: github.ref_name != 'main'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/diag/cheap_gate_guard.py \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --head "${{ github.sha }}"
+
+      - name: Run static scan gate
+        run: |
+          python3 --version || (echo "::error::python3 is required for the scan gate" && exit 1)
+          sh scripts/scan/scan.sh
+
+      # Scanner self-test — fixtures assert each scanner actually CATCHES the
+      # bug class it was built for. A silently-regressed scanner fails open;
+      # this step makes it fail loud. ~5s: fixtures are tiny temp trees, plus
+      # one clean pass over this repo.
+      - name: Scan self-test (fixture ground truth)
+        run: python3 scripts/scan/test_scan.py --jobs 4

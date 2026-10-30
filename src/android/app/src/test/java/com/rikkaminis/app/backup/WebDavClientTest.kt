@@ -5,6 +5,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -162,6 +163,118 @@ class WebDavClientTest {
         val items = dav().list()
         assertEquals(1, items.size)
         assertEquals("rikkaminis-backup-20260802-0000.json", items.first().displayName)
+    }
+
+    @Test
+    fun `list keeps an entry whose 200 propstat is followed by a 404 propstat`() {
+        // [FIX-R3-D / F-10] RFC 4918 lets one <response> carry several
+        // <propstat> groups: the properties the server could answer, and those
+        // it could not (404). The parser kept ONE status for the whole
+        // response, so the trailing 404 group erased the 200 and the resource
+        // disappeared — a folder that every other client lists came back empty
+        // ("no remote backups").
+        enqueue207(
+            """<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/rikkaminis-backup-20260801-1200.json</d:href>
+                <d:propstat>
+                  <d:prop>
+                    <d:getcontentlength>99</d:getcontentlength>
+                    <d:getlastmodified>Sat, 01 Aug 2026 12:00:00 GMT</d:getlastmodified>
+                    <d:resourcetype/>
+                  </d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+                <d:propstat>
+                  <d:prop>
+                    <d:displayname/>
+                    <d:getcontenttype/>
+                  </d:prop>
+                  <d:status>HTTP/1.1 404 Not Found</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>""".trimIndent()
+        )
+        val items = dav().list()
+        assertEquals(1, items.size)
+        val item = items.first()
+        assertEquals("rikkaminis-backup-20260801-1200.json", item.displayName)
+        assertEquals(99L, item.contentLength)
+        assertEquals(Instant.parse("2026-08-01T12:00:00Z"), item.lastModified)
+        assertFalse(item.isCollection)
+    }
+
+    @Test
+    fun `a 404 propstat cannot erase a displayname the 200 propstat carried`() {
+        // Same shape, other direction: the 404 group also carries a
+        // <displayname> (some servers emit an empty one per missing property).
+        // It must not overwrite the answered group's value.
+        enqueue207(
+            """<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/2026-08.json</d:href>
+                <d:propstat>
+                  <d:prop>
+                    <d:displayname>2026-08.json</d:displayname>
+                    <d:getcontentlength>5</d:getcontentlength>
+                  </d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+                <d:propstat>
+                  <d:prop><d:displayname>ignored</d:displayname></d:prop>
+                  <d:status>HTTP/1.1 404 Not Found</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>""".trimIndent()
+        )
+        val items = dav().list()
+        assertEquals(1, items.size)
+        assertEquals("2026-08.json", items.first().displayName)
+        assertEquals(5L, items.first().contentLength)
+    }
+
+    @Test
+    fun `an entry whose every propstat group failed is still dropped`() {
+        enqueue207(
+            """<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/gone.json</d:href>
+                <d:propstat>
+                  <d:prop><d:getcontentlength>0</d:getcontentlength></d:prop>
+                  <d:status>HTTP/1.1 404 Not Found</d:status>
+                </d:propstat>
+                <d:propstat>
+                  <d:prop><d:getlastmodified/></d:prop>
+                  <d:status>HTTP/1.1 403 Forbidden</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>""".trimIndent()
+        )
+        assertTrue(dav().list().isEmpty())
+    }
+
+    @Test
+    fun `a response-level status without propstat still decides`() {
+        // Some servers answer a failed PROPFIND with <href> + <status> and no
+        // propstat at all; that response must stay dropped.
+        enqueue207(
+            """<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/nope.json</d:href>
+                <d:status>HTTP/1.1 404 Not Found</d:status>
+              </d:response>
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/ok.json</d:href>
+                <d:status>HTTP/1.1 200 OK</d:status>
+              </d:response>
+            </d:multistatus>""".trimIndent()
+        )
+        val items = dav().list()
+        assertEquals(listOf("ok.json"), items.map { it.displayName })
     }
 
     @Test
@@ -386,6 +499,221 @@ class WebDavClientTest {
         val json = WebDavSync.restore(config, WebDavBackupItem("h", "rikkaminis-backup-1.json", 17, Instant.EPOCH), client)
         assertEquals("{\"formatVersion\":1}", json)
         assertEquals("/dav/RikkaMinis_backups/rikkaminis-backup-1.json", server.takeRequest().path)
+    }
+
+    // ── Non-WebDAV responses (captive portal / proxy login pages) ─────────
+    //
+    // [fix/p1-webdav-propf] World W5: the link comes up on a Wi-Fi portal, a
+    // proxy error page or an SSO login page, and the PROPFIND is answered
+    // with 200 + HTML. Before the fix `isSuccessful` waved it through, the
+    // parser found zero <response> nodes, and the UI said "the server has no
+    // backups" — while testConnection() (same code path, depth 0) said the
+    // connection was fine. Both statements were wrong and both sounded
+    // certain.
+
+    private fun enqueuePage(code: Int, body: String) {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(code)
+                .setHeader("Content-Type", "text/html; charset=utf-8")
+                .setBody(body)
+        )
+    }
+
+    private val loginPage = """<!DOCTYPE html>
+        |<html><head><title>Sign in</title></head>
+        |<body><form action="/login"><h1>Wi-Fi sign-in required</h1></form></body></html>"""
+        .trimMargin()
+
+    private fun expectNonDav(block: () -> Unit): WebDavNonDavResponse =
+        try {
+            block()
+            throw AssertionError(
+                "expected WebDavNonDavResponse — the call reported success for a non-WebDAV body",
+            )
+        } catch (e: WebDavNonDavResponse) {
+            e
+        }
+
+    @Test
+    fun `list throws on 200 plus an html login page instead of an empty list`() {
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { dav().list() }
+        assertEquals(200, e.statusCode)
+        assertTrue("message should name the cause: ${e.message}", e.message!!.contains("non-WebDAV response"))
+        assertTrue("message should keep the code: ${e.message}", e.message!!.contains("HTTP 200"))
+        assertTrue("message should point at the likely cause: ${e.message}", e.message!!.contains("portal"))
+    }
+
+    @Test
+    fun `testConnection fails when the server answers with an html page`() {
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { dav().testConnection() }
+        assertEquals(200, e.statusCode)
+    }
+
+    @Test
+    fun `an html page that merely mentions multistatus is still refused`() {
+        // Guards the second signal: the body DOES contain the word, so only
+        // "the parsed document root is <multistatus>" can reject it.
+        enqueuePage(
+            200,
+            "<!DOCTYPE html><html><body><p>PROPFIND multistatus rejected by proxy</p></body></html>",
+        )
+        val e = expectNonDav { dav().list() }
+        assertEquals(200, e.statusCode)
+    }
+
+    @Test
+    fun `a 207 whose body is not a multistatus document is refused with its own wording`() {
+        enqueuePage(207, "<html><body>multistatus expected</body></html>")
+        val e = expectNonDav { dav().list() }
+        assertEquals(207, e.statusCode)
+        assertTrue("message should say unreadable/207: ${e.message}", e.message!!.contains("HTTP 207"))
+    }
+
+    @Test
+    fun `truncated multistatus xml is refused rather than read as an empty folder`() {
+        // Root parses as multistatus, then the document ends mid-element: the
+        // parser blows up, which must not degrade to "no backups".
+        enqueuePage(
+            207,
+            """<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/x""",
+        )
+        expectNonDav { dav().list() }
+    }
+
+    @Test
+    fun `list returns an empty list for a genuine multistatus with zero responses`() {
+        // The legitimate "empty folder" case must keep working — and must NOT
+        // throw. This is the arm the fix is most likely to break.
+        enqueue207("""<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:"/>""")
+        assertEquals(0, dav().list().size)
+    }
+
+    @Test
+    fun `list still returns the single file of a one-entry multistatus`() {
+        enqueue207(
+            """<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/RikkaMinis_backups/rikkaminis-backup-20260101-0101.json</d:href>
+                <d:propstat>
+                  <d:prop>
+                    <d:getcontentlength>5</d:getcontentlength>
+                    <d:getlastmodified>Thu, 01 Jan 2026 01:01:00 GMT</d:getlastmodified>
+                  </d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>""".trimIndent(),
+        )
+        val items = dav().list()
+        assertEquals(1, items.size)
+        assertEquals("rikkaminis-backup-20260101-0101.json", items.first().displayName)
+        assertEquals(Instant.parse("2026-01-01T01:01:00Z"), items.first().lastModified)
+    }
+
+    @Test
+    fun `listBackupFiles propagates the non-WebDAV failure instead of an empty list`() {
+        // The exact user-visible symptom: the remote-backup screen showed an
+        // empty list. Its 404 tolerance must not swallow a login page.
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { WebDavSync.listBackupFiles(config, client) }
+        assertEquals(200, e.statusCode)
+    }
+
+    // ── Non-WebDAV bodies on PUT / GET / DELETE ───────────────────────────
+    //
+    // [fix/webdav-method-judgement] World W5, the other half of the PROPFIND
+    // seam above: put()/get()/delete() judged only the status code, so a
+    // portal 200 made an upload report success with nothing stored, fed the
+    // login page to ConfigBackup.import as if it were a backup document, and
+    // reported deletions that never happened. The judge reads the FIRST bytes
+    // (a JSON payload never opens with `<`), so a real backup whose message
+    // content merely mentions html keeps working — that arm is a test below,
+    // not an assumption.
+
+    @Test
+    fun `put refuses a portal page served in place of the upload answer`() {
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { dav().put("rikkaminis-backup-1.json", "{}".toByteArray()) }
+        assertEquals(200, e.statusCode)
+        assertTrue("message should name the operation: ${e.message}", e.message!!.contains("Upload"))
+        assertTrue("message should point at the likely cause: ${e.message}", e.message!!.contains("portal"))
+    }
+
+    @Test
+    fun `put refuses a portal page on the create-collection retry path too`() {
+        // First PUT → 409, ensureCollectionExists PROPFIND → 404 + MKCOL → 201,
+        // retry PUT → 200 + login page. Only the retry path is judged here:
+        // a fix applied to just one of the two success branches would leave
+        // this case green.
+        server.enqueue(MockResponse().setResponseCode(409))
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.enqueue(MockResponse().setResponseCode(201))
+        enqueuePage(200, loginPage)
+        expectNonDav { dav().put("rikkaminis-backup-1.json", "{}".toByteArray()) }
+    }
+
+    @Test
+    fun `put tolerates an empty body and a json body on success`() {
+        server.enqueue(MockResponse().setResponseCode(201)) // empty 201
+        dav().put("rikkaminis-backup-a.json", "{}".toByteArray())
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{\"stored\":true}")) // non-empty 200
+        dav().put("rikkaminis-backup-b.json", "{}".toByteArray())
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `get refuses a portal page instead of feeding it to the importer`() {
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { dav().get("rikkaminis-backup-1.json") }
+        assertEquals(200, e.statusCode)
+        assertTrue("message should name the operation: ${e.message}", e.message!!.contains("Download"))
+    }
+
+    @Test
+    fun `get refuses an empty 200 body`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(""))
+        val e = expectNonDav { dav().get("rikkaminis-backup-1.json") }
+        assertTrue("message should say empty: ${e.message}", e.message!!.contains("empty body"))
+    }
+
+    @Test
+    fun `get tolerates json whose message content merely mentions html`() {
+        // A real backup carries arbitrary user text — a message can contain
+        // "<html". The judge looks at the OPENING bytes only; a substring scan
+        // here would refuse valid backups.
+        val body = """{"messages":[{"text":"see the <html> spec below"}]}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(body))
+        val bytes = dav().get("rikkaminis-backup-1.json")
+        assertEquals(body, String(bytes, Charsets.UTF_8))
+    }
+
+    @Test
+    fun `get tolerates a bom and leading whitespace before the json`() {
+        val body = "\uFEFF\n  {\"formatVersion\":1}"
+        server.enqueue(MockResponse().setResponseCode(200).setBody(body))
+        val bytes = dav().get("rikkaminis-backup-1.json")
+        assertEquals(body, String(bytes, Charsets.UTF_8))
+    }
+
+    @Test
+    fun `delete refuses a portal page instead of reporting a deletion that never happened`() {
+        enqueuePage(200, loginPage)
+        val e = expectNonDav { dav().delete("rikkaminis-backup-1.json") }
+        assertEquals(200, e.statusCode)
+        assertTrue("message should name the operation: ${e.message}", e.message!!.contains("Delete"))
+    }
+
+    @Test
+    fun `delete tolerates the normal empty success bodies`() {
+        server.enqueue(MockResponse().setResponseCode(204))
+        dav().delete("rikkaminis-backup-a.json")
+        server.enqueue(MockResponse().setResponseCode(200)) // empty 200 also legal
+        dav().delete("rikkaminis-backup-b.json")
+        assertEquals(2, server.requestCount)
     }
 
     // ── Transport security (plain-HTTP refusal) ───────────────────────────

@@ -1,6 +1,5 @@
 package com.rikkaminis.app.ui.components
 
-import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -9,7 +8,10 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -43,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -58,7 +61,10 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -123,11 +129,17 @@ fun ImageGalleryViewer(
     // for why we don't touch decorFitsSystemWindows on the activity
     // window.
     DisposableEffect(Unit) {
-        // [fix/render-ui F-271] Was `(view.context as? android.app.Activity)?.window`,
-        // which is always null here: `view` is the *dialog's* AndroidComposeView
-        // and the dialog's context chain is ContextThemeWrapper(ContextThemeWrapper(…)),
-        // never an Activity. The walker below is the working form.
-        val window = findDialogWindow(view)
+        // The window controlled here is the HOST activity window: `view` is
+        // the host composition's view (LocalView.current evaluated before
+        // the Dialog below composes), so its context chain reaches the
+        // Activity. The dialog's own view is handled by the inner effect —
+        // only there does the parent chain contain a DialogWindowProvider.
+        // [fix/render-ui F-271] replaced this with findDialogWindow(view),
+        // but the host view's parent chain (ContentFrameLayout →
+        // FitWindowsLinearLayout → DecorView) never contains one, so
+        // `window` was null on every entry and this whole block — hide and
+        // restore — was a silent no-op.
+        val window = (view.context as? android.app.Activity)?.window
         val controller = window?.let { WindowInsetsControllerCompat(it, view) }
         val prevLightStatus = controller?.isAppearanceLightStatusBars
         val prevLightNav = controller?.isAppearanceLightNavigationBars
@@ -179,7 +191,7 @@ fun ImageGalleryViewer(
         DisposableEffect(dialogView) {
             val win = findDialogWindow(dialogView)
             win?.let { w ->
-                w.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
+                w.addFlags(galleryDialogWindowFlags())
                 WindowCompat.setDecorFitsSystemWindows(w, false)
                 @Suppress("DEPRECATION")
                 w.statusBarColor = android.graphics.Color.TRANSPARENT
@@ -314,7 +326,18 @@ fun ImageGalleryViewer(
                                         try {
                                             shareImage(context, currentItem.model)
                                         } finally {
-                                            sharing = false
+                                            // [deep-audit-1049 B-02] `sharing` is Compose
+                                            // state and `scope` is MinisApp.applicationScope
+                                            // = SupervisorJob + Dispatchers.IO (no Looper), so
+                                            // the reset has to land on Main — writing it from
+                                            // IO races recomposition and can throw
+                                            // "Reading a state that was created after the
+                                            // snapshot was taken". NonCancellable keeps the
+                                            // reset running if the job is cancelled between
+                                            // the share and this line.
+                                            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                                sharing = false
+                                            }
                                         }
                                     }
                                 },
@@ -350,7 +373,12 @@ fun ImageGalleryViewer(
                                                 Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                             }
                                         } finally {
-                                            saving = false
+                                            // [deep-audit-1049 B-02] Same off-main write as
+                                            // the Share button's finally: `saving` is Compose
+                                            // state, `scope` runs on Dispatchers.IO.
+                                            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                                saving = false
+                                            }
                                         }
                                     }
                                 },
@@ -362,6 +390,19 @@ fun ImageGalleryViewer(
         }
     }
 }
+
+/**
+ * [R4-V F-08] Does the gallery page own the current drag?
+ *
+ * While the picture sits at 1× the pager must be the one that moves. A
+ * magnified picture, or a second finger down (pinch), is the only case where
+ * the page owns the gesture — everything else is the pager's swipe. This is
+ * the decision the pointer loop below consults *before* consuming, kept as a
+ * named pure function so the boundary is pinned by a JVM test instead of by a
+ * gesture recogniser that cannot run off-device.
+ */
+internal fun galleryPageOwnsDrag(scale: Float, pressedPointers: Int): Boolean =
+    scale > 1f || pressedPointers > 1
 
 /**
  * One page inside [ImageGalleryViewer]. Owns its own zoom/pan state so the
@@ -376,10 +417,25 @@ private fun GalleryPage(
     var scale by remember { mutableFloatStateOf(1f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
+    val context = LocalContext.current
+    // [fix/dv21-b4-B06] The page handed Coil the raw model (`minis://…`, a
+    // `File`, a `Uri`) with no ImageRequest, so the decode ran with an
+    // unbounded height: the pager box constrains the layout, but a very tall
+    // screenshot still decoded up to its intrinsic size and could exceed the
+    // RecordingCanvas draw ceiling — and this is the surface a user zooms in
+    // on. Explicitly bounded, with the same shared ceiling the markdown
+    // renderers use (`Coil` scales down to it and never up, so ordinary photos
+    // decode exactly as before).
+    val imageRequest = remember(item.model) {
+        ImageRequest.Builder(context)
+            .data(item.model)
+            .limitDisplaySize()
+            .build()
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AsyncImage(
-            model = item.model,
+            model = imageRequest,
             contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier
@@ -394,15 +450,40 @@ private fun GalleryPage(
                 // so the parent pager doesn't change pages while the user
                 // is panning around inside a magnified image. Mirrors iOS
                 // UIScrollView naturally blocking the parent TabView swipe.
+                //
+                // [R4-V F-08] This used to be a bare `detectTransformGestures`,
+                // which consumes EVERY position change past touch slop — even
+                // at scale == 1f, where it also discards the pan (it only
+                // applies pan while zoomed). A single-finger swipe inside the
+                // picture therefore never reached `HorizontalPager` and paging
+                // was dead. The page now owns the drag only while it is
+                // magnified or a second finger is down (pinch), and only then
+                // consumes: at 1× the event stream is left to the pager,
+                // untouched.
                 .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 8f)
-                        if (scale > 1f) {
-                            offsetX += pan.x
-                            offsetY += pan.y
-                        } else {
-                            offsetX = 0f
-                            offsetY = 0f
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        // `while` (not `do/while`) so the loop variable lives in
+                        // the loop's own scope — the same reading, no reliance on
+                        // do-body declarations being visible to the condition.
+                        var pointerDown = true
+                        while (pointerDown) {
+                            val event = awaitPointerEvent()
+                            val pressed = event.changes.count { it.pressed }
+                            if (galleryPageOwnsDrag(scale, pressed)) {
+                                val zoom = event.calculateZoom()
+                                val pan = event.calculatePan()
+                                scale = (scale * zoom).coerceIn(1f, 8f)
+                                if (scale > 1f) {
+                                    offsetX += pan.x
+                                    offsetY += pan.y
+                                } else {
+                                    offsetX = 0f
+                                    offsetY = 0f
+                                }
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            }
+                            pointerDown = event.changes.any { it.pressed }
                         }
                     }
                 }
@@ -421,6 +502,18 @@ private fun GalleryPage(
         )
     }
 }
+
+/**
+ * Flags the gallery's Dialog window needs:
+ *  - FLAG_LAYOUT_NO_LIMITS: let the pager extend under the display cutout;
+ *  - FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS: tell the system THIS window paints
+ *    the status/nav-bar background itself — without it the dialog leaves a
+ *    grey band under the status bar even with statusBarColor = TRANSPARENT
+ *    (same contract as WebPreviewFullscreenScreen / WebPreviewBottomSheet).
+ */
+internal fun galleryDialogWindowFlags(): Int =
+    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
 
 /**
  * [fix/render-ui F-271] Find the hosting `Window` of a Compose `Dialog`.

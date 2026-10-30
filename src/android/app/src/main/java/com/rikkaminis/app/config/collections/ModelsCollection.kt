@@ -11,7 +11,11 @@ import com.rikkaminis.app.config.fields.ReadOnlyField
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelOverrides
+import com.rikkaminis.app.data.model.directionalModalities
+import com.rikkaminis.app.data.model.expandDirectionalModalities
+import com.rikkaminis.app.data.model.modalityNamesInOrder
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.provider.ModelsDevApi
 
 /**
  * Exposes ModelEntry overrides under `models.<entryUUID>.…`. Mirrors
@@ -51,6 +55,7 @@ class ModelsCollection(
             modalitiesOverrideField(forId),
             contextWindowField(forId),
             contextWindowOverrideField(forId),
+            supportsReasoningField(forId),
             supportsToolsField(forId),
             supportsVisionField(forId),
         )
@@ -70,13 +75,15 @@ class ModelsCollection(
             ?: throw ConfigError.InvalidValue("`instance_id` (or `provider_id`) required")
         if (instanceId.isEmpty()) throw ConfigError.InvalidValue("`instance_id` (or `provider_id`) required")
 
-        val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value
+        // [da1026-D] Trim before validating (parity with modelsUpdate's
+        // [da1022-E] blank-id gate): a whitespace-only id passed isEmpty()
+        // and minted a blank composite-key row.
+        val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value?.trim()
             ?: throw ConfigError.InvalidValue("`model_id` required")
         if (modelIdStr.isEmpty()) throw ConfigError.InvalidValue("`model_id` required")
 
-        if (repo.instance(instanceId) == null) {
-            throw ConfigError.InvalidValue("No provider instance with id $instanceId")
-        }
+        val instance = repo.instance(instanceId)
+            ?: throw ConfigError.InvalidValue("No provider instance with id $instanceId")
         // Refuse silent dedupe: the spec contract is that re-adding the
         // same provider+model pair surfaces an `already_exists` error so
         // the agent knows the prior add already succeeded.
@@ -97,20 +104,49 @@ class ModelsCollection(
         val model = LLMModel(
             id = modelIdStr,
             displayName = displayName,
-            provider = instanceId,
+            // [da1026-D] Persist the human provider name (ProviderType
+            // displayName) — the same value provider.models.add and
+            // AddCustomModelScreen write — instead of the instance UUID.
+            // minis-model-use list rendered the raw UUID and
+            // ModelsDevApi.enrichModel could never resolve providerKeyMap /
+            // registry for these rows, dropping them into the
+            // order-dependent all-providers scan (the F-212 failure).
+            provider = instance.providerType.displayName,
             contextWindow = contextWindow,
             maxOutputTokens = maxOut,
             supportsReasoning = supportsReasoning,
         )
+        // [r3-b08 F-04] The explicit numbers ALSO go into `overrides`. They used
+        // to live only on `baseModel`, and `ModelsDevApi.applyDevData` prefers the
+        // registry value (`devModel.contextWindow ?: model.contextWindow`), so for
+        // any id models.dev knows (gpt-4o, claude-…, every popular one) the
+        // agent's `context_window`/`max_output_tokens`/`supports_reasoning` were
+        // silently replaced by the catalog defaults on the very next read — the
+        // entry came back with 128000/16384 while the add call had returned
+        // ok:true. `overrides` is the user-explicit layer and is applied AFTER
+        // enrichment (`effectiveEntryModel` = enrich(baseModel).withOverrides(…)),
+        // which is exactly the precedence a hand-typed value deserves.
+        //
+        // `display_name` stays on baseModel only: it is the row's NAME, not an
+        // override of the registry's name (and duplicating it would make the
+        // detail screen show an "overridden" badge for a field the user never
+        // deliberately pinned).
         val entry = ModelEntry(
             providerInstanceId = instanceId,
             baseModel = model,
+            overrides = ModelOverrides(
+                contextWindow = contextWindow,
+                maxOutputTokens = maxOut,
+                supportsReasoning = supportsReasoning,
+            ),
             isCustom = true,
             isHidden = false,
             userModifiedAt = System.currentTimeMillis(),
         )
-        repo.addEntry(entry)
-        return entry.id
+        // [da1023-C] Return the canonical persisted id (saveConfig's
+        // canonicalize pass rewrites entry.uuid to the composite
+        // instanceId/modelId key), not the pre-persist uuid.
+        return repo.addEntry(entry)
     }
 
     override fun remove(id: String) {
@@ -200,7 +236,10 @@ class ModelsCollection(
             revertable = true,
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
-                ConfigValue.Int(e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens ?: 0)
+                // [dv22-A4] Same single source as contextWindow (this one sat
+                // in the same function family and read the raw base model):
+                // models.dev first, the user's override second.
+                ConfigValue.Int(effectiveModel(e).maxOutputTokens ?: 0)
             },
             writer = { v ->
                 val i = (v as? ConfigValue.Int)?.value ?: throw ConfigError.TypeMismatch("int")
@@ -231,61 +270,33 @@ class ModelsCollection(
     // -- Capability fields (modalities / contextWindow / derived) --
 
     /**
-     * Canonical names matching `minis-model-use list` so the two tools
-     * agree on terminology. Order is meaningful for [encodeModalities]'
-     * stable output. Mirrors iOS `modalityNamesInOrder`.
+     * Build the *effective* modality list of [e] — the canonical
+     * direction-suffixed names both `minis-model-use list` and this collection
+     * emit.
+     *
+     * [dv21-A05] It goes through the SAME resolver as the offload side
+     * (`ModelsDevApi.effectiveModel` → `LLMModel.directionalModalities`), so the
+     * two surfaces cannot answer differently:
+     *   - the base model is enriched from models.dev first and the user's
+     *     overrides applied on top (this surface used to skip enrichment
+     *     entirely, so every built-in model — all 39 declare null modality
+     *     fields by construction — reported `[]`);
+     *   - an absent list means text on that side, evaluated PER DIRECTION
+     *     (a pure image generator keeps `supportsTools = false`).
      */
-    private val modalityNamesInOrder = listOf(
-        "text_input", "text_output",
-        "image_input", "pdf_input", "audio_input", "video_input",
-        "image_output", "audio_output", "video_output",
-    )
-    private val allowedModalities = modalityNamesInOrder.toSet()
-
     /**
-     * Build the *effective* modality list: union of override (if any)
-     * with baseModel input/output lists, intersected with the allowed
-     * names so we never emit junk like "image" without a direction.
+     * [dv22-A4] The single enriched-model resolver for this collection —
+     * the SAME `ModelsDevApi.effectiveModel` the offload faces and the
+     * agent-facing `minis-model-use` list go through. Private one-line
+     * alias: every "what can this model do" field below funnels through
+     * this one call site (the parity test pins the literal call count at
+     * 1, and the alias keeps that true however many fields need it).
      */
-    private fun effectiveModalities(e: ModelEntry): List<String> {
-        val ovInputs = e.overrides.inputModalities
-        val ovOutputs = e.overrides.outputModalities
-        val baseInputs = e.baseModel.inputModalities ?: emptyList()
-        val baseOutputs = e.baseModel.outputModalities ?: emptyList()
-        val inputs = ovInputs ?: baseInputs
-        val outputs = ovOutputs ?: baseOutputs
+    private fun effectiveModel(e: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(e)
 
-        // Translate models.dev short tokens (e.g. "text", "image") into
-        // direction-suffixed names that match `minis-model-use list`.
-        val out = LinkedHashSet<String>()
-        for (m in inputs) appendDirectional(out, m, "input")
-        for (m in outputs) appendDirectional(out, m, "output")
-
-        // Stable order — matches modalityNamesInOrder.
-        return modalityNamesInOrder.filter { it in out }
-    }
-
-    private fun appendDirectional(out: MutableSet<String>, raw: String, direction: String) {
-        val short = raw.lowercase()
-        // Canonical "text" → "text_input"/"text_output".
-        if (short == "text") {
-            out.add("text_$direction"); return
-        }
-        if (short == "image") {
-            out.add("image_$direction"); return
-        }
-        if (short == "pdf") {
-            out.add("pdf_$direction"); return
-        }
-        if (short == "audio") {
-            out.add("audio_$direction"); return
-        }
-        if (short == "video") {
-            out.add("video_$direction"); return
-        }
-        // Already directional? Use as-is when it's in our allowed set.
-        if (short in allowedModalities) out.add(short)
-    }
+    private fun effectiveModalities(e: ModelEntry): List<String> =
+        effectiveModel(e).directionalModalities
 
     /** Split the user-supplied flat list into input/output components. */
     private fun decodeModalitiesOverride(names: List<String>): Pair<List<String>, List<String>> {
@@ -293,7 +304,7 @@ class ModelsCollection(
         val outputs = ArrayList<String>()
         for (n in names) {
             val low = n.lowercase()
-            if (low !in allowedModalities) {
+            if (low !in modalityNamesInOrder) {
                 throw ConfigError.InvalidValue(
                     "Unknown modality '$n'. Allowed: ${modalityNamesInOrder.joinToString(", ")}"
                 )
@@ -332,10 +343,15 @@ class ModelsCollection(
                 if (ov.inputModalities == null && ov.outputModalities == null) {
                     return@ClosureField ConfigValue.Arr(emptyList())
                 }
-                val out = LinkedHashSet<String>()
-                for (m in (ov.inputModalities ?: emptyList())) appendDirectional(out, m, "input")
-                for (m in (ov.outputModalities ?: emptyList())) appendDirectional(out, m, "output")
-                ConfigValue.Arr(modalityNamesInOrder.filter { it in out }.map { ConfigValue.Str(it) })
+                // Raw override reader — reports exactly what the user wrote.
+                // expandDirectionalModalities() (no text fallback) keeps that
+                // promise: the derived "absent means text" default must never
+                // be persisted-looking output here, or a partial override would
+                // read back as a different one.
+                ConfigValue.Arr(
+                    expandDirectionalModalities(ov.inputModalities, ov.outputModalities)
+                        .map { ConfigValue.Str(it) },
+                )
             },
             writer = { v ->
                 val arr = (v as? ConfigValue.Arr)?.value ?: throw ConfigError.TypeMismatch("array")
@@ -373,8 +389,13 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Int(),
             reader = {
                 val e = entry(id) ?: return@ReadOnlyField ConfigValue.Null
-                val effective = e.overrides.contextWindow ?: e.baseModel.contextWindow ?: 0
-                ConfigValue.Int(effective)
+                // [dv22-A4] Route through the shared enriched resolver. The
+                // raw `overrides ?: baseModel ?: 0` chain skipped models.dev
+                // entirely, so every built-in model whose local row carries a
+                // null window reported 0 (33 of the 39 built-ins) even though
+                // the registry knows the real number. Enrichment is a default,
+                // so overrides still win — `withOverrides` applies them second.
+                ConfigValue.Int(effectiveModel(e).contextWindow ?: 0)
             },
         )
 
@@ -395,6 +416,44 @@ class ModelsCollection(
                 mutate(id) { e ->
                     e.copy(overrides = e.overrides.copy(contextWindow = if (i == 0) null else i))
                 }
+            },
+        )
+
+    /**
+     * [R5-E F-04] `models.<id>.supportsReasoning` — the reasoning capability
+     * flag, writable as an override.
+     *
+     * Before this field the collection exposed `supportsTools` / `supportsVision`
+     * but not the flag that actually drives the thinking-level ceiling, while
+     * `add()` already persisted `overrides.supportsReasoning` ([r3-b08 F-04]).
+     * Two consequences: `minis-config get models.<id>.supportsReasoning`
+     * answered unknown_path, and the `.remove` snapshot (built by walking
+     * `fields()`) dropped the property, so the removed row's `old` value lied.
+     *
+     * The read is EFFECTIVE, not raw: `overrides.supportsReasoning` alone is
+     * null for every model the user never pinned, while the registry value is
+     * what the caller actually needs — the same trap [contextWindowField]
+     * documents at [dv22-A4], where the raw `overrides ?: baseModel` chain
+     * answered 0 for 33 of the 39 built-ins. Writing PINS the flag (overrides
+     * win over the registry, see `LLMModel.withOverrides`); there is no clear
+     * sentinel — a bool has no third value to distinguish "false" from
+     * "unset", so a written value stays pinned.
+     */
+    private fun supportsReasoningField(id: String): ConfigField =
+        ClosureField(
+            path = "models.$id.supportsReasoning",
+            displayName = "Supports reasoning",
+            description = "Effective reasoning flag (override applied if set, otherwise from models.dev / the provider). Writing pins it for this entry.",
+            valueSchema = ConfigSchema.Bool,
+            risk = ConfigRisk.SENSITIVE,
+            revertable = true,
+            reader = {
+                val e = entry(id) ?: return@ClosureField ConfigValue.Null
+                ConfigValue.Bool(effectiveModel(e).supportsReasoning == true)
+            },
+            writer = { v ->
+                val b = (v as? ConfigValue.Bool)?.value ?: throw ConfigError.TypeMismatch("bool")
+                mutate(id) { e -> e.withSupportsReasoningOverride(b) }
             },
         )
 
@@ -422,3 +481,14 @@ class ModelsCollection(
             },
         )
 }
+
+/**
+ * [R5-E F-04] The write transformation behind
+ * `models.<id>.supportsReasoning` — extracted as a pure function so the
+ * override semantics are testable without a repository: the value lands in
+ * `overrides` (which win over the enriched registry value in
+ * `ModelEntry.model`), it never touches `baseModel`, and writing `false` is a
+ * PIN, not a clear (a bool has no third value).
+ */
+internal fun ModelEntry.withSupportsReasoningOverride(value: Boolean): ModelEntry =
+    copy(overrides = overrides.copy(supportsReasoning = value))

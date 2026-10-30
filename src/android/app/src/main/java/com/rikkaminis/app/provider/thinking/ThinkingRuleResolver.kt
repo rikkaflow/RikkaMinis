@@ -1,6 +1,9 @@
 package com.rikkaminis.app.provider.thinking
 
 import com.rikkaminis.app.data.model.ThinkingLevel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -142,18 +145,36 @@ object ThinkingRuleResolver {
     @Volatile
     private var customRulesCache: Map<String, List<ThinkingRule>> = emptyMap()
 
+    /**
+     * [da1030-C ISSUE-05] Monotonic revision of [customRulesCache], bumped by every
+     * mutation path below. The cache is process-wide and mutated from OUTSIDE any
+     * screen (repository load, worker restore, `minis-config` write, backup import),
+     * so a Compose screen whose keys are only `(instance.id, reloadKey)` — where
+     * reloadKey bumps only for edits made ON that screen — kept rendering pre-write
+     * rules and then wrote the stale list back on the next save, silently reverting
+     * the external write. The UI collects this flow and puts it in the remember keys
+     * instead of trying to enumerate every external writer.
+     *
+     * Readers only compare/observe it (a counter, not a payload). Never reset it to
+     * 0 — a "back to initial" value would look like no change to an active collector.
+     */
+    private val _customRulesRevision = MutableStateFlow(0L)
+
+    /** Observable revision; see [_customRulesRevision]. */
+    val customRulesRevision: StateFlow<Long> = _customRulesRevision.asStateFlow()
+
     /** Replace the whole cache (called once after the repository loads config). */
     @Synchronized
     fun setAllCustomRules(byInstance: Map<String, List<ThinkingRule>>) {
         customRulesCache = byInstance
+        _customRulesRevision.value += 1
     }
 
     /** Replace one instance's custom rules (called after an add/edit/delete/reorder). */
     @Synchronized
     fun setCustomRules(instanceId: String, rules: List<ThinkingRule>) {
-        customRulesCache = customRulesCache.toMutableMap().apply {
-            if (rules.isEmpty()) remove(instanceId) else put(instanceId, rules)
-        }
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
     }
 
     /**
@@ -168,6 +189,11 @@ object ThinkingRuleResolver {
      * process resolved to the custom rule). This is the same cross-process sync class
      * as the knobs fields: write side (main) and read side (worker) must both carry it.
      *
+     * [da1030-C ISSUE-05] Writes the cache itself instead of delegating to
+     * [setCustomRules] so this mutator bumps [_customRulesRevision] exactly once per
+     * call (a delegated call would bump twice for one restore). The map surgery is
+     * shared via [withInstanceRules].
+     *
      * Returns the restored rule count for the request-run log.
      */
     @Synchronized
@@ -178,15 +204,30 @@ object ThinkingRuleResolver {
         // instanceId, and this cache lives for the process lifetime — so a
         // later run with no custom rules silently kept applying the old ones.
         if (field == null) {
-            setCustomRules(instanceId, emptyList())
+            customRulesCache = withInstanceRules(customRulesCache, instanceId, emptyList())
+            _customRulesRevision.value += 1
             return 0
         }
         val rules = (0 until field.length()).mapNotNull { i ->
             val o = field.optJSONObject(i) ?: return@mapNotNull null
             ThinkingRuleCoding.decodeRuleJson(o)
         }
-        setCustomRules(instanceId, rules)
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
         return rules.size
+    }
+
+    /**
+     * Copy-on-write single-entry update of the custom-rule cache; an empty [rules]
+     * list removes the entry. Pure — the revision bump stays with each public
+     * mutator so one logical write cannot be counted twice.
+     */
+    private fun withInstanceRules(
+        cache: Map<String, List<ThinkingRule>>,
+        instanceId: String,
+        rules: List<ThinkingRule>,
+    ): Map<String, List<ThinkingRule>> = cache.toMutableMap().apply {
+        if (rules.isEmpty()) remove(instanceId) else put(instanceId, rules)
     }
 
     /** This instance's custom rules in priority order, or empty. */
@@ -351,11 +392,43 @@ object ThinkingRuleResolver {
     }
 
     /**
+     * Read-only evaluation entry: resolve against an EXPLICIT custom-rule list instead of
+     * the process-wide cache.
+     *
+     * [meta-audit-1028 D4 F-01] This exists because the rule editor's live preview had no
+     * way to resolve a rule that is not saved yet except by PUBLISHING it: it called
+     * `setCustomRules("__preview__", listOf(rule))`, resolved, then removed it. Publishing
+     * is not a read — it mutates the process-wide cache and bumps [customRulesRevision],
+     * and [da1030-C ISSUE-05] made that revision the provider screen's Room reload key. The
+     * preview is evaluated in the dialog's COMPOSITION body, so the dialog bumped it twice
+     * per frame: the provider screen re-subscribed and re-queried every custom rule of the
+     * instance on every frame the dialog was open, and the cache briefly held a rule that
+     * exists nowhere (a throw between publish and cleanup left it there).
+     *
+     * The defect was the borrowed publish channel, not the revision semantics, so the fix
+     * is a read path — [customRulesRevision] keeps bumping exactly once per real mutation.
+     * [draftRules] are prepended exactly like [customRulesFor]'s result, so the trace here
+     * is the trace [apply] produces once the rule is saved.
+     */
+    fun applyDraftRules(
+        body: JSONObject,
+        ctx: ThinkingResolveContext,
+        draftRules: List<ThinkingRule>,
+    ): ThinkingResolveTrace = applyResolved(body, ctx, draftRules)
+
+    /**
      * Resolve and apply the thinking parameters for one request. The body is mutated in
      * place so the call site stays identical to the function this replaced; the trace is
      * returned for logging.
      */
-    fun apply(body: JSONObject, ctx: ThinkingResolveContext): ThinkingResolveTrace {
+    fun apply(body: JSONObject, ctx: ThinkingResolveContext): ThinkingResolveTrace =
+        applyResolved(body, ctx, customRulesFor(ctx.instanceId))
+
+    private fun applyResolved(
+        body: JSONObject,
+        ctx: ThinkingResolveContext,
+        customRules: List<ThinkingRule>,
+    ): ThinkingResolveTrace {
         val before = body.keys().asSequence().toSet()
 
         // ---- AUTO: let the vendor decide ----
@@ -379,7 +452,7 @@ object ThinkingRuleResolver {
         // are prepended above the built-ins, so a custom rule can override a vendor
         // default by matching first — but never remove a built-in. An empty custom
         // list makes `rules` == `builtInRules(ctx)`, byte-identical to Phase 1.
-        val winner = resolveWinner(ctx)
+        val winner = resolveWinner(ctx, customRules)
             ?: return ThinkingResolveTrace(
                 matchedRuleLabel = "none",
                 matchedRuleKind = ThinkingRule.Kind.PROVIDER_TYPE_DEFAULT,
@@ -414,9 +487,17 @@ object ThinkingRuleResolver {
      * prepended above the built-ins, so a custom rule can override a vendor default by
      * matching first — but never remove a built-in. An empty custom list makes the
      * result byte-identical to Phase 1.
+     *
+     * [meta-audit-1028 D4 F-01] The rule list is a PARAMETER, not a cache read: the
+     * preview path hands in a draft the cache must never see (see [applyDraftRules]),
+     * and every request path hands in [customRulesFor]'s result — the same list, read at
+     * the same moment, so the two entries cannot drift.
      */
-    private fun resolveWinner(ctx: ThinkingResolveContext): ThinkingRule? =
-        (customRulesFor(ctx.instanceId) + builtInRules(ctx))
+    private fun resolveWinner(
+        ctx: ThinkingResolveContext,
+        customRules: List<ThinkingRule>,
+    ): ThinkingRule? =
+        (customRules + builtInRules(ctx))
             .firstOrNull { it.scope.matches(ctx.modelId) }
 
     /**
@@ -687,11 +768,18 @@ object ThinkingRuleResolver {
                     // top of apply(); kept for exhaustiveness.
                     ThinkingLevel.AUTO -> 0
                 }
-                if (budget > 0 && ctx.maxTokens > 0) {
+                if (budget > 0) {
                     // [T-android-qwen3-thinking-budget-max-tokens-constraint] absorbed
                     // upstream (a5a0de20): maxTokens<2 leaves no room for any positive
                     // budget strictly below max, so DROP the field rather than emit an
                     // invalid value.
+                    // [deep-audit-1047 A-01] The `< 2` guard used to sit inside a
+                    // `ctx.maxTokens > 0` condition, so `maxTokens <= 0` skipped the
+                    // whole clamp and the RAW budget reached the wire. The provider
+                    // writes `clampOutboundMaxTokens(maxTokens, …)`, which floors at 1
+                    // — i.e. the wire always carries a positive `max_tokens`, and a
+                    // non-positive request value now means "no room", not "no clamp".
+                    // Guards are ordered so the reachable formula below is untouched.
                     if (ctx.maxTokens < 2) {
                         budget = 0
                     } else {

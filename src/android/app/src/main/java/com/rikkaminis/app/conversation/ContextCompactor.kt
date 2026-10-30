@@ -1,7 +1,6 @@
 package com.rikkaminis.app.conversation
 
 import com.rikkaminis.app.data.ContextPolicy
-import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 
 /**
@@ -119,6 +118,67 @@ object ContextCompactor {
      * @param escalatedFromOffload 是否因 offload 欠交付而要求升级（唯一允许低于
      *   压缩线触发的例外）
      */
+    /**
+     * [fix/compact-pregate-exhausted-1016] 循环路径的前置门（纯判定，可单测）：
+     * 本轮压力档位 + offload 欠交付标志，是否允许调用方走到 [decide]。
+     *
+     * 这道门唯一的用途是把 [decide] 里 `estimateTailTokens` 那次 O(N) 历史遍历
+     * 从「无压力的常见回合」上摘掉，所以它必须对**所有 decide 会动手的档位**开口：
+     *  - `NEEDS_COMPACT` —— 压缩带内（1016 之前的唯一形态）；
+     *  - `EXHAUSTED` —— 天花板 / 小窗档 exhaust 线以上，正是 [decide] 回答
+     *    RESCUE（每用户动作周期一次）或 EXHAUSTED 停摆兜底的入口；
+     *  - `OK` 且 escalated —— [T-ctx-offload-escalation] 的压缩线以下例外。
+     *
+     * 开口不等于压缩：[decide] 自己重读 [ContextPolicy.check]，防抖/尾门/档位
+     * 契约全部照旧，因此放宽前置门不可能造出 decide 会拒绝的压缩。
+     *
+     * 发送入口（`maybeTriggerAutoCompact`）**刻意不走这道门**：那里的 EXHAUSTED
+     * 已由 checkContextBeforeSend 拦下发送，恢复动作归对话框（新会话 / 显式
+     * /compact），RESCUE 是长跑任务中途的可选项，不是发送前的可选项。
+     */
+    fun loopGateOpens(
+        verdict: ContextPolicy.CheckResult,
+        escalatedFromOffload: Boolean,
+    ): Boolean =
+        verdict == ContextPolicy.CheckResult.NEEDS_COMPACT ||
+            verdict == ContextPolicy.CheckResult.EXHAUSTED ||
+            escalatedFromOffload
+
+    /**
+     * [fix/compact-lastfailure-pin-1016] 候选链失败的**单步归约**（纯函数，可单测）。
+     *
+     * 链上的失败分两类：ContextTooLarge 分类的（唯一能让外层 catch 走二分拆解的
+     * 容量证据）与普通的（超时 / 5xx / unavailable / truncated）。归约规则：
+     *  - TooLarge → 钉住**第一个**出现的（容量证据的时序以首次为准，后续 TooLarge
+     *    不覆盖）；
+     *  - 普通失败 → 覆盖「最后一个普通失败」槽位（保持既有语义：链尾失败即终态）。
+     *
+     * 调用方在链尾用 [chainTerminalFailure] 取终态。把规则放在这里而不是散在
+     * 循环里，是因为「哪条失败被抛出去」决定了外层要不要二分拆解，必须单源且
+     * 可被 JVM 装置按失败序列直接验。
+     *
+     * @return (新的 lastOrdinary, 新的 pinnedTooLarge)
+     */
+    fun chainFailureAfter(
+        lastOrdinary: Exception,
+        pinnedTooLarge: Exception?,
+        candidate: Exception,
+        isTooLarge: (Throwable) -> Boolean,
+    ): Pair<Exception, Exception?> =
+        if (isTooLarge(candidate)) lastOrdinary to (pinnedTooLarge ?: candidate)
+        else candidate to pinnedTooLarge
+
+    /**
+     * [fix/compact-lastfailure-pin-1016] 链全败时的**终态选择**（纯函数）：
+     * 钉住的 TooLarge 优先于最后一个普通失败。
+     *
+     * 外层 catch 只按 `isContextTooLargeError` 判断要不要二分拆解；终态若被链尾
+     * 的普通失败（超时 / 5xx）冲掉，链上唯一的容量证据就丢了 —— 不拆解、不重试，
+     * 整条链以失败收场（真实日志：`[Compact] Splitting` 3 天 0 次触发）。
+     */
+    fun chainTerminalFailure(lastOrdinary: Exception, pinnedTooLarge: Exception?): Exception =
+        pinnedTooLarge ?: lastOrdinary
+
     fun decide(
         estimatedTokens: Int,
         contextWindow: Int,
@@ -164,9 +224,19 @@ object ContextCompactor {
         // （候选池耗尽，缺口是 offload 结构上够不到的对话文本），调用方显式
         // 要求升级——否则上下文会卡在 offload 线与压缩线之间的死区里空转，
         // 直到自然涨过压缩线。tail/debounce 闸门仍然生效，升级只放宽这一条。
-        if (!escalatedFromOffload &&
-            policy.check(estimatedTokens, contextWindow) != ContextPolicy.CheckResult.NEEDS_COMPACT
-        ) {
+        // [fix/compact-escalation-tier-contract-1016] 但「只放宽这一条」必须
+        // 真的只放宽 band 检查，不能顺手替档位造一条设计上不存在的压缩线：
+        // exhaustedOnly 档（compactThreshold = 0，ContextPolicy 文档原文
+        // "too small for auto-compact; only surface .exhausted"；本类
+        // reservedForGrowth 的小窗豁免用的就是这一对字段）里 check() 永远不会
+        // 回答 NEEDS_COMPACT，escalation 若继续放行就等于在小窗档自动压缩——
+        // 用真实类量过：window 50 000 / tokens 45 000 / escalated=true ->
+        // AUTO_COMPACT，而同一坐标 check()=EXHAUSTED。小窗档仍只允许 EXHAUSTED
+        // 语义，恢复动作归对话框（manualCompactAllowed）或新会话。
+        val bandReached =
+            policy.check(estimatedTokens, contextWindow) == ContextPolicy.CheckResult.NEEDS_COMPACT
+        val tierHasNoCompactLine = policy.compactThreshold <= 0 || policy.exhaustedOnly
+        if (!bandReached && (!escalatedFromOffload || tierHasNoCompactLine)) {
             return Decision.OK
         }
         // Guard against Long underflow: `lastAutoCompactAtMs` is
@@ -210,22 +280,29 @@ object ContextCompactor {
     }
 
     /**
-     * 估算一条消息完整贡献的 token 数：content 文本 + contentParts 里的
-     * Text / ToolResult.content / ToolUse.input。工具结果在 agent 会话里通常
-     * 占大头，必须计入，否则尾部估算严重低估 → 刚压缩过又压缩。
+     * 估算一条消息完整贡献的 token 数 —— **委托** wire 对齐的权威实现
+     * [ContextEstimator.estimateMessageTokensFull]，本函数不再持有自己的公式。
+     *
+     * [fix/audit2-estimate-1015] 旧实现是 `estimateTokens(content)` 再逐 part 求和
+     * —— 对"content 与同文本 Text part 双填"的消息把同一段文本算两遍，而双填是
+     * **常态而非边角**：主发送路径的用户消息（`ChatViewModel`：
+     * `content = trimmed` + `contentParts = [Text(trimmed), …]`）与每一条
+     * assistant 文本轮（`AgentLoopEngine`：`content = turnText` +
+     * `assistantParts[0] = Text(turnText)`）都是这个形状。wire 侧在
+     * `contentParts` 非空时**只发 parts**（OpenAIProvider 的 structured-parts
+     * 分支：两个 role 的 `content` 都由 Text parts 拼出，`msg.content` 本身不发），
+     * 所以双计是纯虚高 —— 它同时喂大 [estimateTailTokens] 的 TAIL_TOO_SMALL 闸门
+     * 与两处保留预算（`resolveBudgetAnchorIdx` / `clampSliceStartByBudget`）。
+     *
+     * 为什么保留本函数而不是删掉改名：它有 6 个既有调用点，逐个改名只是把同一次
+     * 语义修正摊成更大的 diff。两个入口名背后只有**一份公式**（此处委托，
+     * [ContextEstimator] 是 wire 语义 KDoc 与来源记录的持有者）。
+     * 委托方向 = "调用点名前向计量权威"；[ContextEstimator] 反向只依赖本对象更低层
+     * 的文本原语 [estimateTokens]。两个 object 都没有 `init` 块互相引用，JVM 类
+     * 初始化是惰性的，不构成初始化环。
      */
-    fun estimateMessageTokens(message: LLMMessage): Long {
-        var total = estimateTokens(message.content)
-        message.contentParts.forEach { part ->
-            when (part) {
-                is AgentContentPart.Text -> total += estimateTokens(part.text)
-                is AgentContentPart.ToolResult -> total += estimateTokens(part.content)
-                is AgentContentPart.ToolUse -> total += estimateTokens(part.input.toString())
-                is AgentContentPart.ImageData -> Unit // 字节数据不计入文本 token 估算
-            }
-        }
-        return total
-    }
+    fun estimateMessageTokens(message: LLMMessage): Long =
+        ContextEstimator.estimateMessageTokensFull(message)
 
     /**
      * 最近一次压缩锚点（marker.lastCompactedMessageId）之后内容的总体积估算。
@@ -273,4 +350,27 @@ object ContextCompactor {
 
         Do NOT translate or alter code snippets, file paths, identifiers, or error messages. Be concise but never lose information the agent needs.
     """.trimIndent()
+
+    /**
+     * Input text for ONE summarizer pass: the previous rounds' summary
+     * (already stripped of its pinned block) followed by this pass's
+     * transcript, or just the transcript when there is no previous summary.
+     *
+     * [fix/r3-b11-compact-F01] Single home for that framing so the depth-0
+     * pass and the halving recursion cannot drift apart — the F-01 defect was
+     * exactly such a drift: the split branch handed the first half `null`
+     * instead of the pushed-down summary, so every earlier compact round
+     * vanished from the new summary the moment a pass hit ContextTooLarge.
+     *
+     * Pure string assembly: no LLM, no Android. The literal framing is pinned
+     * by a JVM test because downstream tests and the summarizer prompt assume
+     * it.
+     */
+    fun compactInputText(previousSummaryStripped: String?, transcript: String): String =
+        if (previousSummaryStripped.isNullOrBlank()) {
+            transcript
+        } else {
+            "Previous context summary:\n$previousSummaryStripped\n\n" +
+                "New conversation to merge:\n$transcript"
+        }
 }

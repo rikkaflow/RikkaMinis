@@ -101,7 +101,20 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
         // 1. unknown_tool_repeat — most specific signal, runs first.
         val unknownStreak = countUnknownStreakFromTail(toolName)
         if (unknownStreak >= config.unknownToolThreshold) {
-            val msg = "[LOOP BLOCKED] CRITICAL: attempted unavailable tool '$toolName' " +
+            // [R5-C C-C-09] The engine feeds THIS string back into record() as
+            // `errorMessage` when it refuses the call (AgentLoopEngine's
+            // blocked-call arm passes `precheck.message`). record() classifies
+            // the attempt through extractUnknownToolName, so the wording is a
+            // parser contract, not prose: "attempted unavailable tool 'x'"
+            // matched neither regex, the blocked attempt entered history with
+            // `unknownToolName = null`, countUnknownStreakFromTail() broke on
+            // its own tail entry, and every block therefore reset the streak —
+            // of every threshold+1 hallucinated calls exactly one was ever
+            // refused. Keep an "unknown tool '<name>'" phrase that
+            // UNKNOWN_TOOL_RE_1 captures (the parser test in
+            // ToolLoopDetectorTest pins the round trip through the REAL check()
+            // output, not a hand-written string).
+            val msg = "[LOOP BLOCKED] CRITICAL: unknown tool '$toolName' attempted " +
                 "$unknownStreak times. Stop retrying that missing tool and answer without it."
             AppLogger.warning("ToolLoopDetector",
                 "CRITICAL unknown_tool_repeat tool=$toolName streak=$unknownStreak")
@@ -377,8 +390,15 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
      *   "unknown tool: foobar"          → group 1 = "foobar"
      *   "tool 'foobar' not found"       → group 1 = "foobar"
      * Both case-insensitive; quoting and surrounding whitespace tolerated.
+     *
+     * [r3-B11-F04] `internal` for the JVM test that feeds the REAL
+     * production message ([com.rikkaminis.app.tools.UnknownToolMessage.message])
+     * through this parser: the two sides used to be tested separately with a
+     * hand-written error string that had no trailing period, so the mismatch
+     * (message emits `"Unknown tool: foobar."` → group 1 captured `"foobar."`)
+     * was invisible and `unknown_tool_repeat` could never fire.
      */
-    private fun extractUnknownToolName(errorMessage: String?): String? {
+    internal fun extractUnknownToolName(errorMessage: String?): String? {
         if (errorMessage.isNullOrBlank()) return null
         UNKNOWN_TOOL_RE_1.find(errorMessage)?.groupValues?.getOrNull(1)?.let { return it }
         UNKNOWN_TOOL_RE_2.find(errorMessage)?.groupValues?.getOrNull(1)?.let { return it }
@@ -406,11 +426,11 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
         internal val ARGS_HASH_IGNORED_KEYS: Set<String> = setOf("tool_title")
 
         private val UNKNOWN_TOOL_RE_1 = Regex(
-            """unknown tool[:\s]+["']?([a-zA-Z0-9_.\-]+)["']?""",
+            """unknown(?:\s+or\s+forbidden)?\s+tool[:\s]+["']?([a-zA-Z0-9_\-]+(?:\.[a-zA-Z0-9_\-]+)*)["']?""",
             RegexOption.IGNORE_CASE,
         )
         private val UNKNOWN_TOOL_RE_2 = Regex(
-            """tool\s+["']?([a-zA-Z0-9_.\-]+)["']?\s+(?:not found|is not available)""",
+            """tool\s+["']?([a-zA-Z0-9_\-]+(?:\.[a-zA-Z0-9_\-]+)*)["']?\s+(?:not found|is not available)""",
             RegexOption.IGNORE_CASE,
         )
         private val HEX = "0123456789abcdef".toCharArray()

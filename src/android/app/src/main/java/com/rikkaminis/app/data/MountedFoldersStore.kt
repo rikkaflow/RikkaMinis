@@ -76,6 +76,21 @@ class MountedFoldersStore(private val context: Context) {
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
 
     /**
+     * [E2-F12] Set when [storeFile] exists but could not be read or parsed.
+     *
+     * The reader used to swallow every failure (`runCatching { … }` with no
+     * handler) and leave the list empty, which looks exactly like "the user has
+     * no mounts" — and the next mutation ([add] / [remove] / [refreshWritability])
+     * then wrote that empty list back through [saveToDisk], permanently erasing
+     * `mounted-folders.json`. The file could get into that state without any
+     * user action: [saveToDisk] wrote it with a bare `writeText`, so a kill or a
+     * full disk mid-write truncated it. Unreadable must therefore mean "keep the
+     * in-memory list and leave the bytes alone", never "publish zero mounts".
+     */
+    @Volatile
+    private var diskUnreadable = false
+
+    /**
      * T219-5: fired after every CRUD operation that mutates the persisted
      * list. MinisApp wires this to `PRootKernel.applyMountedFoldersSnapshot`
      * so future shells pick up the new bind specs without a process restart.
@@ -121,7 +136,11 @@ class MountedFoldersStore(private val context: Context) {
         // OS-level writability driven by the actual filesystem (Option A path
         // is what PRoot will use, not the SAF grant). isWritePermission can
         // be true while a per-package scoped-storage rule still rejects open(2).
-        val probedWritable = probeWritable(resolvedHostPath)
+        // [deep-audit-1025 ISSUE-08] probeWritable() is blocking file I/O
+        // (create + delete a probe file) and `add()` is reached from a
+        // Main-scoped launch in MountedFoldersScreen — on a slow or
+        // network-backed mount that stalls frames.
+        val probedWritable = withContext(Dispatchers.IO) { probeWritable(resolvedHostPath) }
         val entry = Entry(
             name = name,
             sourceDisplayName = sourceDisplayName,
@@ -205,7 +224,12 @@ class MountedFoldersStore(private val context: Context) {
     suspend fun refreshWritability() = mutex.withLock {
         val before = _entries.value
         val after = before.map { e ->
-            val probed = e.resolvedHostPath?.let { probeWritable(it) } ?: false
+            // [deep-audit-1025 ISSUE-08] the probe is blocking file I/O, and
+            // this reader runs on the caller's thread (Main: ON_RESUME and the
+            // storage-permission result both call it), so probe off it.
+            val probed = e.resolvedHostPath
+                ?.let { p -> withContext(Dispatchers.IO) { probeWritable(p) } }
+                ?: false
             if (probed != e.isWritable) e.copy(isWritable = probed) else e
         }
         if (after != before) {
@@ -274,6 +298,11 @@ class MountedFoldersStore(private val context: Context) {
      * the same reality PRoot will see — `open(O_WRONLY|O_CREAT)` against
      * the real filesystem — so scoped-storage restrictions or freshly
      * revoked permissions reflect honestly in the badge.
+     *
+     * Blocking: this is synchronous host file I/O. Every caller must hop off
+     * its own thread first (`withContext(Dispatchers.IO) { … }`) —
+     * `readonly_mount_write_guard.py` enforces that mechanically
+     * [deep-audit-1025 ISSUE-08].
      */
     fun probeWritable(hostPath: String): Boolean {
         val dir = File(hostPath)
@@ -289,34 +318,77 @@ class MountedFoldersStore(private val context: Context) {
         }
     }
 
-    private fun resolveVolumeRoot(context: Context, volume: String): String? {
-        if (volume.equals("primary", ignoreCase = true)) {
-            return Environment.getExternalStorageDirectory()?.absolutePath
-        }
-        // Removable storage — match by uuid via StorageManager (API 24+ for
-        // storageVolumes, but `directory` is API 30+. Fall back gracefully
-        // on older devices by walking /storage/<uuid>).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
-            sm?.storageVolumes?.firstOrNull { it.uuid?.equals(volume, ignoreCase = true) == true }
-                ?.directory?.absolutePath?.let { return it }
-        }
-        val fallback = File("/storage/$volume")
-        return if (fallback.isDirectory) fallback.absolutePath else null
-    }
+    // [dv20-A4-A06] The volume-root resolver used to live here as a private
+    // method, twinned by a drifted copy in `PRootKernel`. It is now the single
+    // top-level [resolveVolumeRoot] at the bottom of this file, shared by both
+    // readers — see [resolveVolumeRootDecision] for the union rule.
 
+    /**
+     * [E2-F12] Read the persisted list. A failure is NOT "zero mounts" — see
+     * [diskUnreadable]: the in-memory list is left untouched and the file is
+     * quarantined before the next write instead of being overwritten blind.
+     */
     private fun loadFromDisk() {
         if (!storeFile.isFile) return
         runCatching {
             val text = storeFile.readText()
             val parsed = JSON.decodeFromString<List<Entry>>(text)
             _entries.value = parsed
+        }.onFailure { e ->
+            diskUnreadable = true
+            AppLogger.warning(
+                TAG,
+                "loadFromDisk: ${storeFile.name} unreadable (${e.javaClass.simpleName}: ${e.message}) — " +
+                    "keeping ${_entries.value.size} in-memory mount(s); the file will be moved aside, not overwritten",
+            )
         }
     }
 
+    /**
+     * [E2-F12] Persist [list]. Two changes from a bare `writeText`:
+     *
+     *   1. If the last read failed ([diskUnreadable]) and the file is still
+     *      there, the unreadable bytes are moved aside
+     *      ([mountStoreQuarantineName]) before anything is written, so the
+     *      user's original file survives for recovery instead of being
+     *      replaced by a list we could not have read from it. If neither rename
+     *      nor copy succeeds the write is refused outright — writing anyway is
+     *      exactly the data loss being prevented.
+     *   2. The write itself is temp + rename, so a kill or a full disk can no
+     *      longer leave a truncated JSON behind (that truncation is how the file
+     *      got unreadable in the first place, and it also silently dropped the
+     *      mounts on the next launch).
+     */
     private suspend fun saveToDisk(list: List<Entry>) = withContext(Dispatchers.IO) {
+        if (diskUnreadable && storeFile.isFile) {
+            val aside = File(storeFile.parentFile, mountStoreQuarantineName(storeFile.name, System.currentTimeMillis()))
+            val preserved = runCatching { storeFile.renameTo(aside) }.getOrDefault(false) ||
+                runCatching {
+                    storeFile.copyTo(aside, overwrite = true)
+                    true
+                }.getOrDefault(false)
+            if (!preserved) {
+                AppLogger.error(
+                    TAG,
+                    "saveToDisk: ${storeFile.name} is unreadable and could not be moved aside — " +
+                        "refusing to write ${list.size} mount(s) over it",
+                )
+                return@withContext
+            }
+            AppLogger.warning(TAG, "saveToDisk: unreadable ${storeFile.name} moved aside to ${aside.name}")
+            diskUnreadable = false
+        }
         runCatching {
-            storeFile.writeText(JSON.encodeToString(list))
+            val text = JSON.encodeToString(list)
+            val tmp = File(storeFile.parentFile, "${storeFile.name}.tmp")
+            tmp.writeText(text)
+            if (!tmp.renameTo(storeFile)) {
+                // Some filesystems refuse rename onto an existing path.
+                storeFile.writeText(text)
+                tmp.delete()
+            }
+        }.onFailure { e ->
+            AppLogger.warning(TAG, "saveToDisk: write failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -341,6 +413,101 @@ class MountedFoldersStore(private val context: Context) {
         private const val EXTERNALSTORAGE_AUTHORITY = "com.android.externalstorage.documents"
         private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     }
+}
+
+/**
+ * [E2-F12] Name an unreadable `mounted-folders.json` is moved aside to before a
+ * save overwrites it. Pure (name shape only) so a JVM probe can pin the exact
+ * form the store looks for after a failed load.
+ */
+internal fun mountStoreQuarantineName(storeName: String, nowMs: Long): String =
+    "$storeName.unreadable-$nowMs"
+
+/**
+ * [dv20-A4-A06] One candidate volume for [resolveVolumeRootDecision].
+ * [directory] carries the API 30+ `StorageVolume.directory` path; null below
+ * API 30 (the platform does not expose it there) or when the volume has no
+ * directory.
+ */
+internal data class VolumeRootCandidate(val uuid: String?, val directory: String?)
+
+/**
+ * [dv20-A4-A06] Pure core of SAF volume-root resolution — the single place the
+ * decision is made, and the single place the `< API 30` fallback exists.
+ *
+ * Before this, two same-semantics implementations had drifted apart:
+ * `PRootKernel.resolveVolumeRoot` stopped at `volume.directory` (API 30+) and
+ * returned null for removable volumes on API 26–29, while this store's private
+ * copy carried the `File("/storage/<uuid>")` fallback. A folder mounted on a
+ * removable volume therefore resolved here (and landed in
+ * `Entry.resolvedHostPath`) but not in `PRootKernel.applyMountedFoldersSnapshot`,
+ * which re-resolved from scratch — the mount was silently dropped from
+ * `bindMounts` and never got its read-only guard.
+ *
+ * The decision is the UNION of both former shapes — the fallback wins over "no
+ * answer": primary/empty → primary dir; API 30+ volume match with a non-null
+ * directory → that path; everything else (API 26–29 match, API 30+ match whose
+ * directory is null, unknown volume) → `/storage/<uuid>` when it is a real
+ * directory, else null.
+ *
+ * Android-free on purpose: [resolveVolumeRoot] supplies the platform edges and
+ * the JVM probe pins this contract without an Android runtime.
+ */
+internal fun resolveVolumeRootDecision(
+    volumeId: String,
+    sdkInt: Int,
+    primaryDir: String?,
+    volumes: List<VolumeRootCandidate>,
+    fallbackIsDirectory: (String) -> Boolean,
+): String? {
+    if (volumeId.equals("primary", ignoreCase = true) || volumeId.isEmpty()) {
+        return primaryDir
+    }
+    if (sdkInt >= 24) { // StorageManager.storageVolumes
+        for (candidate in volumes) {
+            if (candidate.uuid?.equals(volumeId, ignoreCase = true) == true) {
+                if (sdkInt >= 30) { // StorageVolume.getDirectory
+                    candidate.directory?.let { return it }
+                }
+            }
+        }
+    }
+    // < API 30, and API 30+ volumes whose directory is null: walk the legacy
+    // mount point. Removable volumes expose /storage/<uuid> there even though
+    // StorageVolume.directory is unavailable below API 30.
+    val fallback = "/storage/$volumeId"
+    return if (fallbackIsDirectory(fallback)) fallback else null
+}
+
+/**
+ * [dv20-A4-A06] The one volume-root resolver: platform edges for
+ * [resolveVolumeRootDecision]. `PRootKernel` and this store both call it, so
+ * the two readers of a mount's host path cannot disagree again.
+ */
+internal fun resolveVolumeRoot(context: Context, volumeId: String): String? {
+    val primaryDir = Environment.getExternalStorageDirectory()?.absolutePath
+    val volumes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
+        sm?.storageVolumes?.map { volume ->
+            VolumeRootCandidate(
+                uuid = volume.uuid,
+                directory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    volume.directory?.absolutePath
+                } else {
+                    null
+                },
+            )
+        }.orEmpty()
+    } else {
+        emptyList()
+    }
+    return resolveVolumeRootDecision(
+        volumeId = volumeId,
+        sdkInt = Build.VERSION.SDK_INT,
+        primaryDir = primaryDir,
+        volumes = volumes,
+        fallbackIsDirectory = { File(it).isDirectory },
+    )
 }
 
 /**

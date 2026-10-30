@@ -2,7 +2,6 @@ package com.rikkaminis.app.ui.browser
 
 import android.content.Context
 import android.content.Intent
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +44,7 @@ import androidx.core.content.FileProvider
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.util.ExternalIntent
 
 /**
  * [T-android-browser-download-ux] Downloads panel — Android port of iOS
@@ -67,7 +68,18 @@ fun BrowserDownloadsSheet(
 
     // Terminal entries stop counting toward the badge once the user has
     // actually looked at the panel.
-    LaunchedEffect(Unit) { tabPool.markDownloadsSeen() }
+    //
+    // [dv15-B3] ...and that must hold for as long as the panel is open, not
+    // only at the instant it opens. Before: a one-shot `LaunchedEffect(Unit)`
+    // marked whatever was terminal right then; a download that finished while
+    // the panel was up stayed `seen = false`, so the toolbar badge lit up
+    // behind the open panel and stayed lit after closing it (until the next
+    // open). The effect now re-runs whenever a pass is owed — the decision is
+    // pure and JVM-tested (`pendingDownloadSeenPass`) — and every pass is the
+    // same idempotent `markDownloadsSeen()`, so a list with nothing left to
+    // mark yields an equal list and cannot loop.
+    val needsSeenPass = remember(downloads) { pendingDownloadSeenPass(downloads) }
+    LaunchedEffect(needsSeenPass) { if (needsSeenPass) tabPool.markDownloadsSeen() }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -240,10 +252,41 @@ private fun openDownloadedFile(context: Context, entry: BrowserTabPool.DownloadE
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, null))
+        // [deep-audit-1049 B-03] Shared launcher: NEW_TASK moves onto the
+        // chooser (the intent that is actually started — a chooser does not
+        // inherit the inner intent's flags), and the failure is no longer a
+        // logcat line the user cannot see.
+        ExternalIntent.share(context, intent, null) {
+            android.widget.Toast.makeText(
+                context,
+                context.getString(R.string.filepreview_no_app),
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         android.util.Log.w("BrowserDownloads", "open failed: ${e.message}")
+        android.widget.Toast.makeText(
+            context,
+            context.getString(R.string.filepreview_no_app),
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
     }
 }
+
+/**
+ * [dv15-B3] Does the open panel owe the store a "mark terminal entries seen"
+ * pass for this list?
+ *
+ * True iff some terminal entry is still unseen. Top-level and free of
+ * Compose/Android on purpose: this is the decision that was missing — the
+ * panel used to make exactly one pass, at open time — so it is the part a JVM
+ * test can run for real (`BrowserDownloadsSeenTest`), instead of asserting on
+ * source text.
+ *
+ * In-flight entries are ignored: they are not terminal, `markDownloadsSeen()`
+ * would not touch them, and keying on them would re-run the pass on every
+ * progress byte.
+ */
+internal fun pendingDownloadSeenPass(downloads: List<BrowserTabPool.DownloadEntry>): Boolean =
+    downloads.any { it.state != BrowserTabPool.DownloadState.DOWNLOADING && !it.seen }

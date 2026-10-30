@@ -51,6 +51,69 @@ object MemoryRollupEngine {
     /** Rollup product file name, living next to GLOBAL.md in the memory dir. */
     const val ROLLUP_FILE = "MEMORY-ROLLUP.md"
 
+    // ── Candidate口径 (single source) ────────────────────────────────────
+
+    /**
+     * Daily-log file names are exactly `YYYY-MM-DD.md`. Kept here as the single
+     * copy: the executor ([com.rikkaminis.app.workspace.MemoryRollupRunner]) and
+     * the system-prompt size hint
+     * ([com.rikkaminis.app.data.repository.MemoryRepository]) must judge
+     * candidacy identically — when they diverged, the prompt kept naming an
+     * already-distilled log as the largest pending one and the agent burned a
+     * memory_rollup call per turn to be told SKIPPED_ALREADY.
+     * ([dv15-A4] deep-audit-1036 A-07)
+     */
+    private val DATE_FILE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
+
+    /**
+     * Whether [fileName] is a *past*, non-empty daily log — the shape both
+     * sides agree on, regardless of whether it was distilled yet.
+     *
+     * [todayStr] is `yyyy-MM-dd` in the caller's timezone: today (and any
+     * future-dated file) is still being written, so it is never a candidate.
+     * ISO dates compare lexicographically, which is the cutoff the executor has
+     * always used.
+     */
+    fun isPastDailyLog(fileName: String, byteSize: Long, todayStr: String): Boolean {
+        val datePart = fileName.removeSuffix(".md")
+        if (!DATE_FILE_PATTERN.matches(datePart)) return false
+        if (datePart >= todayStr) return false
+        return byteSize > 0L
+    }
+
+    /**
+     * Whether [fileName] is a log the rollup would actually select right now: a
+     * past, non-empty daily log that no existing rollup section covers yet *and
+     * that still holds at least one entry worth distilling*.
+     *
+     * A candidate for both sides — the executor's picker and the prompt-side
+     * size hint — so the hint can only ever name a file the executor would not
+     * answer with SKIPPED_ALREADY / NOTHING_TO_DISTILL.
+     *
+     * [readContent] supplies the file's text; it is only invoked once the two
+     * cheap dimensions (date shape + already-distilled) pass, so callers pay
+     * the read for plausible logs only. `null` means "unreadable" and is *not*
+     * a candidate — the executor cannot distill a file it cannot read.
+     *
+     * [dv28-A3] The content dimension lives HERE, not at the call site. It used
+     * to live inside the executor's picker only, while this predicate promised
+     * to be the shared口径: a log made entirely of in-flight notes (>= 50 KB)
+     * was then named by the system prompt every turn and every memory_rollup
+     * call answered NOTHING_TO_DISTILL. (deep-audit-1048 A-03)
+     */
+    fun isRollupCandidate(
+        fileName: String,
+        byteSize: Long,
+        todayStr: String,
+        rollupContent: String,
+        readContent: () -> String?,
+    ): Boolean {
+        if (!isPastDailyLog(fileName, byteSize, todayStr)) return false
+        if (hasRollupForDate(rollupContent, fileName.removeSuffix(".md"))) return false
+        val text = readContent() ?: return false
+        return distillableEntries(extractEntries(text)).isNotEmpty()
+    }
+
     private val TIMESTAMP_MARKER = Regex("""<!-- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) -->\s*\n?""")
 
     // ── Entry splitting ──────────────────────────────────────────────────
@@ -180,6 +243,39 @@ object MemoryRollupEngine {
         return RollupClass.TRANSIENT
     }
 
+    /**
+     * The entries a rollup would actually render: everything that is not
+     * [RollupClass.TRANSIENT], decided on the DEDUPED entry list.
+     *
+     * The single place that answers "is there anything worth distilling", used
+     * by BOTH the candidacy predicate ([isRollupCandidate], i.e. "does this log
+     * qualify at all") and the document builder ([buildRollupText], i.e. "what
+     * goes into the section") — so the "distillable"口径 cannot fork into a
+     * second, drifting copy. [dv28-A3] (deep-audit-1048 A-03)
+     *
+     * [FIX-R3-E F-11] Dedup moved INSIDE this function. The executor's picker
+     * and the candidacy predicate classified the RAW entries while
+     * [buildRollupText] classified the merged ones — and merging can flip the
+     * verdict: two entries with the same title, the first a converged lesson
+     * and the second carrying a weak unfinished signal ("待验证" / "进行中"),
+     * merge into one body that [classify] reads as TRANSIENT. The result was a
+     * log the prompt named as the largest pending one, that `memory_rollup`
+     * picked every time, and whose section always rendered empty
+     * (`NOTHING_TO_DISTILL`) — starving every smaller log behind it. One
+     * judging list, one verdict.
+     */
+    fun distillableEntries(rawEntries: List<Entry>): List<Entry> {
+        // Dedup FIRST, then classify — the merged list is the only judging
+        // list. Kept as two statements on purpose: `scripts/scan/
+        // backup_remap_rollup_check.py` pins this filter expression as its
+        // fixture anchor (arm M21 mutates it to reconstruct the old defect),
+        // and that gate may not be edited by this branch.
+        val entries = dedupeEntries(rawEntries)
+        val distillable =
+            entries.filter { classify(it) != RollupClass.TRANSIENT }
+        return distillable
+    }
+
     // ── Dedup ────────────────────────────────────────────────────────────
 
     /**
@@ -249,8 +345,10 @@ object MemoryRollupEngine {
         entries: List<Entry>,
         generatedAt: String = "auto",
     ): String {
-        val distilled = dedupeEntries(entries)
-            .filter { classify(it) != RollupClass.TRANSIENT }
+        // [FIX-R3-E F-11] `distillableEntries` dedupes internally now — passing
+        // the raw list is the same question the candidacy predicate and the
+        // executor's picker ask, so all three answer identically.
+        val distilled = distillableEntries(entries)
 
         if (distilled.isEmpty()) return ""
 

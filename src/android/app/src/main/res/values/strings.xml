@@ -351,6 +351,7 @@
     <string name="webpreview_close">Close</string>
     <string name="webpreview_stop">Stop loading</string>
     <string name="webpreview_reload">Reload</string>
+    <string name="webpreview_renderer_gone">The page stopped responding and its view was closed by the system.</string>
     <string name="webpreview_open_external">Open in external browser</string>
     <string name="webpreview_open_fullscreen">Open fullscreen</string>
     <string name="webpreview_more">More</string>
@@ -467,6 +468,9 @@
     <string name="browser_history_clear">Clear</string>
     <string name="browser_history_done">Done</string>
     <string name="browser_history_search">Search history</string>
+    <string name="browser_history_today">Today</string>
+    <string name="browser_history_yesterday">Yesterday</string>
+    <string name="browser_history_results">Results</string>
     <string name="browser_history_empty_title">No browsing history</string>
     <string name="browser_history_empty_subtitle">History is kept for 7 days</string>
     <string name="browser_history_clear_dialog_title">Clear Browsing History?</string>
@@ -689,6 +693,9 @@
     <string name="skill_import_error_no_url">Enter a URL</string>
     <string name="skill_import_error_invalid">Invalid SKILL.md or skill already exists</string>
     <string name="skill_import_error_format">Invalid SKILL.md. Ensure YAML frontmatter with \'name:\' field.</string>
+    <string name="skill_file_error_read">Could not read the selected file</string>
+    <string name="skill_file_error_archive">Invalid skill archive: no SKILL.md found inside</string>
+    <string name="skill_file_error_detail">Import failed: %1$s</string>
     <string name="skill_import_in_progress">Importing...</string>
     <string name="skill_import_submit">Import</string>
     <string name="skill_detail_label_name">Name</string>
@@ -740,6 +747,7 @@
     <string name="storage_clear_confirm_text">This will delete %1$s of files. This action cannot be undone.</string>
     <string name="storage_section_orphans">Reclaimable space</string>
     <string name="storage_orphan_banner">%1$d orphaned item(s) from deleted sessions — %2$s</string>
+    <string name="storage_orphan_banner_blocked">%1$d item(s) (%2$s) look like leftovers, but the database currently lists no conversations. Cleanup is blocked so data the app can no longer see is not deleted.</string>
     <string name="storage_reclaim_button">Reclaim</string>
     <string name="storage_reclaim_confirm_title">Reclaim orphaned files?</string>
     <string name="storage_reclaim_confirm_text">This will permanently delete %1$d orphaned item(s) (%2$s) left over from deleted sessions. The remaining conversations are not affected. This cannot be undone.</string>
@@ -886,6 +894,10 @@
     <string name="modeldetail_capabilities_footer">Context window and max output tokens (in tokens). Leave empty to use provider defaults. Enable Thinking for models that support extended reasoning.</string>
     <string name="modeldetail_provider_default">Provider default</string>
     <string name="modeldetail_max_tokens_exceeds_warning">Exceeds provider-reported limit (%1$d). The value is saved but may cause errors.</string>
+    <!-- [meta-audit-1028 E5 / B06 F-07] Shown when updateEntry refuses the save (the id is already used by another model of this provider). The screen stays open so the edit is not lost. -->
+    <string name="modeldetail_error_model_id_exists">"%1$s" is already used by another model of this provider. Choose a different Model ID.</string>
+    <!-- [meta-audit-1028 E5 / B06 F-07] Shown when addEntry refuses to add (same id already exists). -->
+    <string name="add_custom_model_error_model_id_exists">"%1$s" already exists for this provider. Choose a different Model ID.</string>
     <string name="modeldetail_section_input_modality">Input Modality</string>
     <string name="modeldetail_image_input">Image Input</string>
     <string name="modeldetail_pdf_input">PDF Input</string>
@@ -1450,9 +1462,12 @@
     <string name="browser_viewport_width">Width</string>
     <string name="browser_viewport_height">Height</string>
     <string name="common_loading">Loading…</string>
+    <!-- [meta-audit-1028 D4] A secret whose Keystore read failed: the box shows nothing
+         while a value exists on disk, so saving would erase it. Save stays disabled. -->
+    <string name="settings_secret_unreadable">Could not read the stored value — nothing was saved. Close and reopen this form.</string>
     <string name="rootfs_reset_button">Reset</string>
     <string name="session_title_label">Title</string>
-    <string name="backup_import_too_large">Backup file is too large (%1$d MB, max %2$d MB) — nothing was imported.</string>
+    <string name="backup_import_too_large">Backup file is too large (%1$d MB, max %2$d MB) — nothing was imported. Shorten the chat history window (or turn it off) and export again, then import the new file.</string>
     <string name="backup_export_incomplete">Warning: %1$d field(s) failed to read — this backup may be incomplete.</string>
     <string name="code_expand">Expand %1$d lines</string>
     <string name="code_collapse">Collapse</string>
@@ -1475,6 +1490,7 @@
     <string name="sysmsg_compact_failed">Compaction failed: %1$s</string>
     <string name="sysmsg_context_full_hint">Context is getting full (%1$d / %2$d tokens). Consider running /compact to fold older turns into a summary.</string>
     <string name="sysmsg_wait_compact">Wait for the current compact to finish before sending.</string>
+    <string name="sysmsg_edit_wait_stream">You are editing a message. Stop the current response first - an edit replaces the old message and cannot be queued.</string>
     <string name="sysmsg_context_trimmed">Context reached the %1$d limit; trimmed the oldest %2$d messages to continue.</string>
     <string name="sysmsg_compact_no_provider">No provider configured. Cannot compact.</string>
     <string name="sysmsg_compact_empty_session">Nothing to compact — the session is empty.</string>
@@ -1749,5 +1765,46 @@
     <string name="scheduled_delete_title">Delete scheduled task?</string>
     <string name="scheduled_delete_body">“%1$s” will be permanently deleted.</string>
     <string name="scheduled_fuse_notification_title">Scheduled task suspended</string>
+    <string name="scheduled_edit_missing_body">This task no longer exists. It may have been deleted while this screen was open.</string>
     <string name="scheduled_fuse_notification_body">“%1$s” failed %2$d times in a row and was disabled. Resume it in Settings.</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    Spoken when rewriting a bare URL before text-to-speech synthesis (device locale for the host name inserted).<string name="tts_spoken_link_to_host">link to %1$s</string>
+    <string name="tts_spoken_bare_link">link</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Auto-approve</string>
+    <string name="perm_auto_approve_title">Auto-approve mode</string>
+    <string name="perm_auto_approve_desc">Apply routine settings changes without asking. Sensitive and destructive changes can still require confirmation.</string>
+    <string name="perm_auto_approve_sensitive">Include sensitive settings</string>
+    <string name="perm_auto_approve_sensitive_desc">Also apply provider credentials (API keys, base URLs) without asking. The agent could silently repoint them.</string>
+    <string name="perm_auto_approve_privileged">Allow privileged tools</string>
+    <string name="perm_auto_approve_privileged_desc">Let the agent use the accessibility and Shizuku command lines (they drive other apps and read the screen).</string>
+    <string name="perm_auto_approve_footer">Off by default. Turning this on stops the confirmation dialog for routine writes and stops permission prompts for agent tools. Every change is still logged under Logs → Config Changes.</string>
+    <string name="perm_auto_approve_confirm_title">Turn on auto-approve?</string>
+    <string name="perm_auto_approve_confirm_text">Routine settings changes will be applied without asking, and agent tools will run without permission prompts. Sensitive settings (provider API keys) and destructive changes still ask. You can turn this off any time.</string>
+    <string name="perm_auto_approve_confirm_on">Turn on</string>
+    <string name="perm_section_runtime_batch">System permissions</string>
+    <string name="perm_runtime_batch_desc">Android asks for these one at a time while you use each capability. Grant them all now in one sitting so they stop interrupting later.</string>
+    <string name="perm_runtime_batch_title">Grant all system permissions</string>
+    <string name="perm_runtime_batch_sub">Calendar, contacts, location, photos, microphone, camera, notifications</string>
+    <string name="perm_runtime_batch_all_granted">All system permissions already granted.</string>
+    <string name="perm_runtime_batch_partial">%1$d permission(s) still not granted — Android declined or you skipped them.</string>
+    <!-- [feat/storage-budget-loop] Storage budget channel + warning. The app owns
+         a rootfs the agent grows (apk/build/fixture dirs); without this the only
+         place that number surfaced was Android Settings' "user data". -->
+    <string name="notif_storage_budget_channel_name">Storage budget</string>
+    <string name="notif_storage_budget_channel_description">Warns when this app\'s own data (sandbox shell, sessions, media) grows past its budget.</string>
+    <string name="notif_storage_budget_title">This app is using a lot of storage</string>
+    <string name="notif_storage_budget_body">%1$s used by this app (budget %2$s). Tap to see what is taking the space.</string>
+    <string name="mirror_section_title">External copy</string>
+    <string name="mirror_section_footer">A continuously updated copy outside the app\'s own storage. Clearing app data does not remove it, and any file manager can read it.</string>
+    <string name="mirror_enable">External mirror</string>
+    <string name="mirror_enable_sub">Download/RikkaMinis/backup — updated automatically</string>
+    <string name="mirror_last_sync">Last sync: %1$s</string>
+    <string name="mirror_never">Never synced yet</string>
+    <string name="mirror_pending_count">%1$d file(s) waiting to sync</string>
+    <string name="mirror_diag_stale">Sync is overdue: %1$d file(s) waiting (%2$d min since the last write)</string>
+    <string name="mirror_diag_failed">Last sync failed</string>
+    <string name="mirror_diag_unavailable">No usable storage target</string>
+    <string name="mirror_retry">Retry</string>
 </resources>

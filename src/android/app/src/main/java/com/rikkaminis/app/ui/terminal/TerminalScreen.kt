@@ -35,9 +35,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Eject
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.KeyboardHide
 import androidx.compose.material.icons.outlined.Cancel
-import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.PauseCircle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -53,18 +51,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
 import com.rikkaminis.app.sandbox.TerminalSession
 import com.rikkaminis.app.terminal.MinisOpenUrlBroker
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 
 // iOS-matched palette
 private val TerminalBg = Color(0xFF000000)
@@ -99,10 +95,51 @@ fun TerminalScreen(
     val sessionState by terminalSession.state.collectAsStateEffect()
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
-    LaunchedEffect(Unit) {
+    // [R5-F F-C-10] Keyed on the SESSION OBJECT, not on Unit: AppNavigation
+    // rebuilds the session when the route's `sessionId` changes (that id is
+    // baked into the proot args and the PTY env at start, so a different
+    // session is a different PTY). An unkeyed effect kept starting and
+    // stopping the object it captured on the first composition — i.e. nothing
+    // for the live screen.
+    LaunchedEffect(terminalSession) {
         if (!terminalSession.isRunning) terminalSession.start(sessionId = sessionId)
+    }
+
+    // [R5-F F-C-10] The prefill is keyed on the COMMAND. `launchSingleTop`
+    // keeps this destination on top and REPLACES its NavBackStackEntry with a
+    // copy carrying the new route arguments (NavController.launchSingleTopInternal
+    // → NavBackStackEntry(entry, args)), so the screen recomposes with the new
+    // `initCommand` — but the old `LaunchedEffect(Unit)` never ran again, which
+    // made "open_terminal?init_command=… while the terminal is already on
+    // screen" silently do nothing.
+    //
+    // Re-delivery is idempotent by construction — not by the navigation
+    // library's entry equality: the key is the command STRING, so navigating
+    // with the SAME command twice leaves this effect un-restarted and the
+    // characters are never stacked twice into the input line. A DIFFERENT
+    // command is a different key and does restart it, which is the whole point.
+    LaunchedEffect(terminalSession, initCommand) {
         if (!initCommand.isNullOrBlank()) {
-            kotlinx.coroutines.delay(500)
+            // [da1032-D] Wait for READY, never a fixed wall-clock guess. RUNNING
+            // is published by TerminalSession only after its `cd /var/minis &&
+            // clear\r` preamble has been written, so this ordering guarantees
+            // the preamble is ahead of the prefill in the PTY input queue. The
+            // old `delay(500)` raced a boot that takes ≥500 ms routinely (PRoot
+            // boot + a 300 ms delay before the preamble): the prefill then
+            // landed first and the two writes merged into one line that the
+            // shell executed — `clear` erased it in the best case.
+            //
+            // ponytail: no boot timeout — if the PTY never becomes RUNNING
+            // (failed start leaves STOPPED/BOOTING) this suspends until the
+            // screen is disposed and the effect is cancelled, which is exactly
+            // what happens today. 天花板: a start() that fails silently keeps
+            // the prefill invisible. 升级触发: a real-device report of "deep
+            // link terminal opens but never shows the command" while the
+            // session state is STOPPED.
+            terminalSession.state.first { it == TerminalSession.State.RUNNING }
+            // A short settle for the interactive shell to consume the preamble
+            // (cd + clear) before the prefill is echoed under it.
+            kotlinx.coroutines.delay(100)
             // Strip control characters that would execute commands (CR, LF, ESC, etc.)
             // before sending to the PTY — defense-in-depth alongside DeepLinkHandler's
             // sanitization. The initCommand is meant to pre-fill visible text, not
@@ -114,7 +151,11 @@ fun TerminalScreen(
         }
     }
 
-    DisposableEffect(Unit) {
+    // [R5-F F-C-10] Keyed on the session for the same reason as the start
+    // effect above: with `remember(sessionId)` in AppNavigation a changed
+    // sessionId produces a NEW object, and an unkeyed dispose would leave that
+    // new PTY running forever (the closure captured the old one).
+    DisposableEffect(terminalSession) {
         onDispose { terminalSession.stop() }
     }
 
@@ -133,8 +174,14 @@ fun TerminalScreen(
         val uri = pendingUrl ?: return@LaunchedEffect
         if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
             previewUrl = uri.toString()
+            // Only claim the broker for what this screen actually presents.
+            // A non-web scheme (minis:// deep link / in-app file preview) is
+            // left pending on purpose: ChatScreen's observer defers while
+            // `terminalVisible` is true and re-runs the moment it flips back
+            // to false, so dismissing the terminal delivers the URL there.
+            // [da1027-G] consuming unconditionally here ate those URLs.
+            MinisOpenUrlBroker.consume()
         }
-        MinisOpenUrlBroker.consume()
     }
 
     val accessoryBarHeightDp = 40.dp

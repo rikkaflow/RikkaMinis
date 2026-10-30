@@ -1,5 +1,8 @@
 package com.rikkaminis.app.ui.markdown
 
+import com.rikkaminis.app.ui.chat.MediaKind
+import com.rikkaminis.app.ui.chat.mediaKindOfUrl
+
 /**
  * Lightweight markdown parser that converts raw markdown text into a list of block nodes.
  * Supports: headings, code blocks (fenced), blockquotes, bullet/numbered/task lists,
@@ -53,11 +56,75 @@ object MarkdownParser {
     /** Object Replacement Character (U+FFFC) — sentinel used by math placeholders. */
     private const val ORC = '￼'
 
-    private val nativeVideoExts = setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
-    private val nativeAudioExts = setOf("mp3", "m4a", "wav", "aac", "ogg", "flac")
+    // [dv22/B-06] The extension sets live in one place only
+    // (`ui/chat/MarkdownBlockModel.kt`). This parser classifies through
+    // `mediaKindOfUrl` so the block renderer, the inline split and the image
+    // gallery can never disagree about what counts as video/audio.
 
     /** Regex for a standalone `![alt](url)` node on its own line. */
     private val standaloneImageRegex = Regex("""^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$""")
+
+    /**
+     * ATX heading: 1–6 `#` at column 0, whitespace, then text.
+     *
+     * One regex for both consumers — the heading branch below and the
+     * paragraph loop's break test — because the two must agree on where a
+     * paragraph ends. [dv15/B-07] The loop used a bare `startsWith("# ")`
+     * (level 1 only), so a `##`…`######` heading glued to the previous
+     * paragraph (no blank line between them) was collected as paragraph text
+     * and never produced a [Block.Heading]. Breaking on a set WIDER than the
+     * branch is safe (the line just becomes its own paragraph, `i` always
+     * advances); breaking on a narrower one is the bug.
+     */
+    private val atxHeadingRegex = Regex("^(#{1,6})\\s+(.+)$")
+
+    /** Numbered-list item; the paragraph loop uses the prefix-only form below. */
+    private val numberedListItemRegex = Regex("^\\s{0,3}(\\d{1,2})[.)](?:\\s+(.*))?$")
+
+    /**
+     * Prefix test for "this line starts a numbered item" — for break/continuation
+     * decisions. Kept narrower than a bare `\d{1,2}[.)]` on purpose: `3.5 倍`
+     * is prose, not item `3.` (same rule the list branch enforces via
+     * [numberedListItemRegex] requiring whitespace or EOL after the marker).
+     */
+    private val numberedListMarkerRegex = Regex("^\\s{0,3}\\d{1,2}[.)](?:\\s|$)")
+
+    /**
+     * A blockquote line is `>` at end of line, or `>` followed by a space or a
+     * tab. `>foo` / `>5` / `>=` are PROSE — shell output and comparisons that
+     * an LLM emits constantly — and wrapping them in a quote rule is a
+     * regression the chat parser already paid for (T117). Same predicate as
+     * `ui/chat/MarkdownBlockModel.kt:isBlockquoteLine` — identical predicate,
+     * kept as a separate copy because the two parsers serve different surfaces.
+     *
+     * [dv15/B-07] One function for the three places that must agree (quote
+     * branch entry, quote collector, paragraph break): an entry predicate
+     * narrower than the collector's would produce a quote block that swallows
+     * the following lines, and a paragraph break narrower than the branch
+     * leaves quote lines stuck inside prose.
+     */
+    private fun isBlockquoteLine(line: String): Boolean {
+        val trimmed = line.trimStart()
+        if (!trimmed.startsWith(">")) return false
+        if (trimmed.length == 1) return true
+        val next = trimmed[1]
+        return next == ' ' || next == '\t'
+    }
+
+    /**
+     * True when `lines[idx]` starts a GFM table — header line plus a
+     * separator row, and at least one of the two carrying a `|`.
+     *
+     * The pipe requirement is the [T5/md-setext-table] heuristic: a pipe-less
+     * `---` matches [isTableSeparator] as a single-column separator, which
+     * turned "Title\n---" into an empty Table. Shared by the Table branch and
+     * the paragraph loop so the loop can never believe a table starts where
+     * the branch does not (that mismatch is what let a table glued to a
+     * paragraph be absorbed as prose).
+     */
+    private fun startsTable(lines: List<String>, idx: Int): Boolean =
+        idx + 1 < lines.size && isTableSeparator(lines[idx + 1]) &&
+            (lines[idx].contains('|') || lines[idx + 1].contains('|'))
 
     /**
      * Classify a media URL by file extension. Extracts the extension from the
@@ -65,16 +132,13 @@ object MarkdownParser {
      * literal or percent-encoded) still get their real extension. Handles both
      * unencoded names (e.g. `foo#China.mp4`) and encoded ones (`foo%23China.mp4`).
      */
-    private fun mediaBlockFor(alt: String, url: String): Block {
-        val lastSeg = url.substringAfterLast('/')
-        val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
-        val ext = decoded.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            in nativeVideoExts -> Block.Video(alt, url)
-            in nativeAudioExts -> Block.Audio(alt, url)
-            else -> Block.Image(alt, url)
+    private fun mediaBlockFor(alt: String, url: String): Block =
+        // [dv22/B-06] One classifier for every media surface (`ui/chat/MarkdownBlockModel.kt`).
+        when (mediaKindOfUrl(url)) {
+            MediaKind.VIDEO -> Block.Video(alt, url)
+            MediaKind.AUDIO -> Block.Audio(alt, url)
+            MediaKind.IMAGE -> Block.Image(alt, url)
         }
-    }
 
     data class ListItem(val content: String, val checked: Boolean? = null)
 
@@ -135,7 +199,7 @@ object MarkdownParser {
             }
 
             // ATX Heading
-            val headingMatch = Regex("^(#{1,6})\\s+(.+)$").find(line)
+            val headingMatch = atxHeadingRegex.find(line)
             if (headingMatch != null) {
                 val level = headingMatch.groupValues[1].length
                 // [T5/md-trailing-hash] Closing sequence: strip a trailing run of
@@ -149,11 +213,15 @@ object MarkdownParser {
             }
 
             // Blockquote
-            if (line.trimStart().startsWith("> ") || line.trimStart() == ">") {
+            if (isBlockquoteLine(line)) {
                 val quoteLines = mutableListOf<String>()
-                while (i < lines.size && (lines[i].trimStart().startsWith("> ") || lines[i].trimStart() == ">")) {
+                while (i < lines.size && isBlockquoteLine(lines[i])) {
                     val ql = lines[i].trimStart()
-                    quoteLines.add(if (ql == ">") "" else ql.removePrefix("> "))
+                    // `>` alone → empty line; `>x` / `>\tx` → strip the marker and
+                    // at most one following space (CommonMark). The old
+                    // `removePrefix("> ")` left `\t` and no-space variants intact
+                    // so the raw marker leaked into the quoted text.
+                    quoteLines.add(ql.removePrefix(">").removePrefix(" "))
                     i++
                 }
                 val inner = parse(quoteLines.joinToString("\n"))
@@ -168,9 +236,7 @@ object MarkdownParser {
             // A real table always carries a '|' in its header or separator row,
             // so require one; otherwise fall through (paragraph + thematic
             // break), which is the documented non-support of setext headings.
-            if (i + 1 < lines.size && isTableSeparator(lines[i + 1]) &&
-                (lines[i].contains('|') || lines[i + 1].contains('|'))
-            ) {
+            if (startsTable(lines, i)) {
                 val table = parseTable(lines, i)
                 if (table != null) {
                     blocks.add(table.first)
@@ -197,7 +263,14 @@ object MarkdownParser {
                     // startsWith("  ") test and was swallowed as a
                     // continuation of the previous bullet's content.
                     // containsMatchIn tests the prefix the regex reads.
-                    while (i < lines.size && lines[i].startsWith("  ") && !Regex("^\\s{0,3}[-*+]\\s").containsMatchIn(lines[i])) {
+                    // [crash-1016] A fenced code block under a bullet is a CODE BLOCK,
+                    // not continuation text: fence bodies used to leak into item
+                    // content and be inline-parsed (the chat parser's list loops had
+                    // the same hole; an empty `\(`\)` inside such a body crashed the
+                    // renderer there). Keep the two parsers in sync.
+                    while (i < lines.size && lines[i].startsWith("  ") &&
+                        !Regex("^\\s{0,3}[-*+]\\s").containsMatchIn(lines[i]) &&
+                        !lines[i].trimStart().startsWith("```")) {
                         items[items.lastIndex] = items.last().copy(
                             content = items.last().content + "\n" + lines[i].trimStart()
                         )
@@ -217,15 +290,33 @@ object MarkdownParser {
             // capped at 2 so a year/big-number paragraph ("2020 年…") is
             // never misparsed (user report); CommonMark caps at 9, we
             // deliberately go tighter.
-            val numMatch = Regex("^\\s{0,3}(\\d{1,2})[.)](?:\\s+(.*))?$").find(line)
+            val numMatch = numberedListItemRegex.find(line)
             if (numMatch != null) {
                 val startNum = numMatch.groupValues[1].toIntOrNull() ?: 1
                 val items = mutableListOf<ListItem>()
                 while (i < lines.size) {
-                    val nm = Regex("^\\s{0,3}(\\d{1,2})[.)](?:\\s+(.*))?$").find(lines[i])
+                    val nm = numberedListItemRegex.find(lines[i])
                     if (nm == null) break
                     items.add(ListItem(nm.groupValues[2]))
                     i++
+                    // Collect continuation lines (indented) — same shape as the
+                    // bullet branch above. [dv15/B-07] Without this, a wrapped
+                    // item ("1. long line" + "   still item one") ended the list
+                    // at the wrap and rendered the tail as a standalone
+                    // paragraph; the bullet branch has merged these since
+                    // [fix/audit-0917-b9]. Two exclusions mirror the bullet
+                    // branch: a deeper marker is a NEW item, and an indented
+                    // fence is a CODE BLOCK rather than continuation prose
+                    // ([crash-1016] — fence bodies must not reach the inline
+                    // renderer).
+                    while (i < lines.size && lines[i].startsWith("  ") &&
+                        !numberedListMarkerRegex.containsMatchIn(lines[i]) &&
+                        !lines[i].trimStart().startsWith("```")) {
+                        items[items.lastIndex] = items.last().copy(
+                            content = items.last().content + "\n" + lines[i].trimStart()
+                        )
+                        i++
+                    }
                 }
                 blocks.add(Block.NumberedList(startNum, items))
                 continue
@@ -263,11 +354,32 @@ object MarkdownParser {
             while (i < lines.size) {
                 val pl = lines[i]
                 if (pl.isBlank() || pl.trimStart().startsWith("```") ||
-                    pl.trimStart().startsWith("# ") || pl.trimStart().startsWith("> ") ||
+                    // [dv15/B-07] Any ATX level, not just `# `: a `##`…`######`
+                    // heading glued to the previous paragraph (no blank line)
+                    // used to be collected as paragraph text and never became a
+                    // Heading. Same predicate as the heading branch above — the
+                    // two must agree or a line can be neither block.
+                    // `trimStart()` mirrors the pre-fix predicate's own shape
+                    // (it read the trimmed line) and the twin's `isAtxHeading(t)`;
+                    // only the level-1-only part was wrong. The heading BRANCH
+                    // still reads the raw line, so an indented `  ## x` splits
+                    // off into its own Paragraph exactly as `  # x` always did —
+                    // a break set wider than the branch is safe, a narrower one
+                    // is the bug.
+                    atxHeadingRegex.matches(pl.trimStart()) ||
+                    isBlockquoteLine(pl) ||
                     Regex("^\\s{0,3}[-*+]\\s+").containsMatchIn(pl) ||
                     // Keep in sync with the numbered-list marker above (≤2 digits).
-                    Regex("^\\s{0,3}\\d{1,2}[.)](?:\\s|$)").containsMatchIn(pl) ||
+                    numberedListMarkerRegex.containsMatchIn(pl) ||
                     pl.matches(Regex("^\\s{0,3}([-*_])\\s*\\1\\s*\\1(\\s*\\1)*\\s*$")) ||
+                    // [dv15/B-07] A table glued to a paragraph: the Table rule
+                    // above only fires when the header row is a block start, so
+                    // without this break the header+separator were absorbed as
+                    // paragraph text and the whole table rendered as prose.
+                    // Exactly the branch's own predicate ([startsTable]) — not a
+                    // narrower copy — or the two paths disagree on the same two
+                    // lines depending on whether a blank line precedes them.
+                    startsTable(lines, i) ||
                     standaloneImageRegex.containsMatchIn(pl)
                 ) break
                 paraLines.add(pl)
@@ -550,34 +662,14 @@ object MarkdownParser {
     }
 
     /**
-     * Currency-skip heuristic: $5 / $10.99 should stay as plain text. Treat
-     * the `$ … $` content as math only if it has a math-ish character
-     * (`\\^_{}` / common big-symbol unicode) or is longer than 2 chars (so
-     * `x+y` qualifies but bare digits like `5` do not). Mirrors iOS.
+     * [r5-ef / F-F-07, P1] Delegates to [MarkdownMathHeuristic] — the single
+     * implementation shared with the streaming renderer. It used to be a private
+     * copy; three rounds of currency fixes landed here only, so `$5k-$10k`
+     * rendered as KaTeX while streaming and as dollars once settled. Do not
+     * re-inline the logic: `markdown_math_single_source_check` refuses a second
+     * glyph table, and `MarkdownMathParityTest` pins both callers to one answer.
      */
-    private fun looksLikeMath(content: String): Boolean {
-        if (content.isEmpty()) return false
-        // T208 Layer B: previous heuristic rejected single-letter math like
-        // `$c$` or `$i$` — `length > 2` returned false and the literal
-        // dollar-wrapped text leaked into the rendered output. Any of:
-        //   - obvious LaTeX glyphs (`\`, `^`, `_`, `{`, `}`, integrals…)
-        //   - short alphanumeric content with no whitespace and no leading
-        //     digit (currency like `$5` filtered out by the leading-digit
-        //     check; `$5.99` further filtered by the dot rule below)
-        // qualifies as math. Mirrors iOS MarkdownMathExtractor.looksLikeMath.
-        val mathChars = charArrayOf('\\', '^', '_', '{', '}', '∫', '∑', '∏', '√', '+', '-', '=', '<', '>')
-        for (c in content) {
-            if (c in mathChars) return true
-        }
-        // Currency heuristic: `$5`, `$5.99`, `$1,000` look numeric. Skip.
-        if (content[0].isDigit()) return false
-        // Whitespace at either edge usually means a stray dollar, not math.
-        if (content.first().isWhitespace() || content.last().isWhitespace()) return false
-        // Short ASCII identifier-ish content (`$c$`, `$x$`, `$pi$`) up to
-        // 30 chars is almost certainly a variable reference.
-        if (content.length <= 30 && content.all { it.isLetterOrDigit() }) return true
-        return content.length > 2
-    }
+    private fun looksLikeMath(content: String): Boolean = MarkdownMathHeuristic.looksLikeMath(content)
 
     /**
      * Walk the AST replacing math placeholders. Display-math placeholders

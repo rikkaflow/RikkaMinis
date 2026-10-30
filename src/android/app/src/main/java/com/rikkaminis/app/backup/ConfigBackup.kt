@@ -8,6 +8,7 @@ import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.db.ChatSessionEntity
 import com.rikkaminis.app.data.db.MessageEntity
@@ -17,6 +18,8 @@ import com.rikkaminis.app.data.repository.MCPRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.repository.SkillRepository
+import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.scheduled.ScheduledTasksRestoreOutcome
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -45,6 +48,12 @@ import java.io.File
 object ConfigBackup {
     private const val TAG = "ConfigBackup"
 
+    /** [fix/dv18-4 A-07] Warning sink handed to the Android-free group
+     *  run-config decode seam ([readGroupRunConfig]) — a lambda so the decode
+     *  stays JVM-unit-testable: tests capture the message instead of needing
+     *  logcat. */
+    private val warnGroupRunConfig: (String) -> Unit = { Log.w(TAG, it) }
+
     /** Bumped only on breaking payload changes; readers reject newer majors. */
     const val FORMAT_VERSION = 1
 
@@ -54,7 +63,12 @@ object ConfigBackup {
      * device-local state (session ids, cached metadata) or derived, and
      * restoring it would do more harm than good.
      */
-    private val BACKED_UP_SCOPES = setOf(
+    // [da1028-B / ISSUE-03] `internal` (not private) so
+    // ConfigBackupEnvvarsAndOverlayTest can pin the exact scope set — a
+    // text-grep probe cannot tell "envvars is in the set" from "the string
+    // appears in the KDoc". Same testability-visibility precedent as
+    // `memoryBackupEntries` / `ROLLUP_BACKUP_FILE` in this file.
+    internal val BACKED_UP_SCOPES = setOf(
         "appearance",   // theme, font scale, chat bubble/background look
         "chat",         // composer + rendering preferences
         "background",   // background image / effect settings
@@ -63,6 +77,21 @@ object ConfigBackup {
         "memory",       // memory feature toggles
         "logs",         // log retention preferences
         "runtime",      // agent-runtime knobs (e.g. max concurrent sessions)
+        // [da1028-B / ISSUE-03] `envvars.privacyMode` is a real, registered
+        // config face (ConfigBuiltins.registerEnvVars). Missing from this list
+        // it was exported by nobody and — worse — a payload that carried it
+        // was rejected on the way back in ("outside backup scope"), so
+        // migrating devices silently dropped the privacy switch.
+        //
+        // Scope "envvars" contributes exactly two registry-level fields: the
+        // `envvars` aggregate (ReadOnly, dropped by the READWRITE filter) and
+        // `envvars.privacyMode`. The per-key `envvars.<KEY>.value|note|group`
+        // children are *not* registry-level fields — they only exist through
+        // EnvVarsCollection.fields(forId) — and buildSections walks
+        // ConfigRegistry.allVisibleFieldPaths() (top-level only), so this entry
+        // cannot pull them (or a secret value) into a backup. The keys
+        // themselves travel in their own `envVars` section, secret-gated.
+        "envvars",      // env-var privacy mode toggle
     )
     // NOTE: `session.*` is deliberately NOT backed up. Despite the dot-path
     // prefix it is not a persisted preference — session.primaryModel /
@@ -122,6 +151,12 @@ object ConfigBackup {
      */
     internal class ExportSections(
         val fields: JSONObject,
+        /** Registry fields that could not be read, PLUS [FIX-P1A / FINDING-7]
+         *  env-var values that were declared to travel with secrets but could
+         *  not be read. One counter, because both mean the same thing to the
+         *  user ("this backup is missing something it claims to carry") and
+         *  both already flow to the export callers / the payload's
+         *  `readFailures`. */
         val readFailures: Int,
         val providers: JSONArray,
         val thinkingRules: JSONArray,
@@ -172,26 +207,266 @@ object ConfigBackup {
         // [feat/scheduled-tasks-l0] Scheduled-tasks document from the store
         // (null = omit the section; import side skips it like a pre-L0 file).
         scheduledTasks: JSONObject? = null,
-    ): String {
+    ): String = buildWithinCap(MAX_PAYLOAD_BYTES.toLong()) { capBytes, includeArtifacts ->
         val sections = buildSections(
             providerRepo, includeSecrets, envVarRepo, skillRepo, memoryRepo,
             mcpRepo, chatRepo, chatWindowDays, artifactRoots,
             scheduledTasks = scheduledTasks,
+            documentCapBytes = capBytes,
+            includeArtifacts = includeArtifacts,
         )
-        val payload = buildPayloadObject(sections, includeSecrets, webDavConfig).toString()
-        // [T-backup-export-size-cap] Enforce the same ceiling on the export
-        // side that import already checks (MAX_PAYLOAD_BYTES). With the byte
-        // budget packing above, chat history alone can no longer blow the
-        // cap — it is trimmed to fit. What remains possible is the non-chat
-        // skeleton itself growing past the cap (pathological skills /
-        // memory files), and for that the hard refusal below stays: it keeps
-        // the failure local and actionable instead of OOMing the import side.
-        if (payload.length > MAX_PAYLOAD_BYTES) {
-            throw IllegalStateException(
-                "Backup too large (${payload.length} chars, max $MAX_PAYLOAD_BYTES)",
+        // Two views of the SAME tree: the document, and the document minus the
+        // chat arrays. [T-backup-export-size-cap] The ladder in [buildWithinCap]
+        // can only tell "shrink chat" apart from "chat is not the problem" if
+        // it knows the non-chat size. Serializing the skeleton costs one ~3MB
+        // string here and only on this (non-production) path.
+        val skeleton = buildPayloadObject(sections, includeSecrets, webDavConfig).apply {
+            remove("chatSessions")
+            remove("chatMessages")
+            remove("chatTruncated")
+        }
+        BuiltPayload(
+            text = buildPayloadObject(sections, includeSecrets, webDavConfig).toString(),
+            nonChatBytes = utf8Length(skeleton.toString()),
+            hadArtifacts = sections.artifacts.has("archive"),
+            // Only evaluated when the ladder gives up — see [oversizeMessage].
+            sectionBreakdown = { describeSections(sections) },
+        )
+    }
+
+    /**
+     * [D-C fix/backup-bootstrap-size] One attempt of [export]'s size ladder.
+     *
+     * @property text the serialized document.
+     * @property nonChatBytes UTF-8 size of everything EXCEPT the two chat
+     *   arrays (fields / providers / skills / memory files / artifacts). This
+     *   is what decides whether shrinking chat can bring the document under
+     *   the cap at all: a skeleton that is already over it cannot be rescued
+     *   by dropping chat, and pretending otherwise burns rebuild rounds.
+     * @property hadArtifacts whether this attempt embedded the artifact zip —
+     *   the only large section that is optional by design, so it is the last
+     *   thing the ladder gives up.
+     * @property sectionBreakdown lazy per-section sizes for the failure
+     *   message. A lambda so the happy path never pays for serializing every
+     *   section again (the artifact archive alone is a ~12MB base64 string).
+     */
+    internal class BuiltPayload(
+        val text: String,
+        val nonChatBytes: Long,
+        val hadArtifacts: Boolean,
+        val sectionBreakdown: () -> String = { "" },
+    )
+
+    /** [D-C fix/backup-bootstrap-size] How many times the ladder may shrink the
+     *  chat budget before it starts giving up sections. 0.7^4 ≈ 24% of the
+     *  original budget — enough to absorb any estimation drift, bounded so a
+     *  pathological payload cannot spin. */
+    internal const val EXPORT_CHAT_DEGRADE_ROUNDS = 4
+
+    /** [D-C fix/backup-bootstrap-size] Per-round chat-budget shrink factor. 0.7
+     *  is the largest drop that still keeps a usable prefix of history per
+     *  round (halving would throw a plausible export away to save a few bytes). */
+    internal const val EXPORT_CHAT_DEGRADE_FACTOR = 0.7
+
+    /**
+     * [D-C fix/backup-bootstrap-size] Produce a document that is guaranteed to
+     * fit the IMPORT side's ceiling, degrading content instead of refusing.
+     *
+     * Why the ladder exists at all: before the unit fix, export measured
+     * `payload.length` (UTF-16 code units) while import measured UTF-8 BYTES.
+     * Chinese-heavy payloads sit at bytes/chars ≈ 1.08, so a 71.4MB file
+     * passed export at 66.1M "chars" and was then permanently unimportable —
+     * the user's only backup. With both sides in bytes the budget packing in
+     * [buildSections] already keeps chat inside the cap; this ladder is the
+     * belt for everything the budget cannot see (a skeleton that grew since
+     * the measurement, a serializer change, an artifact zip that base64-
+     * inflates past what was estimated). Losing the tail of the chat history
+     * is always better than producing a file that cannot be restored.
+     *
+     * Order: chat rounds (×[EXPORT_CHAT_DEGRADE_FACTOR], at most
+     * [EXPORT_CHAT_DEGRADE_ROUNDS]) → drop the artifact archive (once) →
+     * throw with a per-section breakdown. Chat first because it is the bulk
+     * and the safest to trim (the restore already reports what it dropped);
+     * artifacts last because they are the agent's actual outputs.
+     *
+     * Extracted (rather than inlined in [export]) so the ladder is JVM-testable
+     * with a fake builder: the 64MiB cap cannot be exercised in a unit test
+     * without allocating 64MiB of Chinese text, but the DECISION logic can.
+     */
+    internal suspend fun buildWithinCap(
+        capBytes: Long,
+        // Headroom the DOCUMENT must keep free beyond the skeleton for chat to
+        // be worth re-packing (production: SAFETY_MARGIN_BYTES). A parameter
+        // because a test-scale cap (a few KB) is smaller than the real 1MB
+        // margin, which would make every fake payload look skeleton-bound.
+        safetyMarginBytes: Long = SAFETY_MARGIN_BYTES.toLong(),
+        build: suspend (capBytes: Long, includeArtifacts: Boolean) -> BuiltPayload,
+    ): String {
+        var scale = 1.0
+        var includeArtifacts = true
+        var chatRounds = 0
+        var artifactsDropped = false
+        while (true) {
+            val attemptCap = (capBytes * scale).toLong().coerceAtLeast(0L)
+            val attempt = build(attemptCap, includeArtifacts)
+            val totalBytes = utf8Length(attempt.text)
+            if (totalBytes <= capBytes) return attempt.text
+            val chatBytes = totalBytes - attempt.nonChatBytes
+            // Can chat be the culprit? Only if something is left of it AND the
+            // skeleton plus its headroom still leaves room for it.
+            val chatCanHelp = chatBytes > 0 &&
+                attempt.nonChatBytes + safetyMarginBytes < capBytes
+            if (chatCanHelp && chatRounds < EXPORT_CHAT_DEGRADE_ROUNDS) {
+                chatRounds++
+                scale *= EXPORT_CHAT_DEGRADE_FACTOR
+                continue
+            }
+            if (includeArtifacts && attempt.hadArtifacts && !artifactsDropped) {
+                artifactsDropped = true
+                includeArtifacts = false
+                continue
+            }
+            throw IllegalStateException(oversizeMessage(capBytes, totalBytes, attempt))
+        }
+    }
+
+    /** Which section blew the cap, and what the user can do about it. Names
+     *  sizes because "too large" without a culprit left the 2026-10-27 user
+     *  with no move except hand-trimming the JSON. */
+    private fun oversizeMessage(
+        capBytes: Long,
+        totalBytes: Long,
+        attempt: BuiltPayload,
+    ): String {
+        val chatBytes = totalBytes - attempt.nonChatBytes
+        val kb = { v: Long -> "${v / 1024}KB" }
+        return "Backup too large: ${totalBytes} bytes (${kb(totalBytes)}), cap " +
+            "$capBytes bytes (${kb(capBytes)}). Sections: ${attempt.sectionBreakdown()}; " +
+            "chat=${kb(chatBytes)} (already trimmed over " +
+            "$EXPORT_CHAT_DEGRADE_ROUNDS rounds). The import side enforces the same " +
+            "byte cap, so a larger file could not be restored. To fit: remove or " +
+            "shrink oversized skills, trim daily memory logs, shorten the chat " +
+            "history window, or exclude the artifact archive, then export again."
+    }
+
+    /** Per-section UTF-8 sizes of a built payload, largest first. Called only
+     *  from [oversizeMessage]; every section is re-serialized here. */
+    private fun describeSections(sections: ExportSections): String {
+        val sizes = listOf(
+            "fields" to sections.fields,
+            "providers" to sections.providers,
+            "thinkingRules" to sections.thinkingRules,
+            "groups" to sections.groups,
+            "envVars" to sections.envVars,
+            "skills" to sections.skills,
+            "memoryFiles" to sections.memoryFiles,
+            "mcpServers" to sections.mcpServers,
+            "artifacts" to sections.artifacts,
+            "scheduledTasks" to (sections.scheduledTasks ?: JSONObject()),
+        ).map { (name, value) -> name to utf8Length(value.toString()) }
+            .sortedByDescending { it.second }
+        return sizes.joinToString(", ") { (name, bytes) -> "$name=${bytes / 1024}KB" }
+    }
+
+    /**
+     * [D-B fix/backup-bootstrap-size] Outcome of merging a backed-up WebDAV
+     * server block into whatever this install already holds.
+     *
+     * @property config the config to persist, or null when the backup block
+     *   has no url (nothing to restore — same as before this fix).
+     * @property notice one line for [ImportResult.skipped] when the user has to
+     *   know something happened to the password; null when the restore is
+     *   complete and self-explanatory.
+     */
+    internal class WebDavRestorePlan(
+        val config: WebDavConfig?,
+        val notice: String?,
+    )
+
+    /**
+     * [D-B fix/backup-bootstrap-size] Decide what the `webdavConfig` section of
+     * a backup means on THIS install.
+     *
+     * The trap this exists to avoid: [WebDavConfigStore.save] documents that a
+     * BLANK password CLEARS the stored password (the dialog pre-fills it, so a
+     * blank only ever means "the user cleared it"). A secrets-free backup has
+     * no password by construction, so naively handing its blanks to save()
+     * would delete the password the user had just retyped — turning a restore
+     * into a silent wipe of the very credential the restore was supposed to
+     * leave in place. Three cases, in order:
+     *
+     *  1. backup carries a non-blank password (secrets export) → it wins
+     *     outright. This is the family's restore-is-restore rule (providers /
+     *     groups behave the same way).
+     *  2. backup carries no (or a blank) password, this install has one →
+     *     keep the local password, take url/username/path from the backup.
+     *     Nothing is lost and nothing is cleared.
+     *  3. backup carries no password and this install has none (fresh
+     *     reinstall — the deadlock case) → store the three non-secret fields
+     *     and tell the user the password still has to be typed. That is the
+     *     whole point: three fields restored instead of zero, and the hint
+     *     arrives through the existing `skipped` channel instead of a new UI.
+     */
+    internal fun resolveWebDavRestore(
+        backup: JSONObject,
+        existing: WebDavConfig?,
+    ): WebDavRestorePlan {
+        val url = backup.optString("url", "")
+        if (url.isEmpty()) return WebDavRestorePlan(config = null, notice = null)
+        val username = backup.optString("username", "")
+        val path = backup.optString("path", WebDavConfig.DEFAULT_BACKUP_DIR)
+        val backedUpPassword = backup.optString("password", "")
+        if (backedUpPassword.isNotEmpty()) {
+            return WebDavRestorePlan(
+                config = WebDavConfig(url, username, backedUpPassword, path),
+                notice = null,
             )
         }
-        return payload
+        val keptPassword = existing?.password.orEmpty()
+        return if (keptPassword.isNotEmpty()) {
+            WebDavRestorePlan(
+                config = WebDavConfig(url, username, keptPassword, path),
+                notice = "webdav: 密码沿用本机现有配置（备份未包含密钥）",
+            )
+        } else {
+            WebDavRestorePlan(
+                config = WebDavConfig(url, username, "", path),
+                notice = "webdav 密码需重新填写（备份未包含密钥）",
+            )
+        }
+    }
+
+    /**
+     * [D-B fix/backup-bootstrap-size] The `webdavConfig` section for a backup
+     * payload, or null when nothing should be written (no server configured).
+     *
+     * Deliberately a standalone pure function (JVM-testable): the gate split
+     * here is the whole fix, and a text probe cannot tell "password omitted"
+     * from "password present but empty". Contract:
+     *  - no config → null → the section is absent (never an empty object —
+     *    import keys off section presence);
+     *  - `includeSecrets=false` → url / username / path only, NO `password`
+     *    key at all. Import keys off the *absence* of the password field to
+     *    preserve the local password — see [resolveWebDavRestore];
+     *  - `includeSecrets=true` → all four fields, even a blank password
+     *    (writing `"password": ""` makes the no-secrets intent explicit and
+     *    round-trips to "store the blank", which is what the user had).
+     *
+     * If the product ever reclassifies the username as a credential, revert
+     * this function to the pre-D-B single `includeSecrets &&` gate — that
+     * restores the old semantics wholesale (section absent without secrets).
+     */
+    internal fun buildWebDavConfigSection(
+        includeSecrets: Boolean,
+        webDavConfig: WebDavConfig?,
+    ): JSONObject? {
+        if (webDavConfig == null) return null
+        return JSONObject().apply {
+            put("url", webDavConfig.url)
+            put("username", webDavConfig.username)
+            put("path", webDavConfig.path)
+            if (includeSecrets) put("password", webDavConfig.password)
+        }
     }
 
     /**
@@ -223,18 +498,17 @@ object ConfigBackup {
         // backup (brief §6.6). Additive section: absent in pre-L0 backups, and
         // import treats absence as "nothing to restore" (no version bump).
         sections.scheduledTasks?.let { put("scheduledTasks", it) }
-        // [T-auto-backup-assets] The WebDAV server config rides the same
-        // secrets gate as provider keys: it contains the server password.
-        // Without secrets we never carry it — a restore that drops every
-        // credential also drops the server it would reconnect to.
-        if (includeSecrets && webDavConfig != null) {
-            put("webdavConfig", JSONObject().apply {
-                put("url", webDavConfig.url)
-                put("username", webDavConfig.username)
-                put("password", webDavConfig.password)
-                put("path", webDavConfig.path)
-            })
-        }
+        // [D-B fix/backup-bootstrap-size] The WebDAV server block used to ride
+        // the secrets gate AS A WHOLE, which deadlocked the one scenario it is
+        // for: the config lives in EncryptedSharedPreferences, so a re-signed
+        // reinstall always loses it — "restore your remote backups" demanded
+        // the remote credentials, and those were the thing that was lost.
+        // url / username / path are configuration, not credentials: url+path
+        // only say WHERE, and username grants nothing without the password
+        // (same level as CF_ACCOUNT_EMAIL, which has always travelled in
+        // cleartext config). Only `password` is gated. Net effect on a fresh
+        // install: three fields arrive by restore, one still has to be typed.
+        buildWebDavConfigSection(includeSecrets, webDavConfig)?.let { put("webdavConfig", it) }
         if (sections.readFailures > 0) put("readFailures", sections.readFailures)
     }
 
@@ -242,7 +516,11 @@ object ConfigBackup {
      * [T-backup-streaming-export] Stream the document to [writer] without ever
      * materializing it as a String: the non-chat skeleton is stringified once
      * (~2-4MB even on a heavy install), then the chat arrays are written
-     * element by element. Returns the number of unreadable fields.
+     * element by element. Returns the number of unreadable items: registry
+     * fields that failed to read, plus [FIX-P1A / FINDING-7] env-var values
+     * that `includeSecrets` promised to carry but could not read (those also
+     * get `_valueUnreadable` on their entry, so the payload itself is
+     * self-reconcilable).
      *
      * Peak heap is bounded by the largest single element instead of the whole
      * document, which is what keeps a 90-day export inside a 512MB largeHeap.
@@ -351,6 +629,16 @@ object ConfigBackup {
         chatWindowDays: Int = 90,
         artifactRoots: List<File>? = null,
         scheduledTasks: JSONObject? = null,
+        // [D-C fix/backup-bootstrap-size] The ceiling this assembly packs
+        // against, in UTF-8 BYTES. Defaults to the real import cap; [export]'s
+        // size ladder lowers it on retries (×0.7) so the chat packer trims
+        // harder instead of the caller re-slicing a finished document.
+        documentCapBytes: Long = MAX_PAYLOAD_BYTES.toLong(),
+        // [D-C] The ladder's last resort: the artifact archive is the only
+        // large section that is optional by design, so it can be excluded
+        // outright. False = the `artifacts` section stays empty (import treats
+        // an absent archive exactly like a pre-artifact backup).
+        includeArtifacts: Boolean = true,
     ): ExportSections {
         val registry = ConfigRegistry.get()
 
@@ -455,7 +743,17 @@ object ConfigBackup {
         // file so a multi-MB set never sits fully in memory as a string.
         val artifacts = JSONObject()
         var artifactSkipped = 0
-        if (artifactRoots != null && artifactRoots.isNotEmpty()) {
+        // [D-C fix/backup-bootstrap-size] `includeArtifacts=false` is the size
+        // ladder's last resort (see [buildWithinCap]).
+        // [FIX-R5-B1 / F-12] …and it used to leave a bare `{}` — the same shape
+        // as "this device had no artifacts at all" — so the import side had no
+        // way to tell the user that the archive had been thrown away to fit the
+        // cap. Now the section SAYS SO, and Stage 9 turns that claim into a
+        // `skipped` line. Only claimed when there was something to drop.
+        if (!includeArtifacts && artifactRoots != null && artifactRoots.isNotEmpty()) {
+            artifacts.put(ARTIFACTS_DROPPED_FOR_SIZE, true)
+        }
+        if (includeArtifacts && artifactRoots != null && artifactRoots.isNotEmpty()) {
             val archiveFile = java.io.File.createTempFile("artifact-backup-", ".zip")
             try {
                 var totalBytes = 0L
@@ -474,10 +772,25 @@ object ConfigBackup {
                             )
                             val prefix = if (isMcpRoot) "mcp" else "shared"
                             artifactSkipped += sel.oversizedSkipped + sel.nonTextSkipped
+                            // [dv20-a1 A-01] A credentials-free export must not
+                            // carry the MCP server config in the clear. This
+                            // artifact face was the one channel that ignored
+                            // `includeSecrets`, so a servers.json with
+                            // headers/env/args-token/url-query rode the "mcp/"
+                            // prefix into the archive while Stage 5 was busy
+                            // stripping those very fields out of the
+                            // `mcpServers` section. The redactor IS Stage 5's
+                            // single source (stripExportedMcpSecrets) — no
+                            // second rule. Gated on `!includeSecrets` so an
+                            // explicit with-credentials export is untouched.
+                            val transform =
+                                if (isMcpRoot && !includeSecrets) ::redactMcpArtifactEntry else null
+                            val dropped = ArrayList<String>()
                             totalBytes += ArtifactArchiver.writeEntries(
-                                zos, root, sel.files, "$prefix/",
+                                zos, root, sel.files, "$prefix/", transform, dropped,
                             )
-                            fileCount += sel.files.size
+                            fileCount += sel.files.size - dropped.size
+                            artifactSkipped += dropped.size
                         }
                     }
                 }
@@ -489,8 +802,13 @@ object ConfigBackup {
                     )
                     artifacts.put("archiveBytes", zipBytes.size)
                     artifacts.put("fileCount", fileCount)
-                    if (artifactSkipped > 0) artifacts.put("skipped", artifactSkipped)
                 }
+                // [FIX-R3-D / F-12] The skip count rides the section even when
+                // nothing survived the cap (fileCount == 0): it used to be
+                // nested inside the archive branch, so "5 files were left out"
+                // was only reported when at least one file made it in — the
+                // all-skipped case read as "there was nothing here".
+                if (artifactSkipped > 0) artifacts.put("skipped", artifactSkipped)
             } finally {
                 runCatching { archiveFile.delete() }
             }
@@ -502,21 +820,47 @@ object ConfigBackup {
         // Values are credentials, so they ride the same includeSecrets gate as
         // provider apiKeys: without secrets we carry key+note only and the user
         // refills the value after import.
+        // [FIX-P1A / FINDING-7] `includeSecrets=true` used to mean "every value
+        // that happened to be readable" with no trace of the rest: the payload
+        // still declared `includesSecrets`, the entry still appeared, and only
+        // the `value` key was silently absent — indistinguishable from "the
+        // user never set one". On a device whose encrypted store is gone (the
+        // exact world a restore exists for) that produced an empty-shell
+        // backup the user believed was complete. The pass now ACCOUNTS for
+        // every value it could not read: a per-entry `_valueUnreadable` marker
+        // (the same `_`-prefixed backup-layer annotation convention as
+        // `_entryIds`) plus a bump of [ExportSections.readFailures], which the
+        // export callers already surface. No new top-level field, so the
+        // payload contract (buildPayloadObject / the streaming frame list) is
+        // untouched, and import ignores unknown keys.
         val envVars = JSONArray()
+        var missingSecretValues: List<String> = emptyList()
         if (envVarRepo != null) {
-            for (entry in envVarRepo.entries.value) {
-                envVars.put(JSONObject().apply {
-                    put("key", entry.key)
-                    put("note", entry.note)
+            val built = buildEnvVarExportEntries(
+                entries = envVarRepo.entries.value.map {
                     // [T-envvar-group-sync] group rides the metadata (never
                     // secret-gated): a restore without it silently flattens
                     // the user's grouping, which is exactly the
                     // field-evap class [T-fix-backup-field-evap] guards.
-                    if (entry.group.isNotEmpty()) put("group", entry.group)
-                    if (includeSecrets) {
-                        envVarRepo.getValue(entry.key)?.let { put("value", it) }
-                    }
-                })
+                    EnvVarBackupMeta(key = it.key, note = it.note, group = it.group)
+                },
+                includeSecrets = includeSecrets,
+                // A THROWING read is a missing value, not a fatal export: the
+                // whole point is that the gap becomes visible, not that one
+                // unreadable credential costs the user their entire backup.
+                readValue = { key -> runCatching { envVarRepo.getValue(key) }.getOrNull() },
+            )
+            for (i in 0 until built.entries.length()) {
+                built.entries.optJSONObject(i)?.let { envVars.put(it) }
+            }
+            missingSecretValues = built.missingSecretValues
+            if (missingSecretValues.isNotEmpty()) {
+                readFailures += missingSecretValues.size
+                Log.w(
+                    TAG,
+                    "export: ${missingSecretValues.size} env var value(s) unreadable, " +
+                        "carried key only: ${summariseIds(missingSecretValues)}",
+                )
             }
         }
 
@@ -592,10 +936,28 @@ object ConfigBackup {
         // with the switch in the right position and nothing behind it.
         val memoryFiles = JSONArray()
         if (memoryRepo != null) {
-            for (info in runCatching { memoryRepo.listAllFiles() }.getOrDefault(emptyList())) {
-                val content = runCatching { memoryRepo.readFile(info.name) }.getOrNull() ?: continue
+            // [FIX-E / ISSUE-09] listAllFiles() deliberately hides the distilled
+            // MEMORY-ROLLUP.md from the settings list — memoryBackupEntries()
+            // puts it back for the payload only, so a restored device keeps the
+            // distilled rules the daily logs were folded into.
+            //
+            // [FIX-R3-D / F-05] The reader is the export's own "is this file
+            // there" rule, not `readFile`'s folded `""`: `listAllFiles` lists
+            // GLOBAL.md even when it does not exist, and a device without one
+            // used to export `content:""` for it — which the restore side's
+            // guard then (correctly) refuses to apply over real content.
+            val entries = memoryBackupEntries(
+                listed = runCatching { memoryRepo.listAllFiles() }
+                    .getOrDefault(emptyList()).map { it.name },
+            ) { name ->
+                readMemoryFileForBackup(
+                    runCatching { memoryRepo.memoryDirectory() }.getOrNull(),
+                    name,
+                )
+            }
+            for ((name, content) in entries) {
                 memoryFiles.put(JSONObject().apply {
-                    put("name", info.name)
+                    put("name", name)
                     put("content", content)
                 })
             }
@@ -637,18 +999,25 @@ object ConfigBackup {
         val chatSessionList = mutableListOf<JSONObject>()
         val chatMessageList = mutableListOf<JSONObject>()
         var chatTruncated: JSONObject? = null
+        // [fix/meta1028-d1 F-04] Rows that exist in the DB but could not be read
+        // at all. Distinct from the budget counters below: those mean "we chose
+        // not to carry this", these mean "we could not look at it". Both have to
+        // reach the user, otherwise a damaged read looks like a clean backup.
+        var chatReadFailures = 0
         if (chatRepo != null && chatWindowDays > 0) {
             // Serialize the non-chat skeleton ONCE to measure its exact
-            // serialized cost; the chat sections get whatever budget is left
-            // under MAX_PAYLOAD_BYTES. SAFETY_MARGIN_BYTES absorbs the JSON
+            // serialized cost IN UTF-8 BYTES (the unit the import side
+            // enforces — see the [ChatBackupBudget] header); the chat sections
+            // get whatever budget is left under MAX_PAYLOAD_BYTES.
+            // SAFETY_MARGIN_BYTES absorbs the JSON
             // escaping / separators between the skeleton and the chat arrays
             // plus any drift between the estimate and the final document.
             //
-            // [T-backup-lazy-chat-load] Take the LENGTH only. Binding the
+            // [T-backup-lazy-chat-load] Take the measurement only. Binding the
             // string to a val here kept ~40MB of UTF-16 reachable for the
             // whole chat-packing block below, on top of the tree it was
             // rendered from and the arrays that accumulate during packing.
-            val skeletonChars = JSONObject().apply {
+            val skeletonBytes = JSONObject().apply {
                 put("format", "openminis.config.backup")
                 put("version", FORMAT_VERSION)
                 put("createdAt", System.currentTimeMillis())
@@ -671,7 +1040,7 @@ object ConfigBackup {
                 // time; webdavConfig isn't in buildSections scope.)
                 scheduledTasks?.let { put("scheduledTasks", it) }
                 if (readFailures > 0) put("readFailures", readFailures)
-            }.toString().length
+            }.toString().let(::utf8Length)
 
             val cutoff = System.currentTimeMillis() - chatWindowDays * 24L * 3600 * 1000
             val sessions = runCatching {
@@ -711,15 +1080,42 @@ object ConfigBackup {
             }
 
             val packed = packChatHistoryWithBudgetLazily(
-                skeletonChars = skeletonChars,
-                budgetTotalChars = (MAX_PAYLOAD_BYTES - SAFETY_MARGIN_BYTES).toLong(),
+                skeletonBytes = skeletonBytes,
+                // [D-C fix/backup-bootstrap-size] Bytes on both ends: the cap
+                // the import side enforces (readSafBytes + import's byte gate)
+                // and the margin are UTF-8 bytes, and so is every charge the
+                // packer makes. `documentCapBytes` is lowered by export()'s
+                // size ladder on retries, which is why this is not the
+                // constant directly.
+                budgetTotalBytes = documentCapBytes - SAFETY_MARGIN_BYTES,
                 sessionJsons = sessionJsons,
                 messagesAt = { index ->
-                    runCatching {
-                        chatRepo.dao.messagesLast(
+                    // [fix/meta1028-d1 F-04] Was a bare
+                    // `chatRepo.dao.messagesLast(...)` inside
+                    // `runCatching { }.getOrDefault(emptyList())`: one
+                    // CursorWindow overflow (a single oversized parts_json /
+                    // reasoning_content row) turned into "this session has no
+                    // messages", the session header still shipped, and the
+                    // export reported success. Route through the tolerant tail
+                    // read and ACCOUNT for what it could not read.
+                    val tail = try {
+                        chatRepo.loadMessagesTailTolerant(
                             sessions[index].id, MAX_CHAT_MESSAGES_PER_SESSION,
                         )
-                    }.getOrDefault(emptyList()).map { m ->
+                    } catch (e: Exception) {
+                        runCatching {
+                            Log.w(
+                                TAG,
+                                "export: could not read messages for session " +
+                                    "${sessions[index].id}: ${e.message}",
+                            )
+                        }
+                        null
+                    }
+                    if (tail == null) chatReadFailures += 1
+                    else chatReadFailures += tail.unreadableRows
+                    val messages = tail?.messages ?: emptyList()
+                    messages.map { m ->
                         BudgetChatMessage(
                             id = m.id,
                             sessionId = m.sessionId,
@@ -737,17 +1133,21 @@ object ConfigBackup {
             for (s in packed.sessions) chatSessionList.add(s)
             for (m in packed.messages) chatMessageList.add(m)
 
-            if (packed.sessionsDropped > 0 || packed.messagesDropped > 0) {
+            if (packed.sessionsDropped > 0 || packed.messagesDropped > 0 || chatReadFailures > 0) {
                 chatTruncated = JSONObject().apply {
                     put("sessionsDropped", packed.sessionsDropped)
                     put("messagesDropped", packed.messagesDropped)
+                    // [fix/meta1028-d1 F-04] "could not read" is not "trimmed to
+                    // fit" — see chatTruncationNotes.
+                    if (chatReadFailures > 0) put("messagesUnreadable", chatReadFailures)
                     put("budgetBytes", MAX_PAYLOAD_BYTES)
                 }
                 Log.w(
                     TAG,
-                    "export: chat history budget-trimmed " +
+                    "export: chat history incomplete " +
                         "(sessionsDropped=${packed.sessionsDropped} " +
-                        "messagesDropped=${packed.messagesDropped})",
+                        "messagesDropped=${packed.messagesDropped} " +
+                        "messagesUnreadable=$chatReadFailures)",
                 )
             }
         }
@@ -838,16 +1238,34 @@ object ConfigBackup {
         // [feat/scheduled-tasks-l0] Restores the scheduled-tasks document via
         // the store (caller supplies the suspension point — this class has no
         // Context). Absent/null section = pre-L0 backup, stage skipped.
-        onScheduledTasks: (suspend (JSONObject) -> Unit)? = null,
+        // [FIX-1028 / A-16] Returns what the store DID: the store refuses to
+        // overwrite a non-empty local task set with an empty/unknown-version
+        // section, and that refusal has to reach the user instead of being
+        // reported as `scheduledTasksImported = true`. Null = caller has no
+        // report (treated as applied, which is the pre-fix contract).
+        onScheduledTasks: (suspend (JSONObject) -> ScheduledTasksRestoreOutcome?)? = null,
+        // [D-B fix/backup-bootstrap-size] The WebDAV server config this install
+        // currently holds (caller reads it from WebDavConfigStore — this class
+        // has no Context). Needed because a secrets-free backup carries no
+        // password, and [WebDavConfigStore.save] treats a blank password as
+        // "clear the stored one": applying such a backup blind would wipe the
+        // password the user just retyped. Null = nothing stored here, so a
+        // missing backup password really does mean "ask the user".
+        existingWebDavConfig: WebDavConfig? = null,
     ): ImportResult {
         // [fix-audit-p1-2] Reject oversized documents BEFORE any parsing /
         // decoding: a backup with embedded skill archives or chat history is
         // Base64-decoded into full byte arrays in memory, so an unbounded
         // payload is an OOM door. This check runs on the raw string, before
         // JSONTokener allocates the parsed tree.
-        if (json.length > MAX_PAYLOAD_BYTES) {
+        // [D-C fix/backup-bootstrap-size] Measured in UTF-8 BYTES — the same
+        // unit the SAF read cap (BackupSettingsScreen) and the export-side
+        // budget use. It used to be `.length` (UTF-16 code units) while the
+        // reader above it capped bytes, so every non-ASCII document was
+        // judged by two different rulers.
+        if (documentExceedsPayloadCap(json)) {
             throw InvalidBackupException(
-                "Backup too large (${json.length} chars, max ${MAX_PAYLOAD_BYTES})"
+                "Backup too large (${utf8Length(json)} bytes, max $MAX_PAYLOAD_BYTES)"
             )
         }
         val root = try {
@@ -895,6 +1313,21 @@ object ConfigBackup {
         // stage can re-attach rules to the instance that now owns the label
         // (merge and append paths both re-mint or reuse ids).
         val providerKeyToId = HashMap<String, String>()
+        // [FIX-R5-B1 / F-05] The ids that took each (providerType, label), in
+        // arrival order — the order the `providers` array and the
+        // `thinkingRules` groups share. Consumed front-first by Stage 1.5 so a
+        // duplicate label no longer loses one instance's whole rules group.
+        val idsByProviderKey = HashMap<String, MutableList<String>>()
+        // [FIX-R3-D / F-08] Instance ids Stage 1 already created or merged into
+        // during THIS run. A backup legitimately carries two providers with the
+        // same (providerType, label) — e.g. the user duplicated an OpenAI
+        // instance and gave both the same label, or imported one twice before
+        // the conflict rename existed. `mergeImportInstanceJSON` matches on
+        // exactly that pair against the LIVE list, so without this set the
+        // second entry of the pair silently merged into the instance the first
+        // one had just produced: one provider lost, the second one's
+        // credentials/settings overwritten, and `providersImported == 2`.
+        val claimedInstanceIds = HashSet<String>()
         try {
 
         // [T-backup-group-idmap] Order matters. Providers create the model
@@ -927,9 +1360,23 @@ object ConfigBackup {
                     // otherwise fall back to the classic append-and-pair.
                     // [T-backup-restore-credentials] A restore applies the
                     // backup's credentials to the existing instance.
-                    val merged = providerRepo.mergeImportInstanceJSON(
-                        obj.toString(), srcEntryIds,
-                    )
+                    //
+                    // [FIX-R3-D / F-08] …unless this run already claimed the
+                    // matching instance (the duplicate-label case above): then
+                    // the entry is an ADDITIONAL provider and takes the append
+                    // path, which renames its label instead of overwriting a
+                    // sibling.
+                    val matchedLiveId = providerRepo.instances.firstOrNull {
+                        it.providerType.name == obj.optString("providerType", "") &&
+                            it.label == label
+                    }?.id
+                    val merged = if (shouldMergeIntoExisting(matchedLiveId, claimedInstanceIds)) {
+                        providerRepo.mergeImportInstanceJSON(
+                            obj.toString(), srcEntryIds,
+                        )
+                    } else {
+                        null
+                    }
                     val resolvedLabel: String?
                     if (merged != null) {
                         resolvedLabel = label
@@ -984,9 +1431,36 @@ object ConfigBackup {
                             it.providerType.name == obj.optString("providerType", "")
                     }?.id
                     if (instId != null) {
+                        // [FIX-R3-D / F-08] Whatever this entry produced/merged
+                        // into is off the table as a merge target for the REST
+                        // of this document.
+                        claimedInstanceIds.add(instId)
+                        // [da1031-A] Key by the BACKUP's original label, not the
+                        // possibly auto-renamed one: Stage 1.5 looks rules up by
+                        // the (providerType, providerLabel) pair the rules export
+                        // carried, and importInstanceJSON's conflict rename
+                        // ("$label ($suffix)") never appears there. Keying by
+                        // resolvedLabel made every renamed import lose its whole
+                        // thinking-rules group.
+                        //
+                        // The key expression stays spelled inline here (no local
+                        // val, no helper) because `backup_remap_rollup_check.py`
+                        // pins this exact shape as the Stage-1 registration and
+                        // mutates it to prove the criterion has teeth.
                         providerKeyToId[
-                            obj.optString("providerType", "") + "\u0000" + resolvedLabel
+                            obj.optString("providerType", "") + "\u0000" + label
                         ] = instId
+                        // [FIX-R5-B1 / F-05] …and keep EVERY id that took this
+                        // key, in arrival order. The single slot above can only
+                        // answer "who owns this key" (last write wins), which
+                        // made Stage 1.5 hand BOTH thinking-rules groups of a
+                        // duplicate-label pair to the SECOND instance — the
+                        // first came out with no rules at all. The rules groups
+                        // are written in provider order, so the i-th group for a
+                        // key belongs to the i-th provider for that key.
+                        idsByProviderKey.getOrPut(
+                            obj.optString("providerType", "") + "\u0000" + label
+                        ) { ArrayList() }.add(instId)
                     }
                 } catch (t: Throwable) {
                     skipped.add("provider \"$label\": ${t.message ?: "import failed"}")
@@ -1007,10 +1481,27 @@ object ConfigBackup {
                 val type = group.optString("providerType", "")
                 val label = group.optString("providerLabel", "")
                 val rules = group.optJSONArray("rules") ?: continue
-                val instId = providerKeyToId["$type\u0000$label"]
+                // [FIX-R5-B1 / F-05] One rules group per provider entry that had
+                // rules, in provider order. Take the next id registered for this
+                // key from the arrival-order list; the single slot (the LAST
+                // instance that took the key) is the fallback for a payload that
+                // carries more groups than providers.
+                val pendingForThisKey = idsByProviderKey["$type\u0000$label"]
+                val nextInOrder = if (pendingForThisKey.isNullOrEmpty()) {
+                    null
+                } else {
+                    pendingForThisKey.removeAt(0)
+                }
+                val instId = nextInOrder ?: providerKeyToId["$type\u0000$label"]
                 if (instId == null) {
                     skipped.add("thinking rules for \"$label\" (provider not restored)")
                     continue
+                }
+                if (nextInOrder == null && pendingForThisKey != null) {
+                    skipped.add(
+                        "thinking rules for \"$label\": more rule groups than restored " +
+                            "providers for this key, applied to its last instance"
+                    )
                 }
                 try {
                     thinkingRulesImported += providerRepo.restoreThinkingRules(instId, rules)
@@ -1023,10 +1514,26 @@ object ConfigBackup {
         // -- Stage 2: model groups (remaps member entry ids, builds group map) --
         val groups = root.optJSONArray("groups")
         if (groups != null) {
-            val existingGroupIds = providerRepo.config.value.modelGroups.map { it.id }.toSet()
-            val existingGroupNames = providerRepo.config.value.modelGroups.map { it.name }.toSet()
+            // [FIX-R5-B1 / F-05] Group ids Stage 2 has already claimed during
+            // THIS run (created, or merged into). Without it the same-name
+            // branch below treats the group the FIRST entry just created as
+            // "an existing local group" and merges the second backup group into
+            // it: members union (fine) but the run-config is written a second
+            // time, so the backup's second group's strategy / thinking level /
+            // context limit silently overwrite the first's, one group is lost,
+            // and `groupsImported == 2`. Stage 1 has the identical guard
+            // ([claimedInstanceIds] + [shouldMergeIntoExisting]); this is its
+            // Stage 2 twin.
+            val claimedGroupIds = HashSet<String>()
             for (i in 0 until groups.length()) {
                 val g = groups.optJSONObject(i) ?: continue
+                // Read the live list per entry: both sets below feed DECISIONS
+                // (which source id is free, which name needs a "(2)" suffix) and
+                // a snapshot taken before the loop made the rename branch dead
+                // code — every same-name entry merged instead.
+                val liveGroups = providerRepo.config.value.modelGroups
+                val existingGroupIds = liveGroups.map { it.id }.toSet()
+                val existingGroupNames = liveGroups.map { it.name }.toSet()
                 val srcId = g.optString("id", "")
                 val name = g.optString("name", "group #${i + 1}")
                 // Remap member entries through the entry map; drop members whose
@@ -1037,7 +1544,14 @@ object ConfigBackup {
                 if (srcMembers != null) {
                     for (j in 0 until srcMembers.length()) {
                         val old = srcMembers.optString(j, "")
+                        // [dv20-a1 A-02] A System voice sentinel is virtual —
+                        // it is never in the backup's `modelEntries`, so the
+                        // entry map cannot know it and the member used to be
+                        // counted as dropped. The sentinel id is
+                        // device-independent (byte-identical to iOS), so
+                        // remap fidelity means keeping it verbatim.
                         val mapped = entryIdMap[old]
+                            ?: old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }
                         if (mapped != null) members.add(mapped) else droppedMembers++
                     }
                 }
@@ -1046,7 +1560,7 @@ object ConfigBackup {
                 // creating "name (2)". Local members are kept (union), so a
                 // restore is additive rather than destructive.
                 val existingGroup = providerRepo.config.value.modelGroups
-                    .firstOrNull { it.name == name }
+                    .firstOrNull { it.name == name && it.id !in claimedGroupIds }
                 if (existingGroup != null) {
                     val mergedMembers = existingGroup.memberEntryIds.toMutableList()
                     var addedAny = false
@@ -1056,10 +1570,28 @@ object ConfigBackup {
                             addedAny = true
                         }
                     }
-                    if (addedAny) {
-                        providerRepo.updateGroup(existingGroup.copy(memberEntryIds = mergedMembers))
+                    // [fix/dv18-4 A-07] A restore is a restore: the group
+                    // section carries the run-config (strategy / fallback /
+                    // per-group thinking level / context limits), so a
+                    // same-name merge must restore it too — the same shape as
+                    // Stage 1's mergeImportInstanceJSON, where a same-label
+                    // restore DOES restore the instance's run-config. Members
+                    // stay a UNION (additive, above); the run-config is
+                    // backup-wins, and the pre-restore snapshot is the
+                    // rollback safety net.
+                    // ponytail: members union + run-config backup-wins | 天花板:
+                    // 用户想「只并成员、保留本地运行配置」时无处表达 | 升级触发:
+                    // 真机反馈恢复后分组配置被改写 ⇒ 在导入 UI 加显式 run-config
+                    // 开关，不在本层猜。
+                    val merged = applyGroupRunConfig(
+                        existingGroup,
+                        readGroupRunConfig(g, warnGroupRunConfig),
+                    ).copy(memberEntryIds = mergedMembers)
+                    if (addedAny || merged != existingGroup) {
+                        providerRepo.updateGroup(merged)
                     }
                     if (srcId.isNotEmpty()) groupIdMap[srcId] = existingGroup.id
+                    claimedGroupIds.add(existingGroup.id)
                     groupsImported++
                     if (droppedMembers > 0) {
                         skipped.add(
@@ -1085,28 +1617,23 @@ object ConfigBackup {
                     resolvedName = "$name ($suffix)"
                 }
                 try {
+                    // [fix/dv18-4 A-07] Same decode as the merge branch above —
+                    // one seam, two appliers (mirrors Stage 1's
+                    // readImportInstanceFields / applyImportInstanceFields).
+                    val runConfig = readGroupRunConfig(g, warnGroupRunConfig)
                     val group = ModelGroup(
                         id = newId,
                         name = resolvedName,
                         memberEntryIds = members,
-                        strategy = enumOrDefault(
-                            g.optString("strategy"),
-                            com.rikkaminis.app.data.model.RoutingStrategy.fallback,
-                        ),
-                        fallbackStrategy = enumOrDefault(
-                            g.optString("fallbackStrategy"),
-                            com.rikkaminis.app.data.model.FallbackStrategy.default,
-                        ),
-                        defaultThinkingLevel = g.optString("defaultThinkingLevel")
-                            .takeIf { it.isNotEmpty() }
-                            ?.let { runCatching { ThinkingLevel.valueOf(it) }.getOrNull() },
-                        contextLimitTokens = if (g.has("contextLimitTokens"))
-                            g.optInt("contextLimitTokens").takeIf { it > 0 } else null,
-                        lastContextLimitTokens = if (g.has("lastContextLimitTokens"))
-                            g.optInt("lastContextLimitTokens").takeIf { it > 0 } else null,
+                        strategy = runConfig.strategy.value,
+                        fallbackStrategy = runConfig.fallbackStrategy.value,
+                        defaultThinkingLevel = runConfig.defaultThinkingLevel.value,
+                        contextLimitTokens = runConfig.contextLimitTokens.value,
+                        lastContextLimitTokens = runConfig.lastContextLimitTokens.value,
                     )
                     providerRepo.addGroup(group)
                     if (srcId.isNotEmpty()) groupIdMap[srcId] = newId
+                    claimedGroupIds.add(newId)
                     groupsImported++
                     if (droppedMembers > 0) {
                         skipped.add(
@@ -1123,6 +1650,12 @@ object ConfigBackup {
         // -- Stage 3: scalar fields (defaults.* group/entry ids remapped) --
         val fields = root.optJSONObject("fields")
         if (fields != null) {
+            // [FIX-R3-D / F-02] This install's own ids, read ONCE before the
+            // loop: they are what makes a same-install restore (or a backup
+            // with no `groups` section) survive remapping verbatim instead of
+            // being filtered away by the field writers.
+            val localGroupIds = providerRepo.config.value.modelGroups.map { it.id }.toSet()
+            val localEntryIds = providerRepo.config.value.modelEntries.map { it.id }.toSet()
             val keys = fields.keys()
             while (keys.hasNext()) {
                 val path = keys.next()
@@ -1152,11 +1685,36 @@ object ConfigBackup {
                     skipped.add("$path: unreadable value in backup")
                     continue
                 }
-                // Rewrite the group/entry ids these fields carry from source ids
-                // to the ids just minted above. An id with no mapping is left
-                // as-is so the field's own writer reports it as unknown rather
-                // than this layer swallowing it.
-                val value = remapDefaultsIds(path, decoded, groupIdMap, entryIdMap)
+                // [FIX-P1A / RT-S5] Rewrite the group/entry ids these fields
+                // carry from source ids to the ids just minted above. An id the
+                // maps cannot resolve means the group/entry it names is not in
+                // this backup at all: writing it through either threw (primary /
+                // sub / voice group → the restore refused a value the backup
+                // did carry) or had the remainder silently filtered out (agent
+                // loop lists → a second import CLEARED the local list). Skip the
+                // field, keep the local value, and name it in `skipped`.
+                val remap = remapDefaultsIds(
+                    path,
+                    decoded,
+                    groupIdMap,
+                    entryIdMap,
+                    localGroupIds = localGroupIds,
+                    localEntryIds = localEntryIds,
+                )
+                val value = remap.value
+                if (value == null) {
+                    skipped.add(
+                        "$path: referenced id(s) not present in this backup " +
+                            "(${summariseIds(remap.unmapped)}) — local value kept",
+                    )
+                    continue
+                }
+                if (remap.unmapped.isNotEmpty()) {
+                    skipped.add(
+                        "$path: ${remap.unmapped.size} id(s) not present in this backup " +
+                            "(${summariseIds(remap.unmapped)}) — dropped, rest applied",
+                    )
+                }
                 try {
                     // Validate against the field's own schema before writing so
                     // a stale enum / out-of-range number is reported instead of
@@ -1180,10 +1738,6 @@ object ConfigBackup {
                     skipped.add("env var #${i + 1}: missing key")
                     continue
                 }
-                if (envVarRepo.isDuplicateKey(key)) {
-                    skipped.add("env var \"$key\": already exists, left as-is")
-                    continue
-                }
                 // A backup taken without secrets carries no value; add the key
                 // with an empty value so the metadata/note survive and the user
                 // only has to refill the secret rather than recreate the entry.
@@ -1193,6 +1747,48 @@ object ConfigBackup {
                 // backup carries it; old backups fall back to "" (uncategorized)
                 // exactly like a fresh entry.
                 val group = ev.optString("group", "")
+                // [T-envvar-restore-deadlock] A key that already exists is no
+                // longer skipped wholesale — that made the reinstall case
+                // unrecoverable (secret-free restore creates empty shells, and
+                // every later restore with secrets was skipped, so the values
+                // could never come back). planEnvVarRestore() decides per
+                // branch: an empty local value takes the backup's, a live one
+                // that differs is kept and reported, and a secret-free backup
+                // writes no value at all.
+                val existing = envVarRepo.entries.value
+                    .firstOrNull { it.key.equals(key, ignoreCase = true) }
+                if (existing != null) {
+                    val localValue = envVarRepo.getValue(existing.key)
+                    val plan = planEnvVarRestore(
+                        key = existing.key,
+                        localValue = localValue,
+                        localNote = existing.note,
+                        localGroup = existing.group,
+                        backupValue = value,
+                        backupNote = note,
+                        backupGroup = group,
+                    )
+                    if (!plan.touchesAnything) {
+                        plan.report?.let { skipped.add(it) }
+                        continue
+                    }
+                    // update() always writes the value, so hand it the one that
+                    // must end up stored (the plan's, else the local one).
+                    val updated = envVarRepo.update(
+                        id = existing.id,
+                        newKey = existing.key,
+                        newValue = plan.value ?: localValue.orEmpty(),
+                        newNote = plan.note ?: existing.note,
+                        newGroup = plan.group ?: existing.group,
+                    )
+                    if (updated) {
+                        if (plan.writesValue) envVarsImported++
+                        plan.report?.let { skipped.add(it) }
+                    } else {
+                        skipped.add("env var \"$key\": rejected (invalid key)")
+                    }
+                    continue
+                }
                 if (envVarRepo.add(key, value, note, group)) {
                     envVarsImported++
                     if (value.isEmpty()) {
@@ -1234,9 +1830,17 @@ object ConfigBackup {
                             // [fix/audit-b22 / T4-L8] Pass the exported id so a
                             // skill renamed since the backup is refreshed in
                             // place instead of being duplicated.
+                            // [fix/audit-1015-b2a] Same source passthrough as
+                            // the body branch below: hard-coding FILE in
+                            // importFromArchive rewrote every restored skill's
+                            // importSource to "file", and a URL-imported skill
+                            // then failed updateFromURL's importSource != URL
+                            // guard, losing its online updates for good.
                             skillRepo.importFromArchive(
                                 ByteArrayInputStream(bytes),
                                 s.optString("id", "").takeIf { it.isNotEmpty() },
+                                SkillRepository.ImportSource.from(s.optString("importSource", "file")),
+                                s.optString("sourceURL", "").takeIf { it.isNotEmpty() },
                             )
                         }
                     } else {
@@ -1269,6 +1873,19 @@ object ConfigBackup {
                     if (!s.optBoolean("isEnabled", true)) {
                         runCatching { skillRepo.setEnabled(imported.id, false) }
                     }
+                    // [fix/audit-1015-b2b] Export wrote installedAt/updatedAt/
+                    // useCount; import never read them back, so a restore
+                    // zeroed useCount and re-stamped both timestamps. Older
+                    // backups without these keys decode as 0 and are ignored
+                    // (restoreUsageMetadata applies only >0 values).
+                    runCatching {
+                        skillRepo.restoreUsageMetadata(
+                            id = imported.id,
+                            installedAt = s.optLong("installedAt", 0L),
+                            updatedAt = s.optLong("updatedAt", 0L),
+                            useCount = s.optDouble("useCount", 0.0),
+                        )
+                    }
                     skillsImported++
                     if (archive.isEmpty()) {
                         skipped.add(
@@ -1286,36 +1903,50 @@ object ConfigBackup {
         }
 
         // -- Stage 6: memory files (GLOBAL.md + daily logs) --
+        // [FIX-1028B / L9033] `saveFile` is a whole-file overwrite and the
+        // memory dir is the one thing on this device that is appended to on
+        // every agent turn, so restoring an older backup used to truncate the
+        // daily logs / GLOBAL.md / rollup back to the export moment — no race
+        // required, and the dialog reported it as a clean restore. The per-file
+        // guard (newer local copy wins, undecidable ⇒ keep) lives in
+        // [restoreMemoryFiles] / [decideMemoryRestore] so it is pinned by
+        // MemoryRestoreGuardTest; `createdAt` was previously write-only.
         val memArr = root.optJSONArray("memoryFiles")
         if (memArr != null && memoryRepo != null) {
-            for (i in 0 until memArr.length()) {
-                val m = memArr.optJSONObject(i) ?: continue
-                val name = m.optString("name", "").trim()
-                if (name.isEmpty()) {
-                    skipped.add("memory file #${i + 1}: missing name")
-                    continue
-                }
-                // Defence in depth: these names become file names under the
-                // memory dir, so anything with a path separator is rejected
-                // outright rather than trusted from the payload.
-                if (name.contains('/') || name.contains('\\') || name.contains("..")) {
-                    skipped.add("memory file \"$name\": unsafe name, skipped")
-                    continue
-                }
-                val content = m.optString("content", "")
-                try {
-                    memoryRepo.saveFile(name, content)
-                    memoryFilesImported++
-                } catch (t: Throwable) {
-                    skipped.add("memory file \"$name\": ${t.message ?: "write failed"}")
-                }
-            }
+            // The memory dir comes from the repository itself rather than being
+            // re-derived here: one source of truth for "where memory lives", so
+            // this guard can never inspect a directory that saveFile does not
+            // write to.
+            val memoryDir = memoryRepo.memoryDirectory()
+            memoryFilesImported = restoreMemoryFiles(
+                section = memArr,
+                // [FIX-R5-B1 / F-01] Was `root.optLong("createdAt", 0L)`, which
+                // is `0` for every `.minisbak`-converted document (that
+                // converter wrote only `exportedAt`) ⇒ Stage 6 refused every
+                // memory file this device already had. [documentCreatedAt]
+                // keeps `createdAt` primary and falls back to `exportedAt`.
+                backupCreatedAt = documentCreatedAt(root),
+                localFile = { name -> File(memoryDir, name) },
+                saveFile = { name, content -> memoryRepo.saveFile(name, content) },
+                skipped = skipped,
+            )
         } else if (memArr != null && memArr.length() > 0 && memoryRepo == null) {
             skipped.add("${memArr.length()} memory file(s): not restorable here")
         }
 
         // -- Stage 7: MCP servers --
         val mcpArr = root.optJSONArray("mcpServers")
+        // [dv28-a5 A-05] Stage 9 ALSO restores `mcp/servers.json` out of the
+        // artifact archive, and that copy is verbatim (whole-file overwrite,
+        // ArtifactArchiver.extractZipByPrefix). When this stage merged the
+        // backup's server list, the archive entry landing afterwards rewrote
+        // servers.json with the BACKUP's list: every server this device has but
+        // the backup does not was silently erased, and the in-memory merge
+        // survived only until the next cold start re-read the file. Derived from
+        // the same two operands that gate the merge below, so a backup WITHOUT
+        // an `mcpServers` section (archive-only, hand-crafted) still restores
+        // its list raw — skipping there would lose it entirely.
+        val serverListMergedInStage7 = mcpRepo != null && mcpArr != null && mcpArr.length() > 0
         if (mcpArr != null && mcpRepo != null) {
             var needsReauth = 0
             for (i in 0 until mcpArr.length()) {
@@ -1363,7 +1994,18 @@ object ConfigBackup {
         val chatMessagesArr = root.optJSONArray("chatMessages")
         if (chatSessionsArr != null && chatRepo != null) {
             val (sessionsImported, messagesImported) =
-                importChatSections(chatRepo, chatSessionsArr, chatMessagesArr, skipped)
+                importChatSections(
+                    chatRepo = chatRepo,
+                    chatSessionsArr = chatSessionsArr,
+                    chatMessagesArr = chatMessagesArr,
+                    skipped = skipped,
+                    // [FIX-E / ISSUE-09] session modelBinding rows carry the
+                    // source install's group/entry uuids — remap them onto the
+                    // ids minted by Stages 1-2 or restoreFromBinding degrades
+                    // every restored session to its stale modelId.
+                    groupIdMap = groupIdMap,
+                    entryIdMap = entryIdMap,
+                )
             chatSessionsImported += sessionsImported
             chatMessagesImported += messagesImported
         } else if (chatSessionsArr != null && chatSessionsArr.length() > 0 && chatRepo == null) {
@@ -1375,15 +2017,24 @@ object ConfigBackup {
         // fit MAX_PAYLOAD_BYTES, and the user should know how much was left
         // out (and that the exporting device's local DB still holds it all).
         root.optJSONObject("chatTruncated")?.let { tr ->
-            val s = tr.optInt("sessionsDropped", 0)
-            val m = tr.optInt("messagesDropped", 0)
-            if (s > 0 || m > 0) {
-                skipped.add(
-                    "chat history was budget-trimmed at export: " +
-                        "$m message(s) and $s session(s) not carried (full history stays on the source device)"
-                )
-            }
+            // [FIX-P1B / RT-S1] The converter (OpenMinisBackupCompat) records a
+            // missing JSONL shard as `shardsMissing` when the source package has
+            // a hole in its shard sequence. A hole is permanent message loss on
+            // this side, and the reader before P1-B simply stopped at it — so a
+            // package that was visibly incomplete imported as if it were whole.
+            // `ImportResult.skipped` is already the channel the backup screen
+            // shows, so no new UI. `optInt(k, 0)` keeps every package written
+            // before this key existed on the old path. Both kinds of
+            // incompleteness (exporter trim + package hole) are accounted in
+            // [chatTruncationNotes]; this call site only forwards its lines.
+            skipped.addAll(chatTruncationNotes(tr))
         }
+
+        // [FIX-1028 / A-6] What the `.minisbak` converter could not carry over
+        // (or carried over degraded). Absent section = document did not come
+        // from that converter, or it had nothing to report — same shape either
+        // way, so old payloads are unaffected.
+        skipped.addAll(conversionNotes(root.optJSONArray("conversionNotes")))
 
         // -- Stage 9: artifact files (shared/ + mcp data, from the embedded zip) --
         // The archive routes entries by first path segment into the matching
@@ -1394,6 +2045,25 @@ object ConfigBackup {
         if (artifactsObj != null && artifactRoots != null && artifactRoots.isNotEmpty()) {
             val archive = artifactsObj.optString("archive", "")
             val estimatedBytes = (archive.length / 4L) * 3L
+            // [FIX-R3-D / F-12] The exporter's own skip count now has a reader
+            // (it was written and never consumed): report it through the same
+            // channel the rest of Stage 9 uses, so "the archive is missing
+            // files" is distinguishable from "the archive is complete".
+            val skippedAtExport = artifactsObj.optInt("skipped", 0)
+            if (skippedAtExport > 0) {
+                skipped.add("artifacts: $skippedAtExport file(s) were left out at export")
+            }
+            // [FIX-R5-B1 / F-12] The size ladder dropped the whole archive on
+            // the EXPORTING device. Reported here, before the archive checks,
+            // because there is no `archive` key to inspect: without this line
+            // the restore looked complete while shared/ and mcp/ files were
+            // silently missing.
+            if (artifactsObj.optBoolean(ARTIFACTS_DROPPED_FOR_SIZE, false)) {
+                skipped.add(
+                    "artifacts: the backup dropped its archive to fit the size cap " +
+                        "(shared/ and mcp/ files are not in this package)"
+                )
+            }
             if (archive.isNotEmpty() && estimatedBytes <= MAX_ARTIFACT_ARCHIVE_BYTES) {
                 try {
                     val bytes = android.util.Base64.decode(archive, android.util.Base64.NO_WRAP)
@@ -1405,16 +2075,61 @@ object ConfigBackup {
                             val prefix = if (root.name == "mcp-servers") "mcp" else "shared"
                             destByPrefix[prefix] = root
                         }
-                        artifactFilesImported = ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)
+                        // [da1034-A1] Pre-fix archives (and any hand-crafted
+                        // one) can still carry "mcp/oauth/…" bridge entries —
+                        // live bearer tokens. extractZipByPrefix writes
+                        // entries verbatim, so the ONLY safe place to drop
+                        // them is BEFORE extraction: restoring an old backup
+                        // must never overwrite this device's live token
+                        // bridge. The archive the exporter writes is already
+                        // oauth-free (ArtifactBackupScope.DENIED_DIRS); this
+                        // filter is the restore-side second wall.
+                        val filtered = java.io.File.createTempFile("artifact-restore-", ".zip")
+                        try {
+                            // [dv28-a5 A-05] The filter has a second job besides
+                            // the credential wall: Stage 7 already merged the
+                            // backup's server list (MCPRepository.importJSON keeps
+                            // this device's entries), and a verbatim copy of
+                            // `mcp/servers.json` would overwrite that merged file
+                            // with the backup's list. Skipped only when the merge
+                            // actually ran — see serverListMergedInStage7.
+                            val filterResult = stripMcpOAuthEntries(
+                                tmp,
+                                filtered,
+                                dropPrestagedServerList = serverListMergedInStage7,
+                            )
+                            if (filterResult.oauthDropped > 0) {
+                                skipped.add(
+                                    "artifacts: skipped ${filterResult.oauthDropped} " +
+                                        "oauth bridge entries"
+                                )
+                            }
+                            if (filterResult.prestagedDropped > 0) {
+                                skipped.add(
+                                    "artifacts: servers.json restored via Stage 7 merge " +
+                                        "(skipped raw copy)"
+                                )
+                            }
+                            artifactFilesImported =
+                                ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
+                        } finally {
+                            runCatching { filtered.delete() }
+                        }
                     } finally {
                         runCatching { tmp.delete() }
                     }
                 } catch (t: Throwable) {
                     skipped.add("artifacts: ${t.message ?: "extract failed"}")
                 }
-            } else if (archive.isEmpty()) {
+            } else if (artifactsObj.has("archive") && archive.isEmpty()) {
+                // [FIX-R3-D / F-12] "archive key present but empty" is the
+                // exporter's `includeArtifacts=false` shape. A section that is
+                // a bare `{}` (an older export, or the skip-only one this fix
+                // introduces) carries no claim at all — reporting "archive
+                // empty" for it turned every restore of such a package into a
+                // fake warning.
                 skipped.add("artifacts: archive empty in backup")
-            } else {
+            } else if (estimatedBytes > MAX_ARTIFACT_ARCHIVE_BYTES) {
                 skipped.add("artifacts: archive too large (${estimatedBytes} bytes)")
             }
         } else if (artifactsObj != null && artifactsObj.has("archive") && artifactRoots == null) {
@@ -1425,21 +2140,19 @@ object ConfigBackup {
         // Restores (manual and the auto-backup path) apply the backed-up
         // WebDAV server config so a new install can immediately reach its
         // remote backups.
+        //
+        // [D-B fix/backup-bootstrap-size] A secrets-free backup carries
+        // url/username/path but NO password (see [buildWebDavConfigSection]).
+        // [resolveWebDavRestore] decides the merge — critically, it never emits
+        // a blank password over a stored one, because [WebDavConfigStore.save]
+        // reads a blank password as "clear it".
         val wdObj = root.optJSONObject("webdavConfig")
         if (wdObj != null) {
-            val url = wdObj.optString("url", "")
-            if (url.isNotEmpty() && onWebDavConfig != null) {
-                onWebDavConfig(
-                    WebDavConfig(
-                        url = url,
-                        username = wdObj.optString("username", ""),
-                        password = wdObj.optString("password", ""),
-                        path = wdObj.optString(
-                            "path", WebDavConfig.DEFAULT_BACKUP_DIR,
-                        ),
-                    )
-                )
+            val plan = resolveWebDavRestore(wdObj, existingWebDavConfig)
+            if (plan.config != null && onWebDavConfig != null) {
+                onWebDavConfig(plan.config)
                 webdavConfigImported = true
+                plan.notice?.let { skipped.add(it) }
             } else if (onWebDavConfig == null) {
                 skipped.add("WebDAV server config: not restorable here")
             }
@@ -1456,8 +2169,11 @@ object ConfigBackup {
         if (scheduledObj != null) {
             if (onScheduledTasks != null) {
                 try {
-                    onScheduledTasks(scheduledObj)
-                    scheduledTasksImported = true
+                    val outcome = onScheduledTasks(scheduledObj)
+                    if (outcome == null || outcome.applied) {
+                        scheduledTasksImported = true
+                    }
+                    outcome?.notice?.let { skipped.add("scheduled tasks: $it") }
                 } catch (t: Throwable) {
                     skipped.add("scheduled tasks: restore failed (${t.message})")
                 }
@@ -1509,40 +2225,89 @@ object ConfigBackup {
         }
     }
 
-    /** [enumValueOf] that falls back to [default] instead of throwing on a
-     *  token this build doesn't know (forward-compat with newer backups). */
-    private inline fun <reified T : Enum<T>> enumOrDefault(name: String, default: T): T =
-        runCatching { enumValueOf<T>(name) }.getOrDefault(default)
+    /**
+     * [FIX-P1B / RT-S1] The user-facing "this package was not whole" lines for
+     * an import, derived from the payload's `chatTruncated` object.
+     *
+     * Two independent kinds of incompleteness live in that one object and they
+     * must NOT be conflated:
+     *  - `sessionsDropped` / `messagesDropped` — the exporter deliberately
+     *    trimmed the history to fit its byte budget. The source device still
+     *    has everything (this is the pre-existing contract).
+     *  - `shardsMissing` — the source PACKAGE has a hole in its JSONL shard
+     *    sequence. Messages are gone here and the exporter never knew: before
+     *    P1-B the reader treated the hole as end-of-sequence, so the tail of
+     *    the transcript vanished silently and the import looked clean.
+     *
+     * Pure on purpose (no repos, no I/O): the call site in [import] only
+     * forwards these lines into `ImportResult.skipped`, which the backup screen
+     * already renders. Dead-literal tested in ChatTruncationNotesTest.
+     */
+    internal fun chatTruncationNotes(tr: JSONObject): List<String> {
+        val out = ArrayList<String>(2)
+        val s = tr.optInt("sessionsDropped", 0)
+        val m = tr.optInt("messagesDropped", 0)
+        if (s > 0 || m > 0) {
+            out.add(
+                "chat history was budget-trimmed at export: " +
+                    "$m message(s) and $s session(s) not carried (full history stays on the source device)"
+            )
+        }
+        val shards = tr.optInt("shardsMissing", 0)
+        if (shards > 0) {
+            out.add(
+                "backup package was incomplete: $shards data shard(s) missing " +
+                    "(chat/rule history restored partially; the source device still holds the full copy)"
+            )
+        }
+        // [FIX-1028 / A-5] Third kind: the shard was there but a line inside it
+        // was not parseable JSON (transfer cut mid-line, half-written shard).
+        // The converter used to drop such a line silently, so a package that
+        // lost records to damage looked exactly like a complete one.
+        // [fix/meta1028-d1 F-04] Fourth kind: the rows were never carried because
+        // reading them failed on THIS device (oversized row past the
+        // CursorWindow, damaged DB) — not because the budget trimmed them and not
+        // because the package lost them. Before the fix this state exported as a
+        // clean backup with the session present and empty.
+        val unreadable = tr.optInt("messagesUnreadable", 0)
+        if (unreadable > 0) {
+            out.add(
+                "chat history was only partially exported: $unreadable message(s) could not be read " +
+                    "from this device's database (oversized/damaged rows); the source device holds " +
+                    "the rest of that conversation"
+            )
+        }
+        val unparsable = tr.optInt("unparsableLines", 0)
+        if (unparsable > 0) {
+            out.add(
+                "backup package held $unparsable unreadable record line(s) " +
+                    "(damaged/truncated JSONL in the source package: those entries are not in this restore)"
+            )
+        }
+        return out
+    }
 
     /**
-     * Rewrite the source group/entry ids embedded in a `defaults.*` field to the
-     * ids minted during this import. Group-typed fields
-     * (primaryGroup / subGroup / agentLoopGroups) map through [groupIdMap];
-     * agentLoopEntries maps through [entryIdMap]. Everything else is returned
-     * unchanged. Unmapped ids are passed through so the field's own writer can
-     * report them as unknown rather than this layer silently dropping them.
+     * [FIX-1028 / A-6] The user-facing lines for the `.minisbak` converter's own
+     * warnings (`conversionNotes` in the converted document).
+     *
+     * [OpenMinisBackupCompat] collects them while converting — a provider
+     * carried over with zero model entries, a skill whose archive failed to
+     * pack, a memory file over the size cap — and used to throw the list away:
+     * nothing in the tree read it, so a thinner-than-expected restore came with
+     * no explanation at all. `ImportResult.skipped` is the channel the backup
+     * screen already renders, so no new UI and no new key elsewhere.
+     *
+     * Pure on purpose (no repos, no I/O), like [chatTruncationNotes].
      */
-    private fun remapDefaultsIds(
-        path: String,
-        value: ConfigValue,
-        groupIdMap: Map<String, String>,
-        entryIdMap: Map<String, String>,
-    ): ConfigValue {
-        val map = when (path) {
-            "defaults.primaryGroup", "defaults.subGroup", "defaults.agentLoopGroups" -> groupIdMap
-            "defaults.agentLoopEntries" -> entryIdMap
-            else -> return value
+    internal fun conversionNotes(notes: JSONArray?): List<String> {
+        if (notes == null) return emptyList()
+        val out = ArrayList<String>(notes.length())
+        for (i in 0 until notes.length()) {
+            val line = notes.optString(i, "").trim()
+            if (line.isNotEmpty()) out.add("conversion: $line")
         }
-        if (map.isEmpty()) return value
-        return when (value) {
-            is ConfigValue.Str -> ConfigValue.Str(map[value.value] ?: value.value)
-            is ConfigValue.Arr -> ConfigValue.Arr(
-                value.value.map { el ->
-                    if (el is ConfigValue.Str) ConfigValue.Str(map[el.value] ?: el.value) else el
-                }
-            )
-            else -> value
-        }
+        return out
     }
 
     /** Hard cap on messages carried per session in a chat-history backup. */
@@ -1595,6 +2360,24 @@ object ConfigBackup {
      *  protection at a fraction of the cost. */
     const val SNAPSHOT_KEEP = 1
 
+    /** [FIX-P1A / RT-S3] Snapshot file naming COMES FROM HERE — never re-spelled
+     *  in the writer, the allocator or the listing filter (three places that
+     *  must agree, or a half-written temp becomes a rollback candidate). */
+    private const val SNAPSHOT_PREFIX = "rikkaminis-snapshot-"
+
+    /** `.json` — the only extension [listSnapshots] accepts. */
+    private const val SNAPSHOT_SUFFIX = ".json"
+
+    /** [FIX-P1A / RT-S3] Sidecar a snapshot is streamed into before the rename.
+     *  `name.json.tmp` deliberately does NOT satisfy the `.json` listing filter. */
+    private const val SNAPSHOT_TMP_SUFFIX = ".tmp"
+
+    /** [FIX-P1A / RT-S3] Age at which an orphaned `.json.tmp` is swept. A full
+     *  snapshot write is seconds even on a heavy install (70MB streamed), so an
+     *  hour is three orders of magnitude of slack — it cannot race a live write,
+     *  and it keeps a killed write's partial file from lingering forever. */
+    internal const val SNAPSHOT_TMP_STALE_MS = 60 * 60 * 1000L
+
     /** [fix-audit-p1-2] Per-skill archive cap for backups. A skill with
      *  bundled assets bigger than this degrades to SKILL.md-only in the
      *  payload rather than ballooning the backup into an OOM risk (the whole
@@ -1607,6 +2390,58 @@ object ConfigBackup {
      *  instead of OOMing mid-restore). */
     const val MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
+    /**
+     * [D-C fix/backup-bootstrap-size] UTF-8 size of [value], i.e. how many
+     * bytes the document occupies on disk / in the SAF stream.
+     *
+     * THE single unit of every backup size decision. Before this helper the
+     * export side compared `String.length` (UTF-16 code units) against
+     * [MAX_PAYLOAD_BYTES] while the import side compared BYTES — for Chinese
+     * text (bytes/chars ≈ 1.08) that made a 71.4MB file pass export at 66.1M
+     * "chars" and then be rejected forever on import. Every gate must call
+     * this, never `.length`.
+     *
+     * Computed by walking the chars (1/2/3 bytes, 4 for a surrogate pair)
+     * instead of `toByteArray().size`: allocating a second copy of a 70MB
+     * string just to measure it is exactly the OOM shape the streaming export
+     * was built to avoid. A LONE surrogate counts as 3 bytes while Android's
+     * encoder writes '?' (1 byte) for it, so this over-estimates by at most
+     * 2 bytes per broken char — an over-estimate can only make the packer
+     * trim slightly more, never produce an oversize file.
+     */
+    internal fun utf8Length(value: CharSequence): Long {
+        var bytes = 0L
+        var i = 0
+        val n = value.length
+        while (i < n) {
+            val c = value[i]
+            bytes += when {
+                c.code < 0x80 -> 1
+                c.code < 0x800 -> 2
+                Character.isHighSurrogate(c) && i + 1 < n &&
+                    Character.isLowSurrogate(value[i + 1]) -> {
+                    i++
+                    4
+                }
+                else -> 3
+            }
+            i++
+        }
+        return bytes
+    }
+
+    /**
+     * [D-C fix/backup-bootstrap-size] The import-side ceiling test, in the ONE
+     * unit that matters (UTF-8 bytes). Extracted so it can be exercised against
+     * a small [capBytes] in a JVM test — the real 64MiB cap needs a 64MiB
+     * document to trip, which no unit test should allocate; the ruler and the
+     * comparison can still be pinned.
+     */
+    internal fun documentExceedsPayloadCap(
+        document: String,
+        capBytes: Long = MAX_PAYLOAD_BYTES.toLong(),
+    ): Boolean = utf8Length(document) > capBytes
+
     /** [T-auto-backup-assets] Upper bound for a decoded artifact archive. The
      *  export side caps the selection at [ArtifactBackupScope.MAX_ARCHIVE_BYTES]
      *  (~12MB → ~16MB base64); this import-side ceiling mirrors it with slack
@@ -1614,25 +2449,99 @@ object ConfigBackup {
      *  an oversized blob can't spike memory. */
     const val MAX_ARTIFACT_ARCHIVE_BYTES = 20L * 1024 * 1024
 
+    /** [FIX-R5-B1 / F-12] Marker the exporter puts in the `artifacts` section
+     *  when the size ladder dropped the archive ENTIRELY — [buildWithinCap]'s
+     *  last resort (`includeArtifacts = false`).
+     *
+     *  The dropped section used to be a bare `{}`, byte-identical to "this
+     *  device had nothing to archive": Stage 9 skipped it silently, so a
+     *  restore of a package whose shared/ + mcp/ files had been thrown away to
+     *  fit the payload cap reported a clean restore. The flag is a claim the
+     *  READER turns into a line in `skipped`; it is never set for a device that
+     *  genuinely had no artifacts, so reporting it is always true. */
+    const val ARTIFACTS_DROPPED_FOR_SIZE = "droppedForSize"
+
     /** [fix-audit-p0-3] Snapshot files live under `filesDir/backup-snapshots`,
      *  named with second precision so two restores in the same minute can't
      *  clobber each other (the old minute-precision [suggestedFileName] did
      *  exactly that — restoring A then B overwrote A's rollback point). The
      *  distinct `rikkaminis-snapshot-` prefix also keeps them out of the
-     *  WebDAV remote-list matcher (`rikkaminis-backup-*`). */
+     *  WebDAV remote-list matcher (`rikkaminis-backup-*`).
+     *
+     *  [FIX-P1A / RT-S3] Second precision is only the BASE name now — see
+     *  [allocateSnapshotFile], which resolves collisions against the directory
+     *  instead of trusting the clock. */
     fun snapshotFileName(now: Long = System.currentTimeMillis()): String {
-        val fmt = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
-        return "rikkaminis-snapshot-${fmt.format(java.util.Date(now))}.json"
+        // [FIX-1028 / B-12] The stamp shape lives in BackupRotation, because
+        // listSnapshots + pruneSnapshots now READ it back (a writer that
+        // re-spelled the format would silently make every snapshot unorderable,
+        // and an unorderable snapshot is never rotated away).
+        return "$SNAPSHOT_PREFIX${BackupRotation.stamp(now)}$SNAPSHOT_SUFFIX"
     }
 
-    /** Writes [payload] as a fresh snapshot into [dir] and prunes to the
-     *  newest [SNAPSHOT_KEEP] files. Returns the written file. */
+    /**
+     * [FIX-P1A / RT-S3] A snapshot file name that is free in [dir] RIGHT NOW.
+     *
+     * Why existence (not time): the old name was the clock at second
+     * precision, so two restores inside one second wrote the same path — the
+     * second write truncated the first, and a failure half-way through it left
+     * zero usable rollback points instead of one. Milliseconds would only move
+     * the window: world W7 is a clock that jumps (manual change, NTP, a device
+     * that boots with a stale RTC), and any time-derived name can then land on
+     * a name that already exists. Resolving against the directory is
+     * clock-proof, keeps the readable second-precision stem (so the files stay
+     * sortable/greppable by name for a human), and needs no persisted state.
+     * Same-second writes get `-2`, `-3`, … instead of overwriting.
+     *
+     * The `.tmp` sidecar is checked too: a write that died mid-stream leaves
+     * one behind, and reusing that name would mean reusing a half-written
+     * buffer.
+     */
+    internal fun allocateSnapshotFile(
+        dir: java.io.File,
+        now: Long = System.currentTimeMillis(),
+    ): java.io.File {
+        val base = snapshotFileName(now)
+        val stem = base.removeSuffix(SNAPSHOT_SUFFIX)
+        if (snapshotNameInUse(dir, base)) {
+            var n = 2
+            while (snapshotNameInUse(dir, "$stem-$n$SNAPSHOT_SUFFIX")) {
+                // Bounded: every snapshot in a second costs a full payload
+                // write (~70MB), so 1000 collisions inside one second is not a
+                // slow disk, it is a bug. Fail closed rather than overwrite the
+                // only rollback point.
+                if (n >= 1000) {
+                    throw java.io.IOException(
+                        "snapshot name space exhausted in ${dir.name} (1000 names for $stem)"
+                    )
+                }
+                n++
+            }
+            return java.io.File(dir, "$stem-$n$SNAPSHOT_SUFFIX")
+        }
+        return java.io.File(dir, base)
+    }
+
+    private fun snapshotNameInUse(dir: java.io.File, name: String): Boolean =
+        java.io.File(dir, name).exists() ||
+            java.io.File(dir, name + SNAPSHOT_TMP_SUFFIX).exists()
+
+    /** [FIX-P1A / RT-S3] Writes [payload] as a fresh snapshot into [dir] and
+     *  prunes to the newest [SNAPSHOT_KEEP] files. Returns the written file.
+     *
+     *  Atomic: the document goes to `<name>.json.tmp` and is renamed onto the
+     *  final name only after the writer closed cleanly, so an ENOSPC or a kill
+     *  mid-stream can never leave a truncated JSON that [listSnapshots] would
+     *  happily offer as the newest rollback point. */
     fun writeSnapshot(dir: java.io.File, payload: String): java.io.File {
-        dir.mkdirs()
-        val file = java.io.File(dir, snapshotFileName())
-        file.writeText(payload)
-        listSnapshots(dir).drop(SNAPSHOT_KEEP).forEach { runCatching { it.delete() } }
-        return file
+        val (tmp, target) = openSnapshotForWrite(dir)
+        try {
+            tmp.writeText(payload)
+        } catch (t: Throwable) {
+            runCatching { tmp.delete() }
+            throw t
+        }
+        return commitSnapshotWrite(tmp, target, dir)
     }
 
     /**
@@ -1646,18 +2555,121 @@ object ConfigBackup {
         dir: java.io.File,
         writerBlock: suspend (java.io.Writer) -> Unit,
     ): java.io.File {
-        dir.mkdirs()
-        val file = java.io.File(dir, snapshotFileName())
-        file.outputStream().bufferedWriter().use { w -> writerBlock(w) }
-        listSnapshots(dir).drop(SNAPSHOT_KEEP).forEach { runCatching { it.delete() } }
-        return file
+        val (tmp, target) = openSnapshotForWrite(dir)
+        try {
+            tmp.outputStream().bufferedWriter().use { w -> writerBlock(w) }
+        } catch (t: Throwable) {
+            runCatching { tmp.delete() }
+            throw t
+        }
+        return commitSnapshotWrite(tmp, target, dir)
     }
 
-    /** Snapshots in [dir], newest first. Only `rikkaminis-snapshot-*.json`. */
+    /** [FIX-P1A / RT-S3] `(tmp, final)` for one snapshot write. */
+    private fun openSnapshotForWrite(
+        dir: java.io.File,
+        now: Long = System.currentTimeMillis(),
+    ): Pair<java.io.File, java.io.File> {
+        dir.mkdirs()
+        sweepStaleSnapshotTemps(dir, now)
+        val target = allocateSnapshotFile(dir, now)
+        return java.io.File(dir, target.name + SNAPSHOT_TMP_SUFFIX) to target
+    }
+
+    /** [FIX-P1A / RT-S3] Rename the finished `.tmp` onto its final name, then
+     *  prune. A failed rename removes the temp and throws — the caller (the
+     *  restore flow) must not go on as if a rollback point existed. */
+    private fun commitSnapshotWrite(
+        tmp: java.io.File,
+        target: java.io.File,
+        dir: java.io.File,
+    ): java.io.File {
+        if (!tmp.renameTo(target)) {
+            runCatching { tmp.delete() }
+            throw java.io.IOException("snapshot rename failed: ${target.name}")
+        }
+        pruneSnapshots(dir, justWritten = target)
+        return target
+    }
+
+    /**
+     * [FIX-P1A / RT-S3 → FIX-1028 / B-12] Keep [SNAPSHOT_KEEP] snapshots, ALWAYS
+     * the one just written, and never one whose age cannot be read.
+     *
+     * The two fixes address the same wound from two sides. P1A stopped counting
+     * the fresh file as a prunable candidate; B-12 stopped trusting mtime for
+     * the ORDER at all — a clock-rollback write still sorts last by mtime, so
+     * without name ordering the list offered the wrong rollback point and the
+     * "exclude the fresh file" rule was the only thing keeping it on disk, with
+     * KEEP=1 leaving no second chance. Order now comes from the name stamp;
+     * the fresh file and every unstamped file are additionally protected.
+     *
+     * Both exclusions follow one rule — rather keep a file than delete the
+     * wrong one: the fresh snapshot is never a victim, and neither is a file
+     * whose name carries no parseable stamp ([BackupRotation.rotationVictims]).
+     * The latter stays on disk for the user to inspect; nothing here can tell
+     * whether it is newer than what we kept.
+     */
+    private fun pruneSnapshots(dir: java.io.File, justWritten: java.io.File) {
+        BackupRotation.rotationVictims(
+            items = listSnapshots(dir),
+            name = { it.name },
+            key = { snapshotStampMillis(it) },
+            keep = SNAPSHOT_KEEP,
+            protect = { it.name == justWritten.name },
+        ).forEach { runCatching { it.delete() } }
+    }
+
+    /**
+     * [FIX-P1A / RT-S3] Delete `.json.tmp` remnants of a write that was killed
+     * mid-stream. They are invisible to [listSnapshots] (so they were never a
+     * rollback hazard, only dead weight), and nothing else ever removes them.
+     * Age-gated at [SNAPSHOT_TMP_STALE_MS] so a concurrent write's temp is
+     * never a candidate; with a rolled-back clock the age is negative and
+     * nothing is swept (the safe direction).
+     */
+    private fun sweepStaleSnapshotTemps(
+        dir: java.io.File,
+        now: Long = System.currentTimeMillis(),
+    ) {
+        val files = dir.listFiles() ?: return
+        for (f in files) {
+            if (!f.isFile) continue
+            if (!f.name.startsWith(SNAPSHOT_PREFIX)) continue
+            if (!f.name.endsWith(SNAPSHOT_SUFFIX + SNAPSHOT_TMP_SUFFIX)) continue
+            if (now - f.lastModified() < SNAPSHOT_TMP_STALE_MS) continue
+            runCatching { f.delete() }
+        }
+    }
+
+    /** Snapshots in [dir], newest first. Only `rikkaminis-snapshot-*.json` —
+     *  the `.json.tmp` sidecars of an in-flight / killed write never match
+     *  (see [SNAPSHOT_TMP_SUFFIX]), which is what keeps a half-written
+     *  document out of the rollback list.
+     *
+     *  [FIX-1028 / B-12] "Newest" is the stamp in the NAME, not `lastModified`:
+     *  a restore performed after a clock rollback wrote a file whose mtime
+     *  looked older than its predecessor, so mtime ordering offered the WRONG
+     *  rollback point and pruning deleted the new one. */
     fun listSnapshots(dir: java.io.File): List<java.io.File> =
         dir.listFiles { f ->
-            f.isFile && f.name.startsWith("rikkaminis-snapshot-") && f.name.endsWith(".json")
-        }?.sortedByDescending { it.lastModified() } ?: emptyList()
+            f.isFile && f.name.startsWith(SNAPSHOT_PREFIX) && f.name.endsWith(SNAPSHOT_SUFFIX)
+        }?.let { files ->
+            BackupRotation.newestFirst(files.toList(), name = { it.name }, key = { snapshotStampMillis(it) })
+        } ?: emptyList()
+
+    /** [FIX-1028 / B-12] A snapshot's ordering key, decoded from its file name.
+     *  Null = the name carries no stamp (came from elsewhere) ⇒ age unknown. */
+    internal fun snapshotStampMillis(file: java.io.File): Long? =
+        BackupRotation.stampMillis(file.name, SNAPSHOT_PREFIX, SNAPSHOT_SUFFIX)
+
+    /** [FIX-1028 / B-12] Timestamp a snapshot row should DISPLAY: the name
+     *  stamp when parseable — the same key [listSnapshots] orders by, so the
+     *  times shown can never contradict the order — else the file's mtime.
+     *  Showing mtime on a name-ordered list is how a rolled-back clock made the
+     *  newest rollback point look like the oldest. */
+    fun snapshotDisplayMillis(file: java.io.File): Long =
+        snapshotStampMillis(file) ?: file.lastModified()
 
     private val ATTACHED_FILES_REGEX =
         Regex("<user-attached-files>.*?</user-attached-files>", RegexOption.DOT_MATCHES_ALL)
@@ -1672,6 +2684,123 @@ object ConfigBackup {
      * dominate. Returns null when nothing textual survives.
      */
     /**
+     * [da1034-A1] Copy [src] to [dst] entry-by-entry, DROPPING every entry
+     * that lands in the MCP OAuth bridge namespace — the plaintext token
+     * bridge (`MCPOAuthStore.bridgeDir`, mounted in-guest as
+     * /var/minis/mcp-servers/oauth). Pre-fix archives carry it verbatim
+     * (`includeSecrets=false` never gated this zip), so a restore would
+     * overwrite this device's live token bridge with whatever the source
+     * device had. Returns the number of dropped entries per kind (0 for a
+     * clean archive — the exporter no longer writes them in the first place).
+     * Pure JVM; a write failure propagates to the Stage 9 catch which reports
+     * it through `skipped` instead of half-restoring.
+     *
+     * [dv28-a5 A-05] Same pass, second drop: when [dropPrestagedServerList] is
+     * set, the MCP server list (`mcp/servers.json`) is dropped too, because
+     * Stage 7 already MERGED the backup's copy into this device's list through
+     * [MCPRepository.importJSON] (merge = this device's other servers survive).
+     * The extraction that follows writes entries verbatim, so letting that one
+     * entry through would replace the merged file with the backup's list and
+     * erase every server the backup did not carry — silently, since the merge
+     * only lived in memory until the next cold start re-read the file. The
+     * caller passes `false` when the merge did not run (no `mcpServers` section:
+     * an archive-only backup), where the raw copy is the only way to restore
+     * the list at all.
+     */
+    internal fun stripMcpOAuthEntries(
+        src: java.io.File,
+        dst: java.io.File,
+        dropPrestagedServerList: Boolean = false,
+    ): RestoreEntryFilterResult {
+        // [da1034-A1] Both operands are private temp files this process just
+        // created, so this refusal is unreachable today — it is here because
+        // the repo's write contract (`readonly_mount_write_guard`) applies to
+        // every write whose target is a path parameter, and a future caller
+        // must not be able to route this copy into a read-only mount by
+        // reusing the helper.
+        if (com.rikkaminis.app.sandbox.PRootKernel.isLinuxPathUnderReadOnlyMount(dst.absolutePath)) {
+            throw java.io.IOException(
+                "refusing to write the oauth-filtered archive under a read-only mount"
+            )
+        }
+        var oauthDropped = 0
+        var prestagedDropped = 0
+        java.io.FileOutputStream(dst).use { fos ->
+            java.util.zip.ZipOutputStream(fos.buffered()).use { zos ->
+                java.util.zip.ZipFile(src).use { zf ->
+                    val entries = zf.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        if (isMcpOAuthEntryName(entry.name)) {
+                            oauthDropped++
+                            continue
+                        }
+                        if (dropPrestagedServerList && isMcpServerListEntryName(entry.name)) {
+                            prestagedDropped++
+                            continue
+                        }
+                        zos.putNextEntry(java.util.zip.ZipEntry(entry.name))
+                        zf.getInputStream(entry).use { it.copyTo(zos) }
+                        zos.closeEntry()
+                    }
+                }
+            }
+        }
+        return RestoreEntryFilterResult(oauthDropped, prestagedDropped)
+    }
+
+    /**
+     * [dv28-a5 A-05] What [stripMcpOAuthEntries] removed while copying the
+     * artifact archive. Two counters, not one: the two drops mean different
+     * things to the user — a credential guard ([da1034-A1]) versus "this file
+     * was already restored by Stage 7's merge" — and each gets its own
+     * `skipped` sentence.
+     */
+    internal data class RestoreEntryFilterResult(
+        val oauthDropped: Int,
+        val prestagedDropped: Int,
+    ) {
+        val dropped: Int get() = oauthDropped + prestagedDropped
+    }
+
+    /**
+     * [dv28-a5 A-05] True for the MCP server list as Stage 9 routes it —
+     * exactly "mcp/servers.json" (`MCPRepository` writes that name at the mcp
+     * root). Compared segment-wise with empty and "." segments collapsed, the
+     * same normalisation [isMcpOAuthEntryName] uses, so "mcp//servers.json" and
+     * "mcp/./servers.json" — all landing on the same file — are recognised
+     * too. Only the one file name is excluded: the rest of the `mcp/` prefix
+     * (custom data the agent wrote) still restores.
+     */
+    internal fun isMcpServerListEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size == 2 && segs[0] == "mcp" && segs[1] == "servers.json"
+    }
+
+    /**
+     * [da1034-A1] True when a zip entry belongs to the MCP OAuth bridge
+     * namespace ("mcp/oauth/…"). Compared segment-wise with empty and "."
+     * segments collapsed, so "mcp//oauth/x.json", "mcp/./oauth/x.json" and
+     * "./mcp/oauth/x.json" all resolve to the same destination and are all
+     * refused — a name that would land inside the live token bridge dir is
+     * dropped, never parsed-then-trusted. ".." never reaches here from a
+     * trusted writer and is rejected wholesale (with absolute paths and
+     * backslashes) by [ArtifactArchiver.extractZipByPrefix].
+     */
+    internal fun isMcpOAuthEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size >= 2 && segs[0] == "mcp" && segs[1] == "oauth"
+    }
+
+    /**
      * [review G1] Strip secret-bearing values from an [exportServerJSON]
      * document. exportServerJSON emits the importable wrapper shape
      * `{"mcpServers":{"<id>":{…}}}` — the credential-bearing entry sits ONE
@@ -1685,6 +2814,33 @@ object ConfigBackup {
      * even with includeSecrets=false. A regression test pins the wrapper
      * shape the export path actually passes.
      */
+    /**
+     * [dv20-a1 A-01] Redact ONE archived artifact entry on its way into a
+     * credentials-free backup. Only `servers.json` — MCPRepository's on-disk
+     * config, `{"mcpServers":{"<id>":{…}}}` under `minis-global/mcp-servers`
+     * — carries credentials, and it is the exact shape the Stage 5 export
+     * section already strips, so this defers to the same
+     * [stripExportedMcpSecrets] instead of growing a second rule. Any other
+     * entry under the mcp root (the jsonl/md data files) passes verbatim.
+     *
+     * Returns **null to drop the entry**: bytes that do not parse must never
+     * be written verbatim into a no-secrets archive (fail closed). A
+     * credential that cannot be redacted is a credential that must not be
+     * exported — and the archive entry name is left to the caller, so restore
+     * routing is unchanged.
+     */
+    internal fun redactMcpArtifactEntry(relPath: String, bytes: ByteArray): ByteArray? {
+        if (relPath.substringAfterLast('/') != "servers.json") return bytes
+        return try {
+            val obj = JSONObject(String(bytes, Charsets.UTF_8))
+            stripExportedMcpSecrets(obj)
+            obj.toString(2).toByteArray(Charsets.UTF_8)
+        } catch (t: Throwable) {
+            AppLogger.warning(TAG, "mcp artifact redaction failed for $relPath: ${t.message}")
+            null
+        }
+    }
+
     internal fun stripExportedMcpSecrets(obj: JSONObject) {
         val inner = obj.optJSONObject("mcpServers")
         if (inner == null) {
@@ -1761,7 +2917,11 @@ object ConfigBackup {
         return url.substring(0, qIdx + 1) + redacted + frag
     }
 
-    internal fun sanitizeChatParts(partsJson: String?): String? {
+    internal fun sanitizeChatParts(partsJson: String?, slimText: Boolean = true): String? {
+        // [FIX-R5-B1 / F-15] slimText=false is the IMPORT face: dead media
+        // pointers are still dropped, but text is left at full size because
+        // ChatRepository.capPartsJsonForRow (500 KB, marker + original length)
+        // is the import-side size authority — see sanitizeIncomingParts.
         if (partsJson.isNullOrBlank()) return null
         val arr = try {
             JSONArray(partsJson)
@@ -1772,7 +2932,25 @@ object ConfigBackup {
         for (i in 0 until arr.length()) {
             val el = arr.optJSONObject(i) ?: continue
             val type = el.optString("type")
-            if (type == "image" || type == "image_url" || type == "video" || type == "video_url") {
+            // [FIX-R3-D / F-15] Every row written today carries `mediaRef`
+            // (see ChatMessageJson.buildMediaRefPartJson) — a pointer to a file
+            // under the EXPORTING device's media store (`relativePath`,
+            // `linuxPath`). The attach filter only knew the pre-migration
+            // `"image"`/`"video"` names, so a cross-device backup shipped those
+            // private paths in every affected message: the receiving device
+            // cannot resolve them (renders a broken attachment) and the backup
+            // leaks a filename/path it has no use for. Dropped for the same
+            // reason as the legacy shapes — the media bytes never travel, so
+            // the reference is dead weight that looks live.
+            // The same two names [com.rikkaminis.app.share.countPartsAttachments]
+            // treats as attachments; that file owns the canonical arm table and
+            // this is its drop-side counterpart (kept in step with it).
+            // One line on purpose: this branch treats image and video the SAME
+            // way (drop both), which is what keeps it out of the "media
+            // quantifier" family that parts_json_funnel_check derives — a
+            // dropper that splits the two by name is asserting per-kind
+            // semantics it does not have.
+            if (type == "image" || type == "image_url" || type == "video" || type == "video_url" || type == "mediaRef") {
                 continue
             }
             if (type == "text") {
@@ -1784,7 +2962,7 @@ object ConfigBackup {
                 // pasted logs / code dumps previously rode uncapped.
                 el.put(
                     "value",
-                    if (cleaned.length > MAX_BACKUP_TEXT_CHARS) {
+                    if (slimText && cleaned.length > MAX_BACKUP_TEXT_CHARS) {
                         cleaned.take(MAX_BACKUP_TEXT_CHARS) +
                             "\n… [truncated ${cleaned.length - MAX_BACKUP_TEXT_CHARS} chars]"
                     } else cleaned
@@ -1799,7 +2977,7 @@ object ConfigBackup {
                 // lands mid-JSON.
                 val value = el.optJSONObject("value") ?: el
                 val input = value.optString("input")
-                if (input.length > MAX_BACKUP_TOOL_INPUT_CHARS) {
+                if (slimText && input.length > MAX_BACKUP_TOOL_INPUT_CHARS) {
                     value.put(
                         "input",
                         input.take(MAX_BACKUP_TOOL_INPUT_CHARS) +
@@ -1812,8 +2990,14 @@ object ConfigBackup {
                 // Drop the snapshot preview: it duplicates the tail of
                 // output and no UI code reads it (verified 2026-08-11).
                 value.remove("snapshot")
+                // [FIX-R3-D / F-15] …and the tool-produced media pointer, for
+                // the same reason as the `mediaRef` part above: `ToolResult.mediaRef`
+                // is a path into THIS device's media store. The tool result
+                // itself stays (its text is the evidence); only the unresolvable
+                // pointer goes.
+                value.remove("mediaRef")
                 val output = value.optString("output")
-                if (output.length > MAX_BACKUP_TOOL_OUTPUT_CHARS) {
+                if (slimText && output.length > MAX_BACKUP_TOOL_OUTPUT_CHARS) {
                     value.put(
                         "output",
                         output.take(MAX_BACKUP_TOOL_OUTPUT_CHARS) +
@@ -1824,6 +3008,44 @@ object ConfigBackup {
             kept.put(el)
         }
         return if (kept.length() == 0) null else kept.toString()
+    }
+
+    /**
+     * [FIX-R5-B1 / F-15] The import-side half of [sanitizeChatParts].
+     *
+     * The exporter ran every row through the sanitizer, but the import side
+     * read the payload verbatim, so a row that arrived any other way — the
+     * OpenMinis `.minisbak` converter (which re-attaches the exporting device's
+     * `mediaRef` pointers verbatim), a hand-edited package, an older build's
+     * export — landed dangling media references (and uncapped text) straight
+     * into the message table: a permanently broken attachment tile and a
+     * private path from another device. Sanitize HERE, where the row is about
+     * to be written, so every writer is covered by one definition.
+     *
+     * [sanitizeChatParts] answers `null` for two different worlds and this
+     * keeps them apart:
+     *  - unparseable payload → hand the ORIGINAL string on (the row-size
+     *    ceiling below still applies; the row is not ours to reinterpret);
+     *  - parsed, but nothing survivable (its only parts were media pointers) →
+     *    an empty string, so the row exists without a dead attachment.
+     *
+     * Applied exactly once per row: the sanitizer is NOT idempotent (a second
+     * pass re-truncates an already-"… [truncated N chars]" text), which is why
+     * the `.minisbak` converter does NOT sanitize its own output — everything
+     * passes through [importChatSections] before it reaches the database.
+     *
+     * It also runs with `slimText = false`: media pointers are still dropped,
+     * but text/tool payloads are NOT slimmed to the export caps, because the
+     * writer's byte ceiling ([ChatRepository.capPartsJsonForRow], 500 KB,
+     * "Content truncated at 500 KB — original length N chars") is the
+     * import-side size authority (pinned by PartsJsonFunnelTest). Slimming
+     * here first would leave that ceiling nothing to truncate and silently
+     * shorten a restored row short of the budget it is allowed to use.
+     */
+    internal fun sanitizeIncomingParts(raw: String): String {
+        if (raw.isBlank()) return raw
+        sanitizeChatParts(raw, slimText = false)?.let { return it }
+        return if (runCatching { JSONArray(raw) }.isSuccess) "" else raw
     }
 
     /** [T-backup-chat-slim] Cuts model reasoning content to a sane size.
@@ -1843,6 +3065,355 @@ object ConfigBackup {
         return "rikkaminis-backup-${fmt.format(java.util.Date(now))}.json"
     }
 }
+
+/**
+ * [FIX-P1A / FINDING-7] One environment variable's NON-secret backup metadata.
+ * A carrier so [buildEnvVarExportEntries] stays pure (no repository, no
+ * Android) and can be pinned on the JVM.
+ */
+internal data class EnvVarBackupMeta(
+    val key: String,
+    val note: String,
+    val group: String,
+)
+
+/**
+ * [FIX-P1A / FINDING-7] The `envVars` section plus the accounting the export
+ * used to drop on the floor.
+ *
+ * @property entries the payload section, one object per variable.
+ * @property missingSecretValues keys whose value was DECLARED to travel
+ *   (`includeSecrets=true`) but could not be read. Empty for a secrets-free
+ *   export by construction — there the absence is the intent, not a failure.
+ */
+internal class EnvVarExport(
+    val entries: JSONArray,
+    val missingSecretValues: List<String>,
+)
+
+/**
+ * [FIX-P1A / FINDING-7] Per-entry marker for "declared with secrets, value
+ * unreadable". `_`-prefixed like `_entryIds`: a backup-layer annotation, never
+ * part of the wire contract (import ignores unknown keys).
+ */
+internal const val ENV_VALUE_UNREADABLE_KEY = "_valueUnreadable"
+
+/**
+ * [FIX-P1A / FINDING-7] Build the `envVars` section and report every value the
+ * export claimed to carry but could not read.
+ *
+ * The defect this closes: `includeSecrets=true` + `getValue(key) == null` used
+ * to emit `{key, note}` and nothing else — no marker, no counter, no log. A
+ * payload that said "credentials included" was therefore indistinguishable
+ * from a complete one, and the loss only surfaced after a device transfer.
+ * Contract now:
+ *  - `includeSecrets=false` → key+note(+group) only, [EnvVarExport.missingSecretValues]
+ *    empty (absence is the requested shape);
+ *  - `includeSecrets=true` + a value → `value` present, nothing to report;
+ *  - `includeSecrets=true` + no value → `_valueUnreadable: true` on the entry
+ *    AND the key in [EnvVarExport.missingSecretValues], so "declared secrets"
+ *    and "values actually carried" can be reconciled from the document alone.
+ *
+ * Never fails the export: a missing credential is a gap to report, not a
+ * reason to leave the user without a backup.
+ */
+internal fun buildEnvVarExportEntries(
+    entries: List<EnvVarBackupMeta>,
+    includeSecrets: Boolean,
+    readValue: (String) -> String?,
+): EnvVarExport {
+    val out = JSONArray()
+    val missing = ArrayList<String>(0)
+    for (entry in entries) {
+        val obj = JSONObject().apply {
+            put("key", entry.key)
+            put("note", entry.note)
+            if (entry.group.isNotEmpty()) put("group", entry.group)
+        }
+        if (includeSecrets) {
+            val value = readValue(entry.key)
+            if (value != null) {
+                obj.put("value", value)
+            } else {
+                obj.put(ENV_VALUE_UNREADABLE_KEY, true)
+                missing.add(entry.key)
+            }
+        }
+        out.put(obj)
+    }
+    return EnvVarExport(out, missing)
+}
+
+/** [FIX-P1A] First few ids plus a count, for log lines that must stay short. */
+internal fun summariseIds(ids: List<String>, max: Int = 3): String {
+    if (ids.size <= max) return ids.joinToString(", ")
+    return ids.take(max).joinToString(", ") + " … (+${ids.size - max})"
+}
+
+/**
+ * [FIX-R3-D / F-08] May a backup's provider entry merge into the live instance
+ * whose (providerType, label) it matched?
+ *
+ * `mergeImportInstanceJSON` answers that question against the live list, which
+ * grows as this import runs. The second provider of a duplicate-label pair
+ * therefore matched the instance the first one had just created/merged into and
+ * overwrote it — the document claimed two providers, one survived. An instance
+ * this run already claimed is not a merge target: the entry takes the append
+ * path and gets the `"<label> (2)"` rename, exactly like a clash with a
+ * pre-existing instance.
+ *
+ * Pure so [BackupProviderMergeTest] can pin the rule on the JVM (the repository
+ * behind it needs Room).
+ */
+internal fun shouldMergeIntoExisting(
+    matchedLiveInstanceId: String?,
+    claimedThisRun: Set<String>,
+): Boolean = matchedLiveInstanceId != null && matchedLiveInstanceId !in claimedThisRun
+
+/**
+ * Rewrite the source group/entry ids embedded in a `defaults.*` field to the
+ * ids minted during this import. Group-typed fields
+ * (primaryGroup / subGroup / voiceInputGroup / voiceOutputGroup /
+ * agentLoopGroups) map through [groupIdMap];
+ * agentLoopEntries and `runtime.compactModelEntryId` (the pinned compaction
+ * model) map through [entryIdMap]. Everything else is returned
+ * unchanged.
+ *
+ * [FIX-P1A / RT-S5] An id the map cannot resolve is no longer written through.
+ * Passing the source id along "so the field's own writer can report it" did
+ * not do that:
+ *  - `defaults.primaryGroup` / `subGroup` / `voice*Group` made the writer throw
+ *    `InvalidValue`, so a value the backup DID carry was refused and the local
+ *    setting stayed as it was with no line in `skipped` tying the two together;
+ *  - `defaults.agentLoopGroups` / `agentLoopEntries` were worse: their writers
+ *    filter unknown ids and write the remainder, so a second import (an older
+ *    package with no `groups` section → empty map → every id unmapped)
+ *    silently CLEARED the user's agent-loop list. Counts looked normal, the UI
+ *    looked fine, the setting was gone.
+ *
+ * Contract now, mirroring [remapSessionBindingJson]: an id the map cannot
+ * resolve is dropped (and [FieldIdRemap.value] is null when nothing survives),
+ * with the ids handed back so the caller can record them in `skipped`. The
+ * criterion is "a second import cannot introduce a new dangling reference",
+ * not "never remap".
+ *
+ * [FIX-R3-D / F-02] There is no longer an "empty map ⇒ pass the value through"
+ * shortcut. That shortcut read as "same-install restore has nothing to
+ * rewrite", but what it actually handed to `field.write` was the SOURCE
+ * install's ids: a backup without a `groups` / `providers` section (an older
+ * package, or one whose providers were all rejected) produced empty maps, the
+ * writers filter unknown ids against this install's lists, and the intersection
+ * was empty — `defaults.agentLoopGroups` / `agentLoopEntries` were CLEARED and
+ * `runtime.compactModelEntryId` was overwritten with a dangling uuid, while the
+ * restore reported success. Same-install restores keep working because the
+ * caller passes this install's own ids ([localGroupIds] / [localEntryIds]):
+ * an id that already exists here is a legitimate target and is kept verbatim,
+ * anything else is reported instead of written.
+ *
+ * Pure and Android-free so [BackupIdRemapTest] can pin every branch on the JVM.
+ * [FIX-E / ISSUE-09] `runtime.compactModelEntryId` used to be absent here: its
+ * consumer (CompactOrchestration's chain head) treats an unresolvable pin as
+ * "not reachable — follow the session chain" with a single INFO line, so a
+ * restore onto another install silently dropped the user's pinned compaction
+ * model instead of failing loudly.
+ * [da1031-A] The two voice-group bindings were absent here for the same
+ * reason *and* absent from the registry, so a restore dropped them twice over.
+ */
+internal fun remapDefaultsIds(
+    path: String,
+    value: ConfigValue,
+    groupIdMap: Map<String, String>,
+    entryIdMap: Map<String, String>,
+    // [FIX-R3-D / F-02] Ids that already exist on THIS install. A same-install
+    // restore (or a backup that carried no `groups` / `providers` section)
+    // references them and must keep working; a foreign id must not be written
+    // through to a writer that would filter it away and clear the local list.
+    localGroupIds: Set<String> = emptySet(),
+    localEntryIds: Set<String> = emptySet(),
+): FieldIdRemap {
+    val map = when (path) {
+        "defaults.primaryGroup", "defaults.subGroup", "defaults.voiceInputGroup", "defaults.voiceOutputGroup", "defaults.agentLoopGroups" -> groupIdMap
+        "defaults.agentLoopEntries", "runtime.compactModelEntryId" -> entryIdMap
+        else -> return FieldIdRemap(value)
+    }
+    // [FIX-R3-D / F-02] Which ids this field's writer would still accept
+    // unchanged. Deliberately read from `path` again rather than from `map`:
+    // an empty map no longer means "the value is fine as-is" (see the KDoc).
+    val localIds = when (path) {
+        "defaults.agentLoopEntries", "runtime.compactModelEntryId" -> localEntryIds
+        else -> localGroupIds
+    }
+    return when (value) {
+        is ConfigValue.Str -> {
+            // A blank id means "nothing selected", not a reference that failed
+            // to resolve: rewriting it would change semantics and reporting it
+            // would be noise on every fresh install.
+            if (value.value.isEmpty()) {
+                FieldIdRemap(value)
+            } else {
+                val resolved = map[value.value]
+                    ?: value.value.takeIf { it in localIds }
+                when {
+                    resolved == null -> FieldIdRemap(value = null, unmapped = listOf(value.value))
+                    // Unchanged: hand back the SAME object so a caller can tell
+                    // "nothing was rewritten" apart from "rewritten to itself".
+                    resolved == value.value -> FieldIdRemap(value)
+                    else -> FieldIdRemap(ConfigValue.Str(resolved))
+                }
+            }
+        }
+        is ConfigValue.Arr -> {
+            val kept = ArrayList<ConfigValue>(value.value.size)
+            val unmapped = ArrayList<String>(0)
+            var rewritten = false
+            for (element in value.value) {
+                if (element !is ConfigValue.Str || element.value.isEmpty()) {
+                    kept.add(element)
+                    continue
+                }
+                val mapped = map[element.value]
+                    ?: element.value.takeIf { it in localIds }
+                when {
+                    mapped == null -> unmapped.add(element.value)
+                    mapped == element.value -> kept.add(element)
+                    else -> {
+                        kept.add(ConfigValue.Str(mapped))
+                        rewritten = true
+                    }
+                }
+            }
+            when {
+                unmapped.isEmpty() && !rewritten -> FieldIdRemap(value)
+                unmapped.isEmpty() -> FieldIdRemap(ConfigValue.Arr(kept))
+                // Nothing survived: writing the empty remainder would CLEAR the
+                // local setting (the silent-wipe shape this fix exists for).
+                kept.isEmpty() -> FieldIdRemap(value = null, unmapped = unmapped)
+                else -> FieldIdRemap(ConfigValue.Arr(kept), unmapped)
+            }
+        }
+        else -> FieldIdRemap(value)
+    }
+}
+
+/**
+ * [FIX-P1A / RT-S5] Outcome of [remapDefaultsIds] for one field.
+ *
+ * @property value what the caller may write; `null` means nothing usable
+ *   survived the remap, so the caller must NOT write (keep the local value).
+ * @property unmapped source ids the map could not resolve. Non-empty means the
+ *   restore is partial and the caller has to say so through `skipped`.
+ */
+internal class FieldIdRemap(
+    val value: ConfigValue?,
+    val unmapped: List<String> = emptyList(),
+)
+
+/**
+ * Rewrite the source group/entry ids inside a session's persisted
+ * `modelBinding` JSON onto the ids minted during this import.
+ *
+ * The two shapes `ChatSessionEntryExt.persistBinding` / `ChatModelRouting`
+ * write are `{"type":"group","groupId":…[,"lastEntryId":…]}` and
+ * `{"type":"entry","entryId":…}`; a restored session whose binding still
+ * points at a foreign uuid fails [ChatViewModel.restoreFromBinding] and
+ * silently degrades to the stored `modelId` (group binding lost, no fallback
+ * chain) — see [FIX-E / ISSUE-09].
+ *
+ * Contract: blank input is returned unchanged; with no maps at all the input
+ * is returned byte-identically (same-install restore must not rewrite
+ * anything); an unmapped id keeps its original value; a payload that is not
+ * the expected JSON object is returned unchanged rather than dropped.
+ */
+internal fun remapSessionBindingJson(
+    bindingJson: String?,
+    groupIdMap: Map<String, String>,
+    entryIdMap: Map<String, String>,
+): String? {
+    if (bindingJson.isNullOrBlank()) return bindingJson
+    if (groupIdMap.isEmpty() && entryIdMap.isEmpty()) return bindingJson
+    return try {
+        val obj = JSONObject(bindingJson)
+        when (obj.optString("type")) {
+            "group" -> {
+                val gid = obj.optString("groupId")
+                if (gid.isNotEmpty()) obj.put("groupId", groupIdMap[gid] ?: gid)
+                val lastEid = obj.optString("lastEntryId")
+                if (lastEid.isNotEmpty()) obj.put("lastEntryId", entryIdMap[lastEid] ?: lastEid)
+            }
+            "entry" -> {
+                val eid = obj.optString("entryId")
+                if (eid.isNotEmpty()) obj.put("entryId", entryIdMap[eid] ?: eid)
+            }
+            // Unknown / future binding shape: keep it verbatim. Re-serializing
+            // would rewrite an object this layer does not understand.
+            else -> return bindingJson
+        }
+        obj.toString()
+    } catch (_: Throwable) {
+        bindingJson
+    }
+}
+
+/**
+ * [FIX-R3-D / F-05] Export-side read for one `memoryFiles` entry: `null` when
+ * the file is not there (or cannot be read), the text when it is.
+ *
+ * `MemoryRepository.readFile` answers `""` for both "absent" and "read failed"
+ * and `listAllFiles` lists `GLOBAL.md` unconditionally, so a device that never
+ * created one exported `{"name":"GLOBAL.md","content":""}` — indistinguishable
+ * from a deliberately emptied file, and the restore side's blank-content guard
+ * has to treat it as "the backup knows nothing about this file". With this
+ * helper the payload simply carries no entry for a file that does not exist;
+ * a genuinely empty file still rides as `""` (its content is the truth).
+ *
+ * Pure `java.io` so [BackupMemoryRollupTest] can pin both halves off device.
+ */
+internal fun readMemoryFileForBackup(dir: File?, name: String): String? {
+    if (dir == null) return null
+    val f = File(dir, name)
+    if (!f.isFile) return null
+    return runCatching { f.readText() }.getOrNull()
+}
+
+/**
+ * [FIX-E / ISSUE-09] The `memoryFiles` entries a backup carries, in payload
+ * order: everything [MemoryRepository.listAllFiles] lists (GLOBAL.md + daily
+ * logs), plus the distilled [MemoryRollupEngine.ROLLUP_FILE] index.
+ *
+ * The rollup is deliberately excluded from `listAllFiles` (it must stay out of
+ * the settings file list and out of `memory_get`), which used to make it the
+ * one memory artifact a backup never carried: after a device transfer the
+ * distilled rules — everything old daily logs were folded into — were simply
+ * gone. It is added here, not in `listAllFiles`, so the UI keeps its shape.
+ *
+ * [read] is the caller's read primitive: a name it cannot read yields null.
+ * Entries for listed names are kept even when the content is empty (unchanged
+ * pre-existing behavior); the optional rollup is only carried when it actually
+ * has content, so a device without one writes no extra entry.
+ */
+internal fun memoryBackupEntries(
+    listed: List<String>,
+    read: (String) -> String?,
+): List<Pair<String, String>> {
+    val out = ArrayList<Pair<String, String>>(listed.size + 1)
+    for (name in listed) {
+        val content = read(name) ?: continue
+        out.add(name to content)
+    }
+    val rollup = ROLLUP_BACKUP_FILE
+    if (rollup !in listed) {
+        val content = read(rollup)
+        if (!content.isNullOrEmpty()) out.add(rollup to content)
+    }
+    return out
+}
+
+/**
+ * [FIX-E / ISSUE-09] Distilled-memory index carried by every backup. Note the
+ * source of truth is [MemoryRollupEngine.ROLLUP_FILE] — never re-spelled.
+ */
+internal const val ROLLUP_BACKUP_FILE: String =
+    com.rikkaminis.app.workspace.MemoryRollupEngine.ROLLUP_FILE
 
 /**
  * [fix-audit-finding-1] The entry-id ordering contract.
@@ -1881,6 +3452,8 @@ internal suspend fun importChatSections(
     chatSessionsArr: JSONArray?,
     chatMessagesArr: JSONArray?,
     skipped: MutableList<String>,
+    groupIdMap: Map<String, String> = emptyMap(),
+    entryIdMap: Map<String, String> = emptyMap(),
 ): Pair<Int, Int> {
     var chatSessionsImported = 0
     var chatMessagesImported = 0
@@ -1897,7 +3470,11 @@ internal suspend fun importChatSections(
                     updatedAt = s.optLong("updatedAt"),
                     category = s.optString("category").ifEmpty { null },
                     lastMessage = s.optString("lastMessage").ifEmpty { null },
-                    modelBinding = s.optString("modelBinding").ifEmpty { null },
+                    modelBinding = remapSessionBindingJson(
+                        s.optString("modelBinding").ifEmpty { null },
+                        groupIdMap = groupIdMap,
+                        entryIdMap = entryIdMap,
+                    ),
                     source = s.optString("source").ifEmpty { null },
                     memoryEnabled = s.optInt("memoryEnabled", 1),
                     pinnedAt = if (s.has("pinnedAt")) s.optLong("pinnedAt") else null,
@@ -1917,14 +3494,32 @@ internal suspend fun importChatSections(
         for (i in 0 until chatMessagesArr.length()) {
             val m = chatMessagesArr.optJSONObject(i) ?: continue
             try {
+                // [fix/da1019-partsjson-funnel] A restored row is a row. The
+                // import path used to insert the payload verbatim, so a backup
+                // carrying an oversized parts_json / reasoning_content (hand-
+                // edited payload, older write path, another tool's export)
+                // landed a blob the loader cannot materialise out of a 2 MB
+                // CursorWindow — SQLiteBlobTooBigException on the next open of
+                // that session. Both columns now take the same ceilings the
+                // runtime writers apply (ChatRepository companion funnels).
                 val message = MessageEntity(
                     id = m.optString("id"),
                     sessionId = m.optString("sessionId"),
                     role = m.optString("role"),
-                    partsJson = m.optString("partsJson"),
+                    // [FIX-R5-B1 / F-15] …and the parts take the same sanitizer
+                    // the export side always applied (drops dangling mediaRef /
+                    // image / video pointers, caps text) — see
+                    // [sanitizeIncomingParts]. Sanitize first, byte-cap second.
+                    partsJson = ChatRepository.capPartsJsonForRow(
+                        ConfigBackup.sanitizeIncomingParts(m.optString("partsJson"))
+                    ),
                     createdAt = m.optLong("createdAt"),
                     sortOrder = m.optInt("sortOrder", i),
-                    reasoningContent = if (m.has("reasoningContent")) m.optString("reasoningContent") else null,
+                    reasoningContent = if (m.has("reasoningContent")) {
+                        ChatRepository.capReasoningContentForRow(m.optString("reasoningContent"))
+                    } else {
+                        null
+                    },
                 )
                 if (chatRepo.dao.getMessage(message.id) == null) {
                     chatRepo.dao.insertMessage(message)
@@ -1936,4 +3531,107 @@ internal suspend fun importChatSections(
         }
     }
     return chatSessionsImported to chatMessagesImported
+}
+
+// --- [fix/dv18-4 A-07] Model-group run-config seams for the backup import
+// path. The `groups[]` section carries five run-config fields on export
+// (buildSections: strategy / fallbackStrategy / defaultThinkingLevel /
+// contextLimitTokens / lastContextLimitTokens), but the import's same-name
+// merge branch decoded NONE of them — a restore onto an install that already
+// had the group silently reset the user's routing strategy / per-group
+// thinking level / context limit to the defaults (Stage 1 vs Stage 2
+// asymmetry: readImportInstanceFields DOES restore the instance run-config
+// on a same-label merge). Same shape as ProviderRepository's Stage-1 seams:
+// one decode (readGroupRunConfig), two appliers — the create path takes
+// `.value` (decode defaults mirror the pre-existing inline decode byte for
+// byte), the merge path goes through applyGroupRunConfig, which honours
+// [BackupField.present] so a legacy backup's missing keys keep the local
+// group's run-config instead of overwriting it with a null/default.
+// Top-level and Android-free (the warning sink is injected) so the round-trip
+// is JVM-unit-testable without an Android Context. ---
+
+/** [enumValueOf] that falls back to [default] instead of throwing on a
+ *  token this build doesn't know (forward-compat with newer backups). */
+private inline fun <reified T : Enum<T>> enumOrDefault(name: String, default: T): T =
+    runCatching { enumValueOf<T>(name) }.getOrDefault(default)
+
+/**
+ * [fix/dv18-4 A-07] One field decoded from a `groups[]` backup entry.
+ * [present] records whether the payload carried the key AT ALL: a pre-T312
+ * backup has none of the run-config keys, and "absent" must leave the target
+ * group's current value alone (restore is additive for what the backup does
+ * not say) rather than overwrite it with a decode default.
+ */
+internal data class BackupField<T>(val present: Boolean, val value: T)
+
+/** [fix/dv18-4 A-07] The five run-config fields of one `groups[]` entry. */
+internal data class GroupRunConfigSnapshot(
+    val strategy: BackupField<RoutingStrategy>,
+    val fallbackStrategy: BackupField<FallbackStrategy>,
+    val defaultThinkingLevel: BackupField<ThinkingLevel?>,
+    val contextLimitTokens: BackupField<Int?>,
+    val lastContextLimitTokens: BackupField<Int?>,
+)
+
+/**
+ * [fix/dv18-4 A-07] The ONE decode of the group run-config keys, shared by
+ * both restore paths (fresh create + same-name merge) so the two cannot drift.
+ * Decode defaults are the pre-fix inline behaviour: enums fall back to the
+ * model defaults on an unknown token, `defaultThinkingLevel` and both token
+ * limits decode to null when absent/empty/non-positive. [warn] receives one
+ * message when a thinking-level token cannot be parsed — the RESULT is
+ * unchanged either way (a backup from a newer build must not sink the whole
+ * import); the point is that the drop stops being silent.
+ */
+internal fun readGroupRunConfig(g: JSONObject, warn: (String) -> Unit): GroupRunConfigSnapshot {
+    val rawThinking = g.optString("defaultThinkingLevel", "")
+    val thinking = rawThinking
+        .takeIf { it.isNotEmpty() }
+        ?.let { runCatching { ThinkingLevel.valueOf(it) }.getOrNull() }
+    if (rawThinking.isNotEmpty() && thinking == null) {
+        warn(
+            "import: group defaultThinkingLevel \"$rawThinking\" is not a level " +
+                "this build knows — no thinking-level override applied"
+        )
+    }
+    return GroupRunConfigSnapshot(
+        strategy = BackupField(
+            present = g.has("strategy"),
+            value = enumOrDefault(g.optString("strategy"), RoutingStrategy.fallback),
+        ),
+        fallbackStrategy = BackupField(
+            present = g.has("fallbackStrategy"),
+            value = enumOrDefault(g.optString("fallbackStrategy"), FallbackStrategy.default),
+        ),
+        defaultThinkingLevel = BackupField(present = g.has("defaultThinkingLevel"), value = thinking),
+        contextLimitTokens = BackupField(
+            present = g.has("contextLimitTokens"),
+            value = g.optInt("contextLimitTokens").takeIf { it > 0 },
+        ),
+        lastContextLimitTokens = BackupField(
+            present = g.has("lastContextLimitTokens"),
+            value = g.optInt("lastContextLimitTokens").takeIf { it > 0 },
+        ),
+    )
+}
+
+/**
+ * [fix/dv18-4 A-07] Apply a decoded [GroupRunConfigSnapshot] onto [base].
+ * Copy-on-write: returns a NEW group, never mutates [base] (it is the live
+ * object out of config.value that concurrent readers may be iterating). Only
+ * fields the payload actually carried ([BackupField.present]) are
+ * overwritten — an absent key keeps [base]'s value, so restoring a legacy
+ * backup is a no-op on run-config, not a reset. Deliberately does NOT touch
+ * id / name / memberEntryIds: the merge match key, the resolved name and the
+ * member union are the caller's decisions (and updateGroup re-copies the
+ * member list on store).
+ */
+internal fun applyGroupRunConfig(base: ModelGroup, f: GroupRunConfigSnapshot): ModelGroup {
+    val out = base.copy()
+    if (f.strategy.present) out.strategy = f.strategy.value
+    if (f.fallbackStrategy.present) out.fallbackStrategy = f.fallbackStrategy.value
+    if (f.defaultThinkingLevel.present) out.defaultThinkingLevel = f.defaultThinkingLevel.value
+    if (f.contextLimitTokens.present) out.contextLimitTokens = f.contextLimitTokens.value
+    if (f.lastContextLimitTokens.present) out.lastContextLimitTokens = f.lastContextLimitTokens.value
+    return out
 }

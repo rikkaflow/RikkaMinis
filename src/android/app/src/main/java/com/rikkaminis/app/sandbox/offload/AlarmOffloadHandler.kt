@@ -43,8 +43,10 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1))
+        // `--help` is a flag, so `positional` is empty for it too: the exit
+        // code has to be decided on the flag, or `--help` answers 2.
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
-            return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, HELP)
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, HELP)
         }
 
         return try {
@@ -297,6 +299,13 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
             val date = runCatching {
                 val sdf = SimpleDateFormat(pat, Locale.US)
                 if (pat.endsWith("'Z'")) sdf.timeZone = TimeZone.getTimeZone("UTC")
+                // [dv16-A A-01] Strict, like the sessions funnel
+                // (parseSessionsDate): lenient mode silently ROLLS an
+                // out-of-range field over (`2026-02-30T14:00` → March 2),
+                // so a mistyped alarm time was accepted as another minute
+                // instead of being refused. HH:MM keeps its own explicit
+                // range check in parseHHMM.
+                sdf.isLenient = false
                 sdf.parse(s)
             }.getOrNull() ?: continue
             val cal = Calendar.getInstance().apply { time = date }
@@ -398,12 +407,6 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
             .put("action", action)
             .put("data", data)
         return NativeOffloadResult(0, OffloadOutput.formatBody(envelope.toString(2), args) + "\n")
-    }
-
-    private fun wrap(text: String, args: OffloadArgs): NativeOffloadResult {
-        val err = text.startsWith("Error")
-        val formatted = OffloadOutput.formatBody(text.trimEnd('\n'), args)
-        return NativeOffloadResult(if (err) 1 else 0, "$formatted\n")
     }
 
     companion object {

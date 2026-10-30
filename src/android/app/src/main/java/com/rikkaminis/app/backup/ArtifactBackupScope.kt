@@ -29,6 +29,21 @@ object ArtifactBackupScope {
      *  from the artifact backup (regenerable environment payloads). */
     private val EXCLUDED_DIRS = setOf("sandbox-env")
 
+    /** Directory names that are NEVER artifacts, at ANY depth.
+     *
+     *  [da1034-A1] `MCPOAuthStore.bridgeDir` is `<minis-global/mcp-servers>/oauth`
+     *  — the in-guest token bridge for `minis-mcp-cli`. It holds LIVE
+     *  credentials in plaintext: `<server>.json` carries `access_token` /
+     *  `refresh_token` / `client_secret` / `token_endpoint` / `client_id` /
+     *  `resource`, and a pending `<server>.secret` handoff file carries the
+     *  client secret itself. `includeSecrets=false` gates the provider /
+     *  envVar / mcpServers JSON sections but NOT this archive, so the
+     *  auto-backup (and every WebDAV copy of it) was shipping those tokens
+     *  verbatim. The walk drops the directory by name, at every level rather
+     *  than only at a root, because the same walker runs over the mcp root
+     *  whose bridge dir is one level below `minis-global/`. */
+    private val DENIED_DIRS = setOf("oauth")
+
     /** File extensions that count as artifacts. Text-only: the automatic
      *  backup must not silently grow into a media hoarder. */
     val DEFAULT_ALLOWED_EXTENSIONS = setOf(
@@ -75,13 +90,69 @@ object ArtifactBackupScope {
         // would otherwise recurse forever (File.isDirectory follows links)
         // and blow the stack. canonicalPath dedupes .. and absolute prefixes,
         // so the first visit wins and any revisit is skipped.
+        //
+        // [FIX-R3-D / F-06] …but "does not loop" is not "stays inside". The
+        // walk only looked at the LINK's own name, so `shared/bridge_bak ->
+        // ../../mcp-servers/oauth` was walked and archived as
+        // `shared/bridge_bak/<server>.json` — plaintext OAuth tokens riding a
+        // credentials-free (`includeSecrets=false`) backup all the way to the
+        // user's WebDAV server, past both DENIED_DIRS and the restore-side
+        // `mcp/oauth/` filter (neither matches that entry name). The resolved
+        // target now has to live under the shared root AND its resolved name
+        // has to survive DENIED_DIRS.
+        //
+        // [FIX-R5-A2 / A-F-06] …and "stays inside the root" is still not
+        // "stays out of the bridge". That first cut compared the canonical
+        // path to the root PREFIX only, so a FILE link
+        // `linear_bak.json -> oauth/linear.json` — inside the root the whole
+        // way — passed, skipped the directory-only DENIED_DIRS check below
+        // (the link is a file, not a directory), and rode every automatic
+        // backup with its plaintext token. The guard now reads the resolved
+        // path's SEGMENTS: any segment naming a credential directory, or the
+        // first segment naming an excluded one, is "not an artifact of this
+        // root" — the same fail-closed stance as the escape check above.
+        val rootCanon = try { sharedRoot.canonicalFile.path } catch (_: Exception) {
+            return Selection(files, 0, 0, 0)
+        }
+        val rootPrefix = if (rootCanon.endsWith(File.separator)) rootCanon else rootCanon + File.separator
+        fun resolveInside(child: File): File? = try {
+            val resolved = child.canonicalFile
+            val path = resolved.path
+            when {
+                // Fail-closed: a link that escapes, an unreadable inode, and a
+                // canonicalisation error are all "not an artifact of this root".
+                path == rootCanon -> resolved
+                !path.startsWith(rootPrefix) -> null
+                else -> {
+                    val segments = path.substring(rootPrefix.length)
+                        .split(File.separatorChar)
+                        .filter { it.isNotEmpty() }
+                    val denied = segments.any { it.lowercase() in DENIED_DIRS }
+                    val excludedTop =
+                        segments.firstOrNull()?.lowercase()?.let { it in EXCLUDED_DIRS } == true
+                    if (denied || excludedTop) null else resolved
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+
         val visited = HashSet<String>()
         fun walk(dir: File, prefix: String) {
             val canon = try { dir.canonicalPath } catch (_: Exception) { return }
             if (!visited.add(canon)) return
             val children = dir.listFiles() ?: return
             for (child in children.sortedBy { it.name }) {
+                // [FIX-R3-D / F-06] Resolve FIRST: `child.name` is the link's
+                // own token, `target.name` is what the bytes actually are.
+                val target = resolveInside(child) ?: continue
                 if (child.isDirectory) {
+                    // [da1034-A1] Credential directories are dropped wherever
+                    // they appear in the tree — see DENIED_DIRS. [FIX-R5-A2]
+                    // resolveInside now rejects these by path segment, so this
+                    // pair is a second belt (it also carries the leaf-name
+                    // intent if the segment rule is ever edited).
+                    if (child.name in DENIED_DIRS || target.name in DENIED_DIRS) continue
                     // Only the shared root has environment payloads; nested
                     // directories are always walked.
                     if (prefix.isEmpty() && child.name in EXCLUDED_DIRS) continue

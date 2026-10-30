@@ -28,6 +28,52 @@ enum class ProviderType(val displayName: String) {
         }
 }
 
+/**
+ * [ARCH-03] Authoritative `models.dev` provider ids for each [ProviderType].
+ *
+ * This is the single source of truth that `ModelsDevApi.providerKeyMap` derives
+ * from. It is deliberately an **exhaustive `when (this)` with no `else`
+ * branch**: adding an eighth vendor to [ProviderType] fails COMPILATION here
+ * (`'when' expression must be exhaustive`) until its `models.dev` mapping is
+ * declared, instead of silently letting the new family's models fall through
+ * to the order-dependent all-providers scan in `ModelsDevApi.enrichModel`
+ * (the F-212 failure: grok-4.5 enriched with a relay's 1,000,000 context;
+ * kimi-k3 given a 5-tier effort ladder from an unrelated relay).
+ *
+ * An empty list is a *deliberate* "this vendor has no public models.dev row"
+ * (previously expressed as an explicit `emptyList()` map entry).
+ */
+val ProviderType.modelsDevProviderIds: List<String>
+    get() = when (this) {
+        ProviderType.anthropic -> listOf("anthropic")
+        ProviderType.gemini -> listOf("google", "google-vertex")
+        ProviderType.openAI -> listOf("openai")
+        ProviderType.openRouter -> listOf("openrouter")
+        ProviderType.xAI -> listOf("xai")
+        ProviderType.kimiCode -> listOf("moonshotai", "moonshotai-cn")
+    }
+
+/**
+ * [ARCH-03] Short / legacy `LLMModel.provider` strings this family's rows carry
+ * in the built-in catalog ([LLMModel.Companion.allModels]) and in data persisted
+ * before [ProviderType.displayName] became the canonical write value.
+ *
+ * Exhaustive `when (this)` for the same reason as [modelsDevProviderIds].
+ * Entries that duplicate [ProviderType.displayName] are harmless (the derived
+ * map just merges two identical keys) — they are listed explicitly so the
+ * mapping is readable at a glance and so a catalog-side rename cannot silently
+ * drop a family out of the key map.
+ */
+val ProviderType.legacyProviderNames: List<String>
+    get() = when (this) {
+        ProviderType.anthropic -> listOf("Anthropic")
+        ProviderType.gemini -> listOf("Google")
+        ProviderType.openAI -> listOf("OpenAI")
+        ProviderType.openRouter -> listOf("OpenRouter")
+        ProviderType.xAI -> listOf("xAI")
+        ProviderType.kimiCode -> listOf("Kimi")
+    }
+
 @Serializable
 enum class ProviderCredential {
     apiKey,
@@ -244,10 +290,18 @@ data class ProviderInstance(
     var credentials: MutableList<ProviderCredentialMeta> = mutableListOf(),
 ) {
 
-    /** Returns the effective API base URL, applying v1 suffix if configured. */
+    /**
+     * Returns the effective API base URL, applying v1 suffix if configured.
+     *
+     * [deep-audit-1039 A-04] The stored value is trimmed before use: legacy
+     * rows (and any writer that bypassed the shared normalization) may carry
+     * padding, and appending `/v1` to `"   "` produced `"   /v1"` — a request
+     * URL that fails with no config-side error. A blank value is `null`
+     * (no override), same as an absent one.
+     */
     val effectiveBaseURL: String?
         get() {
-            val base = customBaseURL?.trimEnd('/') ?: return null
+            val base = customBaseURL?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
             return if (appendV1Suffix && !base.endsWith("/v1")) "$base/v1" else base
         }
 
@@ -352,19 +406,47 @@ data class ModelEntry(
 
     /** Effective model as seen by the rest of the app: baseModel with overrides applied. */
     val model: LLMModel
-        get() = if (overrides.isEmpty) baseModel else baseModel.copy(
-            displayName = overrides.displayName ?: baseModel.displayName,
-            maxOutputTokens = overrides.maxOutputTokens ?: baseModel.maxOutputTokens,
-            contextWindow = overrides.contextWindow ?: baseModel.contextWindow,
-            supportsReasoning = overrides.supportsReasoning ?: baseModel.supportsReasoning,
-            inputModalities = overrides.inputModalities ?: baseModel.inputModalities,
-            outputModalities = overrides.outputModalities ?: baseModel.outputModalities,
-        )
+        get() = baseModel.withOverrides(overrides)
 
     /** True when this entry carries user intent beyond API-reported defaults. */
     val isUserModified: Boolean
         get() = isCustom || isHidden || !overrides.isEmpty
 }
+
+/**
+ * [this] with [overrides] applied — a null override field inherits the base
+ * value. ONE definition: [ModelEntry.model] and the enriched path in
+ * [effectiveEntryModel] both merge through here, so "which side wins" cannot
+ * drift between the two callers (it did: see [effectiveEntryModel]).
+ */
+fun LLMModel.withOverrides(overrides: ModelOverrides): LLMModel =
+    if (overrides.isEmpty) this else copy(
+        displayName = overrides.displayName ?: displayName,
+        maxOutputTokens = overrides.maxOutputTokens ?: maxOutputTokens,
+        contextWindow = overrides.contextWindow ?: contextWindow,
+        supportsReasoning = overrides.supportsReasoning ?: supportsReasoning,
+        inputModalities = overrides.inputModalities ?: inputModalities,
+        outputModalities = overrides.outputModalities ?: outputModalities,
+    )
+
+/**
+ * The model [entry] actually resolves to: **enrich the BASE model first, apply
+ * the user's overrides second**.
+ *
+ * The order is the whole contract. `models.dev` is a *default* registry, not a
+ * user input: every field of an enriched row is filled unconditionally
+ * (`devModel.x ?: model.x` in `ModelsDevApi.applyDevData`), so enrichment after
+ * a merge silently restores the registry value on top of an explicit user
+ * override. `ModelUseManager.entryDict` did exactly that, and the same missing
+ * step in the offload filter / config surface produced three different answers
+ * for one entry.
+ *
+ * [enrich] is a parameter (not a direct `ModelsDevApi` call) so the ordering
+ * stays a pure function the JVM unit tests can exercise without the Android
+ * registry — production callers go through `ModelsDevApi.effectiveModel`.
+ */
+fun effectiveEntryModel(entry: ModelEntry, enrich: (LLMModel) -> LLMModel): LLMModel =
+    enrich(entry.baseModel).withOverrides(entry.overrides)
 
 @Serializable
 @Stable

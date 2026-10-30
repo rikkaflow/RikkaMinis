@@ -50,6 +50,27 @@ import java.util.UUID
  *   android-notification clear                 Clear all delivered (legacy)
  *   android-notification settings              Authorization status
  */
+/**
+ * [dv14-A1] ISSUE-02: the disposition of one `send` / `schedule` invocation.
+ *
+ * Top-level (not inside the companion) because a class nested in a `companion
+ * object` is NOT addressable as `NotificationOffloadHandler.SendDisposition` —
+ * only as `Outer.Companion.Nested` — so keeping it in the companion would make
+ * every call site, including the off-device tests, spell the holder twice.
+ * Pure — no Context, no NotificationManager — so the deferred-vs-immediate
+ * decision stays testable off-device.
+ */
+internal sealed class SendDisposition {
+    /** A deferred trigger: `--after` seconds and/or an ISO `--at`. */
+    class Deferred(val secs: Int?, val at: String?) : SendDisposition()
+
+    /** A supplied-but-unreadable `--after`: refuse instead of guess. */
+    class Invalid(val message: String) : SendDisposition()
+
+    /** Plain `send`, no trigger — deliver immediately (existing design). */
+    object Immediate : SendDisposition()
+}
+
 class NotificationOffloadHandler(private val context: Context) : NativeOffloadHandler {
     private val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     private val store = ScheduledNotificationStore(context)
@@ -80,10 +101,15 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
 
         return try {
             when (val sub = args.positional.firstOrNull() ?: "list") {
-                "send", "schedule" -> handleSend(args)
+                "send", "schedule" -> handleSend(sub, args)
                 "clear" -> {
                     nm.cancelAll()
-                    NativeOffloadResult(0, OffloadOutput.formatBody("All notifications cleared.", args) + "\n")
+                    // [da1034-A4] ISSUE-08: JSON payload, not the sentence
+                    // `All notifications cleared.` (which formatBody passed
+                    // through untouched). `cleared: "all"` mirrors the sibling
+                    // `cancel --all` payload (`cancelled: "all"`).
+                    val data = JSONObject().put("cleared", "all")
+                    NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
                 }
                 "list" -> handleList(args)
                 "pending" -> handlePending(args)
@@ -106,7 +132,7 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
 
     // ── send ────────────────────────────────────────────────────────────────
 
-    private fun handleSend(args: OffloadArgs): NativeOffloadResult {
+    private fun handleSend(sub: String, args: OffloadArgs): NativeOffloadResult {
         val title = args.get("title")
             ?: return NativeOffloadResult(2, "android-notification send: --title is required\n")
 
@@ -187,10 +213,22 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
         // notification via AlarmManager + ScheduledNotificationReceiver.
         // Mirrors apple-notification's UNTimeIntervalNotificationTrigger
         // (after) and UNCalendarNotificationTrigger (at) semantics.
-        val afterSec = args.getInt("after")
-        val atStr = args.get("at")
-        if (afterSec != null || atStr != null) {
-            return scheduleDeferred(title, body, afterSec, atStr, args)
+        // [dv14-A1 ISSUE-02] The raw string is read FIRST: the old
+        // `args.getInt("after")` erased the difference between "not spelled"
+        // and "spelled but unparseable" (`--after 5m` → null → the deferred
+        // branch was skipped and the notification fired immediately with
+        // exit 0). `sendDisposition` refuses an unparseable value instead of
+        // guessing, and an explicit `schedule` with neither flag now reaches
+        // [scheduleDeferred]'s own "--after or --at is required" guard (which
+        // was dead code before: the branch condition never let it run).
+        when (val plan = sendDisposition(
+            sub,
+            args.get("after"),
+            args.get("at"),
+        )) {
+            is SendDisposition.Invalid -> return NativeOffloadResult(2, plan.message)
+            is SendDisposition.Deferred -> return scheduleDeferred(title, body, plan.secs, plan.at, args)
+            SendDisposition.Immediate -> Unit // fall through to the immediate path
         }
 
         // Immediate path (apple-notification has no equivalent — UN
@@ -439,6 +477,12 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
             try {
                 val sdf = SimpleDateFormat(pat, Locale.US).apply {
                     timeZone = if (pat.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else TimeZone.getDefault()
+                    // [dv16-A A-01] Strict, like the sessions funnel
+                    // (parseSessionsDate): lenient mode silently ROLLS an
+                    // out-of-range field over (`2026-02-30T10:00` → March 2),
+                    // so a mistyped `--at` was accepted as a different
+                    // instant instead of being refused.
+                    isLenient = false
                 }
                 return sdf.parse(s)?.time
             } catch (_: Throwable) {}
@@ -512,7 +556,15 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
                     ) + "\n",
                 )
 
-        val max = args.get("max")?.toIntOrNull()?.coerceAtLeast(1) ?: 50
+        // [dv29-A3 A-05] Shared page-size contract. The old
+        // `args.get("max")?.toIntOrNull()?.coerceAtLeast(1) ?: 50` answered
+        // `--max 0` with 1 of 11 active notifications and `--max abc` with all
+        // of them, both at exit 0 — a silently wrong `count` either way.
+        val max = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.NOTIFICATION)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-notification list: ${size.message}\n")
+        }
         val pm = context.packageManager
         val appNameCache = mutableMapOf<String, String>()
 
@@ -554,6 +606,32 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
 
     companion object {
         private const val TAG = "NotificationOffload"
+
+        /**
+         * [dv14-A1] ISSUE-02: read the RAW `--after` string first, so
+         * "spelled but unparseable" (`--after 5m` — agents copy the `s`/`m`
+         * suffix habit from `android-alarm timer --duration 5m`) is refused
+         * with exit 2 instead of being erased into "not spelled" and falling
+         * through to the immediate branch. An explicit `schedule` subcommand
+         * with neither flag is routed to the deferred path too, so
+         * [scheduleDeferred]'s "--after or --at is required" guard is live
+         * rather than dead code; plain `send` with neither flag stays the
+         * documented immediate delivery (see the pre-T58 comment in
+         * [handleSend]).
+         */
+        internal fun sendDisposition(sub: String, rawAfter: String?, rawAt: String?): SendDisposition {
+            val secs = when (rawAfter) {
+                null -> null
+                else -> rawAfter.toIntOrNull()
+                    ?: return SendDisposition.Invalid(
+                        "android-notification: invalid --after '$rawAfter' (expects whole seconds)\n",
+                    )
+            }
+            if (secs != null || rawAt != null) return SendDisposition.Deferred(secs, rawAt)
+            if (sub == "schedule") return SendDisposition.Deferred(null, null)
+            return SendDisposition.Immediate
+        }
+
         // Single source of truth for the android-notification channel.
         // ScheduledNotificationReceiver (the deferred fire path) builds its
         // notification against this same id — a separate constant there had

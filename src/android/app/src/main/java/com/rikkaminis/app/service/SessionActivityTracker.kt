@@ -85,6 +85,79 @@ object SessionActivityTracker {
     val isToolRunning: StateFlow<Boolean> = _isToolRunning.asStateFlow()
 
     /**
+     * [R4-U F-06] Per-session running-tool state (pure core,
+     * [ToolSlotRegistry]). The four flows above are now DERIVED from it by
+     * [publishToolSlot] instead of being the storage: two sessions streaming at
+     * once used to share one slot, so the fast session's tool finishing blanked
+     * the slow session's tool mid-execution.
+     *
+     * Radius note: no production call site passes a session id yet (they all go
+     * through the 4-arg `updateToolStatus` / `clearToolRunning`), so
+     * [toolSlotKey] attributes an update to a session only when exactly one is
+     * streaming; the concurrent case lands in
+     * [ToolSlotRegistry.UNATTRIBUTED], where the depth counter at least stops
+     * the first `finish` from wiping the second tool's display. Wiring the
+     * callers is a provider-pack change — see the report's residual R1.
+     */
+    private val toolSlots = ToolSlotRegistry()
+
+    /**
+     * [R4-U F-05] Idle-stop deadline extended so a background turn end can show
+     * the completion capsule (pure core, [CompletionLinger]). 0 = no linger.
+     */
+    private var completionLingerUntilMs = CompletionLinger.CLEARED
+
+    /**
+     * [R4-U F-06] Which registry key an unattributed tool update belongs to.
+     *
+     * One streaming session ⇒ that session (correct by construction). Two or
+     * more ⇒ the shared [ToolSlotRegistry.UNATTRIBUTED] bucket, because guessing
+     * one of them would attribute a tool to the wrong chat — the very bug this
+     * fix is about.
+     */
+    private fun toolSlotKey(): String {
+        val active = _activeSessions.value
+        return if (active.size == 1) active.first() else ToolSlotRegistry.UNATTRIBUTED
+    }
+
+    /**
+     * [R4-U F-06] Recomputes the display flows from the registry's
+     * representative entry. Called after every registry mutation so the four
+     * public flows never drift from the per-session truth.
+     */
+    private fun publishToolSlot() {
+        val slot = toolSlots.representative(_activeSessions.value)
+        _currentToolName.value = slot?.toolName
+        _currentToolTitle.value = slot?.toolTitle
+        _isToolRunning.value = slot?.isRunning == true
+        if (slot != null) {
+            _currentToolStatus.value = slot.status
+            // Only an attributed entry may retarget the capsule: the shared
+            // bucket cannot say which chat the work belongs to.
+            if (slot.sessionId.isNotBlank()) _currentSessionId.value = slot.sessionId
+        } else {
+            // [R5-D F-01②] Nothing left to render. Keeping the ended session's
+            // tool line here left the notification describing a tool nobody is
+            // running any more, and kept the capsule's tap target pointed at a
+            // finished chat while another session still streams. Reset to the
+            // idle line and re-align the id to whoever is still active.
+            _currentToolStatus.value = ToolSlotRegistry.IDLE_STATUS
+            val active = _activeSessions.value
+            if (active.isNotEmpty()) {
+                _currentSessionId.value = when {
+                    active.size == 1 -> active.first()
+                    // Several sessions but no tool: keep the id only if it is
+                    // one of them, else the most recently activated session.
+                    else -> _currentSessionId.value?.takeIf { it in active }
+                        ?: active.lastOrNull()
+                }
+            }
+            // active.isEmpty() deliberately keeps the id: setInactive preserves
+            // the finished turn's tap target for the completion capsule.
+        }
+    }
+
+    /**
      * T-overlay-glyph-typed-outcome: typed outcome of the most recently
      * completed tool call. Replaces the old text-sniffing heuristic in
      * [ToolOverlayController] (which read stale "Running: foo" status
@@ -169,10 +242,30 @@ object SessionActivityTracker {
      */
     private const val IDLE_STOP_DELAY_MS = 500L
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val pendingIdleStop = Runnable {
-        if (!shouldRunService()) {
-            stopServiceNow()
+    // Explicit `: Runnable` is required: the body re-arms itself via
+    // `postDelayed(pendingIdleStop, …)`, and an inferred type makes the
+    // compiler's type check recursive (CI #2871: "recursive problem").
+    private val pendingIdleStop: Runnable = Runnable {
+        if (shouldRunService()) {
+            // A session came back mid-debounce: cancelPendingIdleStop() already
+            // removed this callback, so reaching here means the state is fresh.
+            return@Runnable
         }
+        // [R4-U F-05] Do not tear the service down while a background turn's
+        // completion capsule still needs it. Re-arm once for the remaining
+        // window instead of stopping, so the linger is bounded and cannot pin
+        // the foreground service forever.
+        val remaining = CompletionLinger.remainingMs(
+            completionLingerUntilMs,
+            System.currentTimeMillis(),
+        )
+        if (remaining > 0L) {
+            AppLogger.info(TAG, "idle stop deferred $remaining ms for completion capsule")
+            mainHandler.postDelayed(pendingIdleStop, remaining)
+            return@Runnable
+        }
+        completionLingerUntilMs = CompletionLinger.CLEARED
+        stopServiceNow()
     }
 
     private fun cancelPendingIdleStop() {
@@ -212,6 +305,18 @@ object SessionActivityTracker {
     fun maybeRefreshService() {
         if (isAppForeground && shouldRunService()) {
             startServiceIfNeeded()
+            return
+        }
+        // [R5-D F-04②] Back in the foreground with nothing left to run. The
+        // overlay hides itself on a foreground transition (the user is reading
+        // the chat), so the completion window has nothing left to buy — without
+        // this the capsule's 30 s linger kept a foreground service (and its
+        // "tool running" row) alive while the user was looking at the finished
+        // reply. Only reached when a linger is actually armed, i.e. the state
+        // setInactive armed for a BACKGROUND turn end.
+        if (isAppForeground && completionLingerUntilMs > CompletionLinger.CLEARED) {
+            completionLingerUntilMs = CompletionLinger.CLEARED
+            scheduleIdleStop()
         }
     }
 
@@ -244,19 +349,39 @@ object SessionActivityTracker {
     /**
      * [fix/audit0917-b8] Guards the read-modify-write of [_activeSessions]
      * plus the `wasActive` decision in [setActive] / [setInactive]. Kept
-     * separate from the `streamCancellers` / `pendingErrorFlag` monitors so
-     * the completion-listener fan-out below stays outside any lock.
+     * separate from the `streamCancellers` monitor and the
+     * [StreamErrorFlags] lock so the completion-listener fan-out below stays
+     * outside any lock.
      */
     private val activeSessionsLock = Any()
 
     /**
-     * T180-bg-notif: per-session "task is finishing — was it cancelled?"
-     * flag, set by [setInactive]'s callers via [setInactiveError] when
-     * the streamJob unwinds because of an error (vs a clean completion).
-     * Drives the success/error variant of the completion notification.
-     * Cleared as soon as the listener has fired.
+     * T180-bg-notif: per-session "this RUN ended in error" flag. Drives the
+     * success/error variant of the completion notification AND the
+     * scheduled-task outcome ([com.rikkaminis.app.scheduled.ScheduledTaskRunner]
+     * maps `isError` → RESULT_ERROR / RESULT_OK).
+     *
+     * Lifecycle — one flag per run, every edge owned by a named call:
+     *  - **set** → [markStreamError] the moment a terminal failure reaches the
+     *    error banner (`ChatViewModel.setInlineError`);
+     *  - **clear** → [clearStreamError] when that same run recovers (inline
+     *    error retracted by `clearInlineError`), plus the stale-flag drop in
+     *    [setActive] so a leftover flag can never report the NEXT run;
+     *  - **consume** → [setInactive] reads-and-removes it as `wasError`, which
+     *    is the value the completion listener fans out.
+     *
+     * [fix/da1015-sched-errorprop] Before this, the only writers were
+     * `catch (e: Exception)` blocks at the run boundaries — but
+     * `AgentLoopEngine` swallows almost every model failure and returns
+     * NORMALLY (`terminalErrorSurfaced` + fall-through to the break), so those
+     * catches never ran: a failed run was reported as a clean completion,
+     * `ScheduledTaskRunner` recorded RESULT_OK, `lastRunDate` got pinned and
+     * `failStreak` reset ⇒ the task fuse could never trip.
+     *
+     * The store is [StreamErrorFlags] — plain Kotlin, no Android — so the
+     * run-scoping rule is unit-testable directly.
      */
-    private val pendingErrorFlag = mutableSetOf<String>()
+    private val pendingErrorFlag = StreamErrorFlags()
 
     /**
      * T180-bg-notif: completion listener. Wired in MinisApp.onCreate to
@@ -316,6 +441,16 @@ object SessionActivityTracker {
         _lastToolName.value = null
         _lastToolTitle.value = null
         _lastToolStatus.value = null
+        // [R5-D F-04②] Dismissing the capsule removes the ONLY reason the
+        // service is still alive after the turn ended. Leave the linger armed
+        // and the idle stop stays deferred for the rest of the 30 s window: a
+        // foreground service (and its ongoing row) kept up by a capsule the
+        // user just closed. Clearing the deadline lets the next idle-stop pass
+        // stop immediately; re-arming it through scheduleIdleStop() keeps the
+        // same 500 ms debounce as every other stop so a draft→persisted session
+        // swap in adjacent frames still cannot turn into a stop/start race.
+        completionLingerUntilMs = CompletionLinger.CLEARED
+        if (!shouldRunService()) scheduleIdleStop()
     }
 
     /**
@@ -332,6 +467,14 @@ object SessionActivityTracker {
      * action can fan out to every running session.
      */
     fun setActive(sessionId: String, onStop: (() -> Unit)? = null) {
+        // [fix/da1015-sched-errorprop] Run-scoped flag hygiene. The flag is
+        // normally consumed by setInactive at the end of the failing run, but
+        // a stale streamJob whose finally skipped setInactive (the
+        // claim-token guard) leaves it behind — and it would then be reported
+        // as the NEXT run's outcome (false "failed" → task fuse counts a
+        // failure for a run that succeeded). A new run starts from a clean
+        // slate; it re-flags itself if it fails.
+        pendingErrorFlag.clear(sessionId)
         // [fix/audit0917-b8] Same lock as setInactive — activation and
         // deactivation of the same session can arrive from different threads
         // (stream job vs. UI teardown); a concurrent pair used to be able to
@@ -353,7 +496,17 @@ object SessionActivityTracker {
         _lastToolName.value = null
         _lastToolTitle.value = null
         _lastToolStatus.value = null
+        // [R5-D F-01①] Run-boundary slot reset. A session runs one agent loop
+        // at a time, so any tool entry left under THIS session's key belongs to
+        // a finished run — most often a start whose finish never arrived (a
+        // preflight/loop-guard refusal skips clearToolRunning, which is the one
+        // leak the finish fallback cannot see because no finish ever comes).
+        // Dropping it here and in [setInactive] bounds the phantom to a single
+        // turn; it must not outlive the run that created it.
+        toolSlots.drop(sessionId)
         AppLogger.info(TAG, "Session activated: $sessionId (total: ${_activeSessions.value.size})")
+        // [R4-U F-05] A new run supersedes any completion capsule window.
+        completionLingerUntilMs = CompletionLinger.CLEARED
 
         if (wasIdle) {
             startServiceIfNeeded()
@@ -380,11 +533,16 @@ object SessionActivityTracker {
             was
         }
         synchronized(streamCancellers) { streamCancellers.remove(sessionId) }
-        val wasError = synchronized(pendingErrorFlag) { pendingErrorFlag.remove(sessionId) }
+        val wasError = pendingErrorFlag.consume(sessionId)
         AppLogger.info(TAG, "Session deactivated: $sessionId (total: ${_activeSessions.value.size})")
 
+        // [R4-U F-06] The ended session owns no running tool any more.
+        toolSlots.drop(sessionId)
         if (_activeSessions.value.isEmpty()) {
-            _currentToolStatus.value = "Idle"
+            // The shared bucket belongs to no session either — keeping it would
+            // render "running <tool>" for a turn that already ended.
+            toolSlots.drop(ToolSlotRegistry.UNATTRIBUTED)
+            _currentToolStatus.value = ToolSlotRegistry.IDLE_STATUS
             _currentToolName.value = null
             _currentToolTitle.value = null
             _isToolRunning.value = false
@@ -404,8 +562,34 @@ object SessionActivityTracker {
             }
         }
         if (!shouldRunService()) {
+            // [R4-U F-05] Arm the bounded completion window BEFORE the stop is
+            // scheduled: the service has to outlive this turn end when the
+            // capsule is the only place the user will see the result.
+            completionLingerUntilMs = CompletionLinger.deadlineOnTurnEnd(
+                nowMs = System.currentTimeMillis(),
+                wasActive = wasActive,
+                appForeground = isAppForeground,
+                eligible = AgentForegroundService.completionLingerEligible(),
+            )
+            // [R5-D F-04①] The service now outlives the turn to carry the
+            // capsule, so its ongoing notification has to be repainted with
+            // the state the flows above just cleared into (no tool, no
+            // spinner). Skipping the refresh froze row 9001 on the finished
+            // turn's tool line + indeterminate progress for the WHOLE window —
+            // the exact "假运行" this window must not produce. Safe from the
+            // background: notify on an already-running service, no start call.
+            if (completionLingerUntilMs > CompletionLinger.CLEARED) {
+                AgentForegroundService.refreshIfRunning(
+                    sessionCountForNotification(),
+                    statusForNotification(),
+                )
+            }
             stopService()
         } else {
+            // [R4-U F-06] Another session is still streaming: re-derive the
+            // display from the remaining entries instead of leaving the ended
+            // session's tool on screen.
+            publishToolSlot()
             updateService()
         }
         // T180-bg-notif: fire the completion listener AFTER service state
@@ -418,13 +602,39 @@ object SessionActivityTracker {
     }
 
     /**
-     * T180-bg-notif: caller marks the session's stream as having ended in
-     * an error. Must be invoked BEFORE [setInactive] (the flag is consumed
-     * inside setInactive). If never called, the completion listener fires
-     * with `isError=false`.
+     * Marks the session's CURRENT run as having ended in an error. Must be
+     * invoked BEFORE [setInactive] (the flag is consumed there). If never
+     * called, the completion listener fires with `isError=false`.
+     *
+     * [fix/da1015-sched-errorprop] Idempotent, and paired with
+     * [clearStreamError]: terminal failures flag here, a same-run recovery
+     * retracts in `clearInlineError`, and [setActive] drops any stale flag
+     * when the next run starts.
+     *
+     * User cancellation is deliberately NOT an error: no `CancellationException`
+     * handler calls this (they only log), so a stopped run still reports
+     * `isError=false`.
      */
     fun markStreamError(sessionId: String) {
-        synchronized(pendingErrorFlag) { pendingErrorFlag.add(sessionId) }
+        if (pendingErrorFlag.mark(sessionId)) {
+            AppLogger.info(TAG, "Stream error flagged: $sessionId")
+        }
+    }
+
+    /**
+     * Counterpart of [markStreamError] for a run that did NOT end in failure —
+     * the terminal error was retracted because the run recovered (the inline
+     * banner is cleared by `clearInlineError`), or a new run is starting and
+     * the previous run's flag is stale.
+     *
+     * Fires no completion listener and does not change [setInactive]'s
+     * semantics: a session with no flag still completes with `isError=false`,
+     * exactly as before this method existed.
+     */
+    fun clearStreamError(sessionId: String) {
+        if (pendingErrorFlag.clear(sessionId)) {
+            AppLogger.info(TAG, "Stream error flag cleared: $sessionId")
+        }
     }
 
     /**
@@ -494,7 +704,16 @@ object SessionActivityTracker {
      * progress indicator.
      */
     fun updateToolStatus(status: String) {
-        _currentToolStatus.value = status
+        // [R4-U F-06] Text-only update, routed through the registry so a future
+        // per-session writer is not shadowed by a global status write.
+        toolSlots.start(
+            sessionId = toolSlotKey(),
+            toolName = null,
+            toolTitle = null,
+            status = status,
+            isRunning = false,
+        )
+        publishToolSlot()
         if (_activeSessions.value.isNotEmpty()) {
             updateService()
         }
@@ -518,10 +737,42 @@ object SessionActivityTracker {
      * the per-tool label (existing behavior).
      */
     fun updateToolStatus(status: String, toolName: String?, isRunning: Boolean, toolTitle: String?) {
-        _currentToolStatus.value = status
-        _currentToolName.value = toolName
-        _currentToolTitle.value = toolTitle?.takeIf { it.isNotBlank() }
-        _isToolRunning.value = isRunning
+        applyToolUpdate(toolSlotKey(), status, toolName, isRunning, toolTitle)
+    }
+
+    /**
+     * [R4-U F-06] Session-attributed variant — the wiring point for callers that
+     * know which chat they are running in (`AgentLoopEngine`'s tool dispatch,
+     * the offload handlers). No production caller passes a session id yet, so
+     * this is a declared resume point: switching a caller from the 4-arg
+     * overload to this one immediately gives that tool its own registry entry
+     * and takes the "fast session blanks the slow one" case out of the shared
+     * bucket. Kept next to the overload instead of a separate object so the two
+     * writers cannot drift.
+     */
+    fun updateToolStatus(
+        sessionId: String,
+        status: String,
+        toolName: String?,
+        isRunning: Boolean,
+        toolTitle: String?,
+    ) {
+        if (sessionId.isBlank()) {
+            applyToolUpdate(toolSlotKey(), status, toolName, isRunning, toolTitle)
+            return
+        }
+        applyToolUpdate(sessionId, status, toolName, isRunning, toolTitle)
+    }
+
+    private fun applyToolUpdate(
+        key: String,
+        status: String,
+        toolName: String?,
+        isRunning: Boolean,
+        toolTitle: String?,
+    ) {
+        toolSlots.start(key, toolName, toolTitle, status, isRunning)
+        publishToolSlot()
         // [T-overlay-glyph-typed-outcome] Starting a new tool clears the
         // previous outcome so the overlay glyph (which reads
         // lastToolOutcome) does not leak the prior result into the new
@@ -539,18 +790,51 @@ object SessionActivityTracker {
      * showing an active progress bar.
      */
     fun clearToolRunning(outcome: ToolOutcome = ToolOutcome.Unknown) {
-        if (!_isToolRunning.value && _currentToolName.value == null) return
+        // [R4-U F-06] Finish only this key's entry — the display is re-derived
+        // from whatever remains. With several sessions streaming and no
+        // attribution the shared bucket's depth decides, so one tool ending no
+        // longer blanks a tool another session still runs.
+        val key = toolSlotKey()
+        val ending = toolSlots.slot(key)
+        if (ending == null && !_isToolRunning.value && _currentToolName.value == null) return
         // Snapshot identity + status before wiping the live values so the
         // overlay's post-completion render has something concrete to show.
         // Only retain a status string when it's a real tool-status line
         // (not the "Idle" placeholder).
-        _lastToolName.value = _currentToolName.value
-        _lastToolTitle.value = _currentToolTitle.value
-        _lastToolStatus.value = _currentToolStatus.value
-            ?.takeIf { it.isNotBlank() && !it.equals("Idle", ignoreCase = true) }
-        _currentToolName.value = null
-        _currentToolTitle.value = null
-        _isToolRunning.value = false
+        _lastToolName.value = ending?.toolName ?: _currentToolName.value
+        _lastToolTitle.value = ending?.toolTitle ?: _currentToolTitle.value
+        _lastToolStatus.value = (ending?.status ?: _currentToolStatus.value)
+            ?.takeIf {
+                it.isNotBlank() && !it.equals(ToolSlotRegistry.IDLE_STATUS, ignoreCase = true)
+            }
+        toolSlots.finish(key)
+        publishToolSlot()
+        _lastToolOutcome.value = outcome
+        if (_activeSessions.value.isNotEmpty()) {
+            updateService()
+        }
+    }
+
+    /**
+     * [R4-U F-06] Session-attributed finish — pairs with the 5-arg
+     * [updateToolStatus]. Wiring a caller's start AND its finish together is
+     * what keeps the per-session entries balanced; wiring only one side would
+     * leave the shared bucket's depth stuck above zero.
+     */
+    fun clearToolRunning(outcome: ToolOutcome, sessionId: String) {
+        if (sessionId.isBlank()) {
+            clearToolRunning(outcome)
+            return
+        }
+        val ending = toolSlots.slot(sessionId)
+        _lastToolName.value = ending?.toolName ?: _currentToolName.value
+        _lastToolTitle.value = ending?.toolTitle ?: _currentToolTitle.value
+        _lastToolStatus.value = (ending?.status ?: _currentToolStatus.value)
+            ?.takeIf {
+                it.isNotBlank() && !it.equals(ToolSlotRegistry.IDLE_STATUS, ignoreCase = true)
+            }
+        toolSlots.finish(sessionId)
+        publishToolSlot()
         _lastToolOutcome.value = outcome
         if (_activeSessions.value.isNotEmpty()) {
             updateService()
@@ -588,6 +872,22 @@ object SessionActivityTracker {
         // app is invisible — memory state still updates, and the service
         // will be refreshed on next foreground via [maybeRefreshService].
         if (!isAppForeground) {
+            // [R4-U F-04] Two different operations were being refused with one
+            // guard. `startForegroundService()` while invisible is the
+            // T-MIUI-FGS-race crash and stays refused — but a notification on
+            // an ALREADY RUNNING foreground service is a plain
+            // NotificationManager.notify(): no start deadline, no OEM race, safe
+            // from the background. Refusing it too is what froze the status row
+            // (text + progress) at the exact moment the user left the app, while
+            // tools kept running and the overlay kept updating.
+            if (AgentForegroundService.refreshIfRunning(
+                    sessionCountForNotification(),
+                    statusForNotification(),
+                )
+            ) {
+                Log.d(TAG, "FGS notification refreshed while app is backgrounded")
+                return
+            }
             Log.d(TAG, "skipping FG service update while app is backgrounded")
             return
         }
@@ -662,4 +962,34 @@ object SessionActivityTracker {
         AgentForegroundService.stopService(context)
         Log.d(TAG, "All sessions complete, service stopped after idle debounce")
     }
+}
+
+/**
+ * [fix/da1015-sched-errorprop] Run-scoped "this session's stream ended in an
+ * error" store — the pure core of [SessionActivityTracker.pendingErrorFlag].
+ *
+ * Extracted out of the tracker because the tracker is an Android singleton
+ * (Context / Handler / Looper / Log), so its flag semantics could only be
+ * pinned by source probes. This class is plain Kotlin: `mark` / `clear` /
+ * `consume` under one lock, no Android imports — which makes the run-scoping
+ * rule ("a flag never outlives the run that set it") unit-testable directly
+ * instead of by assertion on text.
+ *
+ * Threading: marked from the agent-loop coroutine (IO) and consumed from
+ * whichever thread the run's `finally` lands on — the same reason the
+ * tracker wrapped its bare `mutableSetOf` in `synchronized`.
+ */
+internal class StreamErrorFlags {
+    private val lock = Any()
+    private val flagged = mutableSetOf<String>()
+
+    /** @return true when THIS call set the flag (false = already flagged). */
+    fun mark(sessionId: String): Boolean = synchronized(lock) { flagged.add(sessionId) }
+
+    /** @return true when THIS call retracted a flag (false = nothing to clear). */
+    fun clear(sessionId: String): Boolean = synchronized(lock) { flagged.remove(sessionId) }
+
+    /** Consume-on-read for [SessionActivityTracker.setInactive]: return the
+     *  flag AND drop it, so it can never be counted twice. */
+    fun consume(sessionId: String): Boolean = clear(sessionId)
 }

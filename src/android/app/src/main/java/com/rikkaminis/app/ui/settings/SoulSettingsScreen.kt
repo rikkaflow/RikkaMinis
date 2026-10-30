@@ -1,8 +1,6 @@
 package com.rikkaminis.app.ui.settings
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,9 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -22,6 +18,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -29,7 +26,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -86,19 +82,36 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
     // (see [SoulMetadata.displayEmoji]).
     var preservedEmoji by remember { mutableStateOf(SoulMetadata.DEFAULT.emoji) }
 
+    // [da1028-B / ISSUE-04] Re-seed the editors whenever SOUL.md is rewritten
+    // outside this screen — `minis-config set soul.body …` behind the confirm
+    // sheet, a backup-restore, or the chat memory sheet's SOUL.md editor.
+    // Without it the fields keep the values read at open time and the next
+    // Save writes that stale snapshot back over the external change (the
+    // 1026-A / 1027-E silent-rollback family). Keyed on the store's write
+    // counter rather than cachedMetadata because StateFlow de-duplicates equal
+    // values and would stay silent for a body-only rewrite. A re-seed caused
+    // by our own Save is idempotent (the file now holds what the editors hold).
+    val writeVersion by SoulStore.writeVersion.collectAsState()
+
     // Initial load + (defensive) ensureExists. The Application-level call
     // already seeded on first run, but loading from a freshly cleared app
     // shouldn't crash.
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
+    LaunchedEffect(writeVersion) {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: parsing SOUL.md is
+        // disk read + decode and stays on Dispatchers.IO, but the editor state
+        // is now written AFTER `withContext` returns (on the composition's
+        // dispatcher) instead of from inside the IO block. Compose state has no
+        // cross-thread happens-before, so the old shape could publish a
+        // half-updated editor to the next frame.
+        val parsed = withContext(Dispatchers.IO) {
             SoulStore.ensureExists(context)
-            val parsed = SoulStore.load(context) ?: SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
-            name = parsed.metadata.name
-            preservedEmoji = parsed.metadata.emoji
-            style = parsed.metadata.style
-            lang = parsed.metadata.lang
-            body = parsed.body
+            SoulStore.load(context) ?: SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
         }
+        name = parsed.metadata.name
+        preservedEmoji = parsed.metadata.emoji
+        style = parsed.metadata.style
+        lang = parsed.metadata.lang
+        body = parsed.body
         loaded = true
     }
 

@@ -1,10 +1,12 @@
 package com.rikkaminis.app.ui.media
 
 import com.rikkaminis.app.R
+import com.rikkaminis.app.logging.AppLogger
 import androidx.compose.ui.res.stringResource
 import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -14,19 +16,20 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -50,6 +53,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,6 +76,37 @@ import kotlinx.coroutines.isActive
 import java.io.File
 import kotlin.math.roundToInt
 
+// [rv1014-E4] Upper bound for the auto-sized inline video height — portrait
+// videos shouldn't dominate the chat viewport. Density-independent successor
+// of the old coerceIn(100, 800) px bound in the layoutParams write (which
+// never took effect — see the setOnPreparedListener comment in
+// InlineVideoPlayer).
+private val MAX_INLINE_VIDEO_HEIGHT = 480.dp
+
+/**
+ * [dv19-B02 / dv19-B06] What identifies a media host's data source.
+ *
+ * Every native media host in this family keys BOTH its view (`key(...)` around
+ * the `AndroidView`) and its playback/progress state (`remember(...)`) on one
+ * of these values. When the two disagree, the view keeps rendering the old
+ * media while its state has already reset — the stale-video / frozen-240dp /
+ * un-hidden-MediaController family. They are plain functions here so the
+ * choice is a testable decision instead of an inline expression that four
+ * hosts can drift apart on:
+ *
+ *  - [inlineMediaSourceKey]: an inline video card is handed whatever the
+ *    message carried — a host path OR a `content://` uri (VideoView accepts
+ *    both) — so the string itself is the identity, no normalisation;
+ *  - [resolvedMediaSourceKey]: the fullscreen dialog and the markdown audio
+ *    renderers work off a resolved host [File], which is `null` until the
+ *    async resolver lands. The `null` → path transition is what re-runs their
+ *    `remember`/`LaunchedEffect` exactly once, so the key must stay the
+ *    absolute path (not `File.name`, which collides across directories).
+ */
+internal fun inlineMediaSourceKey(filePath: String): String = filePath
+
+internal fun resolvedMediaSourceKey(file: File?): String? = file?.absolutePath
+
 /**
  * Inline audio player composable for embedding in chat messages.
  * Shows play/pause/stop controls and a progress bar.
@@ -82,11 +117,28 @@ fun InlineAudioPlayer(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    var isPlaying by remember { mutableStateOf(false) }
-    var progress by remember { mutableFloatStateOf(0f) }
-    var duration by remember { mutableStateOf("0:00") }
-    var position by remember { mutableStateOf("0:00") }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [dv19-B06] Transport/progress state carries the file key, exactly like
+    // `error` / `prepared` / `pendingPlay` / `mediaPlayer` below. This
+    // composable is reused across chat message slots, so the unkeyed
+    // isPlaying / progress / duration / position kept the PREVIOUS file's
+    // play state and timestamps on screen until the new player's first
+    // callback landed (and an unkeyed isPlaying could even render the Stop
+    // button for a file that was never started).
+    var isPlaying by remember(filePath) { mutableStateOf(false) }
+    var progress by remember(filePath) { mutableFloatStateOf(0f) }
+    var duration by remember(filePath) { mutableStateOf("0:00") }
+    var position by remember(filePath) { mutableStateOf("0:00") }
+    // [da1033-B] Keyed on filePath like prepared/pendingPlay/mediaPlayer below:
+    // this composable is reused across chat message slots, so an unkeyed error
+    // kept the previous file's message and replaced the new player's whole
+    // button area with stale "Audio error: …" text.
+    var error by remember(filePath) { mutableStateOf<String?>(null) }
+    // [sweep1014-B33] prepareAsync() means there is a short window where the
+    // player is still Preparing and start() would throw. A tap landing in that
+    // window is queued here and drained by the prepared listener, so a tap
+    // still starts playback exactly like the old blocking prepare() did.
+    var prepared by remember(filePath) { mutableStateOf(false) }
+    var pendingPlay by remember(filePath) { mutableStateOf(false) }
 
     val mediaPlayer = remember(filePath) { MediaPlayer() }
 
@@ -99,13 +151,27 @@ fun InlineAudioPlayer(
                 // Try as content URI
                 mediaPlayer.setDataSource(context, Uri.parse(filePath))
             }
-            mediaPlayer.prepare()
-            duration = formatDuration(mediaPlayer.duration)
-
             mediaPlayer.setOnCompletionListener {
                 isPlaying = false
                 progress = 0f
                 position = "0:00"
+            }
+            // [sweep1014-B33] Duration is only known once the player is
+            // prepared, and preparing must not block the main thread: the old
+            // synchronous prepare() stalled composition until the decoder had
+            // opened the track (and an unreadable/corrupt source blocked the
+            // UI thread for the whole timeout). prepareAsync() + this listener
+            // keeps the very same observable behaviour, just off the UI thread.
+            mediaPlayer.setOnPreparedListener { mp ->
+                duration = formatDuration(mp.duration)
+                prepared = true
+                if (pendingPlay) {
+                    pendingPlay = false
+                    try {
+                        mp.start()
+                        isPlaying = true
+                    } catch (_: Exception) {}
+                }
             }
             // [audit-0909 T10-M6] Surface playback errors explicitly. Without
             // this the player sat in the Error state while the UI still showed
@@ -117,13 +183,20 @@ fun InlineAudioPlayer(
                 error = "MediaPlayer error ($what/$extra)"
                 true
             }
+            mediaPlayer.prepareAsync()
         } catch (e: Exception) {
             error = e.message
         }
 
         onDispose {
             try {
+                // A player still Preparing (prepareAsync pending) can't be
+                // stopped — release() alone is the terminating path; calling
+                // stop() there throws IllegalStateException, which onDispose
+                // would swallow but leave the player unreleased.
                 if (mediaPlayer.isPlaying) mediaPlayer.stop()
+            } catch (_: Exception) {}
+            try {
                 mediaPlayer.release()
             } catch (_: Exception) {}
         }
@@ -170,17 +243,24 @@ fun InlineAudioPlayer(
                             // state — pause()/start() then throw
                             // IllegalStateException, which crashed the app
                             // because this callback had no guard.
-                            try {
-                                if (isPlaying) {
-                                    mediaPlayer.pause()
+                            // [sweep1014-B33] Still-Preparing taps are queued
+                            // (see pendingPlay) rather than letting start()
+                            // throw inside the (sub-second) prepare window.
+                            if (!prepared) {
+                                pendingPlay = true
+                            } else {
+                                try {
+                                    if (isPlaying) {
+                                        mediaPlayer.pause()
+                                        isPlaying = false
+                                    } else {
+                                        mediaPlayer.start()
+                                        isPlaying = true
+                                    }
+                                } catch (e: Exception) {
                                     isPlaying = false
-                                } else {
-                                    mediaPlayer.start()
-                                    isPlaying = true
+                                    error = e.message ?: "Playback failed"
                                 }
-                            } catch (e: Exception) {
-                                isPlaying = false
-                                error = e.message ?: "Playback failed"
                             }
                         },
                         modifier = Modifier
@@ -221,11 +301,27 @@ fun InlineAudioPlayer(
                         Spacer(Modifier.width(8.dp))
                         IconButton(
                             onClick = {
-                                mediaPlayer.seekTo(0)
-                                mediaPlayer.pause()
-                                isPlaying = false
-                                progress = 0f
-                                position = "0:00"
+                                // [da1033-B] Same guard as the play/pause button
+                                // above. The native player can already sit in
+                                // the Error state while this frame still renders
+                                // Stop: isPlaying / error arrive through the
+                                // main-thread callback queue, so this click can
+                                // be handled first and seekTo()/pause() then
+                                // throw IllegalStateException — which crashed
+                                // the app because this callback had no guard.
+                                // [sweep1014-B33] !prepared is the still-
+                                // Preparing window (prepareAsync pending).
+                                if (!prepared) return@IconButton
+                                try {
+                                    mediaPlayer.seekTo(0)
+                                    mediaPlayer.pause()
+                                    isPlaying = false
+                                    progress = 0f
+                                    position = "0:00"
+                                } catch (e: Exception) {
+                                    isPlaying = false
+                                    error = e.message ?: "Playback failed"
+                                }
                             },
                             modifier = Modifier.size(28.dp),
                         ) {
@@ -263,6 +359,16 @@ fun InlineVideoPlayer(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    // [sweep1014-B33] Hoisted out of the AndroidView factory so the release
+    // hook can reach it. Before, the controller was created inline and there
+    // was no release hook at all: scrolling the message out of view left the
+    // VideoView playing off-screen and the controller's window attached
+    // (WindowLeaked).
+    val mediaController = remember(filePath) { android.widget.MediaController(context) }
+    // [rv1014-E4] Video aspect ratio, learned at onPrepared from the player's
+    // own videoWidth/videoHeight — intrinsic video dimensions, valid there
+    // regardless of view measurement. Null until prepared → 240dp placeholder.
+    var videoAspectRatio by remember(filePath) { mutableStateOf<Float?>(null) }
 
     Surface(
         modifier = modifier
@@ -270,45 +376,79 @@ fun InlineVideoPlayer(
             .clip(RoundedCornerShape(12.dp)),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
     ) {
-        androidx.compose.ui.viewinterop.AndroidView(
-            factory = { ctx ->
-                android.widget.VideoView(ctx).apply {
-                    val file = File(filePath)
-                    val uri = if (file.exists()) Uri.fromFile(file) else Uri.parse(filePath)
-                    setVideoURI(uri)
+        // [dv19-B02] The host View is keyed on the data source. Without it the
+        // AndroidView factory ran only for the first filePath: a reused slot
+        // (FilePreviewScreen renders every attachment into the same
+        // composition slot) kept playing the PREVIOUS video, `videoAspectRatio`
+        // had already reset to null so the height stayed at the 240dp
+        // placeholder, and the old VideoView held the old MediaController whose
+        // window nobody hid — the very WindowLeaked shape the release hook
+        // below was written for. mediaController and videoAspectRatio are keyed
+        // on the same expression, so view and state now move together.
+        key(inlineMediaSourceKey(filePath)) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                factory = { ctx ->
+                    android.widget.VideoView(ctx).apply {
+                        val file = File(filePath)
+                        val uri = if (file.exists()) Uri.fromFile(file) else Uri.parse(filePath)
+                        setVideoURI(uri)
 
-                    // Add basic media controller
-                    val controller = android.widget.MediaController(ctx)
-                    controller.setAnchorView(this)
-                    setMediaController(controller)
+                        // Add basic media controller
+                        mediaController.setAnchorView(this)
+                        setMediaController(mediaController)
 
-                    setOnPreparedListener { mp ->
-                        // Auto-size to video dimensions
-                        val videoWidth = mp.videoWidth
-                        val videoHeight = mp.videoHeight
-                        if (videoWidth > 0 && videoHeight > 0) {
-                            val ratio = videoHeight.toFloat() / videoWidth
-                            layoutParams = layoutParams.apply {
-                                height = (width * ratio).toInt().coerceIn(100, 800)
+                        setOnPreparedListener { mp ->
+                            // Auto-size to video dimensions. [rv1014-E4] The previous
+                            // fix computed the height inside a `layoutParams.apply{}` —
+                            // Kotlin resolves that `width` to LayoutParams.width
+                            // (MATCH_PARENT here), not the measured view width, and the
+                            // fixed .height(240.dp) constraint makes Compose's measure
+                            // policy coerce the child LP on every measure
+                            // (AndroidViewHolder.obtainMeasureSpec: min == max →
+                            // EXACTLY), so neither the old nor the new write ever
+                            // changed the displayed height (always the 240dp
+                            // placeholder). mp.videoWidth/videoHeight are the intrinsic
+                            // video dimensions — valid right here, regardless of view
+                            // measurement — so hand the ratio to Compose and let
+                            // aspectRatio derive the height from the actually-measured
+                            // width.
+                            if (mp.videoWidth > 0 && mp.videoHeight > 0) {
+                                videoAspectRatio = mp.videoWidth.toFloat() / mp.videoHeight
                             }
+                            // Auto-play and surface the controller so the user sees
+                            // a live first frame instead of a black surface waiting
+                            // for an extra tap.
+                            start()
+                            mediaController.show(0)
                         }
-                        // Auto-play and surface the controller so the user sees
-                        // a live first frame instead of a black surface waiting
-                        // for an extra tap.
-                        start()
-                        controller.show(0)
+                        setOnErrorListener { _, what, extra ->
+                            android.util.Log.w("InlineVideoPlayer",
+                                "VideoView error what=$what extra=$extra path=$filePath")
+                            false
+                        }
                     }
-                    setOnErrorListener { _, what, extra ->
-                        android.util.Log.w("InlineVideoPlayer",
-                            "VideoView error what=$what extra=$extra path=$filePath")
-                        false
-                    }
-                }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(240.dp),
-        )
+                },
+                // [sweep1014-B33] Terminating path for the inline player: stop the
+                // track and detach the controller window when the composable
+                // leaves composition (scroll-out, session switch, navigation).
+                onRelease = { view ->
+                    mediaController.hide()
+                    view.stopPlayback()
+                },
+                // [rv1014-E4] With the aspect ratio known, Compose derives the
+                // height from the measured width (capped so portrait videos don't
+                // dominate the viewport); before the player reports dimensions,
+                // keep the 240dp placeholder the layout always showed.
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(
+                        videoAspectRatio?.let { ratio ->
+                            Modifier.aspectRatio(ratio)
+                                .heightIn(max = MAX_INLINE_VIDEO_HEIGHT)
+                        } ?: Modifier.height(240.dp)
+                    ),
+            )
+        }
     }
 }
 
@@ -334,6 +474,37 @@ fun MinisFullscreenVideoPlayer(
     file: File,
     onDismiss: () -> Unit,
 ) {
+    val hostView = LocalView.current
+    // [dv17-b08-host-window-bars] The Dialog below owns its own window, but
+    // while it covers the screen the HOST activity window still owns the
+    // system-bar visibility/appearance the system falls back to (the inner
+    // effect in FullscreenVideoContent only ever sees the Dialog's window via
+    // findDialogWindow). Same save-hide-restore pair as the three sibling
+    // components that got this right — ImageGalleryViewer, the WebPreview
+    // fullscreen screen and the WebPreview sheet — so a swipe-revealed
+    // transient bar paints over our black background instead of the host's
+    // default chrome, and the host is handed back exactly as we found it.
+    DisposableEffect(hostView) {
+        val window = (hostView.context as? android.app.Activity)?.window
+        if (window == null) {
+            onDispose { }
+        } else {
+            val controller = androidx.core.view.WindowInsetsControllerCompat(window, hostView)
+            val previousLightStatusBars = controller.isAppearanceLightStatusBars
+            val previousLightNavigationBars = controller.isAppearanceLightNavigationBars
+            // Dark-background immersive: white icons if the bars ever peek in.
+            controller.isAppearanceLightStatusBars = false
+            controller.isAppearanceLightNavigationBars = false
+            controller.systemBarsBehavior =
+                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            onDispose {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                controller.isAppearanceLightStatusBars = previousLightStatusBars
+                controller.isAppearanceLightNavigationBars = previousLightNavigationBars
+            }
+        }
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -380,6 +551,13 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     android.view.WindowManager.LayoutParams.MATCH_PARENT,
                 )
                 window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
+                // [dv17-b08-dialog-flags] Tell the system THIS window paints
+                // the system-bar backgrounds itself. Without the flag Android
+                // ignores statusBarColor/navigationBarColor below and fills the
+                // swipe-revealed bar region with its own opaque default — a
+                // grey band under the status bar (same contract as
+                // WebPreviewFullscreenScreen.kt / ImageGalleryViewer.kt).
+                window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
                 window.statusBarColor = android.graphics.Color.TRANSPARENT
                 window.navigationBarColor = android.graphics.Color.TRANSPARENT
             } catch (_: Throwable) {}
@@ -403,14 +581,21 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
         }
     }
 
-    var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
-    var isPlaying by remember { mutableStateOf(true) }
-    var durationMs by remember { mutableStateOf(0) }
-    var positionMs by remember { mutableStateOf(0) }
-    var scrubbing by remember { mutableStateOf(false) }
-    var scrubTarget by remember { mutableFloatStateOf(0f) }
-    var showControls by remember { mutableStateOf(true) }
-    var dragOffsetPx by remember { mutableFloatStateOf(0f) }
+    // [dv19-B02] Every one of these player states carries the same
+    // data-source key as the AndroidView below. The dialog content can be
+    // reused with a different `file` (a preview slot / deep link that swaps
+    // the target while the player stays open), and the unkeyed states then
+    // described the PREVIOUS file: the new VideoView was polled with a stale
+    // isPlaying/durationMs/positionMs until its own onPrepared fired.
+    val fileKey = resolvedMediaSourceKey(file)
+    var videoView by remember(fileKey) { mutableStateOf<android.widget.VideoView?>(null) }
+    var isPlaying by remember(fileKey) { mutableStateOf(true) }
+    var durationMs by remember(fileKey) { mutableStateOf(0) }
+    var positionMs by remember(fileKey) { mutableStateOf(0) }
+    var scrubbing by remember(fileKey) { mutableStateOf(false) }
+    var scrubTarget by remember(fileKey) { mutableFloatStateOf(0f) }
+    var showControls by remember(fileKey) { mutableStateOf(true) }
+    var dragOffsetPx by remember(fileKey) { mutableFloatStateOf(0f) }
 
     val dismissThresholdPx = with(density) { 120.dp.toPx() }
 
@@ -451,7 +636,10 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     },
                     onDragEnd = {
                         if (dragOffsetPx > dismissThresholdPx * 0.5f) {
-                            try { videoView?.pause() } catch (_: Throwable) {}
+                            // [da1027-F] Dismissal is a terminating path, not a
+                            // pause: release the track so the codec/handles do
+                            // not outlive the dialog (pause() left them live).
+                            try { videoView?.stopPlayback() } catch (_: Throwable) {}
                             onDismiss()
                         } else {
                             dragOffsetPx = 0f
@@ -462,36 +650,54 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
             },
     ) {
         // Video surface — offset with drag, toggle controls on tap.
-        androidx.compose.ui.viewinterop.AndroidView(
-            factory = { ctx ->
-                android.widget.VideoView(ctx).apply {
-                    setVideoURI(Uri.fromFile(file))
-                    setOnPreparedListener { mp ->
-                        durationMs = mp.duration.coerceAtLeast(0)
-                        mp.isLooping = false
-                        start()
-                        isPlaying = true
+        // [dv19-B02] Keyed on the data source: on a file change the old
+        // VideoView is disposed (its onRelease stops the track and clears
+        // videoView) and a fresh one is created for the new file instead of
+        // the dialog continuing to play the old one.
+        key(resolvedMediaSourceKey(file)) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                factory = { ctx ->
+                    android.widget.VideoView(ctx).apply {
+                        setVideoURI(Uri.fromFile(file))
+                        setOnPreparedListener { mp ->
+                            durationMs = mp.duration.coerceAtLeast(0)
+                            mp.isLooping = false
+                            start()
+                            isPlaying = true
+                        }
+                        setOnCompletionListener {
+                            isPlaying = false
+                            positionMs = durationMs
+                            showControls = true
+                        }
+                        setOnErrorListener { _, _, _ ->
+                            android.util.Log.w("FullscreenVideo", "VideoView error for ${file.absolutePath}")
+                            true
+                        }
+                        videoView = this
                     }
-                    setOnCompletionListener {
-                        isPlaying = false
-                        positionMs = durationMs
-                        showControls = true
-                    }
-                    setOnErrorListener { _, _, _ ->
-                        android.util.Log.w("FullscreenVideo", "VideoView error for ${file.absolutePath}")
-                        true
-                    }
-                    videoView = this
-                }
-            },
-            modifier = Modifier
-                .fillMaxSize()
-                .offset { IntOffset(0, dragOffsetPx.roundToInt()) }
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                ) { showControls = !showControls },
-        )
+                },
+                // [da1027-F] Terminating path for the fullscreen player — covers
+                // back-key/gesture/dialog dimiss, not just the close button. All
+                // three exits funnel through `onDismiss()` -> the caller's holder
+                // (`previewVideoFile` / `showPlayer`) goes null -> this composable
+                // leaves composition -> the view is released here. Without it the
+                // MediaPlayer and its hardware codec/AudioTrack handles stayed
+                // registered after the dialog closed, so audio could keep playing
+                // for a moment and the native player leaked until GC.
+                onRelease = { view ->
+                    try { view.stopPlayback() } catch (_: Throwable) {}
+                    if (videoView === view) videoView = null
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .offset { IntOffset(0, dragOffsetPx.roundToInt()) }
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { showControls = !showControls },
+            )
+        }
 
         // Top bar: close (always visible when controls shown).
         AnimatedVisibility(
@@ -518,7 +724,10 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     icon = Icons.Default.Close,
                     contentDescription = stringResource(R.string.common_close),
                     onClick = {
-                        try { videoView?.pause() } catch (_: Throwable) {}
+                        // [da1027-F] Close is a terminating path: release the
+                        // player instead of pausing it (pause kept the codec
+                        // and audio handles alive past the dialog).
+                        try { videoView?.stopPlayback() } catch (_: Throwable) {}
                         onDismiss()
                     },
                 )
@@ -667,15 +876,36 @@ private fun shareMediaFile(context: android.content.Context, file: File, mime: S
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(context, authority, file)
     } catch (_: Throwable) {
-        Uri.fromFile(file)
+        // [da1033-B] No `Uri.fromFile` fallback: a plain file:// URI handed to
+        // another process raises FileUriExposedException (API 24+), and the
+        // catch around startActivity() at the bottom swallowed it — the share
+        // key just did nothing, with no log and no toast. Paths outside
+        // res/xml/file_provider_paths.xml (e.g. an external mount) cannot be
+        // shared directly, so tell the user instead of building a dead URI.
+        // Copying the file into cacheDir/share first is deliberately NOT done:
+        // videos here can be tens of MB and this runs on the click callback.
+        AppLogger.warning("InlineMediaPlayer", "share: path not covered by FileProvider: $file")
+        Toast.makeText(
+            context,
+            context.getString(R.string.file_share_failed_toast, file.name),
+            Toast.LENGTH_SHORT,
+        ).show()
+        return
     }
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = mime
         putExtra(Intent.EXTRA_STREAM, uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    val chooser = Intent.createChooser(intent, file.name).apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    // [deep-audit-1049 B-03] Shared launcher. The hand-rolled version had the
+    // flag right but an EMPTY catch — a device with no share target and a
+    // successful share were indistinguishable on screen (the same defect the
+    // FileProvider exit above documents).
+    com.rikkaminis.app.util.ExternalIntent.share(context, intent, file.name) { t ->
+        Toast.makeText(
+            context,
+            context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+            Toast.LENGTH_SHORT,
+        ).show()
     }
-    try { context.startActivity(chooser) } catch (_: Throwable) {}
 }

@@ -1,9 +1,7 @@
 package com.rikkaminis.app.ui.components
 
-import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -59,6 +57,8 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.normalizeModalityName
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.provider.ModelsDevApi
+import com.rikkaminis.app.util.ImageDecoding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -66,6 +66,17 @@ import kotlinx.coroutines.CoroutineScope
 import androidx.compose.runtime.rememberCoroutineScope
 
 private const val TAG = "QuickTest"
+
+/**
+ * [audit3-F-13] Longest-edge ceiling for an image reply preview, in pixels.
+ *
+ * Derived from the layout below (`fillMaxWidth().heightIn(max = 220.dp)` inside
+ * a bottom sheet, `ContentScale.Fit`): on the widest phones that is ~1100 px of
+ * row width and ~600 px of height at 2.75x density, so 1024 keeps the preview
+ * sharp without a resize pass, while a 4K generation (4096x4096 = 64 MB
+ * ARGB_8888, native memory the GC cannot see) is decoded at ~4 MB instead.
+ */
+private const val QUICKTEST_MAX_EDGE_PX = 1024
 
 /**
  * [T-android-model-quick-test] A lightweight half-sheet that fires
@@ -125,7 +136,11 @@ private class QuickTestRun(val kind: QuickTestKind) {
  * if nothing matches we fall back to text so there is always one test.
  */
 private fun applicableKinds(entry: ModelEntry): List<QuickTestKind> {
-    val model = entry.model
+    // [dv22/B-03] Capability source is the effective model (models.dev enrichment
+    // under the user's overrides), not the raw `entry.model`: the built-in
+    // catalog declares no modality fields, so every built-in looked text-only and
+    // the image/speech/transcription quick tests never showed up.
+    val model = ModelsDevApi.effectiveModel(entry)
     val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }
     val inputs = (model.inputModalities ?: emptyList()).map { it.normalizeModalityName() }
     val kinds = mutableListOf<QuickTestKind>()
@@ -317,8 +332,13 @@ private fun TestContent(run: QuickTestRun) {
             style = MaterialTheme.typography.bodyMedium,
         )
         is QuickTestState.ImageReply -> {
+            // [audit3-F-13] Bounded decode. Generation replies are 2K/4K PNGs,
+            // and this `remember {}` runs on the Compose thread: the bare
+            // `decodeByteArray` it replaces allocated the full-resolution
+            // bitmap (64 MB for 4096x4096) before the 220.dp preview could
+            // shrink it.
             val bmp = remember(s.data) {
-                runCatching { BitmapFactory.decodeByteArray(s.data, 0, s.data.size) }.getOrNull()
+                ImageDecoding.decodeBytesBounded(s.data, QUICKTEST_MAX_EDGE_PX)?.bitmap
             }
             if (bmp != null) {
                 Image(
@@ -365,9 +385,18 @@ private fun AudioReplyContent(data: ByteArray) {
     // onFailure log — i.e. the button silently did nothing, with no way for the
     // user to tell a slow write from a dead control.
     var isReady by remember(data) { mutableStateOf(false) }
+    // [R4-V F-12] A failed cache write used to be swallowed: isReady flipped to
+    // true anyway and play() then failed silently, so the control looked live
+    // and did nothing. The failure is now a visible state.
+    var writeFailed by remember(data) { mutableStateOf(false) }
     val player = remember { android.media.MediaPlayer() }
+    // [R4-V F-12] `ByteArray.hashCode()` is IDENTITY (Kotlin arrays do not
+    // override it), so the cache name was different for identical bytes on
+    // every composition and identical for none of them — a name that carries
+    // no information about the clip. Content-derived (size + content hash):
+    // the same clip reuses its file, a different clip never collides.
     val file = remember(data) {
-        java.io.File(context.cacheDir, "quicktest-audio-${data.hashCode()}.bin")
+        java.io.File(context.cacheDir, quickTestClipFileName(data))
     }
 
     fun play() {
@@ -389,14 +418,35 @@ private fun AudioReplyContent(data: ByteArray) {
     // auto-play — same order as before, so setDataSource never sees a
     // half-written file.
     androidx.compose.runtime.LaunchedEffect(file) {
-        withContext(Dispatchers.IO) { runCatching { file.writeBytes(data) } }
+        // [R4-V F-12] Only a write that really landed enables the control.
+        val written = withContext(Dispatchers.IO) {
+            runCatching { file.writeBytes(data) }.isSuccess && file.length() == data.size.toLong()
+        }
+        if (!written) {
+            AppLogger.warning(TAG, "[QuickTest] audio clip cache write failed: ${file.name}")
+            writeFailed = true
+            isReady = false
+            return@LaunchedEffect
+        }
+        writeFailed = false
         isReady = true
         play()
+    }
+    // [da1031-D ISSUE-08] The clip's lifetime is bound to the file key itself,
+    // not to the composable: a re-test replaces `file` (remember(data)) and
+    // this keyed effect deletes the clip that just went out of use. The old
+    // Unit-keyed effect only ever saw the LAST file, so every re-test leaked
+    // its predecessor in cacheDir. Registration order keeps the teardown order
+    // of the original block: reverse-dispose releases the player first, then
+    // deletes the clip.
+    androidx.compose.runtime.DisposableEffect(file) {
+        onDispose {
+            runCatching { file.delete() }
+        }
     }
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
             runCatching { player.release() }
-            runCatching { file.delete() }
         }
     }
 
@@ -412,12 +462,38 @@ private fun AudioReplyContent(data: ByteArray) {
                 tint = MaterialTheme.colorScheme.primary,
             )
         }
-        Text(
-            "%.1f KB".format(data.size / 1024.0),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        if (writeFailed) {
+            // Reuses the existing clip-failure copy rather than adding a key:
+            // the strings files are outside this branch's file set, and "the
+            // local test clip could not be produced" is exactly what happened
+            // from the user's side.
+            Text(
+                stringResource(R.string.quicktest_clip_failed),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        } else {
+            Text(
+                "%.1f KB".format(data.size / 1024.0),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
+}
+
+/**
+ * [R4-V F-12] Cache name for a Quick Test audio clip, derived from its CONTENT.
+ *
+ * `ByteArray.hashCode()` is `Object.hashCode()` — identity, not content — so the
+ * old name was stable within one composition and meaningless across them: two
+ * identical clips never shared a file and the name told a reader nothing. Size
+ * plus [contentHashCode] is stable, cheap, and never collides on equal bytes.
+ * (Cache dir only; this is a name, not a security boundary.)
+ */
+internal fun quickTestClipFileName(data: ByteArray): String {
+    val hash = data.contentHashCode().toUInt().toString(16)
+    return "quicktest-audio-${data.size}-$hash.bin"
 }
 
 /** Reset every run to Running and fire each test concurrently. */
@@ -454,6 +530,21 @@ private suspend fun performTest(
     context: android.content.Context,
 ): QuickTestState = withContext(Dispatchers.IO) {
     fun failure(msg: String) = QuickTestState.Failure(msg)
+
+    // [dv24/B-01] The capability source is the EFFECTIVE model, exactly as
+    // `applicableKinds` above already decides which cards to show. Every
+    // execution call below used to pass the raw `entry.model`, which for a
+    // built-in carries no modality declaration at all: the card appeared
+    // (because the enrichment happened for the *list*) and then the request
+    // that left this process described a text-only model. Across the
+    // `:modelservice` boundary `ModelRequestJson.encodeModel` OMITS a null
+    // `outputModalities`, and that process never calls `ModelsDevApi.init`, so
+    // the worker could not enrich it back — Gemini image routing then skipped
+    // `responseModalities: ["TEXT","IMAGE"]` ("No image returned") and the
+    // OpenAI-compatible providers were routed down `ChatPath`
+    // (`/v1/chat/completions`) instead of `/v1/images/generations` (400/404).
+    // Resolved ONCE here: the three call sites are one decision.
+    val effectiveModel = ModelsDevApi.effectiveModel(entry)
 
     val instance = providerRepository.instance(entry.providerInstanceId)
         ?: return@withContext failure("Provider instance not found.")
@@ -504,7 +595,8 @@ private suspend fun performTest(
                                 audioData = clip,
                                 model = entry.baseModel.id,
                                 language = "en",
-                                resolvedModel = entry.model,
+                                // [dv24/B-01] enriched model, not the raw entry
+                                resolvedModel = effectiveModel,
                             ),
                         )
                         val heard = resp.text.trim().ifEmpty { "(empty transcription)" }
@@ -527,7 +619,8 @@ private suspend fun performTest(
                 when (val r = com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.send(
                     context = context,
                     instance = instance,
-                    model = entry.model,
+                    // [dv24/B-01] enriched model, not the raw entry
+                    model = effectiveModel,
                     messages = listOf(
                         LLMMessage(
                             role = LLMMessage.Role.USER,
@@ -553,20 +646,53 @@ private suspend fun performTest(
         }
 
         QuickTestKind.IMAGE_GEN -> {
-            if (instance.providerType != com.rikkaminis.app.data.model.ProviderType.openAI) {
+            // [da1031-D ISSUE-08] Eligibility is ModelUseProtocol's call now —
+            // the same predicate the worker applies inside decideImageRoute.
+            // The old hardcode (`providerType == openAI`) refused an OpenRouter
+            // / xAI image model on this card even though the worker routes it
+            // fine, so the card lied about the provider's capability.
+            if (!com.rikkaminis.app.sandbox.offload.ModelUseProtocol.supportsImageApiRoute(
+                    providerType = instance.providerType,
+                    credentialType = instance.credentialType,
+                    isOpenAiCompatibleProvider =
+                        com.rikkaminis.app.sandbox.offload.ModelUseProtocol
+                            .isOpenAiCompatibleProviderType(instance.providerType),
+                )
+            ) {
                 return@withContext failure(context.getString(R.string.quicktest_image_unsupported))
             }
             runCatching {
                 when (val r = com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.generateImage(
                     context = context,
                     instance = instance,
-                    model = entry.model,
+                    // [dv24/B-01] enriched model, not the raw entry — the
+                    // worker's ARG modality / route decision reads it
+                    model = effectiveModel,
                     prompt = "A friendly cute mascot logo for an app called RikkaMinis, minimalist, centered, soft colors",
                     n = 1,
                     size = "1024x1024",
                     quality = null,
                 )) {
                     is com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.SendResult.Success -> {
+                        // [da1031-D ISSUE-08] The worker's auto-probe answer rides
+                        // back on the raw result; the model-use offload path
+                        // persists it (ModelUseOffloadHandler), this card used to
+                        // drop it — so every image test re-probed from scratch.
+                        // Same rule as there: write only a non-empty, known mode,
+                        // ignore anything else; a cache write must never turn a
+                        // successful test into a failure.
+                        runCatching {
+                            org.json.JSONObject(r.rawJson)
+                                .optString("image_endpoint_resolved", "")
+                                .takeIf { it.isNotEmpty() }
+                                ?.let { cached ->
+                                    com.rikkaminis.app.data.model.ImageEndpointMode.values()
+                                        .firstOrNull { it.name == cached }
+                                        ?.let { mode ->
+                                            providerRepository.setImageEndpointResolved(instance.id, mode)
+                                        }
+                                }
+                        }
                         val img = r.response.mediaAttachments.firstOrNull {
                             it.type == LLMMediaAttachment.MediaType.IMAGE
                         } ?: return@runCatching failure(context.getString(R.string.quicktest_no_image))
@@ -593,18 +719,37 @@ private suspend fun performTest(
  * synthesizeToFile already writes a WAV container. Returns null on any
  * engine/init failure (caller reports a friendly message). 15 s guard so a
  * stuck engine can't hang the test card forever.
+ *
+ * [dv26/G10] "Nothing may be written after cancellation" is one explicit latch.
+ * Before it, a cancelled call (15 s timeout, or the sheet dismissed while the
+ * engine was still initialising) ran `invokeOnCancellation` + the `finally`
+ * delete, and THEN the late `TextToSpeech(context) { … }` init callback reached
+ * `synthesizeToFile(...)` — writing `quicktest-clip-<ts>.wav` back into cacheDir
+ * with nobody left to delete it. Every side effect below is gated through
+ * [SynthClipPolicy]; the three delete sites cover the three ways a clip can
+ * outlive the caller (exit path, cancel path, callback that lands after cancel).
  */
 private suspend fun synthesizeTestClip(context: android.content.Context, text: String): ByteArray? {
     val file = java.io.File(context.cacheDir, "quicktest-clip-${System.currentTimeMillis()}.wav")
+    // Flipped only by the cancellation path below; read by the init callback,
+    // the synth dispatch and the progress callbacks (all main-looper callbacks).
+    val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
     return try {
         kotlinx.coroutines.withTimeoutOrNull(15_000) {
             kotlinx.coroutines.suspendCancellableCoroutine { cont ->
                 var tts: android.speech.tts.TextToSpeech? = null
                 fun finish(ok: Boolean) {
                     runCatching { tts?.shutdown() }
+                    // A callback landing after cancellation is a late write: the
+                    // clip is on disk and no caller will ever read it.
+                    if (SynthClipPolicy.mustDropOnCallback(cancelled.get())) runCatching { file.delete() }
                     if (cont.isActive) cont.resumeWith(Result.success(ok))
                 }
                 tts = android.speech.tts.TextToSpeech(context) { status ->
+                    if (!SynthClipPolicy.mayTouchEngine(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
                     if (status != android.speech.tts.TextToSpeech.SUCCESS) {
                         finish(false)
                         return@TextToSpeech
@@ -619,10 +764,23 @@ private suspend fun synthesizeTestClip(context: android.content.Context, text: S
                             override fun onError(utteranceId: String?, errorCode: Int) = finish(false)
                         },
                     )
+                    // The request can be cancelled between the init callback and
+                    // this line — re-check right before the write.
+                    if (!SynthClipPolicy.maySynthesize(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
                     val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")
                     if (result != android.speech.tts.TextToSpeech.SUCCESS) finish(false)
                 }
-                cont.invokeOnCancellation { runCatching { tts?.shutdown() } }
+                cont.invokeOnCancellation {
+                    cancelled.set(true)
+                    runCatching { tts?.shutdown() }
+                    // The engine can have finished the write between the dispatch
+                    // and this cancellation, and the `finally` below may run
+                    // before that write lands — drop the clip again here.
+                    runCatching { file.delete() }
+                }
             }
         }?.takeIf { it }?.let { file.readBytes() }
     } catch (e: Exception) {

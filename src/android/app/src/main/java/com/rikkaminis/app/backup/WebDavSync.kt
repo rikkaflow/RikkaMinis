@@ -1,6 +1,7 @@
 package com.rikkaminis.app.backup
 
 import okhttp3.OkHttpClient
+import java.io.File
 import java.time.Instant
 
 /**
@@ -48,10 +49,8 @@ object WebDavSync {
     ) {
         val dav = WebDavClient(config, client)
         dav.ensureCollectionExists()
-        val name = "rikkaminis-backup-${
-            java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
-                .format(java.util.Date())
-        }.json"
+        // [FIX-1028 / B-12] Name stamp is read back by list/prune — one format.
+        val name = "$BACKUP_PREFIX${BackupRotation.stamp()}$BACKUP_SUFFIX"
         dav.put(name, payload, "application/json")
     }
 
@@ -76,17 +75,73 @@ object WebDavSync {
         config: WebDavConfig,
         payload: String,
         client: OkHttpClient = WebDavClient.defaultClient(),
+    ): String = putAutoBackup(config, payload.toByteArray(Charsets.UTF_8), client)
+
+    /**
+     * [fix/da1023-backup-streaming-fetch] File overload for callers that
+     * already have the document on disk — the automatic backup streams its
+     * payload straight into the local copy (ConfigBackup.exportToWriter) and
+     * must NOT rebuild a whole-document String just to upload it. The bytes
+     * are read off disk for the PUT; the file itself stays owned by the
+     * caller (the local rotation manages it).
+     */
+    fun backupAuto(
+        config: WebDavConfig,
+        file: File,
+        client: OkHttpClient = WebDavClient.defaultClient(),
+    ): String = putAutoBackup(config, file.inputStream().use { it.readBytes() }, client)
+
+    /** Shared naming + push for both [backupAuto] overloads (same
+     *  `auto/` subdir convention, second-precision name). */
+    private fun putAutoBackup(
+        config: WebDavConfig,
+        bytes: ByteArray,
+        client: OkHttpClient,
     ): String {
         val dav = WebDavClient(config, client)
         dav.ensureCollectionExists()
         dav.ensureCollectionExists(AUTO_SUBDIR)
-        val name = "rikkaminis-backup-auto-${
-            java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
-                .format(java.util.Date())
-        }.json"
-        dav.put("$AUTO_SUBDIR/$name", payload.toByteArray(Charsets.UTF_8), "application/json")
+        // [FIX-1028 / B-12] Same single stamp format the pruner reads back.
+        val name = "$AUTO_BACKUP_PREFIX${BackupRotation.stamp()}$BACKUP_SUFFIX"
+        dav.put("$AUTO_SUBDIR/$name", bytes, "application/json")
         return name
     }
+
+    /**
+     * [fix/da1023-backup-streaming-fetch] Reduce a remote auto-backup display
+     * name (after the [AUTO_BACKUP_PREFIX] / [BACKUP_SUFFIX] strip) to a token
+     * that is safe to embed in a LOCAL file name. The display name arrives
+     * from the WebDAV server, i.e. it is not under our control: before this,
+     * `rikkaminis-backup-auto-../../evil.json` was concatenated straight into
+     * `File(dir, LOCAL_FILE_PREFIX + stamp + ".json")` and wrote through the
+     * backup-autos directory.
+     *
+     * Fail-closed: returns null (caller must refuse to write) when the stamp
+     *  - is blank (after trimming),
+     *  - contains a path separator (`/` or `\`),
+     *  - contains a `..` sequence (parent traversal), or
+     *  - contains an ASCII control character (C0 or DEL — never legitimate).
+     *
+     * Everything else is whitelisted character by character: `[A-Za-z0-9._-]`
+     * passes through, any other character (space, punctuation, non-ASCII) is
+     * replaced with `_`, so a mildly odd but harmless name still fetches
+     * instead of failing outright.
+     */
+    fun sanitizeAutoBackupStamp(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.contains('/') || trimmed.contains('\\')) return null
+        if (trimmed.contains("..")) return null
+        if (trimmed.any { it.code < 0x20 || it.code == 0x7F }) return null
+        // Explicit ASCII whitelist (NOT Char.isLetterOrDigit, which is
+        // Unicode-category based and would pass CJK through untouched).
+        return trimmed.map {
+            if (it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' ||
+                it == '.' || it == '_' || it == '-'
+            ) it else '_'
+        }.joinToString("")
+    }
+
 
     /** [T-auto-backup-assets] Auto-backup filename prefix (subset of
      *  [BACKUP_PREFIX], distinct from manual uploads by the `auto-` token). */
@@ -114,11 +169,27 @@ object WebDavSync {
         config: WebDavConfig,
         keep: Int = AUTO_BACKUP_KEEP,
         client: OkHttpClient = WebDavClient.defaultClient(),
+        // [FIX-1028 / B-12] The copy the caller JUST pushed. Rotation must never
+        // delete it, which is exactly what happened when a rolled-back clock
+        // gave that upload the oldest-looking name. Trailing on purpose: an
+        // existing `pruneAutoBackups(cfg, keep = N, client)` call site keeps
+        // binding `client` positionally.
+        protectName: String? = null,
     ): Int {
         val dav = WebDavClient(config, client)
-        val stale = listAutoBackupEntries(config, client)
-            .filter { it.subdir == AUTO_SUBDIR }
-            .drop(keep)
+        // [FIX-1028 / B-12] Order and deletion eligibility both come from the
+        // stamp in the display name; a server that omits `getlastmodified`
+        // therefore can no longer decide which copy dies (every entry used to
+        // collapse to Instant.EPOCH and the order became "whatever the server
+        // listed"). Entries whose age cannot be established — no name stamp and
+        // no real last-modified — are never victims.
+        val stale = BackupRotation.rotationVictims(
+            items = listAutoBackupEntries(config, client).filter { it.subdir == AUTO_SUBDIR },
+            name = { it.item.displayName },
+            key = { autoBackupStampMillis(it.item) },
+            keep = keep,
+            protect = { protectName != null && it.item.displayName == protectName },
+        )
         var deleted = 0
         for (entry in stale) {
             val path = "${entry.subdir}/${entry.item.displayName}"
@@ -154,7 +225,9 @@ object WebDavSync {
                         it.displayName.endsWith(BACKUP_SUFFIX)
                 }
                 .map { resourceToBackupItem(it) }
-                .sortedByDescending { it.lastModified }
+                .let { items ->
+                    BackupRotation.newestFirst(items, name = { it.displayName }, key = { manualBackupStampMillis(it) })
+                }
         } catch (e: WebDavException) {
             // [T-backup-list-nomkcol] A read operation must not create the
             // remote folder (that is upload's job); a missing folder is just
@@ -203,8 +276,34 @@ object WebDavSync {
         } catch (e: WebDavException) {
             if (e.statusCode == 404) emptyList() else throw e
         }
-        return (inAuto + legacyInRoot).sortedByDescending { it.item.lastModified }
+        // [FIX-1028 / B-12] Newest first by the stamp in the NAME (falling back
+        // to a real last-modified), never `lastModified` alone: a server that
+        // omits the property returns EPOCH for every entry, and the previous
+        // comparator then preserved listing order — i.e. rotation deleted an
+        // arbitrary copy, not the oldest one.
+        return BackupRotation.newestFirst(
+            inAuto + legacyInRoot,
+            name = { it.item.displayName },
+            key = { autoBackupStampMillis(it.item) },
+        )
     }
+
+    /** [FIX-1028 / B-12] Age of a remote auto backup: name stamp, else a real
+     *  `getlastmodified`. [resourceToBackupItem] maps a missing property to
+     *  `Instant.EPOCH`, so `<= 0` means "the server did not tell us" — null,
+     *  not "the beginning of time". */
+    private fun autoBackupStampMillis(item: WebDavBackupItem): Long? =
+        BackupRotation.stampMillis(item.displayName, AUTO_BACKUP_PREFIX)
+            ?: item.lastModified.toEpochMilli().takeIf { it > 0L }
+
+    /** [FIX-1028 / B-12] Same key for the manual list (display order only:
+     *  manual copies are never pruned). Accepts both the pre-rename and the
+     *  current prefix, plus the minute-precision name [ConfigBackup.suggestedFileName]
+     *  gives a local export. */
+    private fun manualBackupStampMillis(item: WebDavBackupItem): Long? =
+        BackupRotation.stampMillis(item.displayName, BACKUP_PREFIX)
+            ?: BackupRotation.stampMillis(item.displayName, LEGACY_BACKUP_PREFIX)
+            ?: item.lastModified.toEpochMilli().takeIf { it > 0L }
 
     /** Download a remote automatic backup (see [listAutoBackupEntries]) and
      *  return its JSON document, ready for [ConfigBackup.import] or for

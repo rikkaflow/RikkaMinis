@@ -20,6 +20,37 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * [meta1028-D2 F-03] `wait appear|disappear` needs at least ONE selector.
+ *
+ * Without one, the search matches nothing by construction and the two verbs
+ * answer opposite lies: `disappear` returns "disappeared" on the first poll
+ * (nothing was looked for) while `appear` burns the full timeout to answer
+ * found=false. Top-level and parameter-only so the truth table is JVM-testable
+ * without an Android node tree.
+ */
+internal fun waitSelectorProvided(
+    text: String?,
+    textContains: String?,
+    id: String?,
+    className: String?,
+): Boolean = text != null || textContains != null || id != null || className != null
+
+/** [meta1028-D2 F-03] Whole-screen verdict for a `wait appear|disappear` poll. */
+internal enum class WaitVerdict { SATISFIED, KEEP_WAITING }
+
+/**
+ * [meta1028-D2 F-03] `present = true` (appear) is satisfied when the screen
+ * holds a match; `present = false` (disappear) when it holds NONE.
+ *
+ * The predicate is trivial — that is the point. The defect it had to be
+ * separated from is not the comparison, it is WHERE it was applied: the caller
+ * evaluated it once per window root, so "no match in THIS window" was answered
+ * as "no match on the screen".
+ */
+internal fun waitVerdict(present: Boolean, screenMatch: Boolean): WaitVerdict =
+    if (screenMatch == present) WaitVerdict.SATISFIED else WaitVerdict.KEEP_WAITING
+
+/**
  * `android-a11y-cli` — UI-layer automation surface backed by
  * [MinisAccessibilityService]. Mirrors the design doc
  * `docs/.../android-accessibility-cli-design.md`.
@@ -80,18 +111,35 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        // [deep-audit-1017 G2] `tap text --contains X` reads the "contains" flag in
+        // tapText, but it was never declared boolean: the parser took X as the
+        // flag's value and swallowed it, so positional[2] was null and every
+        // `--contains` call died on "missing <text>". Declared here, and the set is
+        // asserted against every hasFlag() name in this file by
+        // AccessibilityTapTextTest.
+        //
+        // [deep-audit-1038 A-02] A key that is READ AS A VALUE must not be declared
+        // here: `OffloadArgs` binds no value for a declared boolean, so the caller's
+        // spelling is dropped and the reader sees "not given". `visible-only` was
+        // declared and read with `getBool` — the one combination that turns an
+        // explicit `--visible-only false` into the opposite of what was asked.
+        // `VisibleOnlyFlag` below is the value side of that split, and
+        // `a11y_handler_contract_check.py` holds the two sets disjoint.
         val args = OffloadArgs(
             request.argv.drop(1),
             booleanFlags = setOf(
                 "help", "h", "long", "double", "clear", "append",
                 "annotate", "compact", "inline", "b",
                 "clickable", "editable", "scrollable", "checked", "enabled",
-                "visible-only", "auto-scroll", "auto-dismiss", "auto-confirm",
+                "auto-scroll", "auto-dismiss", "auto-confirm",
                 "confirm", "deny", "children", "ancestors",
+                "contains",
             ),
         )
+        // `--help` is a flag, so `positional` is empty for it too: the exit
+        // code has to be decided on the flag, or `--help` answers 2.
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
-            return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, TOP_HELP)
         }
         val sub = args.positional[0]
         // T330: tri-state agent gate via OffloadPermissionManager. `service`
@@ -160,7 +208,7 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         // [T-bg-overlay phase 2 fix] Surface a11y sub-action progress to
         // SessionActivityTracker.currentToolStatus so the background
         // overlay capsule + FGS notification show what the agent is
-        // actually doing — "tap by-text Login" instead of the static
+        // actually doing — "tap text Login" instead of the static
         // "Running: a11y_cli". Computed before dispatch so even fast
         // sub-commands (status / ping) get a one-line update before they
         // return. Does NOT touch the per-message tool name / running
@@ -252,7 +300,26 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         val svc = svcOrThrow()
         val maxDepth = args.getInt("depth") ?: 10
         val compact = args.hasFlag("compact")
-        val visibleOnly = args.getBool("visible-only") ?: true
+        // [deep-audit-1038 A-02] Tri-state read of `--visible-only`, which is a
+        // VALUE-taking option (see the `booleanFlags` note in `handle`). While it
+        // was declared boolean, `--visible-only false` bound nothing, `false` fell
+        // through as a stray positional, and this read saw "not given" — the
+        // caller's explicit "hide the invisible nodes" silently became "show
+        // everything". Absent (or a bare `--visible-only`, which the parser folds
+        // into the same unset state) keeps the documented default; a spelled
+        // boolean is honoured in either spelling (`--visible-only false` /
+        // `--visible-only=false`); anything else is refused instead of being
+        // folded into the default.
+        val visibleOnly = when (val read = VisibleOnlyFlag.resolve(args.get("visible-only"))) {
+            VisibleOnlyFlag.Read.Absent -> true
+            is VisibleOnlyFlag.Read.Value -> read.value
+            is VisibleOnlyFlag.Read.Invalid -> return err(
+                args,
+                "INVALID_ARGS",
+                "ui dump: --visible-only expects true|false|1|0|yes|no (got \"${read.raw}\")",
+                exit = 2,
+            )
+        }
         val arr = JSONArray()
         for (root in svc.rootNodes()) {
             walkNode(svc.nodeRegistry, root, 0, maxDepth, visibleOnly, compact, arr)
@@ -420,10 +487,18 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
 
         val baos = java.io.ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.PNG, 100, baos)
+        // [deep-audit-1048 A-02] PNG encode failure is silent: `compress` returns
+        // false instead of throwing, and the old statement-position call shipped
+        // an EMPTY base64 image payload under `success`. Answer the handler's
+        // existing error shape instead — an image the model cannot see must not
+        // read as a successful screenshot.
+        val encoded = scaled.compress(Bitmap.CompressFormat.PNG, 100, baos)
         val outW = scaled.width
         val outH = scaled.height
         scaled.recycle()
+        if (!com.rikkaminis.app.util.saveOutcome(streamOpened = true, compressed = encoded)) {
+            return err(args, "ENCODE_FAILED", "PNG encoder wrote no bytes (compress returned false)")
+        }
         val pngBytes = baos.toByteArray()
 
         val data = JSONObject()
@@ -443,6 +518,11 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
 
         val dir = (context.getExternalFilesDir("a11y_screenshots") ?: java.io.File(context.cacheDir, "a11y_screenshots"))
         if (!dir.exists()) dir.mkdirs()
+        // [da1028-C] Plaintext screenshots are the most sensitive thing this
+        // handler writes and nothing ever deleted them (externalFilesDir is not
+        // the OS-reclaimable cache). Same 24h contract as cache/share. This runs
+        // on the offload server's worker thread, never the main thread.
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
         val file = java.io.File(dir, "a11y_${System.currentTimeMillis()}.png")
         return try {
             java.io.FileOutputStream(file).use { it.write(pngBytes) }
@@ -519,12 +599,23 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         val n = matches.getOrNull(index)
             ?: return err(args, "NODE_NOT_FOUND",
                 "no node with text${if (contains) " containing " else "="}\"$text\" (matches: ${matches.size})")
-        if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        else {
-            val r = Rect(); n.getBoundsInScreen(r)
-            tapXYRaw(svc, r.centerX(), r.centerY(), args)
+        // [deep-audit-1017 G3] Both branches of the attempt used to have their
+        // result thrown away and the call reported `ok` unconditionally: a node
+        // that advertises `clickable` but refuses ACTION_CLICK (disabled, or the
+        // action is handled by an ancestor) and a coordinate tap the system
+        // cancelled both came back as success — the agent believed a tap landed
+        // that never happened. Report what happened instead, and keep the two
+        // failure modes apart from NODE_NOT_FOUND above.
+        if (TapTextFlow.plan(n.isClickable, n.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+            == TapTextFlow.Stage.CLICKED
+        ) {
+            return ok(args, JSONObject().put("text", text).put("action", "click"))
         }
-        return ok(args, JSONObject().put("text", text).put("action", "click"))
+        val r = Rect(); n.getBoundsInScreen(r)
+        val tapped = tapXYRaw(svc, r.centerX(), r.centerY(), args)
+        if (TapTextFlow.fallbackSucceeded(tapped.exitCode)) return tapped
+        return err(args, "ACTION_FAILED",
+            "tap text \"$text\": node did not accept ACTION_CLICK and the coordinate tap failed")
     }
 
     private fun findByTextOrDesc(
@@ -532,13 +623,7 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>,
     ) {
         if (node == null || depth > maxDepth) return
-        val t = node.text?.toString()
-        val d = node.contentDescription?.toString()
-        val match = if (contains)
-            (t != null && t.contains(target)) || (d != null && d.contains(target))
-        else
-            t == target || d == target
-        if (match) out.add(node)
+        if (textOrDescMatches(node, target, contains)) out.add(node)
         for (i in 0 until node.childCount) findByTextOrDesc(node.getChild(i), target, contains, maxDepth, depth + 1, out)
     }
 
@@ -787,34 +872,91 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
 
     private fun waitAppear(args: OffloadArgs, present: Boolean): NativeOffloadResult {
         val svc = svcOrThrow()
+        // [meta1028-D2 F-03] A wait with NO selector used to answer off an empty
+        // match list: `wait disappear` reported "disappeared" instantly (nothing
+        // was ever searched for) and `wait appear` burned the whole timeout to
+        // answer found=false. Refuse instead — exit 2, like the missing/unknown
+        // subcommand paths above.
+        if (!waitSelectorProvided(
+                text = args.get("text"),
+                textContains = args.get("text-contains"),
+                id = args.get("id"),
+                className = args.get("class"),
+            )
+        ) {
+            return NativeOffloadResult(
+                2,
+                "$TOOL wait: at least one of --text/--text-contains/--id/--class is required\n$WAIT_HELP",
+            )
+        }
         val timeout = args.getLong("timeout") ?: 10_000L
         val deadline = System.currentTimeMillis() + timeout
-        val targetText = args.get("text") ?: args.get("text-contains")
-        val containsOnly = args.get("text-contains") != null
-        val targetId = args.get("id")
-        val targetClass = args.get("class")
         while (System.currentTimeMillis() < deadline) {
-            for (root in svc.rootNodes()) {
-                val matches = ArrayList<AccessibilityNodeInfo>()
-                if (targetText != null) findByTextOrDesc(root, targetText, contains = containsOnly, 30, 0, matches)
-                if (targetId != null) findByResourceId(root, targetId, 30, 0, matches)
-                if (targetClass != null) findByClassName(root, targetClass, 30, 0, matches)
-                val found = matches.isNotEmpty()
-                if (found == present) {
-                    return if (present) ok(args, JSONObject().put("found", true)
-                        .put("node", nodeToJson(svc.nodeRegistry, matches.first(), 0, compact = true)))
-                    else ok(args, JSONObject().put("disappeared", true))
+            // [meta1028-D2 F-03] The verdict is decided over the WHOLE SCREEN,
+            // never per window root. `rootNodes()` yields one root per window
+            // (status bar / IME / overlay included), and the old code returned
+            // `disappeared` from INSIDE the root loop as soon as the FIRST root
+            // lacked the target — a spinner still on screen in the app window
+            // was reported gone whenever another window came first in the list.
+            // [findWaitTarget] walks every root and applies the supplied
+            // selectors as an AND (matching `uiFind`/`matchesPredicate`) instead
+            // of unioning each selector's hits into one list (OR).
+            val match = findWaitTarget(svc, args)
+            if (waitVerdict(present, screenMatch = match != null) == WaitVerdict.SATISFIED) {
+                return if (match != null) {
+                    ok(args, JSONObject().put("found", true)
+                        .put("node", nodeToJson(svc.nodeRegistry, match, 0, compact = true)))
+                } else {
+                    ok(args, JSONObject().put("disappeared", true))
                 }
             }
             Thread.sleep(200)
         }
+        // Timeout keeps the family contract: `wait stable` / `wait activity`
+        // also answer exit 0 + timedOut=true, and callers read the flag.
         return ok(args, JSONObject().put("found", false).put("timedOut", true))
     }
 
-    private fun findByClassName(node: AccessibilityNodeInfo?, cls: String, maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>) {
-        if (node == null || depth > maxDepth) return
-        if (node.className?.toString() == cls) out.add(node)
-        for (i in 0 until node.childCount) findByClassName(node.getChild(i), cls, maxDepth, depth + 1, out)
+    /**
+     * [meta1028-D2 F-03] First node that matches EVERY supplied wait selector,
+     * searched across all window roots. Null = nothing on screen matches.
+     */
+    private fun findWaitTarget(svc: MinisAccessibilityService, args: OffloadArgs): AccessibilityNodeInfo? {
+        for (root in svc.rootNodes()) {
+            findWaitMatchIn(root, args, maxDepth = 30, depth = 0)?.let { return it }
+        }
+        return null
+    }
+
+    private fun findWaitMatchIn(
+        node: AccessibilityNodeInfo?, args: OffloadArgs,
+        maxDepth: Int, depth: Int,
+    ): AccessibilityNodeInfo? {
+        if (node == null || depth > maxDepth) return null
+        if (waitNodeMatches(node, args)) return node
+        for (i in 0 until node.childCount) {
+            findWaitMatchIn(node.getChild(i), args, maxDepth, depth + 1)?.let { return it }
+        }
+        return null
+    }
+
+    /** AND semantics, one implementation of the text rule ([textOrDescMatches]). */
+    private fun waitNodeMatches(n: AccessibilityNodeInfo, args: OffloadArgs): Boolean {
+        args.get("text")?.let { if (!textOrDescMatches(n, it, contains = false)) return false }
+        args.get("text-contains")?.let { if (!textOrDescMatches(n, it, contains = true)) return false }
+        args.get("id")?.let { if (n.viewIdResourceName != it) return false }
+        args.get("class")?.let { if (n.className?.toString() != it) return false }
+        return true
+    }
+
+    private fun textOrDescMatches(n: AccessibilityNodeInfo, target: String, contains: Boolean): Boolean {
+        val t = n.text?.toString()
+        val d = n.contentDescription?.toString()
+        return if (contains) {
+            (t != null && t.contains(target)) || (d != null && d.contains(target))
+        } else {
+            t == target || d == target
+        }
     }
 
     private fun waitStable(args: OffloadArgs): NativeOffloadResult {
@@ -1135,10 +1277,17 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
      *
      * Examples:
      *   ui dump           → "a11y_cli: dumping UI tree"
-     *   tap by-text Login → "a11y_cli: tap \"Login\""
-     *   input set --text X → "a11y_cli: input text"
-     *   scroll forward    → "a11y_cli: scroll forward"
+     *   tap text Login    → "a11y_cli: tap \"Login\""
+     *   tap xy 100 200    → "a11y_cli: tap at (100)"
+     *   input text Hello  → "a11y_cli: input text"
+     *   scroll to-text X  → "a11y_cli: scrolling to \"X\""
      *   event watch       → "a11y_cli: watching events"
+     *
+     * [deep-audit-1025 ISSUE-03] The first three examples above were wrong in
+     * the shipped build: the table listed `by-text` / `set` / `forward`, none of
+     * which the dispatcher accepts, so the capsule showed the generic label for
+     * every tap / input / scroll. The verbs and their labels now live together
+     * in [A11yStatusLabels], keyed by the dispatched verb.
      */
     private fun statusForSubAction(sub: String, verb: String?, args: OffloadArgs): String {
         val v = verb ?: ""
@@ -1152,23 +1301,17 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                 "screenshot" -> "a11y_cli: capturing screenshot"
                 else         -> "a11y_cli: ui"
             }
-            "tap" -> when (v) {
-                "by-text"     -> "a11y_cli: tap \"${target ?: ""}\""
-                "by-id"       -> "a11y_cli: tap #${target ?: ""}"
-                "by-node"     -> "a11y_cli: tap node ${target ?: ""}"
-                "at"          -> "a11y_cli: tap at ($target)"
-                else          -> "a11y_cli: tap"
-            }
-            "input" -> when (v) {
-                "set"   -> "a11y_cli: input text"
-                "clear" -> "a11y_cli: clearing input"
-                else    -> "a11y_cli: input"
-            }
-            "scroll" -> when (v) {
-                "forward", "backward", "up", "down" -> "a11y_cli: scroll $v"
-                "to-text"                            -> "a11y_cli: scrolling to \"${target ?: ""}\""
-                else                                 -> "a11y_cli: scroll"
-            }
+            // [deep-audit-1025 ISSUE-03] These three used to be hand-written
+            // `when` tables listing verbs the dispatcher never accepted
+            // (`by-text`/`set`/`forward`), so every real call fell through to
+            // the generic label. They are now rendered from the single table
+            // whose keys ARE the dispatched verbs — see [A11yStatusLabels].
+            "tap" -> A11yStatusLabels.labelFor(A11yStatusLabels.TAP, v, target)
+                ?: "a11y_cli: tap"
+            "input" -> A11yStatusLabels.labelFor(A11yStatusLabels.INPUT, v, target)
+                ?: "a11y_cli: input"
+            "scroll" -> A11yStatusLabels.labelFor(A11yStatusLabels.SCROLL, v, target)
+                ?: "a11y_cli: scroll"
             "gesture"  -> "a11y_cli: gesture${v.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""}"
             "wait"     -> "a11y_cli: waiting for ${v.ifBlank { "condition" }}"
             "event"    -> if (v == "watch") "a11y_cli: watching events" else "a11y_cli: event $v"
@@ -1180,4 +1323,140 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
     }
 
+}
+
+/**
+ * [deep-audit-1025 ISSUE-03] Single source of truth for the a11y sub-action
+ * status line — the text the background overlay capsule and the FGS
+ * notification show while the agent drives the UI.
+ *
+ * The verbs the dispatcher accepts (`tapSub` / `inputSub` / `scrollSub`) and the
+ * verbs this status line could name used to be two hand-written lists, and all
+ * three pairs had drifted apart:
+ *
+ * | group  | dispatched              | the status table knew           |
+ * |--------|-------------------------|---------------------------------|
+ * | tap    | node / xy / text / id   | by-text / by-id / by-node / at  |
+ * | input  | text / clear / key      | set / clear                     |
+ * | scroll | node / xy / to-text     | forward / backward / up / down  |
+ *
+ * Every one of those operations therefore fell through to the generic label
+ * ("a11y_cli: tap"), so the capsule was blank exactly when it was supposed to
+ * narrate — 100 % of a11y calls. The keys here are the dispatched verb itself,
+ * which is what collapses the two lists into one: there is nothing left to keep
+ * in sync by hand, and `a11y_handler_contract_check.py` fails when the two sets
+ * stop matching in either direction.
+ *
+ * `%s` is the sub-command's target argument (positional #2); a label without it
+ * ignores the target. An unknown verb returns null so the caller's generic
+ * fallback still applies — a verb added to the dispatcher without a label here
+ * fails the gate instead of silently degrading the capsule again.
+ */
+internal object A11yStatusLabels {
+    /** `tap node|xy|text|id` → overlay label. */
+    val TAP: Map<String, String> = mapOf(
+        "node" to "a11y_cli: tap node %s",
+        "xy"   to "a11y_cli: tap at (%s)",
+        "text" to "a11y_cli: tap \"%s\"",
+        "id"   to "a11y_cli: tap #%s",
+    )
+
+    /** `input text|clear|key` → overlay label. */
+    val INPUT: Map<String, String> = mapOf(
+        "text"  to "a11y_cli: input text",
+        "clear" to "a11y_cli: clearing input",
+        "key"   to "a11y_cli: input key %s",
+    )
+
+    /** `scroll node|xy|to-text` → overlay label. */
+    val SCROLL: Map<String, String> = mapOf(
+        "node"    to "a11y_cli: scroll node %s",
+        "xy"      to "a11y_cli: scroll at (%s)",
+        "to-text" to "a11y_cli: scrolling to \"%s\"",
+    )
+
+    /**
+     * Render [table]'s label for [verb], substituting [target] for `%s`. Null
+     * when the table has no entry for [verb] (or [verb] is absent), which is the
+     * caller's signal to keep its generic fallback.
+     */
+    fun labelFor(table: Map<String, String>, verb: String?, target: String?): String? {
+        val template = table[verb ?: return null] ?: return null
+        return template.replace(TARGET_PLACEHOLDER, target ?: "")
+    }
+
+    private const val TARGET_PLACEHOLDER = "%s"
+}
+
+/**
+ * [deep-audit-1017 G3] Decision table for `tap text`, kept out of the
+ * Android-touching body so all three outcomes are pinnable on the JVM
+ * (`AccessibilityNodeInfo` cannot be instantiated there).
+ *
+ * A matched node is tapped directly only when it says it is clickable AND the
+ * action is accepted; every other combination falls through to the coordinate
+ * tap, whose own result decides success or failure. Neither result may be
+ * assumed — that assumption is what used to report success for taps that never
+ * happened.
+ */
+internal object TapTextFlow {
+    enum class Stage {
+        /** ACTION_CLICK was offered and accepted — nothing else to try. */
+        CLICKED,
+
+        /** Tap the node's centre and let `tapXYRaw` report the outcome. */
+        COORDINATE_FALLBACK,
+    }
+
+    fun plan(nodeClickable: Boolean, clickAccepted: Boolean): Stage =
+        if (nodeClickable && clickAccepted) Stage.CLICKED else Stage.COORDINATE_FALLBACK
+
+    /** `NativeOffloadResult.exitCode == 0` is the CLI's success convention. */
+    fun fallbackSucceeded(exitCode: Int): Boolean = exitCode == 0
+}
+
+/**
+ * [deep-audit-1038 A-02] The value side of `--visible-only`.
+ *
+ * Android-free on purpose: `ui dump` is the only reader, and the decision it
+ * makes — absent vs. a spelled boolean vs. garbage — is the part that used to
+ * go silently wrong, so it is pinned on the JVM like [TapTextFlow].
+ *
+ * The accepted words are the ones [OffloadArgs.getBool] already accepts, so a
+ * caller that learned `--visible-only=false` from the parser's own vocabulary
+ * does not meet a second, narrower list here. What is different is the GARBAGE
+ * case: `getBool` answers `null` both for "the caller spelled nothing" and for
+ * "the caller spelled nonsense", which is what let a malformed value fall back
+ * to the default instead of being refused.
+ */
+internal object VisibleOnlyFlag {
+
+    /** What the caller spelled for `--visible-only`. */
+    sealed interface Read {
+        /**
+         * No value bound: either the option was not given, or it was given bare
+         * (`--visible-only`), which the parser folds into the same unset state.
+         * The caller's documented default applies.
+         */
+        object Absent : Read
+
+        /** A legal boolean spelling. */
+        data class Value(val value: Boolean) : Read
+
+        /** A spelling that is not a boolean — refused, never guessed at. */
+        data class Invalid(val raw: String) : Read
+    }
+
+    private val TRUE_WORDS = setOf("true", "1", "yes")
+    private val FALSE_WORDS = setOf("false", "0", "no")
+
+    /** Classify [raw] (the bound value, or null when nothing was bound). */
+    fun resolve(raw: String?): Read {
+        if (raw == null) return Read.Absent
+        return when (raw.lowercase()) {
+            in TRUE_WORDS -> Read.Value(true)
+            in FALSE_WORDS -> Read.Value(false)
+            else -> Read.Invalid(raw)
+        }
+    }
 }

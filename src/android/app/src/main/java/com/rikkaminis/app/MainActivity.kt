@@ -18,7 +18,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import android.app.AlertDialog
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -37,9 +36,9 @@ import com.rikkaminis.app.deeplink.DeepLinkHandler
 
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.service.SessionActivityTracker
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.NewerDatabaseGuidanceScreen
 import com.rikkaminis.app.ui.navigation.AppNavigation
-import com.rikkaminis.app.ui.navigation.coldStartRestoreAllowed
 import com.rikkaminis.app.ui.navigation.Routes
 import com.rikkaminis.app.ui.navigation.safeNavigate
 import com.rikkaminis.app.ui.settings.KEY_FONT_APP_BASE
@@ -54,11 +53,10 @@ import com.rikkaminis.app.ui.settings.keepScreenAwakeEnabled
 import com.rikkaminis.app.ui.theme.MinisTheme
 
 private const val KEY_CURRENT_CHAT_SESSION_ID = "minis.current_chat_session_id"
-/** [P3-crash-recovery] 进程级持久化的 lastSessionId（独立 prefs 文件，非 savedInstanceState）。
- * native SIGABRT 不经过 Activity 生命周期，saved state 会丢；这个文件
- * 在每次进入 chat 路由时同步写入，作为崩溃后「重进即回到崩溃前会话」的可靠来源。 */
-private const val PREF_CRASH_RECOVERY = "minis_crash_recovery"
-private const val KEY_LAST_CHAT_SESSION_ID = "last_chat_session_id"
+// [P3-crash-recovery] 进程级持久化的 lastSessionId 现在住在 CrashRecoveryStore
+// （独立 prefs 文件 + 写入时间戳）。native SIGABRT 不经过 Activity 生命周期，
+// saved state 会丢；那个文件在每次进入 chat 路由时写入，作为崩溃后「重进即回到
+// 崩溃前会话」的可靠来源。
 
 class MainActivity : ComponentActivity() {
 
@@ -102,6 +100,28 @@ class MainActivity : ComponentActivity() {
      * Defer the actual navigate to the first [onResume] after [onStart].
      */
     private var pendingLaunchSessionRoute: String? = null
+
+    /**
+     * [r5-d2 D-F-06] Set right after THIS activity successfully launches some
+     * other activity (camera, file picker, SAF document picker, a system
+     * settings page, …). The next ON_START is then the *return leg of an
+     * in-app sub-flow*, not "the app came back from the background" — and the
+     * launch-session reroute must not treat it as one. Consumed (cleared) by
+     * [onStart]; it deliberately stays set if the user wanders off elsewhere
+     * from the launched app, costing one suppressed reroute — a much smaller
+     * defect than wiping the back stack on every picker return.
+     */
+    private var selfLaunchedExternalUi = false
+
+    /**
+     * [r5-d2 D-F-06] Set by [onNewIntent] when a wake-up intent carries its
+     * own destination (a resolvable deep link, or a share). The ON_START that
+     * follows such an intent is part of the *same* wake-up, and a route queued
+     * there would replace the destination the intent just navigated to with a
+     * blank draft. Same shape as `AppNavigation`'s cold-start
+     * `if (hasDeepLink) return` guard, which the warm path never had.
+     */
+    private var incomingWakeIntent = false
 
     /**
      * Used by the "go to settings" gate to open e.g. the app-details or
@@ -171,6 +191,12 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (t: Throwable) {
                 android.util.Log.w("MainActivity", "crash zip save failed: ${t.message}")
+                rollbackCreatedDocument(targetUri)
+                android.widget.Toast.makeText(
+                    this@MainActivity,
+                    getString(com.rikkaminis.app.R.string.crash_freq_save_failed, t.message ?: ""),
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
             } finally {
                 pendingCrashSaveOnClosed?.invoke()
                 pendingCrashSaveOnClosed = null
@@ -287,13 +313,21 @@ class MainActivity : ComponentActivity() {
             // can still be honoured. Auto / Last Session keep the restore; every
             // other mode hands the decision back to the dispatcher.
             ?: if (savedInstanceState == null) {
+                // [R4-U F-02] The restore is a synthesized OpenSession deep link,
+                // and AppNavigation's dispatcher returns early on `hasDeepLink` —
+                // so AUTO's fresh-within-15-minutes rule never ran on a cold
+                // start: a record from three days ago reopened the old chat, and
+                // a deleted session opened a dead chat. The dispatcher's rules
+                // are re-applied here (pure core, see [ChatRoutePresence]), and a
+                // stale / absent / draft-shaped record hands the decision back to
+                // the dispatcher.
                 val launchMode = getAppearancePrefs(this).getInt(KEY_LAUNCH_SESSION, 0)
-                if (coldStartRestoreAllowed(launchMode)) {
-                    getSharedPreferences(PREF_CRASH_RECOVERY, MODE_PRIVATE)
-                        .getString(KEY_LAST_CHAT_SESSION_ID, null)
-                } else {
-                    null
-                }
+                ChatRoutePresence.decideColdStartRestore(
+                    launchMode = launchMode,
+                    storedSessionId = CrashRecoveryStore.sessionId(this),
+                    storedAtMs = CrashRecoveryStore.writtenAtMs(this),
+                    nowMs = System.currentTimeMillis(),
+                )
             } else {
                 null
             }
@@ -568,8 +602,38 @@ class MainActivity : ComponentActivity() {
                 DisposableEffect(navController) {
                     val job = lifecycleScope.launch {
                         navController.currentBackStackEntryFlow.collect { entry ->
-                            val isChatRoute = entry.destination.route == Routes.CHAT
-                            val sid = entry.arguments?.getString("sessionId").takeIf { isChatRoute }
+                            // [R4-U F-09] A dialog destination is pushed ON TOP of
+                            // the chat — `Routes.FILE_PREVIEW` is the `dialog(...)`
+                            // entry in AppNavigation — and the chat screen keeps
+                            // rendering underneath. Treating the top-of-stack
+                            // emission as "the user left the chat" called
+                            // setAbsent() and cleared currentChatSessionId, so
+                            // opening an attachment dropped the keep-alive
+                            // presence (and the next turn's tool state) while the
+                            // user was still sitting in the chat. Resolve the
+                            // chat from the entry BELOW the dialog instead.
+                            val owner = if (ChatRoutePresence.isChatKeptAliveOverlay(
+                                    entry.destination.navigatorName,
+                                )
+                            ) {
+                                navController.previousBackStackEntry
+                            } else {
+                                entry
+                            }
+                            val isChatRoute = owner?.destination?.route == Routes.CHAT
+                            // [da1032-D] The route arg can still be a draft key
+                            // (`__new__<uuid>`) after the first send promoted the
+                            // chat to a real row — the screen keeps its original
+                            // nav arg for its whole lifetime. Everything below
+                            // (keep-alive presence, the tracked currentChatSessionId,
+                            // the crash-recovery file) then points at an orphan
+                            // draft key: SessionActivityTracker holds a session that
+                            // no row owns, and a crash restore lands the user back
+                            // in a synthetic draft. Resolve once, here, through the
+                            // same alias table the rest of the app uses.
+                            val sid = owner?.arguments?.getString("sessionId")
+                                ?.takeIf { isChatRoute }
+                                ?.let { ChatViewModelStore.resolveSessionId(it) }
                             val previous = currentChatSessionId
                             if (sid != previous) {
                                 if (previous != null) {
@@ -579,15 +643,17 @@ class MainActivity : ComponentActivity() {
                                     SessionActivityTracker.setPresent(sid)
                                 }
                                 currentChatSessionId = sid
-                                // [P3-crash-recovery] Persist the last-opened
-                                // session id at the process level so a native
-                                // crash (no saved-state bundle) can still land
-                                // the user back in this chat on next launch.
+                                // [R4-U F-01] Crash-recovery record. Two rules
+                                // live in [CrashRecoveryStore] / [ChatRoutePresence]
+                                // instead of here: a composer draft key
+                                // (`__new__<uuid>`) is never persisted — there is
+                                // no row behind it, so a native-crash restore would
+                                // open a synthetic draft instead of the chat the
+                                // user was actually in — and id + timestamp land in
+                                // ONE edit(), so the AUTO freshness window can never
+                                // read a stale id paired with a fresh timestamp.
                                 if (sid != null) {
-                                    getSharedPreferences(PREF_CRASH_RECOVERY, MODE_PRIVATE)
-                                        .edit()
-                                        .putString(KEY_LAST_CHAT_SESSION_ID, sid)
-                                        .apply()
+                                    CrashRecoveryStore.record(this@MainActivity, sid)
                                 }
                             }
                         }
@@ -630,7 +696,13 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         currentChatSessionId?.let {
-            outState.putString(KEY_CURRENT_CHAT_SESSION_ID, it)
+            // [da1032-D] Second line of defence for the same draft-key family:
+            // whatever writer put an id in [currentChatSessionId], the bundle
+            // carries the canonical one. The nav listener above already resolves
+            // before storing, so this is normally a no-op pass-through — it
+            // matters for any other writer and for ids restored from an older
+            // bundle through [restoredChatSessionId].
+            outState.putString(KEY_CURRENT_CHAT_SESSION_ID, ChatViewModelStore.resolveSessionId(it))
         }
     }
 
@@ -649,17 +721,59 @@ class MainActivity : ComponentActivity() {
      * only mode whose semantics genuinely demand a fresh chat on every
      * activation (cold or warm) — that's exactly the user expectation
      * the issue is reporting on.
+     *
+     * [r5-d2 D-F-06] "Activation" means the app coming back from the
+     * background, NOT every ON_START: the return leg of an in-app sub-flow
+     * (camera / picker / SAF / a settings page we opened) and a wake-up
+     * intent that already navigated somewhere are both excluded below, so the
+     * back-stack wipe only ever happens on a real recents→app transition.
+     * See [selfLaunchedExternalUi] / [incomingWakeIntent].
      */
     override fun onStart() {
         super.onStart()
         if (!hasResumedFromBackground) {
             hasResumedFromBackground = true
+            // Cold start: the decision belongs to AppNavigation's dispatcher.
+            // Drop any stale one-shot flags so they cannot eat the first real
+            // background → foreground transition.
+            selfLaunchedExternalUi = false
+            incomingWakeIntent = false
             return
         }
         val mode = getAppearancePrefs(this).getInt(KEY_LAUNCH_SESSION, 0)
+        // [r5-d2 D-F-06] Not every ON_START after the first one is "the app
+        // came back from the background":
+        //
+        //  1. the return leg of an in-app sub-flow — camera / file picker / SAF
+        //     / a settings page we launched (`selfLaunchedExternalUi`). The
+        //     reroute below cleared the whole back stack, so the user came back
+        //     from the camera and found a blank new chat: the chat they were
+        //     in was gone and the draft they were typing into was orphaned;
+        //  2. a wake-up intent that already navigated to its own destination —
+        //     `minis://session/<id>` from a completion notification or a share
+        //     (`incomingWakeIntent`, set in [onNewIntent]). The reroute landed
+        //     on top of that navigation and replaced it with a draft.
+        //
+        // A pending route from an earlier ON_START is dropped too: onResume
+        // would otherwise execute it on top of the decision made here.
+        if (selfLaunchedExternalUi || incomingWakeIntent) {
+            val reason = if (selfLaunchedExternalUi) "in-app sub-flow return" else "wake-up intent"
+            selfLaunchedExternalUi = false
+            incomingWakeIntent = false
+            pendingLaunchSessionRoute = null
+            AppLogger.info(
+                "LaunchSession",
+                "onStart: launch-session reroute suppressed ($reason, mode=$mode)",
+            )
+            return
+        }
         if (mode != 2) return
         val nav = navController ?: return
-        val newRoute = Routes.chat("__new__${java.util.UUID.randomUUID()}")
+        // [da1029-A] Route through the single source (ComposerDraftStore)
+        // instead of a bare "__new__<uuid>": a fresh id here would orphan the
+        // existing draft slot, and ComposerDraftStore.saveText drops writes
+        // aimed at a different draft id — the user's typed text would vanish.
+        val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
         AppLogger.info("LaunchSession", "resume → mode=NewChat, deferring navigate to onResume (lifecycle=$lifecycle.currentState)")
         pendingLaunchSessionRoute = newRoute
     }
@@ -711,6 +825,32 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * [r5-d2 D-C-09①] Undo the empty document `ACTION_CREATE_DOCUMENT` leaves
+     * behind when the copy into it fails.
+     *
+     * The picker creates the target document the moment the user confirms a
+     * name, long before a single byte is written. A failed
+     * `openOutputStream` / ENOSPC / a provider that revokes the permission
+     * mid-copy therefore left a 0-byte `.zip` with the real archive's name in
+     * the user's folder — indistinguishable from a successful save when they
+     * browse to it later, and the reason a "save failed" report came back as
+     * "there is no error, just an empty file". `DocumentsContract` is the
+     * documented deletes for a `content://` document; `resolver.delete` covers
+     * providers that only implement `delete()` (plain file / downloads
+     * providers). Both are best-effort: a provider that refuses the delete is
+     * not worth failing the flow over (nothing else can be done from here).
+     */
+    private fun rollbackCreatedDocument(targetUri: Uri) {
+        val deleted = runCatching {
+            android.provider.DocumentsContract.deleteDocument(contentResolver, targetUri)
+        }.getOrElse { false }
+        if (!deleted) {
+            runCatching { contentResolver.delete(targetUri, null, null) }
+                .onFailure { android.util.Log.w("MainActivity", "crash zip rollback failed: ${it.message}") }
+        }
+    }
+
+    /**
      * Apply (or release) the activity window's `FLAG_KEEP_SCREEN_ON` based on
      * the user's "Keep Screen Awake" toggle and whether any session has an
      * active task right now. Idempotent — flipping with the same desired
@@ -746,10 +886,45 @@ class MainActivity : ComponentActivity() {
         // FLAG_ACTIVITY_CLEAR_TOP, which delivers the new intent here when
         // MainActivity is already alive. Process the buffered share before
         // touching the deep-link path so the share coordinator sees it.
-        if (intent.getBooleanExtra("shared_content", false)) {
+        val sharedContent = intent.getBooleanExtra("shared_content", false)
+        if (sharedContent) {
             com.rikkaminis.app.share.ShareCoordinator.processPendingShare(this)
         }
+        // [r5-d2 D-F-06] A warm-start intent that carries its own destination
+        // owns the back stack: the branch below navigates to it, and the
+        // ON_START that follows a wake-up would otherwise queue a New-Chat
+        // reroute on top and replace it with a blank draft (report D-F-06).
+        // The flag is armed only while this activity is NOT resumed — a
+        // foreground `onNewIntent` (already-resumed activity) has no following
+        // ON_START, so arming it there would just sit until the next genuine
+        // background return and swallow that reroute instead.
+        val action = DeepLinkHandler.parse(intent.data)
+        if ((sharedContent || action !is DeepLinkAction.Unknown) &&
+            !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        ) {
+            incomingWakeIntent = true
+            pendingLaunchSessionRoute = null
+        }
         handleDeepLink(intent.data)
+    }
+
+    /**
+     * [r5-d2 D-F-06] Every `ActivityResultLauncher` launch funnels through
+     * here: `ActivityResultRegistry` submits its `StartActivityForResult`
+     * contract via `ActivityCompat.startActivityForResult`, and both
+     * `startActivity(…)` overloads end in this three-argument method. One
+     * override therefore covers the camera, the photo picker, SAF document
+     * pickers, and any settings page we open — the whole set of "we left on
+     * purpose" transitions the New-Chat reroute must ignore.
+     *
+     * Set AFTER `super` on purpose: a launch that throws
+     * (`ActivityNotFoundException` on a device without a picker) never left
+     * the app, so it must not arm the suppressor.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        super.startActivityForResult(intent, requestCode, options)
+        selfLaunchedExternalUi = true
     }
 
     private fun handleDeepLink(uri: Uri?) {
@@ -757,7 +932,16 @@ class MainActivity : ComponentActivity() {
         val nav = navController ?: return
         when (action) {
             is DeepLinkAction.OpenTerminal -> {
-                nav.navigate(Routes.terminal(action.initCommand))
+                // [da1032-D] Terminal sessions are bound to the chat session id
+                // (minis-sessions/<sid>/ bind mounts + MINIS_CHAT_SESSION_ID),
+                // so a hot deep link must carry the *resolved* id of the chat
+                // currently on screen — not the raw field, which can still be a
+                // draft key, and not nothing, which binds the terminal to the
+                // global workspace while the user is inside a chat. Same alias
+                // hop as AppNavigation's onOpenTerminal.
+                val terminalSessionId = currentChatSessionId
+                    ?.let { ChatViewModelStore.resolveSessionId(it) }
+                nav.navigate(Routes.terminal(action.initCommand, sessionId = terminalSessionId))
             }
             is DeepLinkAction.OpenSession -> {
                 // T-double-chat-fix (secondary): mirror AppNavigation's
@@ -778,8 +962,17 @@ class MainActivity : ComponentActivity() {
                 nav.navigate(Routes.ENV_VARS)
             }
             // T183: any settings screen reachable by route string.
+            // [da1020-F] The route builders now percent-encode their ids (the
+            // root-cause fix), so a malformed route should be impossible — this
+            // runCatching is the "never crash on a deep link" backstop for
+            // future routes that forget to encode. On failure fall back to
+            // Settings home (always a valid destination), never crash.
             is DeepLinkAction.OpenSettingsScreen -> {
-                nav.navigate(action.route)
+                runCatching { nav.navigate(action.route) }
+                    .onFailure {
+                        AppLogger.warning("DeepLink", "OpenSettingsScreen: navigate failed; falling back to Settings home")
+                        runCatching { nav.navigate(Routes.SETTINGS) }
+                    }
             }
             is DeepLinkAction.OpenPermissionSettings -> {
                 nav.navigate(Routes.PERMISSIONS)
@@ -815,7 +1008,10 @@ class MainActivity : ComponentActivity() {
                         .setPendingChatAction(DeepLinkCoordinator.ChatAction.OPEN_CAMERA)
                     else -> {}
                 }
-                val newRoute = Routes.chat("__new__${java.util.UUID.randomUUID()}")
+                // [da1029-A] Same single-source rule as onStart(): reuse the
+                // live draft id so the composer's existing text survives the
+                // quick-action hop (bare uuid → orphaned slot → dropped text).
+                val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
                 nav.navigate(newRoute) {
                     popUpTo(nav.graph.startDestinationId) { inclusive = true }
                     launchSingleTop = true

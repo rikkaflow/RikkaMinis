@@ -336,6 +336,9 @@
     <string name="browser_history_clear">Очистить</string>
     <string name="browser_history_done">Готово</string>
     <string name="browser_history_search">Поиск по истории</string>
+    <string name="browser_history_today">Сегодня</string>
+    <string name="browser_history_yesterday">Вчера</string>
+    <string name="browser_history_results">Результаты</string>
     <string name="browser_history_empty_title">История просмотров пуста</string>
     <string name="browser_history_empty_subtitle">История хранится 7 дней</string>
     <string name="browser_history_clear_dialog_title">Очистить историю просмотров?</string>
@@ -530,6 +533,9 @@
     <string name="skill_import_error_no_url">Введите URL</string>
     <string name="skill_import_error_invalid">Недопустимый SKILL.md или навык уже существует</string>
     <string name="skill_import_error_format">Недопустимый SKILL.md. Убедитесь, что есть YAML-заголовок с полем \'name:\'.</string>
+    <string name="skill_file_error_read">Не удалось прочитать выбранный файл</string>
+    <string name="skill_file_error_archive">Недопустимый архив навыка: SKILL.md не найдена</string>
+    <string name="skill_file_error_detail">Сбой импорта: %1$s</string>
     <string name="skill_import_in_progress">Импортирование...</string>
     <string name="skill_import_submit">Импортировать</string>
     <string name="skill_detail_label_name">Имя</string>
@@ -1217,9 +1223,10 @@
     <string name="browser_viewport_width">Ширина</string>
     <string name="browser_viewport_height">Высота</string>
     <string name="common_loading">Загрузка…</string>
+    <string name="settings_secret_unreadable">Не удалось прочитать сохранённое значение — ничего не сохранено. Закройте и снова откройте эту форму.</string>
     <string name="rootfs_reset_button">Сбросить</string>
     <string name="session_title_label">Название</string>
-    <string name="backup_import_too_large">Файл резервной копии слишком велик (%1$d МБ, максимум %2$d МБ) — ничего не импортировано.</string>
+    <string name="backup_import_too_large">Файл резервной копии слишком велик (%1$d МБ, максимум %2$d МБ) — ничего не импортировано. Сократите окно истории чата (или отключите его), экспортируйте заново и импортируйте новый файл.</string>
     <string name="backup_export_incomplete">Предупреждение: %1$d полей не удалось прочитать — резервная копия может быть неполной.</string>
     <string name="code_expand">Развернуть %1$d строк</string>
     <string name="code_collapse">Свернуть</string>
@@ -1242,6 +1249,7 @@
     <string name="sysmsg_compact_failed">Ошибка сжатия: %1$s</string>
     <string name="sysmsg_context_full_hint">Контекст почти заполнен (%1$d / %2$d токенов). Выполните /compact, чтобы свернуть ранние витки в сводку.</string>
     <string name="sysmsg_wait_compact">Подождите завершения текущего сжатия перед отправкой.</string>
+    <string name="sysmsg_edit_wait_stream">Вы редактируете сообщение. Сначала остановите текущий ответ — правка заменяет старое сообщение и не может быть поставлена в очередь.</string>
     <string name="sysmsg_context_trimmed">Контекст достиг лимита %1$d; обрезаны самые старые %2$d сообщений для продолжения задачи.</string>
     <string name="sysmsg_compact_no_provider">Провайдер не настроен. Невозможно сжать.</string>
     <string name="sysmsg_compact_empty_session">Нечего сжимать — сессия пуста.</string>
@@ -1600,9 +1608,43 @@
     <string name="scheduled_delete_title">Удалить запланированную задачу?</string>
     <string name="scheduled_delete_body">«%1$s» будет удалена безвозвратно.</string>
     <string name="scheduled_fuse_notification_title">Запланированная задача приостановлена</string>
+    <string name="scheduled_edit_missing_body">Эта задача больше не существует. Возможно, она была удалена, пока этот экран был открыт.</string>
     <string name="scheduled_fuse_notification_body">«%1$s» не удавался %2$d раз подряд и отключён. Возобновите его в настройках.</string>
 
     <string name="backup_passphrase_title">Зашифрованная резервная копия</string>
     <string name="backup_passphrase_body">Этот пакет OpenMinis зашифрован (minisbak-enc/1). Введите парольную фразу, использованную при экспорте.</string>
     <string name="backup_passphrase_label">Парольная фраза</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">Ссылка на %1$s</string>
+    <string name="tts_spoken_bare_link">Ссылка</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Автоодобрение</string>
+    <string name="perm_auto_approve_title">Режим автоодобрения</string>
+    <string name="perm_auto_approve_desc">Применять обычные изменения настроек без запроса. Чувствительные и разрушительные изменения могут по-прежнему требовать подтверждения.</string>
+    <string name="perm_auto_approve_sensitive">Включить чувствительные настройки</string>
+    <string name="perm_auto_approve_sensitive_desc">Также применять учётные данные провайдеров (API-ключи, базовые URL) без запроса. Агент может незаметно их перенаправить.</string>
+    <string name="perm_auto_approve_privileged">Разрешить привилегированные инструменты</string>
+    <string name="perm_auto_approve_privileged_desc">Разрешить агенту использовать командные строки специальных возможностей и Shizuku (они управляют другими приложениями и читают экран).</string>
+    <string name="perm_auto_approve_footer">По умолчанию выключено. При включении обычные записи больше не показывают диалог подтверждения, а запросы разрешений инструментов прекращаются. Все изменения по-прежнему записываются в Журнал → Изменения конфигурации.</string>
+    <string name="perm_auto_approve_confirm_title">Включить автоодобрение?</string>
+    <string name="perm_auto_approve_confirm_text">Обычные изменения настроек будут применяться без запроса, запросы разрешений инструментов прекратятся. Чувствительные настройки (API-ключи провайдеров) и разрушительные изменения по-прежнему требуют подтверждения. Можно отключить в любой момент.</string>
+    <string name="perm_auto_approve_confirm_on">Включить</string>
+    <string name="perm_section_runtime_batch">Системные разрешения</string>
+    <string name="perm_runtime_batch_desc">Android запрашивает их по одному при использовании каждой функции. Выдайте все сразу, чтобы они не прерывали позже.</string>
+    <string name="perm_runtime_batch_title">Выдать все системные разрешения</string>
+    <string name="perm_runtime_batch_sub">Календарь, контакты, местоположение, фото, микрофон, камера, уведомления</string>
+    <string name="perm_runtime_batch_all_granted">Все системные разрешения уже выданы.</string>
+    <string name="perm_runtime_batch_partial">Ещё %1$d разрешений не выдано — Android отклонил или вы пропустили.</string>
+    <string name="mirror_section_title">Внешняя копия</string>
+    <string name="mirror_section_footer">Постоянно обновляемая копия вне хранилища приложения. Она сохраняется при очистке данных приложения и открывается любым файловым менеджером.</string>
+    <string name="mirror_enable">Внешнее зеркало</string>
+    <string name="mirror_enable_sub">Download/RikkaMinis/backup — обновляется автоматически</string>
+    <string name="mirror_last_sync">Последняя синхронизация: %1$s</string>
+    <string name="mirror_never">Ещё не синхронизировано</string>
+    <string name="mirror_pending_count">Ожидают синхронизации: %1$d</string>
+    <string name="mirror_diag_stale">Синхронизация задерживается: %1$d файл(ов) в очереди (%2$d мин с последней записи)</string>
+    <string name="mirror_diag_failed">Последняя синхронизация не удалась</string>
+    <string name="mirror_diag_unavailable">Нет доступного хранилища</string>
+    <string name="mirror_retry">Повторить</string>
 </resources>

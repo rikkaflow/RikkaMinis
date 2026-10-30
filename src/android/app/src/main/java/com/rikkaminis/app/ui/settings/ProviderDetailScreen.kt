@@ -1,8 +1,6 @@
 package com.rikkaminis.app.ui.settings
 
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,11 +15,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.IosShare
@@ -38,9 +33,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,15 +45,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
-import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.repository.ProviderRepository
 import android.widget.Toast
 import com.rikkaminis.app.logging.AppLogger
@@ -76,9 +67,8 @@ import com.rikkaminis.app.ui.components.MinisOutlinedButton
 import com.rikkaminis.app.ui.components.MinisSmallButton
 import com.rikkaminis.app.ui.components.MinisSmallOutlinedButton
 import com.rikkaminis.app.ui.components.MinisSmallTextButton
-import com.rikkaminis.app.ui.components.MinisTextButton
 import com.rikkaminis.app.ui.components.SectionTextField
-import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.provider.ModelsDevApi
 
 private const val TAG = "ProviderDetail"
 
@@ -107,7 +97,13 @@ fun ProviderDetailScreen(
     // skipped the gesture (isCustom gate) — that silently made manually-added
     // models undeletable after a refresh reset their custom identity,
     // see ProviderRepository.replaceEntries [T-provider-custom-identity].
-    var entryToDelete by remember { mutableStateOf<com.rikkaminis.app.data.model.ModelEntry?>(null) }
+    // [deep-audit-1040 B-07] Hold the pending target's ID, not the
+    // `ModelEntry` object captured when the row was long-pressed. With the
+    // object, an external delete / model refresh left the confirm dialog
+    // naming a model that no longer existed, and confirming it called
+    // `removeEntry()` on a dead id. Same channel shape as Quick Test
+    // ([deep-audit-1039 B-08]).
+    var entryToDeleteId by remember { mutableStateOf<String?>(null) }
     var deleted by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -118,9 +114,24 @@ fun ProviderDetailScreen(
         return
     }
     if (instance == null) return
-    val currentInstance = instance
+    // [deep-audit-1040 B-07] Write paths resolve the LATEST persisted instance
+    // instead of pushing this frame's object back with `instance.copy(...)`.
+    // `instance` (above) stays the source for RENDERING; reusing it for writes
+    // meant a write that landed after an external edit (minis-config / Debug
+    // RPC / backup restore) silently reverted the newer fields to the values
+    // this frame had composed with. Mirrors the `currentInstance()` single
+    // source established in ProviderConnectionScreen by [deep-audit-1039 B-04].
+    // The `?: instanceFallback` arm only covers the window between an external
+    // delete and this guard composing again.
+    val instanceFallback = instance
+    fun currentInstance(): ProviderInstance =
+        config.instances.find { it.id == instanceId } ?: instanceFallback
 
-    var label by remember { mutableStateOf(instance.label) }
+    // [da1023-C] Bind label to (instance.id, attribute): the old keyless
+    // remember kept the first instance's values after navigating between
+    // detail pages, and a focus loss then wrote the STALE label back over
+    // the new instance (external RPC rename + UI focus loss = silent revert).
+    var label by remember(instance.id, instance.label) { mutableStateOf(instance.label) }
     val labelChanged = label != instance.label
 
     // [T-android-provider-apikey-save-stale] Hold the stored API key in Compose
@@ -142,7 +153,12 @@ fun ProviderDetailScreen(
     // ProviderConnectionScreen. loadApiKey stays here (cheap, async) so the
     // "API & Connection" row can show "sk-…4242" without a sub-screen hop.
     var storedKey by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(instanceId) {
+    // [deep-audit-1040 B-07] Also key on `config.revision`. `loadApiKey` has no
+    // revision counter of its own, but every path that writes a key also bumps
+    // the config revision (instancesUpdate RPC / import), so this is the
+    // available "the stored credential may have changed" signal. Without it an
+    // external write left the previous key masked on screen.
+    LaunchedEffect(instanceId, config.revision) {
         storedKey = withContext(Dispatchers.IO) { providerRepository.loadApiKey(instanceId) }
     }
 
@@ -151,7 +167,10 @@ fun ProviderDetailScreen(
     // the sheet lives inside this screen.
     var showManageModelsSheet by remember { mutableStateOf(false) }
 
-    var isEnabled by remember { mutableStateOf(instance.isEnabled) }
+    // [da1023-C] Same (instance.id, attribute) binding as label above: an
+    // external RPC enable/disable while this screen is open used to leave the
+    // stale toggle on screen, and the next save wrote the stale value back.
+    var isEnabled by remember(instance.id, instance.isEnabled) { mutableStateOf(instance.isEnabled) }
 
     // saveBaseURLSettings(): single source of truth for persisting the three
     // [perf-provider-detail-models] Cache the entry list per (instanceId, config)
@@ -173,8 +192,11 @@ fun ProviderDetailScreen(
     val entries = remember(instanceId, config) {
         providerRepository.visibleEntries(instanceId)
     }
-    // Full catalog size, for the section header + refresh toast. Computed the
-    // same remembered way so it doesn't rescan on every recomposition either.
+    // Full catalog size, for the section header. Computed the same remembered
+    // way so it doesn't rescan on every recomposition either. [da1026-C] The
+    // refresh toast deliberately does NOT read this snapshot: it is keyed on
+    // the config that existed before the fetch ran, so it would report the
+    // pre-refresh count. The toast re-reads entriesFor() after the refresh.
     val allEntries = remember(instanceId, config) {
         providerRepository.entriesFor(instanceId)
     }
@@ -205,8 +227,9 @@ fun ProviderDetailScreen(
                     if (labelChanged) {
                         Spacer(modifier = Modifier.width(8.dp))
                         MinisSmallButton(onClick = {
-                            providerRepository.updateInstance(instance.copy(label = label))
-                            AppLogger.info(TAG, "Updated label for ${instance.id}: '$label'")
+                            val live = currentInstance()
+                            providerRepository.updateInstance(live.copy(label = label))
+                            AppLogger.info(TAG, "Updated label for ${live.id}: '$label'")
                         }) {
                             Text(stringResource(R.string.common_save))
                         }
@@ -222,8 +245,9 @@ fun ProviderDetailScreen(
                 checked = isEnabled,
                 onCheckedChange = {
                     isEnabled = it
-                    providerRepository.updateInstance(instance.copy(isEnabled = it))
-                    AppLogger.info(TAG, "Set enabled=$it for ${instance.id}")
+                    val live = currentInstance()
+                    providerRepository.updateInstance(live.copy(isEnabled = it))
+                    AppLogger.info(TAG, "Set enabled=$it for ${live.id}")
                 },
                 showDivider = false,
             )
@@ -247,7 +271,16 @@ fun ProviderDetailScreen(
         }
 
         // ─── Thinking Rules [T-android-thinking-rules-phase2 §3] ─────
-        ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository)
+        // [da1028-C] Pass the full entry list (entriesFor, not the visible-only
+        // `entries`): builtInThinkingRulesForDisplay / firstModelId both read
+        // `config.modelEntries` for this instance, so the section's `remember`
+        // keys must observe that exact source or a catalog refresh leaves the
+        // list + resolution preview on a stale snapshot.
+        ThinkingRulesSection(
+            instance = currentInstance(),
+            providerRepository = providerRepository,
+            modelEntries = allEntries,
+        )
 
         // ─── Models ─────────────────────────────────────────────────
         SettingsSection(
@@ -279,9 +312,20 @@ fun ProviderDetailScreen(
                             scope.launch {
                                 try {
                                     val result = providerRepository.refreshModels(instance)
+                                    // [da1026-C] Count AFTER the refresh, never from a
+                                    // captured snapshot: `allEntries` is a plain value
+                                    // remembered against (instanceId, config), so the
+                                    // closure below captured the PRE-refresh list and the
+                                    // toast always reported the old number — a brand-new
+                                    // provider's first successful refresh said
+                                    // "Refreshed 0 models from API". entriesFor() is a
+                                    // synchronous filter over the in-memory config
+                                    // StateFlow (no Room, no IO), so reading it here on
+                                    // the main dispatcher is safe and needs no withContext.
+                                    val total = providerRepository.entriesFor(instance.id).size
                                     Toast.makeText(
                                         toastContext,
-                                        refreshResultMessage(result, allEntries.size, toastContext),
+                                        refreshResultMessage(result, total, toastContext),
                                         Toast.LENGTH_SHORT,
                                     ).show()
                                     AppLogger.info(TAG, "Refreshed models for ${instance.id}: $result")
@@ -329,7 +373,7 @@ fun ProviderDetailScreen(
                             entry = entry,
                             showDivider = idx != entries.lastIndex,
                             onClick = { onModelEntryClick(entry.id) },
-                            onLongClick = { entryToDelete = entry },
+                            onLongClick = { entryToDeleteId = entry.id },
                         )
                     }
                 }
@@ -344,7 +388,7 @@ fun ProviderDetailScreen(
                             entry = entry,
                             showDivider = idx != entries.lastIndex,
                             onClick = { onModelEntryClick(entry.id) },
-                            onLongClick = { entryToDelete = entry },
+                            onLongClick = { entryToDeleteId = entry.id },
                         )
                     }
                 }
@@ -413,8 +457,24 @@ fun ProviderDetailScreen(
             confirmText = stringResource(R.string.provider_detail_export_confirm_action),
             onConfirm = {
                 showExportDialog = false
-                AppLogger.info(TAG, "Export instance ${instance.id} (${instance.label})")
-                exportProviderInstance(exportContext, providerRepository, instance)
+                val live = currentInstance()
+                AppLogger.info(TAG, "Export instance ${live.id} (${live.label})")
+                scope.launch {
+                    // [deep-audit-1048 B-04] The export reports whether the
+                    // chooser really started; a failed staging write / provider
+                    // URI / handler used to be indistinguishable from success.
+                    val launched = exportProviderInstance(exportContext, providerRepository, live)
+                    if (!launched) {
+                        Toast.makeText(
+                            exportContext,
+                            exportContext.getString(
+                                R.string.file_share_failed_toast,
+                                "${live.label}.json",
+                            ),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
             },
         )
     }
@@ -422,9 +482,20 @@ fun ProviderDetailScreen(
     // T143: per-entry delete confirmation. removeEntry also strips the entry
     // from any modelGroups it belongs to (see ProviderRepository L304-306),
     // so the StateFlow update propagates the row removal everywhere.
+    // [deep-audit-1040 B-07] Resolve the pending target against the live catalog
+    // every frame, and close the dialog once it stops resolving (external
+    // delete / restore) rather than confirming a delete against a dead id.
+    // Scoped to `allEntries` (the full catalog, not the visible subset) so a
+    // model that was merely hidden keeps its dialog — it still exists and
+    // deleting it stays meaningful; same choice as Quick Test
+    // ([deep-audit-1039 B-08] resolves against `config.modelEntries`).
+    val entryToDelete = liveEntryToDelete(entryToDeleteId, allEntries)
+    LaunchedEffect(entryToDeleteId, allEntries) {
+        if (entryDeleteTargetVanished(entryToDeleteId, allEntries)) entryToDeleteId = null
+    }
     entryToDelete?.let { e ->
         MinisAlertDialog(
-            onDismissRequest = { entryToDelete = null },
+            onDismissRequest = { entryToDeleteId = null },
             title = stringResource(R.string.provider_detail_delete_model),
             text = stringResource(R.string.provider_detail_delete_model_confirm, e.model.displayName),
             confirmText = stringResource(R.string.common_delete),
@@ -432,7 +503,7 @@ fun ProviderDetailScreen(
             onConfirm = {
                 providerRepository.removeEntry(e.id)
                 AppLogger.info(TAG, "Deleted model entry ${e.id} (${e.model.displayName})")
-                entryToDelete = null
+                entryToDeleteId = null
             },
         )
     }
@@ -573,18 +644,34 @@ private fun connectionSummary(
  * Export the provider instance as JSON and hand it to the system share sheet
  * via FileProvider. Mirrors iOS `ProviderShareSheet` — writes a <label>.json
  * file to app-scoped cache and emits ACTION_SEND with a content:// URI.
+ *
+ * [deep-audit-1048 B-04] Returns whether the chooser was actually started.
+ * Every failure exit used to be a bare `return`, so a failed staging write, a
+ * FileProvider misconfiguration or a missing handler all looked exactly like a
+ * successful export (nothing on screen), and the caller had no way to tell.
  */
-private fun exportProviderInstance(
+private suspend fun exportProviderInstance(
     context: android.content.Context,
     providerRepository: ProviderRepository,
     instance: com.rikkaminis.app.data.model.ProviderInstance,
-) {
-    val json = providerRepository.exportInstanceJSON(instance.id) ?: return
+): Boolean {
     val safeLabel = instance.label.ifBlank { "provider" }
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
-    val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
-    val file = java.io.File(dir, "$safeLabel.json")
-    runCatching { file.writeText(json) }.onFailure { return }
+    // [da1024-G] exportInstanceJSON reads EncryptedSharedPreferences and
+    // serializes the whole instance (hundreds of entries for a large catalog),
+    // and the staging write is disk I/O — both used to run on the UI thread
+    // from the dialog's onConfirm. Returns false when the export or the write
+    // fails; the caller surfaces it instead of silently skipping the sheet.
+    val file = withContext(Dispatchers.IO) {
+        val json = providerRepository.exportInstanceJSON(instance.id) ?: return@withContext null
+        val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+        // Same 24h-TTL pruner the cache/share/ writers use. This file carries
+        // the API key in plain Base64 (see the confirmation dialog), so a stale
+        // copy must not outlive a day.
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
+        val f = java.io.File(dir, "$safeLabel.json")
+        runCatching { f.writeText(json) }.map { f }.getOrNull()
+    } ?: return false
 
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(
@@ -593,7 +680,7 @@ private fun exportProviderInstance(
             file,
         )
     } catch (_: Throwable) {
-        return
+        return false
     }
 
     val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -603,9 +690,15 @@ private fun exportProviderInstance(
         addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     val chooser = android.content.Intent.createChooser(sendIntent, "Export provider").apply {
+        // [deep-audit-1048 B-04] The chooser carries the flag itself, like the
+        // markdown share path and the log share: `exportContext` is whatever
+        // LocalContext hands us, and starting an activity from a non-Activity
+        // context without NEW_TASK throws AndroidRuntimeException.
         addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    context.startActivity(chooser)
+    // A device with no share target throws ActivityNotFoundException here — it
+    // used to escape the coroutine scope and take the process with it.
+    return runCatching { context.startActivity(chooser) }.isSuccess
 }
 
 /** Input modalities that get a (muted) capability badge in the model list. */
@@ -651,8 +744,14 @@ private fun ProviderModelRow(
         // Surface both directions — input badges are muted,
         // output badges use a tinted "generate"-style glyph so
         // they read distinctly. Mirrors iOS #669.
-        val inputModalities = entry.model.inputModalities.orEmpty()
-        val outputModalities = entry.model.outputModalities.orEmpty()
+        // [dv22/B-03] Capability source is the effective model (models.dev
+        // enrichment under the user's overrides) — the raw entry declares no
+        // modalities for any built-in model. normalizeModalities strips the
+        // `_input`/`_output` suffix and lowercases, so the icon-key match is no
+        // longer suffix- and case-sensitive (`IMAGE_INPUT` used to match nothing).
+        val capabilityModel = ModelsDevApi.effectiveModel(entry)
+        val inputModalities = capabilityModel.inputModalities.normalizeModalities().orEmpty()
+        val outputModalities = capabilityModel.outputModalities.normalizeModalities().orEmpty()
         val hasBadge = inputModalities.any { it in modalityIconKeys } ||
             outputModalities.any { it in modalityOutputIconKeys }
         SettingsRow(
@@ -738,3 +837,32 @@ private fun refreshResultMessage(
     com.rikkaminis.app.data.repository.ModelRefreshResult.FAILURE ->
         context.getString(R.string.provider_detail_refresh_failed)
 }
+
+// ─── [deep-audit-1040 B-07] Pending-delete resolution ────────────────────────
+
+/**
+ * Resolve a pending model-entry delete against the LIVE catalog.
+ *
+ * Pure on purpose: the decision is the part worth exercising in a JVM test, and
+ * the Compose side above is only wiring. Same channel shape as the Quick Test
+ * resolver in [com.rikkaminis.app.ui.settings.liveQuickTestEntry]
+ * ([deep-audit-1039 B-08]).
+ *
+ * (Registered debt: this is the third near-identical "resolve a pending id
+ * against the live list" helper in `ui/settings` — see backlog §1040-B1.)
+ */
+internal fun liveEntryToDelete(pendingId: String?, entries: List<ModelEntry>): ModelEntry? =
+    pendingId?.let { id -> entries.find { it.id == id } }
+
+/**
+ * True when the delete confirm dialog is open for an id that no longer
+ * resolves — i.e. the target was deleted (or restored away) externally while
+ * the dialog was up, so the dialog must close instead of confirming a delete
+ * against a dead id.
+ *
+ * Kept separate from [liveEntryToDelete] so the close effect keys on the
+ * DECISION ("the target vanished") rather than on "the lookup returned null" —
+ * the latter is also true when the dialog was never opened.
+ */
+internal fun entryDeleteTargetVanished(pendingId: String?, entries: List<ModelEntry>): Boolean =
+    pendingId != null && liveEntryToDelete(pendingId, entries) == null

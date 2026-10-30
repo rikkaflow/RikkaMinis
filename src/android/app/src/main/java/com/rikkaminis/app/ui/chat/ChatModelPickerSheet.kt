@@ -1,151 +1,41 @@
 package com.rikkaminis.app.ui.chat
 
 // [T-android-split-chat] ModelPickerSheet (+ its private helpers fuzzyMatch /
-// providerDotColor) extracted verbatim from ChatScreen.kt. Full import block
-// copied from ChatScreen.kt (unused imports are warnings, not errors);
+// providerDotColor) extracted verbatim from ChatScreen.kt. Imports pruned to
+// the symbols this file uses (2026-10-27 dead-import sweep);
 // ModelPickerSheet flipped private->internal so ChatScreen can call it.
 
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
-import android.net.Uri
-import android.provider.OpenableColumns
-import java.io.File
-import androidx.core.content.ContextCompat
-import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.asAndroidBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.gestures.verticalDrag
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.AudioFile
-import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.VideoFile
-import androidx.compose.material.icons.automirrored.filled.Article
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.conflate
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.sample
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AppShortcut
-import androidx.compose.material.icons.filled.ArrowCircleUp
-import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.BugReport
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.Extension
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DataUsage
-import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.CloseFullscreen
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lightbulb
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.StopCircle
-import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import com.rikkaminis.app.BuildConfig
 import com.rikkaminis.app.R
-import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.ui.components.MinisAlertDialog
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
-import com.rikkaminis.app.ui.components.MinisMenu
-import com.rikkaminis.app.ui.components.MinisMenuDivider
 import com.rikkaminis.app.ui.components.providerDotColor
+import com.rikkaminis.app.ui.components.rememberCollapsedInstanceIds
+import com.rikkaminis.app.ui.settings.SystemVoiceMemberPresentation
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -153,126 +43,38 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.TextFieldDefaults
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.compositionLocalOf
-import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.produceState
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.onPlaced
-import androidx.compose.ui.layout.boundsInWindow
-import androidx.compose.ui.layout.positionInWindow
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.key.type
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBars
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
-import androidx.compose.material.icons.filled.TextFields
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.material.icons.filled.Cancel
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.outlined.Public
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.automirrored.filled.NoteAdd
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.ArrowCircleDown
 import androidx.compose.material.icons.filled.AccountTree
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.style.TextDecoration
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import com.rikkaminis.app.offload.OffloadPermissionManager
-import com.mikepenz.markdown.compose.components.markdownComponents
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
-import org.intellij.markdown.ast.ASTNode
-import org.intellij.markdown.ast.getTextInNode
-import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
-import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.RoutingStrategy
-import com.rikkaminis.app.data.model.ThinkingLevel
-import com.rikkaminis.app.data.repository.ChatRepository
-import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
-import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.theme.ChatColors
 import com.rikkaminis.app.ui.components.MinisTextButton
+import com.rikkaminis.app.provider.ModelsDevApi
 
 // ── [S3-model-picker-rank] begin — pure ranking helpers ──────────────────
 // Extracted verbatim by the JVM harness (scripts/tests), so everything
@@ -408,12 +210,16 @@ internal fun ModelPickerSheet(
     // Note: the non-text-output "may not work as an Agent" confirmation lives
     // in ChatScreen's callback wrappers (ee828dba), NOT here — the sheet stays
     // a dumb list and the caller owns selection policy.
-    val allInstanceIds = remember(config) {
-        config.instances.filter { it.isEnabled }.map { it.id }.toSet()
-    }
-    var collapsedInstanceIds by remember(allInstanceIds) {
-        mutableStateOf(allInstanceIds)
-    }
+    // [dv28/B-07] Single source. This sheet kept a private copy of the collapse
+    // state and seeded it from `config.instances.filter { it.isEnabled }`, i.e.
+    // a key derived from a MUTABLE per-instance display flag: flipping any
+    // provider's enable switch changed the key, re-seeded the set and folded
+    // every section the user had just arranged. `rememberCollapsedInstanceIds`
+    // keys on the instance-ID set (identity, immune to an unrelated config
+    // write) and is what the other two surfaces that render the same list use.
+    // A disabled instance merely sits in the seed unused — `allInstancesWithEntries`
+    // below filters those out, so the collapse set never gets read for them.
+    var collapsedInstanceIds by rememberCollapsedInstanceIds(config)
 
     // Filtered groups — [S3-model-picker-rank] ranked, not just filtered.
     val filteredGroups = remember(groups, searchText) {
@@ -621,14 +427,32 @@ internal fun ModelPickerSheet(
                                 // rotation, or fallback recovery). Fall back to the first member
                                 // only when the group is NOT selected (preview), or when the active
                                 // entry cannot be resolved.
-                                val resolvedEntry = if (isSelected && activeEntryId != null) {
-                                    config.modelEntries.find { it.id == activeEntryId }
-                                } else null ?: group.memberEntryIds.firstNotNullOfOrNull { entryId ->
-                                    config.modelEntries.find { it.id == entryId }
+                                // [dv25/B-04] The decision (including the fallback above)
+                                // lives in `pickerHeaderEntry` — see its KDoc for the two
+                                // spellings this replaced on this very line: a persisted-only
+                                // `modelEntries.find { it.id == activeEntryId }` (a System
+                                // sentinel active entry resolved to null), and an
+                                // `… } else null ?: group.memberEntryIds…` whose elvis bound to
+                                // the else branch alone, so the SELECTED group — the branch that
+                                // matters — had no fallback at all.
+                                val resolvedEntry = pickerHeaderEntry(
+                                    isSelected = isSelected,
+                                    activeEntryId = activeEntryId,
+                                    memberEntryIds = group.memberEntryIds,
+                                ) { entryId ->
+                                    // [dv24/B-02] persisted entry first, synthesized
+                                    // System voice entry second — one source
+                                    // (SystemVoiceEntries.resolveIn). The System
+                                    // sentinels are never persisted, so a lookup
+                                    // against `config.modelEntries` alone resolved
+                                    // a default Voice Input/Output group to nothing.
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                 }
                                 // Count of resolved members for display
                                 val resolvedCount = group.memberEntryIds.count { entryId ->
-                                    config.modelEntries.any { it.id == entryId }
+                                    // [dv24/B-02] same single source — a System voice
+                                    // member IS a usable member of the group
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId) != null
                                 }
 
                                 // Header sits above the first row, so the
@@ -767,13 +591,20 @@ internal fun ModelPickerSheet(
                                 if (isExpanded) {
                                     // Resolve actual entries from memberEntryIds
                                     val resolvedMembers = group.memberEntryIds.mapNotNull { entryId ->
-                                        config.modelEntries.find { it.id == entryId }
+                                        // [dv24/B-02] single source (see above)
+                                        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                     }
                                     // Fallback: show active entry ONLY if this group is selected
-                                    val displayMembers = resolvedMembers.ifEmpty {
-                                        if (isSelected && activeEntryId != null)
-                                            listOfNotNull(config.modelEntries.find { it.id == activeEntryId })
-                                        else emptyList()
+                                    // [dv25/B-04] the fallback lookup is the same single source
+                                    // as `resolvedMembers` above — the pre-fix `modelEntries`-only
+                                    // spelling dropped a System sentinel active entry and the rows
+                                    // rendered 「No linked models」.
+                                    val displayMembers = pickerDisplayMembers(
+                                        resolvedMembers = resolvedMembers,
+                                        isSelected = isSelected,
+                                        activeEntryId = activeEntryId,
+                                    ) { entryId ->
+                                        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                     }
                                     if (displayMembers.isEmpty()) {
                                         Text(
@@ -786,6 +617,24 @@ internal fun ModelPickerSheet(
                                     displayMembers.forEach { entry ->
                                             val isActive = activeEntryId == entry.id
                                             val instance = config.instances.find { it.id == entry.providerInstanceId }
+                                            // [dv28/B-07] Single source. A System voice
+                                            // member has NO provider instance (the device is
+                                            // its provider), so the old `if (instance != null)`
+                                            // branch dropped the provider name entirely and
+                                            // every row of a default Voice group showed a bare
+                                            // model id — while the group detail screen, which
+                                            // asks the same question through
+                                            // SystemVoiceMemberPresentation, showed
+                                            // 「System · <model>」. The DECISION (what the
+                                            // secondary line says, and when it is empty) lives
+                                            // in the shared presentation helper; only the
+                                            // rendering stays here.
+                                            val memberSubtitle = SystemVoiceMemberPresentation.memberSubtitle(
+                                                instanceLabel = instance?.label?.takeUnless { it.isEmpty() }
+                                                    ?: instance?.providerType?.displayName,
+                                                isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+                                                systemLabel = stringResource(R.string.voice_provider_system),
+                                            )
                                             Row(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
@@ -810,9 +659,9 @@ internal fun ModelPickerSheet(
                                                 Column(modifier = Modifier.weight(1f)) {
                                                     Text(entry.model.displayName, style = MaterialTheme.typography.bodyMedium)
                                                     Row {
-                                                        if (instance != null) {
+                                                        if (memberSubtitle.isNotEmpty()) {
                                                             Text(
-                                                                instance.label.ifEmpty { instance.providerType.displayName },
+                                                                memberSubtitle,
                                                                 style = MaterialTheme.typography.labelSmall,
                                                                 fontWeight = FontWeight.Medium,
                                                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
@@ -899,9 +748,19 @@ internal fun ModelPickerSheet(
                     }
                     // Pinned providers first, then everything else — each group
                     // keeps its original relative order.
+                    // [deep-audit-1041 B-04] Force every provider section open
+                    // while a search is running: the collapse set seeds to "all
+                    // collapsed", so a section that matches the query rendered
+                    // its single collapsed summary row and hid the rest of the
+                    // hits behind a chevron the user had to find and tap. The
+                    // gate is derived at the read site (never written back into
+                    // `collapsedInstanceIds`), so clearing the query restores the
+                    // user's own expand/collapse choices untouched — same
+                    // decision as the shared ModelEntryPicker, which the
+                    // model-group and agent-loop pickers already route through.
                     val orderedProviderSections = pinnedInstancesWithEntries + otherInstancesWithEntries
                     orderedProviderSections.forEachIndexed { sectionIndex, (instance, entries) ->
-                        val isCollapsed = collapsedInstanceIds.contains(instance.id)
+                        val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)
                         // When both Favorites and the rest are present, mark the
                         // boundary with an "All Providers" section label.
                         if (sectionIndex == pinnedInstancesWithEntries.size &&
@@ -1019,7 +878,7 @@ internal fun ModelPickerSheet(
                                                 // voice seed serving as the collapsed
                                                 // representative is indistinguishable from
                                                 // a chat model.
-                                                com.rikkaminis.app.ui.components.modalityBadges(displayEntry.model).forEach { badge ->
+                                                com.rikkaminis.app.ui.components.modalityBadges(ModelsDevApi.effectiveModel(displayEntry)).forEach { badge ->
                                                     Spacer(Modifier.width(4.dp))
                                                     Text(
                                                         badge,
@@ -1091,7 +950,7 @@ internal fun ModelPickerSheet(
                                                     )
                                                     // [T-android-provider-voice] Modality
                                                     // chips (iOS entryRow badges).
-                                                    com.rikkaminis.app.ui.components.modalityBadges(entry.model).forEach { badge ->
+                                                    com.rikkaminis.app.ui.components.modalityBadges(ModelsDevApi.effectiveModel(entry)).forEach { badge ->
                                                         Spacer(Modifier.width(4.dp))
                                                         Text(
                                                             badge,

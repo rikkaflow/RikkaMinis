@@ -6,8 +6,13 @@ import kotlinx.coroutines.launch
 
 // [FE-5 batch 8] Session-lifecycle entry cluster (loadSessionEntity /
 // updateTitleAndCategory / promoteDraftIfNeeded / ensureSession /
-// migrateDraftResources / copyRecursive) extracted verbatim from
+// migrateDraftResources) extracted verbatim from
 // ChatViewModel as extension functions.
+//
+// [meta-audit-1028 C1] The filesystem half of `migrateDraftResources` (the
+// rename-or-merge per entry, previously the inline `copyRecursive`) now lives in
+// `DraftResourceMigration.kt`, where the JVM can drive it against real
+// directories.
 
 
 /** T-chat-title-pill-edit: load the persisted [ChatSessionEntity] for the
@@ -59,26 +64,206 @@ fun ChatViewModel.regenerateSessionTitle() {
  * draft; the DB row + title write happens asynchronously in viewModelScope
  * (local DB, ~50ms — no need to block the UI).
  *
+ * [dv24-b3] The body is a per-session durable artifact, not a 50-char title
+ * prefix. Promotion used to write ONLY `sessions.title = text.take(50)` and
+ * then drop both in-memory copies — and a promoted row has no `messages`
+ * rows, so `ChatHistoryDrawer`'s `pinnedAt / messageCounts` filter hid it,
+ * `ChatViewModel.cleanupIfEmptyOnExit` deleted it the moment the user opened
+ * and left it, and `ChatRepository.deleteEmptySessions` swept it at the next
+ * cold start. Net effect of tapping "New Chat" with a long draft: the text
+ * was destroyed, 100% of the time. The fix persists the captured text as the
+ * promoted session's first `user` row (`appendMessage`, the same single
+ * source `send()` uses — it also writes `last_message` + `updated_at`), so
+ * the row carries a message count (never swept), is visible in the drawer and
+ * re-opens with the full text in the transcript.
+ *
+ * The composer copy is cleared only AFTER that durable write lands, and it is
+ * deliberate: keeping it (as an earlier revision of this fix did) made the
+ * returned-to session show the same text twice (transcript bubble + composer)
+ * and invited a double send. Ordering is the safety net — a cancellation or a
+ * DB failure in between leaves the text in the composer, so the two copies are
+ * never both destroyed.
+ *
+ * The row is intentionally an *unanswered user turn*: that is what
+ * `InterruptedTailDetector` Case D calls it, so the session surfaces the
+ * Resume affordance (send it for real) instead of a phantom "No messages yet"
+ * chat. `_messages` is updated in place because the VM is cached in
+ * `ChatViewModelStore` and would otherwise keep rendering the pre-promotion
+ * (empty) transcript until the next process start.
+ *
+ * [dv25-B08] Two more things promotion has to own, both on the same "the user's
+ * input must survive" line:
+ *
+ *  - **Attachments** ride along. The pre-dv25 body was persisted as
+ *    `buildUserPartsJson(text, emptyList())`, so a draft that carried images /
+ *    files promoted a text-only row and the user's staged uploads evaporated when
+ *    the composer was cleared. The promotion now takes the SAME single source
+ *    `send()` takes (`prepareUserAttachments` → mediaRef parts + attached-files
+ *    inventory), and the in-memory attachment list is cleared with the text.
+ *  - **The newest text**, not the last committed one. `_inputText` is committed per
+ *    keystroke for ordinary typing, but a >8-char IME burst is buffered in the
+ *    composer for 150 ms; reading only the ViewModel string promoted the body as it
+ *    was BEFORE the burst. `composerTextForPromotion` prefers the pending snapshot.
+ *
+ * [meta-audit-1028 C1] Two more entry conditions, both on the same line:
+ *
+ *  - **An attachments-only draft is promotable.** The text guard alone skipped it
+ *    (the attachments live only in this ViewModel's `_attachments`, so nothing
+ *    survived the abandoned draft) while `send()` accepts exactly that message;
+ *    the row is then labelled by the first attachment's file name.
+ *  - **The composer copies are cleared on the main thread and only for the
+ *    snapshot captured here.** The IO half can take hundreds of milliseconds, so
+ *    anything typed or attached during it belongs to the NEXT draft.
+ *
  * Returns true when promotion was triggered — the caller should let
  * onNewChat proceed (the slot is already freed either way).
  */
 fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
     if (!isDraft || realSessionId.isNotEmpty()) return false
-    val text = _inputText.value
-    if (text.isBlank()) return false
+    // [dv25-B08] A second tap while the first promotion is still running must not
+    // capture the same draft again: it would append a SECOND user row for the same
+    // body. Both New-Chat entrances ignore the return value, so returning false
+    // here only says "no new promotion was triggered" — the caller still navigates.
+    if (promoteInFlight) return false
+    // [meta-audit-1028 C1/F-01] Read the composer's staged uploads and BOTH text
+    // copies BEFORE the guard: an attachments-only draft is valid input (`send()`
+    // takes it verbatim, `shouldSkipCleanup` has the matching `hasAttachments`
+    // bit), and the two New-Chat entrances ignore this return value and navigate
+    // anyway — so the old `if (text.isBlank()) return false` dropped a draft that
+    // held only images/files, with the attachments living nowhere but this
+    // ViewModel's memory.
+    val stagedAttachments = _attachments.value
+    val committedAtCapture = _inputText.value
+    val pendingAtCapture = _pendingComposerText.value
+    // [dv25-B08] `_inputText` commits ordinary typing per keystroke but buffers a
+    // large IME burst (voice dictation / pinyin) for 150 ms; the pending snapshot
+    // IS the field's live text, so it is the newest copy of what the user typed.
+    val text = composerTextForPromotion(pendingAtCapture, committedAtCapture)
+    if (!hasPromotableInput(text, stagedAttachments.size)) return false
+    // Captured before `ensureSession()`: that call renames the ViewModel onto the
+    // real id and the draft slot is released right below.
+    val draftId = sessionId
 
-    // Free the draft slot synchronously — the text is captured in `text`,
-    // and nextDraftId must return a fresh ID before the navigation fires.
-    _inputText.value = ""
-    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)
+    // [dv25-B08] Claim the session BEFORE anything is destroyed. `ChatScreen`'s
+    // onDispose fires `cleanupIfEmptyOnExit()` on the very next frame (the top-bar
+    // New Chat navigates immediately, the drawer path after its 200 ms settle), and
+    // in the window between `ensureSession()` — which inserts the row but no
+    // message — and the `appendMessage()` below, that sweep read
+    // `messageCount(sid) == 0`, deleted the brand-new row and called
+    // `ChatViewModelStore.release(sid)`, which cancels THIS coroutine after the
+    // composer copy is already gone. The bit is a session-ownership claim, not a
+    // grace period: it is cleared in `finally`, so a failed promotion releases it.
+    promoteInFlight = true
 
-    // Create a real session row + set its title asynchronously.
-    viewModelScope.launch {
-        val sid = ensureSession()
-        if (sid.isNotEmpty()) {
-            val title = text.take(50).trim()
+    // Free the draft slot synchronously — the text is captured in `text` and still
+    // sits in the composer, so nextDraftId may mint a fresh ID before the
+    // navigation fires without anything being destroyed.
+    //
+    // [dv25-B08] This ordering is deliberate and NOT the "clear after the durable
+    // write" shape used for the in-memory copies below: the slot doubles as the id
+    // allocator for the next New Chat (`ComposerDraftStore.nextDraftId` hands back an
+    // existing slot), so a deferred clear would make the next draft reuse this
+    // draft's id — and the deferred clear would then wipe ITS text. Durability
+    // against cancellation is provided by `promoteInFlight` + the restore below,
+    // not by holding the slot hostage.
+    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, draftId)
+
+    viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        var persisted = false
+        try {
+            val sid = ensureSession()
+            if (sid.isEmpty()) return@launch
+            val title = promoteTitleForDraft(text, stagedAttachments.firstOrNull()?.fileName)
+                // Same fallback the shared title editor applies (`updateTitleAndCategory`):
+                // a blank title must not reach the row label.
+                .ifBlank { "New Chat" }
             chatRepository.updateSessionTitleAndCategory(sid, title, null)
-            _sessionTitle.value = title
+            // [dv25-B08] Attachments take the SAME single-source path `send()` uses:
+            // copied into the promoted session's media dir, with their mediaRef parts
+            // riding the transcript row (so the bubble re-renders after a reload
+            // instead of collapsing to a bodyless text bubble).
+            val prepared = prepareUserAttachments(stagedAttachments, sid)
+            // The transcript row is the durable home for the body: `appendMessage`
+            // also refreshes `last_message` + `updated_at`, which is what makes the
+            // row visible (and un-sweepable) without a second write.
+            val promoted = chatRepository.appendMessage(
+                sid,
+                "user",
+                buildUserPartsJson(text, prepared.mediaRefPartsJson, prepared.attachedFilesXml),
+            )
+            // [meta-audit-1028 C1/F-04] Everything above is IO; everything below is
+            // Compose state. The state writes are hopped onto the main thread, and
+            // each one is scoped to WHAT THIS PROMOTION CAPTURED: the IO half can
+            // take tens to hundreds of milliseconds (attachment scaling + disk
+            // writes), and the pre-fix body unconditionally blanked the composer at
+            // the end of it — discarding whatever the user typed or attached in the
+            // meantime, on a screen they can still see. `_messages` is a
+            // read-modify-write as well, so doing it off the main thread raced the
+            // streaming writers that publish on it.
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                _sessionTitle.value = title
+                _messages.value = _messages.value + ChatMessage(
+                    id = promoted.id,
+                    role = "user",
+                    content = text,
+                    imageUris = prepared.imageUris,
+                    attachmentNames = prepared.attachmentNames,
+                    attachmentUris = prepared.nonImageUris,
+                )
+                // Only now are the composer copies redundant. See the KDoc above.
+                // Each copy is dropped only if it still holds the snapshot captured
+                // on entry — a newer keystroke, a newer pending burst or an extra
+                // attachment belongs to the next draft, not to this promotion.
+                if (_inputText.value == committedAtCapture) _inputText.value = ""
+                if (_pendingComposerText.value == pendingAtCapture) publishPendingComposerText(null)
+                val stagedIds = stagedAttachments.mapTo(HashSet()) { it.id }
+                if (stagedIds.isNotEmpty()) {
+                    val current = _attachments.value
+                    val remaining = current.filterNot { it.id in stagedIds }
+                    if (remaining.size != current.size) _attachments.value = remaining
+                }
+                persisted = true
+            }
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // Termination path: a cancelled scope must stay cancelled (the restore
+            // below still runs in `finally`).
+            throw c
+        } catch (t: Throwable) {
+            com.rikkaminis.app.logging.AppLogger.warning(
+                "ChatViewModel",
+                "promoteDraftIfNeeded failed for $draftId: ${t.message}",
+            )
+        } finally {
+            promoteInFlight = false
+            if (!persisted) {
+                // The durable write did not land: hand the text back to the draft
+                // slot so the next New Chat / process start still finds it.
+                //
+                // Two cases, and they need different targets:
+                //
+                //  - the slot is still OURS (the promotion failed before the
+                //    navigation minted a new draft): writing back under [draftId]
+                //    restores the text exactly where it was.
+                //  - the slot has already been re-claimed by the NEW draft the
+                //    navigation opened (the slot doubles as the id allocator, see
+                //    the clearDraft comment above): writing under [draftId] would
+                //    be dropped by the store's stale-id rule, and the text would
+                //    be lost with the abandoned ViewModel. In that case the text
+                //    goes to the CURRENT owner — but only if that owner is still
+                //    empty, so a draft the user has already typed into is never
+                //    overwritten.
+                val currentOwner = com.rikkaminis.app.data.ComposerDraftStore
+                    .activeDraftIds(context)
+                    .firstOrNull()
+                val restoreTarget = currentOwner
+                    ?.takeIf {
+                        com.rikkaminis.app.data.ComposerDraftStore
+                            .restoreText(context, it)
+                            .isEmpty()
+                    }
+                    ?: draftId
+                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, restoreTarget, text)
+            }
         }
     }
     return true
@@ -102,6 +287,20 @@ internal suspend fun ChatViewModel.ensureSession(): String {
         thinkingLevel = _thinkingLevel.value.name,
     )
     realSessionId = session.id
+    // [r5-d2 B-F-02②] The SECOND write site of the crash-recovery record.
+    // The nav listener already ran for this chat while the route argument was
+    // still the draft key (`__new__<uuid>`) — and at that point it CLEARS the
+    // slot instead of persisting (see `CrashRecoveryStore.slotWriteFor`), so
+    // without this line the whole conversation that follows has no restore
+    // target at all: a native crash / LMK restart lands on whatever session was
+    // recorded before it, or on nothing. Promotion is the first moment a real
+    // id exists, and it is also the last chance — `ChatViewModelStore.rename`
+    // changes only the alias table, so `currentBackStackEntryFlow` never emits
+    // again for this screen (its nav arg stays on the draft key for life).
+    com.rikkaminis.app.CrashRecoveryStore.record(
+        context.applicationContext,
+        session.id,
+    )
     // [feat/hermes-tier1] Draft materialised a NEW session id: re-key the
     // frozen system prompt cache so the prompt built for the draft (if any)
     // is not silently reused under the real id. Session-scoped anchors are
@@ -131,6 +330,31 @@ internal suspend fun ChatViewModel.ensureSession(): String {
         // no-op when no rows match.
         skillRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
         mcpRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
+        // [da1030-A ISSUE-01] Same hop for the pinned WebApp shortcuts. A
+        // shortcut created from this chat while it was still a draft froze
+        // `__new__<uuid>` into both scope columns (AddToHomeSheet writes
+        // `source.sessionId`); `migrateDraftResources` above just moved the
+        // bytes to the real id and deleted the draft directory, so
+        // WebAppPathResolver.resolveSession() resolves `htmlPath` under a path
+        // that no longer exists and the launcher icon reports "Source
+        // Missing". Contained on purpose: a failed DB write must not abort the
+        // promotion (the typed text is already captured in the draft slot).
+        runCatching {
+            (context.applicationContext as? com.rikkaminis.app.MinisApp)
+                ?.webAppShortcutRepository
+                ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
+        }
+        // [da1031-B ISSUE-02 裂缝B] Same hop for the session-scoped offload
+        // permission verdicts (sessionGrants / sessionDenials). A tool the user
+        // allowed on this draft chat was keyed under `__new__<uuid>`; after the
+        // promotion nothing resolves that key any more, so the decision was
+        // silently dropped and the same tool asked again under the real id.
+        // Contained like the shortcut hop above: a failure here must not abort
+        // the promotion.
+        runCatching {
+            com.rikkaminis.app.offload.OffloadPermissionManager
+                .renameSessionGrants(fromDraft = sessionId, toReal = session.id)
+        }
         // Re-point the lazily-created BrowserTabPool if it was already
         // instantiated against the draft key (e.g. user opened the browser
         // sheet before sending a message). Without this, cookies and
@@ -176,19 +400,44 @@ private fun ChatViewModel.migrateDraftResources(fromDraft: String, toReal: Strin
     if (!draftBase.isDirectory) return
     val realBase = java.io.File(base, toReal).apply { mkdirs() }
 
+    // [meta-audit-1028 C1/F-03] "Nothing to move" and "could not read" are
+    // different answers: an unlistable subdirectory leaves the draft tree in place
+    // (it is one of the reasons the `leftover` check below exists), it must not be
+    // reported as a clean migration.
+    var complete = true
     listOf("attachments", "offloads", "workspace", "browser").forEach { subdir ->
         val src = java.io.File(draftBase, subdir)
         if (!src.isDirectory) return@forEach
         val dst = java.io.File(realBase, subdir).apply { mkdirs() }
-        src.listFiles()?.forEach { child ->
+        val children = src.listFiles()
+        if (children == null) {
+            complete = false
+            android.util.Log.w("ChatViewModel",
+                "migrateDraftResources: cannot list ${src.absolutePath} — draft copy kept")
+            return@forEach
+        }
+        children.forEach { child ->
             val target = java.io.File(dst, child.name)
-            runCatching {
-                if (!target.exists() && !child.renameTo(target)) {
-                    copyRecursive(child, target)
-                }
-            }.onFailure {
+            // [meta-audit-1028 C1/F-03] `migrateDraftEntry` is the whole decision:
+            // rename when the name is free, MERGE when the real session already has
+            // that name (the pre-fix `!target.exists() && !child.renameTo(target)`
+            // skipped both branches in exactly that case), and `false` whenever
+            // anything is still sitting in the source — including a directory that
+            // could not be read, which the old `copyRecursive` folded into success.
+            val moved = runCatching { migrateDraftEntry(child, target) }.getOrElse { t ->
                 android.util.Log.w("ChatViewModel",
-                    "migrateDraftResources: failed to move ${child.absolutePath} -> ${target.absolutePath}: ${it.message}")
+                    "migrateDraftResources: failed to move ${child.absolutePath} -> ${target.absolutePath}: ${t.message}")
+                false
+            }
+            // [meta-audit-1028 C1/F-03] The return value used to be dropped, so a
+            // failed entry was only ever noticed by the `leftover` check at the end.
+            // Name the entry: the leftover line says the draft is kept, this says why.
+            if (!moved) {
+                complete = false
+                android.util.Log.w("ChatViewModel",
+                    "migrateDraftResources: ${child.absolutePath} stays in the draft directory " +
+                        "(name already present under ${target.absolutePath} with different " +
+                        "content, or the copy failed)")
             }
         }
     }
@@ -197,7 +446,7 @@ private fun ChatViewModel.migrateDraftResources(fromDraft: String, toReal: Strin
     // whose move had just failed — the user's attachment was logged as
     // "failed to move" and then deleted anyway.
     val leftover = runCatching { draftBase.walkTopDown().any { it.isFile } }.getOrDefault(true)
-    if (!leftover) {
+    if (!leftover && complete) {
         runCatching { draftBase.deleteRecursively() }
     } else {
         android.util.Log.w(
@@ -228,14 +477,3 @@ private fun ChatViewModel.migrateDraftResources(fromDraft: String, toReal: Strin
         }
     }
 }
-
-private fun ChatViewModel.copyRecursive(src: java.io.File, dst: java.io.File): Boolean = runCatching {
-    if (src.isDirectory) {
-        dst.mkdirs()
-        src.listFiles()?.all { copyRecursive(it, java.io.File(dst, it.name)) } ?: true
-    } else {
-        src.copyTo(dst, overwrite = false)
-        src.delete()
-        true
-    }
-}.getOrDefault(false)

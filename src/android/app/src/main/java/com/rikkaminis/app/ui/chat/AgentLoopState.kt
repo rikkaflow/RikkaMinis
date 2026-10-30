@@ -1,5 +1,8 @@
 package com.rikkaminis.app.ui.chat
 
+import com.rikkaminis.app.agent.runtime.AgentTerminal
+import com.rikkaminis.app.agent.runtime.AgentTerminalReason
+import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.provider.LLMProvider
 
 /**
@@ -51,6 +54,36 @@ internal class AgentLoopState(
     val allToolBlocks: MutableList<AssistantBlock> = mutableListOf()
 
     /**
+     * [deep-audit-1016c ISSUE-01] Run-scoped start of the block range that has
+     * NOT been written to any DB row yet — "尚未落库的块起点".
+     *
+     * Why this exists (and why it is NOT the same thing as the per-turn
+     * `turnStartBlockIndex` the loop captures at its top every iteration):
+     * `allToolBlocks` is append-only for the whole run, but five no-tool
+     * continuation branches (`continue` without a terminal persist: EOF-stub,
+     * length-wall prefill / reminder, verify nudge, residue-refill) leave the
+     * text they already streamed unpersisted. The next iteration re-captures
+     * `turnStartBlockIndex` at the CURRENT end of the list, so every later
+     * persistence slice — which used to start there — skips those blocks
+     * forever: the segment reloads as nothing. This index moves ONLY when a
+     * persist actually lands, so the next terminal slice still covers the
+     * skipped segment.
+     *
+     * Two-index contract (do not collapse them):
+     *  - persistence slices (terminal / early / live preview) → THIS index;
+     *  - `rollbackTurnBlocksTo(allToolBlocks, turnStartBlockIndex)` (fallback
+     *    retry: roll back ONLY the failed attempt's partial blocks) and the
+     *    per-turn empty check (`allToolBlocks.drop(turnStartBlockIndex)` —
+     *    "did THIS turn show anything") → `turnStartBlockIndex`.
+     *
+     * Invariants: `0 <= unpersistedBlockStart <= allToolBlocks.size` at all
+     * times; advanced to `allToolBlocks.size` ONLY on a successful persist
+     * (never when the DB returned no row id); reset to 0 wherever
+     * `allToolBlocks` is cleared (queue-interrupt new bubble).
+     */
+    var unpersistedBlockStart: Int = 0
+
+    /**
      * [fix/stream-segmenter-duplication] Monotonic, run-scoped (NOT
      * turn-scoped) block sequence. Text block ids are built as
      *   "text_${turn}_${allToolBlocks.size}_${blockSeq++}"
@@ -80,6 +113,15 @@ internal class AgentLoopState(
 
     /** Context tokens as reported by the last API usage block. */
     var lastContextTokens: Int = 0
+
+    /**
+     * [fix/prewindow-budget-1015] 记下 [lastContextTokens] 是哪个
+     * (providerType, baseUrl, model) 上报的。跨 provider 换模型后读数失效：
+     * 各端点记账口径可差 4.8×（T321 现场），旧读数偏小 → 输出预算虚高爆窗
+     * （预检兜住），偏大 → dynamicMaxTokens 饿死输出（空 length-wall）。引擎
+     * 在预算计算前比对 key，不匹配即视为未知（0）。
+     */
+    var lastContextTokensSourceKey: String? = null
 
     /**
      * Accumulate tool inputs across all turns (so persist includes all, not
@@ -215,11 +257,30 @@ internal class AgentLoopState(
     var lastVerificationDetail: String? = null
 
     /**
-     * Monotonic sequence stamps: an edit and a verification only satisfy the
-     * guard when the verification's stamp is NEWER than every edit's stamp.
+     * [deep-audit-1015 BUG-04] Evidence stamps for the turn-end verify guard,
+     * all fed by ONE run-scoped monotonic clock.
+     *
+     * WHY A SHARED CLOCK: the guard asks whether "the newest passing
+     * verification evidence PREDATES the last edit" — an order between two
+     * events of different kinds. The previous shape (two independent
+     * counters, one bumped per edit and one per passing verification) cannot
+     * answer it: after (edit, edit, verify) the edit counter reads 2 and the
+     * verify counter 1, so "verify > edit" is false even though the
+     * verification WAS the newest event. Both counters were also write-only
+     * (BUG-04), so the guard fired on code edits alone and nudged for
+     * verification the run had already done.
+     *
+     * [evidenceClock] is bumped once per edit/verify event; each stamp
+     * records the clock value of the newest event of its kind, so a plain
+     * `>` is a correct happens-after test.
      */
-    var lastEditSeq: Long = 0
-    var lastVerifySeq: Long = 0
+    var evidenceClock: Long = 0L
+
+    /** [evidenceClock] value at the newest successful code edit (0 = none). */
+    var lastEditStamp: Long = 0L
+
+    /** [evidenceClock] value at the newest PASSING verification (0 = none). */
+    var lastVerifyStamp: Long = 0L
 
     /** How many verify nudges have been injected this run (bounded by
      *  AgentRuntimeLimitsPrefs.verifyNudges(); 0 = guard off). */
@@ -238,6 +299,30 @@ internal class AgentLoopState(
      * (which maps to SUCCEEDED/COMPLETED in t7EndRun — these map to FAILED).
      */
     var terminalErrorSurfaced: Boolean = false
+
+    /**
+     * [deep-audit-1015 BUG-01b] The inline banner this turn owes the user,
+     * held until the turn's own assistant row exists.
+     *
+     * WHY DEFERRED: `setInlineError` persists with
+     * `updateLastAssistantError(sessionId, …)`, which targets the session's
+     * LAST assistant row (`ChatDao`: ORDER BY sort_order DESC LIMIT 1). Code
+     * that runs before this turn persists a row therefore writes the banner
+     * onto the PREVIOUS turn's row — where it survives a reload as a
+     * permanent mislabel of a turn that actually succeeded. The empty-part
+     * case is the sharpest: `persistAssistantTurn` inserts nothing for an
+     * empty part list, so a blank turn has no row of this turn to address at
+     * all (both a failure-terminal banner and the empty-response hint land on
+     * the previous turn). Branches that persist an empty row up front
+     * (~2049 / ~2146) surface inline and are unaffected.
+     *
+     * Contract: a call site sets this INSTEAD of calling setInlineError, and
+     * the no-tool-calls tail consumes it through
+     * [TerminalErrorPlacement.terminalErrorToSurface] right after the turn's
+     * persist returned a row id. Consume-once: the tail clears it even when
+     * it declines to surface.
+     */
+    var pendingInlineError: String? = null
 
     /**
      * [fix/tool-call-copy-suppress] The turn text as it looked BEFOR a restated
@@ -259,4 +344,124 @@ internal class AgentLoopState(
      *  scan of the current turn. A shrink means a new turn began, so the scan
      *  cadence needs no explicit reset. */
     var residueScanAt: Int = 0
+}
+
+/**
+ * [deep-audit-1015 BUG-01a] The run-level exit decisions of
+ * `AgentLoopEngine.runAgentLoop`, lifted out of the engine so they are
+ * directly JVM-testable.
+ *
+ * The engine cannot be driven on the JVM (it needs a full host fake), and the
+ * previous shape of this logic is exactly why the defect survived: the exit
+ * `when` blocks were *copied* into `TerminalErrorSurfacedTest` instead of
+ * called, so the test pinned a mirror of the code rather than the code — a
+ * mutation in either copy left the other green.
+ *
+ * Pure: no Android, no coroutines, no state — just the decision table.
+ */
+internal object AgentLoopExitDecision {
+
+    /**
+     * The value `loopState.loopExitedNormally` must take when the loop leaves
+     * via the "no tool calls" tail.
+     *
+     * BUG-01a: that tail set the flag unconditionally, and every
+     * failure-terminal branch (error-shaped stub ceiling / deterministic
+     * empty / repetition abort / length-wall ceiling / length ×N empty / EOF
+     * stub ceiling) deliberately falls through to it — so a run that had just
+     * told the user it failed was recorded as `SUCCEEDED` + `COMPLETED` in the
+     * T7 state machine and trace. The flag means "the model finished its
+     * reply", and a run whose terminal banner is already on screen did not.
+     *
+     * Note this is NOT the audit-0907 B5 runaway guard: those branches must
+     * still not fall into `finalizeAtTurnLimit`'s "Stopped after N turns"
+     * banner, and they don't — [shouldFinalizeAsRunaway] reads
+     * `terminalErrorSurfaced` independently of this flag.
+     */
+    fun cleanCompletionFlag(terminalErrorSurfaced: Boolean): Boolean = !terminalErrorSurfaced
+
+    /**
+     * Whether the post-loop tail must finalize the run as a MAX_AGENT_TURNS
+     * runaway (the `finalizeAtTurnLimit` hand-holding). True only when the
+     * range was exhausted without a clean exit, without an already-surfaced
+     * terminal error, and without a budget stop.
+     */
+    fun shouldFinalizeAsRunaway(
+        loopExitedNormally: Boolean,
+        terminalErrorSurfaced: Boolean,
+        budgetStopReason: String?,
+    ): Boolean = !loopExitedNormally && !terminalErrorSurfaced && budgetStopReason == null
+
+    /** T7 terminal state for the run. */
+    fun terminal(budgetStopReason: String?, loopExitedNormally: Boolean): AgentTerminal = when {
+        budgetStopReason == "deadline_reached" -> AgentTerminal.INTERRUPTED
+        budgetStopReason != null -> AgentTerminal.FAILED
+        loopExitedNormally -> AgentTerminal.SUCCEEDED
+        else -> AgentTerminal.FAILED
+    }
+
+    /** T7 terminal reason for the run. */
+    fun reason(budgetStopReason: String?, loopExitedNormally: Boolean): AgentTerminalReason = when {
+        budgetStopReason == "deadline_reached" -> AgentTerminalReason.DEADLINE_EXCEEDED
+        budgetStopReason != null -> AgentTerminalReason.EXECUTION_FAILED
+        loopExitedNormally -> AgentTerminalReason.COMPLETED
+        else -> AgentTerminalReason.EXECUTION_FAILED
+    }
+
+    /**
+     * The trace's `error` label. `terminalErrorSurfaced` is tested BEFORE the
+     * runaway fallback so a typed failure branch is never labelled
+     * MAX_AGENT_TURNS (audit-0907 B5).
+     */
+    fun errorLabel(
+        budgetStopReason: String?,
+        terminalErrorSurfaced: Boolean,
+        loopExitedNormally: Boolean,
+    ): String? = when {
+        budgetStopReason != null -> "budget_exhausted($budgetStopReason)"
+        terminalErrorSurfaced -> "terminal_error_surfaced"
+        !loopExitedNormally -> "MAX_AGENT_TURNS"
+        else -> null
+    }
+}
+
+/**
+ * [deep-audit-1015 BUG-01b] Where a turn's terminal error banner may be
+ * written — lifted out of the engine for the same JVM-testability reason as
+ * [AgentLoopExitDecision].
+ */
+internal object TerminalErrorPlacement {
+
+    /**
+     * The parts to persist for a turn that owes the user a terminal banner.
+     *
+     * `persistAssistantTurn` refuses an empty part list, and an unsaved turn
+     * has no row for [ChatDao.updateLastAssistantError] to address — the
+     * banner would land on the previous turn. So a turn with a pending banner
+     * and nothing to persist still writes the same empty-text row the two
+     * existing early-persist branches write (~2044 / ~2141): the row IS the
+     * empty assistant bubble the user is looking at.
+     */
+    fun partsForTerminalError(
+        parts: List<AgentContentPart>,
+        pendingInlineError: String?,
+    ): List<AgentContentPart> =
+        if (pendingInlineError != null && parts.isEmpty()) {
+            listOf(AgentContentPart.Text(""))
+        } else {
+            parts
+        }
+
+    /**
+     * The banner to surface once the turn's row is durable, or null when
+     * nothing may be surfaced.
+     *
+     * [persistedRowId] is what `persistAssistantTurn` returned: null means
+     * this turn produced NO row, and surfacing anyway would persist the
+     * banner onto the previous turn's row (see the KDoc above). Passing the
+     * persist result in is what makes the ordering "persist, then surface"
+     * structural instead of a convention the next edit can silently break.
+     */
+    fun terminalErrorToSurface(pendingInlineError: String?, persistedRowId: String?): String? =
+        if (pendingInlineError != null && persistedRowId != null) pendingInlineError else null
 }

@@ -174,10 +174,13 @@ missing value is actually required.
 `src/android/`, `src/shared/`, `deps/` or the workflow itself, and can be
 triggered manually from the Actions tab. It:
 
-1. Restores the signing keystore from the `DEBUG_KEYSTORE_B64` secret
-2. Runs the pre-build scan gate (`scripts/scan/scan.sh`) — four-way field-sync
-   check, i18n orphan-key check, enum-parse safety, provider process-boundary
-   guard
+1. Restores the release signing keystore from the `RELEASE_KEYSTORE_B64` secret
+   (plus `RELEASE_STORE_PASSWORD` / `RELEASE_KEY_ALIAS` / `RELEASE_KEY_PASSWORD`;
+   missing any of the four fails the job instead of falling back)
+2. Runs the pre-build scan gate — `scripts/scan/scan.sh` (**113 checks** in four
+   families: data/resource contracts, structural guards, behavioural witnesses,
+   primitive self-tests) plus `test_scan.py` (**349 fixtures** proving each gate
+   still goes red when it should)
 3. Installs NDK r28 and builds PRoot from source via `./deps/build_proot.sh clean`
 4. Verifies the build products (`libproot.so`, `libproot-loader.so`) exist
 5. Runs the full unit-test suite (`testReleaseUnitTest`) — red means red
@@ -185,43 +188,78 @@ triggered manually from the Actions tab. It:
 7. Runs `assembleRelease`
 8. Publishes the APK to the `android-latest` release
 
-### Signing in CI
+### Which channel to dispatch
 
-`DEBUG_KEYSTORE_B64` holds a base64-encoded `debug.keystore`. It is a **repo
-secret, not a file in the tree** — keystores are credentials and must not be
-committed.
+A branch fix has two possible gates. Dispatch the cheapest one that can
+actually fail on this diff:
 
-The workflow decodes it to `$RUNNER_TEMP/ci-signing.keystore` and exports
-`MINIS_KEYSTORE_PATH`; `build.gradle.kts` reads that variable and points the
-`debug` signing config at it.
+| Diff touches | Channel | Cost |
+|---|---|---|
+| `scripts/scan/**`, `scripts/diag/**`, `fix-reports/**`, `docs/**`, repo-root `*.md` | `scan-gate-push.yml` | ~7 min |
+| anything else (`src/**`, `deps/**`, `*.gradle.kts`, other workflows) | `build-apk.yml` | 14–23 min |
 
-That indirection is necessary, not decorative. AGP's default is
-`$HOME/.android/debug.keystore`, but `actions/checkout` temporarily overrides
-`HOME` on the runner — so a keystore written to `~/.android/` is restored to a
-path Gradle never reads, and AGP quietly generates a throwaway key instead. The
-build succeeds, the APK looks fine, and it then refuses to install over an
-existing one with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. This bit us once; the
-`Verify APK signature` step exists so it cannot happen silently again. It
-compares the certificate embedded in the built APK against the keystore, using
-`scripts/apk_cert_sha256.py`.
-
-Losing it means losing upgrade continuity: a new key produces APKs that will not
-install over existing ones, and every user has to uninstall and reinstall. Back
-it up somewhere durable.
-
-To rotate or recreate it:
+`scan-gate-push.yml` self-guards: dispatched on a branch, it first runs
+`scripts/diag/cheap_gate_guard.py` and goes **red** if the diff is not
+apparatus-only (fails closed if it cannot prove it either). That way a green
+from the cheap channel can never be mistaken for build evidence: the branch
+simply cannot get one for code the cheap channel never compiled.
 
 ```sh
-keytool -genkeypair -v -keystore debug.keystore \
-  -storepass android -keypass android \
-  -alias androiddebugkey -keyalg RSA -keysize 2048 \
-  -validity 10950 -dname "CN=Android Debug,O=Android,C=US"
+# apparatus-only fix (branch)
+gh workflow run scan-gate-push.yml --ref <branch>
+# -> ~7 min; red at the guard step means the diff is not apparatus-only
 
-base64 -w0 debug.keystore   # paste into the repo secret
+# anything touching production source
+gh workflow run build-apk.yml --ref <branch>
 ```
 
-The storepass, keypass and alias above are the Android defaults and must stay
-as-is — Gradle's `debug` signing config looks for exactly those.
+### Signing in CI
+
+Release builds are signed with a private release keystore that lives in **repo
+secrets, never in the tree**:
+
+| Secret | Contents |
+|---|---|
+| `RELEASE_KEYSTORE_B64` | base64 of the `.keystore` file |
+| `RELEASE_STORE_PASSWORD` | keystore password |
+| `RELEASE_KEY_ALIAS` | key alias (`rikkaminis`) |
+| `RELEASE_KEY_PASSWORD` | key password |
+
+The workflow decodes the keystore to `$RUNNER_TEMP/release-signing.keystore`,
+exports `MINIS_RELEASE_*`, and `build.gradle.kts` reads them into a dedicated
+`release` signing config. The job **fails hard** when any of the four secrets is
+missing — a release APK must never silently fall back to the debug identity.
+
+Older builds were signed with the public AOSP debug key (`androiddebugkey`),
+which meant anyone could forge an APK that passed as a valid upgrade. The
+rotation happened on 2026-10-27; installs from before it must be uninstalled
+once before the first release-signed APK can be installed.
+
+The restore path also avoids a subtle failure: AGP's default is
+`$HOME/.android/debug.keystore`, but `actions/checkout` temporarily overrides
+`HOME`, so a keystore written there is restored to a path Gradle never reads and
+AGP quietly generates a throwaway key. The `Verify APK signature` step compares
+the certificate embedded in the built APK against the keystore via
+`scripts/apk_cert_sha256.py`, so that cannot happen silently.
+
+Losing the key means losing upgrade continuity — every user would have to
+uninstall and reinstall, and a forged APK could claim the old identity again.
+Back the keystore and its passwords up somewhere durable (the owner keeps a 0600
+copy outside the repo).
+
+To rotate:
+
+```sh
+keytool -genkeypair -v -keystore rikka-release.keystore \
+  -alias rikkaminis -keyalg RSA -keysize 4096 -validity 12000 \
+  -dname "CN=RikkaMinis, OU=Personal, O=logicflow-GYW, C=CN"
+# choose a random store password (it is also the key password)
+
+base64 -w0 rikka-release.keystore   # → RELEASE_KEYSTORE_B64
+```
+
+Then update the other three secrets and re-run the workflow. A rotation is a
+**signature change**: existing installs must be uninstalled once.
 
 ---
 

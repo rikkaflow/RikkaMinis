@@ -68,9 +68,25 @@ internal fun sanitizeAgentHistoryMessagesImpl(
         // merge). Any USER message can legally carry a tool_result block, so
         // every USER neighbour merges; only ASSISTANT neighbours insert.
         if (next != null && next.role == LLMMessage.Role.USER) {
-            // Append missing results to the existing user message
+            // [fix/audit-1015-arch03] Anthropic requires tool_result blocks
+            // to precede text blocks within the same user message — prepend
+            // placeholders instead of appending. Serialization emits parts
+            // in order (Anthropic:727 walks contentParts verbatim); OpenAI
+            // extracts tool_results by type and emits role:"tool" messages
+            // first regardless of part order, so the reorder is safe there.
+            // If `next` carries only top-level `content` (no parts), lift it
+            // into a trailing Text part first — otherwise serialization
+            // (which ignores `content` when parts are non-empty) would drop
+            // the original text entirely.
+            val liftedContent = next.contentParts.isEmpty() && next.content.isNotEmpty()
+            val existingParts = if (liftedContent) {
+                listOf<AgentContentPart>(AgentContentPart.Text(next.content))
+            } else {
+                next.contentParts
+            }
             messages[i + 1] = next.copy(
-                contentParts = next.contentParts + placeholders
+                content = if (liftedContent) "" else next.content,
+                contentParts = placeholders + existingParts
             )
         } else {
             // Insert a new user message with just the placeholder results
@@ -120,5 +136,43 @@ internal fun ensureRoleAlternationBeforeUserAppend(
                 contentParts = listOf(AgentContentPart.Text(bridgeText)),
             ),
         )
+    }
+}
+
+/**
+ * [audit-1015 BUG-03B/3C] Whether [msg] is a BLANK assistant shell: a message
+ * the agent loop appends as a turn placeholder that carries nothing usable —
+ * empty content, no content parts, AND no reasoning content. Both provider
+ * request builders filter such messages out
+ * (`.filter { contentParts.isNotEmpty() || content.isNotEmpty() }`), so a
+ * blank shell is invisible to the model — but it still breaks role
+ * alternation inside the in-memory history.
+ *
+ * The predicate is deliberately precise to THREE fields: a shell carrying
+ * reasoningContent is NOT blank (the reasoning round-trips on the next
+ * request for thinking-enabled models — DeepSeek V4 rejects assistant turns
+ * lacking reasoning_content), so it must never be dropped.
+ *
+ * Pure + JVM-testable (no ViewModel/Android dependencies).
+ */
+internal fun isBlankAssistantShell(msg: LLMMessage): Boolean =
+    msg.role == LLMMessage.Role.ASSISTANT &&
+        msg.content.isEmpty() &&
+        msg.contentParts.isEmpty() &&
+        msg.reasoningContent.isNullOrEmpty()
+
+/**
+ * [audit-1015 BUG-03B/3C] Drop the trailing history entry when it is a blank
+ * assistant shell ([isBlankAssistantShell]). Called before (a) the empty
+ * length-wall retry `continue` (BUG-03B — the just-added empty turn must not
+ * ride into the retry request) and (b) the nudge paths' role-alternation
+ * bridge (BUG-03C — an undropped blank shell is filtered out of the request
+ * by the provider, turning [..., shell, USER] into [..., USER, USER]).
+ *
+ * Pure + JVM-testable (no ViewModel/Android dependencies).
+ */
+internal fun dropTrailingBlankAssistantShell(history: MutableList<LLMMessage>) {
+    if (history.isNotEmpty() && isBlankAssistantShell(history.last())) {
+        history.removeAt(history.size - 1)
     }
 }

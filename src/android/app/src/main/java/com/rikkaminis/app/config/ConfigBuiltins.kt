@@ -2,6 +2,7 @@ package com.rikkaminis.app.config
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Looper
 import com.rikkaminis.app.config.collections.EnvVarsCollection
 import com.rikkaminis.app.config.collections.GroupsCollection
 import com.rikkaminis.app.config.collections.ModelsCollection
@@ -15,12 +16,21 @@ import com.rikkaminis.app.config.fields.ReadOnlyField
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
+import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.chat.ChatViewModel
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
+import com.rikkaminis.app.ui.chat.SessionModelResolution
+import com.rikkaminis.app.ui.chat.UnusableModelReason
+import com.rikkaminis.app.ui.chat.applyDefaultModelFallback
+import com.rikkaminis.app.ui.chat.decideSessionModelResolution
+import com.rikkaminis.app.ui.chat.restoreFromBinding
+import com.rikkaminis.app.ui.chat.setThinkingLevel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
-import java.text.SimpleDateFormat
-import java.util.Date
+import kotlinx.coroutines.withContext
 import java.util.Locale
-import java.util.TimeZone
 
 /**
  * Built-in field registrations. Single place to add or remove a
@@ -46,6 +56,30 @@ internal object ConfigBuiltins {
      * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
      */
     @Volatile private var runtimeLimitsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    /**
+     * [fix/da1026-prefs-priming] Strong holder for the concurrency-cap change
+     * listener — the same F-134 rationale as [runtimeLimitsListener] above: a
+     * bare lambda *argument* is held only weakly by SharedPreferencesImpl, so
+     * the GC collects it and the callback silently stops firing (no error, no
+     * exception — the write lands and the registration "succeeded").
+     *
+     * `ConcurrencyPrefs` caches the cap in a @Volatile field that
+     * MinisApp.onCreate primes once. Its PrefsIntField is registered in
+     * [registerRuntime] below, so `minis-config set runtime.maxConcurrentSessions`
+     * and a backup restore write straight to SharedPreferences — with no
+     * listener the primed cache keeps serving the pre-write value to
+     * SessionConcurrencyManager / ExecutionCoordinator / NativeOffloadServer
+     * until the next process start, and RuntimeLimitsScreen's own read-back
+     * shows (then re-persists) that stale value.
+     *
+     * prime() only refreshes the cache; the sized semaphores still take their
+     * bound at process start (see ConcurrencyPrefs's class doc), so this
+     * changes *visibility*, not when the cap takes effect.
+     *
+     * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
+     */
+    @Volatile private var concurrencyPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
     /**
      * [T8-2] Dependency-injected registration. The config layer must not
@@ -131,6 +165,26 @@ internal object ConfigBuiltins {
                 maxValue = com.rikkaminis.app.data.ConcurrencyPrefs.MAX,
             )
         )
+        // [fix/da1026-prefs-priming] Re-prime the ConcurrencyPrefs cache on any
+        // write to its prefs file — the same "changed but takes effect never"
+        // shape the AgentRuntimeLimitsPrefs listener below exists to prevent,
+        // and the same strong-holder requirement (see the field KDoc).
+        // PrefsIntField writes go straight to SharedPreferences (minis-config
+        // / backup restore / the agent), but the cap cache is only primed once
+        // at MinisApp.onCreate: without this listener an external write lands
+        // while SessionConcurrencyManager, ExecutionCoordinator and
+        // NativeOffloadServer keep serving the startup value.
+        //
+        // prime() refreshes the cache only — the sized semaphores keep the
+        // bound they took at process start (deliberate, see ConcurrencyPrefs's
+        // class doc), so this makes the persisted value *visible*, it does not
+        // resize any live slot controller.
+        val appCtx = context.applicationContext
+        val concurrencyListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            com.rikkaminis.app.data.ConcurrencyPrefs.prime(appCtx)
+        }
+        concurrencyPrefsListener = concurrencyListener
+        prefs.registerOnSharedPreferenceChangeListener(concurrencyListener)
         // [T-subagent-toggle] Cross-session sub-agent dispatch switch. Same
         // prefs+key as SubagentPrefs so Settings / minis-config / the agent
         // all read-write one source of truth. OFF by default (side-effectful:
@@ -174,7 +228,8 @@ internal object ConfigBuiltins {
         // unheld lambda is collected by the GC and the callback silently stops
         // firing (see the field's KDoc). Registration is idempotent per
         // (prefs, listener) pair, so re-entering registerInto is harmless.
-        val appCtx = context.applicationContext
+        // (The `appCtx` this listener captures is declared once above, for the
+        // concurrency listener — same application context, one declaration.)
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
             com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.prime(appCtx)
         }
@@ -521,12 +576,32 @@ internal object ConfigBuiltins {
                     val sid = sessionIdProvider()
                     if (sid == null) ConfigValue.Null
                     else {
+                        // [dv25-A06] Read the LIVE value, not just the row: the
+                        // writer above pushes into the resident view model, so a
+                        // row-only read reported a different value than the one
+                        // the write had just accepted (and for a draft it
+                        // reported the empty default while the VM held the real
+                        // level). Precedence lives in
+                        // `SessionConfigWriteThrough.thinkingLevelReadSource`.
+                        val vm = residentViewModel(sid)
                         val session = runBlocking { chatRepo.dao.getSession(sid) }
-                        val raw = session?.thinkingOverride
-                        val token = if (raw == null) "off" else thinkingLevelToToken(
-                            runCatching { ThinkingLevel.valueOf(raw) }.getOrDefault(ThinkingLevel.OFF)
-                        )
-                        ConfigValue.Str(token)
+                        val level = when (
+                            thinkingLevelReadSource(
+                                hasLiveViewModel = vm != null,
+                                vmAdoptedRow = vm?.sessionLoaded?.value == true,
+                                hasPersistedRow = session != null,
+                            )
+                        ) {
+                            SessionConfigReadSource.ResidentViewModel ->
+                                vm!!.requestedThinkingLevel.value
+                            SessionConfigReadSource.PersistedRow -> {
+                                val raw = session?.thinkingOverride
+                                if (raw == null) ThinkingLevel.OFF
+                                else runCatching { ThinkingLevel.valueOf(raw) }.getOrDefault(ThinkingLevel.OFF)
+                            }
+                            SessionConfigReadSource.Absent -> ThinkingLevel.OFF
+                        }
+                        ConfigValue.Str(thinkingLevelToToken(level))
                     }
                 },
                 writer = { v ->
@@ -536,7 +611,15 @@ internal object ConfigBuiltins {
                         ?: throw ConfigError.InvalidValue("Unknown thinking level: $token")
                     val sid = sessionIdProvider()
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
-                    runBlocking { chatRepo.dao.updateThinkingOverride(sid, level.name) }
+                    // [dv24-A05] Persist AND push into the resident VM: the row is
+                    // the only cross-restart store, the VM is what the user sees.
+                    writeSessionConfig(
+                        sessionId = sid,
+                        path = "session.thinkingLevel",
+                        chatRepo = chatRepo,
+                        persist = { chatRepo.dao.updateThinkingOverride(sid, level.name) },
+                        refresh = { vm -> vm.setThinkingLevel(level) },
+                    )
                 },
             )
         )
@@ -552,8 +635,28 @@ internal object ConfigBuiltins {
                     val sid = sessionIdProvider()
                     if (sid == null) ConfigValue.Str("")
                     else {
+                        // [dv25-A06] Same asymmetry as `session.thinkingLevel`, but
+                        // the precedence is ROW-first: the row holds the explicit
+                        // pin, the VM holds the model in use (also non-empty when
+                        // the pin is empty and loadSession's fallback chain picked
+                        // one). Reading the VM would invent a pin the user never
+                        // made. See `SessionConfigWriteThrough.modelBindingReadSource`.
+                        val vm = residentViewModel(sid)
                         val session = runBlocking { chatRepo.dao.getSession(sid) }
-                        ConfigValue.Str(formatBinding(session?.modelBinding))
+                        ConfigValue.Str(
+                            when (
+                                modelBindingReadSource(
+                                    hasLiveViewModel = vm != null,
+                                    hasPersistedRow = session != null,
+                                )
+                            ) {
+                                SessionConfigReadSource.ResidentViewModel ->
+                                    residentBindingToken(vm!!)
+                                SessionConfigReadSource.PersistedRow ->
+                                    formatBinding(session?.modelBinding)
+                                SessionConfigReadSource.Absent -> ""
+                            }
+                        )
                     }
                 },
                 writer = { v ->
@@ -563,7 +666,17 @@ internal object ConfigBuiltins {
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
                     if (s.isEmpty()) {
                         // Clear the binding — fall back to default group/entry on next load.
-                        runBlocking { chatRepo.dao.updateSessionBinding(sid, "", "") }
+                        // [dv24-A05] The live VM must run the SAME fallback the next
+                        // `loadSession()` would (priority 3: default group → new-chat
+                        // default), otherwise the chat keeps showing the cleared pin
+                        // while the row already says "no binding".
+                        writeSessionConfig(
+                            sessionId = sid,
+                            path = "session.primaryModel",
+                            chatRepo = chatRepo,
+                            persist = { chatRepo.dao.updateSessionBinding(sid, "", "") },
+                            refresh = { vm -> vm.applyDefaultModelFallback() },
+                        )
                         return@ClosureField
                     }
                     val cfg = providerRepo.config.value
@@ -575,6 +688,13 @@ internal object ConfigBuiltins {
                             }
                             val entry = cfg.modelEntries.find { it.id == uuid }
                                 ?: throw ConfigError.InvalidValue("Unknown model entry uuid: $uuid")
+                            // [dv25-A06] Existence is not usability: writing a
+                            // binding to a disabled instance / a keyless instance
+                            // produces a row that `restoreFromBinding` then REFUSES
+                            // (see decideSessionModelResolution), so the write
+                            // reported success and the chat fell back to another
+                            // model. Same decision source as the runtime gate.
+                            requireUsableEntry(providerRepo, entry, "entry:$uuid")
                             """{"type":"entry","entryId":"$uuid"}""" to entry.baseModel.id
                         }
                         s.startsWith("group:") -> {
@@ -584,19 +704,33 @@ internal object ConfigBuiltins {
                             }
                             val group = cfg.modelGroups.find { it.id == gid }
                                 ?: throw ConfigError.InvalidValue("Unknown group id: $gid")
-                            val firstEntryId = group.memberEntryIds.firstOrNull()
-                                ?: throw ConfigError.InvalidValue("Group $gid has no member entries")
-                            val firstEntry = cfg.modelEntries.find { it.id == firstEntryId }
-                                ?: throw ConfigError.InvalidValue("Group $gid references missing entry $firstEntryId")
+                            // [dv25-A06] A group binding is usable only when at
+                            // least one member is: `resolveProviderFromGroup`
+                            // returns false when every member is disabled /
+                            // keyless, so binding such a group wrote a row the
+                            // runtime then discarded. Pick the first USABLE member
+                            // for `model_id` (it used to be the first member,
+                            // which could itself be the unusable one).
+                            val firstEntry = firstUsableGroupMember(providerRepo, group)
                             """{"type":"group","groupId":"$gid"}""" to firstEntry.baseModel.id
                         }
                         else -> throw ConfigError.InvalidValue(
                             "Expected `entry:<uuid>` or `group:<id>`, got '$s'"
                         )
                     }
-                    runBlocking {
-                        chatRepo.dao.updateSessionBinding(sid, bindingJson, modelId)
-                    }
+                    writeSessionConfig(
+                        sessionId = sid,
+                        path = "session.primaryModel",
+                        chatRepo = chatRepo,
+                        persist = { chatRepo.dao.updateSessionBinding(sid, bindingJson, modelId) },
+                        refresh = { vm ->
+                            // Same three priorities `loadSession` uses: the persisted
+                            // binding first (this also honours the provider-enabled /
+                            // credential gates), then the default group → new-chat
+                            // default when that binding is unusable.
+                            if (!vm.restoreFromBinding(bindingJson)) vm.applyDefaultModelFallback()
+                        },
+                    )
                 },
             )
         )
@@ -605,6 +739,203 @@ internal object ConfigBuiltins {
         // `subModelSource` field in `model_binding` JSON, no agent-loop
         // fallback path). Reported up at the spec level rather than
         // adding a no-op key that silently throws on every write.
+    }
+
+    private const val TAG = "ConfigBuiltins"
+
+    /**
+     * [dv24-A05] A `session.*` write lands on **every** surface that can hold
+     * the value, in one call.
+     *
+     * Before this, `minis-config set session.thinkingLevel high` /
+     * `session.primaryModel entry:<uuid>` ran a single
+     * `runBlocking { dao.update… }`. `ChatViewModel` reads both fields exactly
+     * once, inside `loadSession()`, and `ChatViewModelStore` keeps that instance
+     * alive for the whole process — so the agent's write returned success while
+     * the chat kept using the OLD model / level. Worse, the next in-app picker
+     * tap wrote that stale in-memory state back over the row, silently undoing
+     * the config write.
+     *
+     * Both halves are load-bearing, which is why they live in one function
+     * rather than at each call site:
+     *   - `persist` — the Room row is the only cross-restart store;
+     *   - `refresh` — the resident VM is the only live surface, and it is the
+     *     one that would otherwise clobber the row.
+     * The refresh goes through the VM's own entry points (`setThinkingLevel`,
+     * `restoreFromBinding` / `applyDefaultModelFallback`), i.e. the same
+     * decisions the UI and `loadSession()` take — no second state path.
+     *
+     * Row first, VM second: if the VM-side entry throws, the value is already
+     * persisted (the write succeeded) and the UI is one load behind — the
+     * opposite order would report failure for a write that did land.
+     *
+     * Draft sessions (`__new__…`, no row yet): the UPDATE matches 0 rows, so
+     * the resident VM is the only place the value can live — it holds it and
+     * `ensureSession()` folds it into the row at insert time. With no VM either
+     * there is nothing to hold it; that case is logged rather than silently
+     * accepted (it used to be indistinguishable from success).
+     */
+    private fun writeSessionConfig(
+        sessionId: String,
+        path: String,
+        chatRepo: ChatRepository,
+        persist: suspend () -> Unit,
+        refresh: (ChatViewModel) -> Unit,
+    ) {
+        // The resident VM is looked up BEFORE the write and refreshed after it
+        // (see SessionConfigWriteThrough.deliver): the row is the only
+        // cross-restart store, the VM is the only live surface, and the VM is
+        // the one that would otherwise clobber the row with stale memory.
+        //
+        // `peekViewModel` is main-thread-only (it walks ViewModelStore), hence
+        // the hop — and the refresh must run on Main too, exactly like the
+        // in-app picker does.
+        val vm = runOnMainThread { ChatViewModelStore.peekViewModel(sessionId) }
+        SessionConfigWriteThrough.deliver(
+            vm = vm,
+            persist = persist,
+            hasPersistedRow = { chatRepo.dao.getSession(sessionId) != null },
+            refresh = { resident ->
+                runOnMainThread {
+                    runCatching { refresh(resident) }.onFailure {
+                        AppLogger.warning(
+                            TAG,
+                            "$path: resident view model refresh failed for " +
+                                "'$sessionId': ${it.message}",
+                        )
+                    }
+                }
+            },
+            onDraftWithoutRow = {
+                // [r3-b08 F-11] "Logged" is not "told": the caller is the agent,
+                // and it was still reading `ok: true` / "Settings updated." for a
+                // value that landed nowhere (SessionConfigWriteThrough's own KDoc
+                // says the caller has to be told BECAUSE the write reported
+                // success). Fail the row instead, so `minis-config set` answers
+                // `ok: false` with the reason a retry can act on.
+                AppLogger.warning(
+                    TAG,
+                    "$path: session '$sessionId' has no persisted row and no resident " +
+                        "view model — the UPDATE matched 0 rows, so the value is not retained",
+                )
+                throw ConfigError.InvalidValue(
+                    "$path cannot be retained: session '$sessionId' has no persisted row " +
+                        "and no resident chat view model yet. Open the chat (or send a " +
+                        "first message) and retry."
+                )
+            },
+        )
+    }
+
+    /**
+     * Run [block] on the Android main thread and wait for it.
+     *
+     * `minis-config` is served from the offload worker thread, while every
+     * `ChatViewModel` `MutableStateFlow` write and every `ProviderFactory.create`
+     * call behind the VM's entry points is main-thread-only. Waiting (rather
+     * than `launch`) is what makes the write-through real: the agent's next
+     * sentence has to see the new level. The fast path exists because hopping to
+     * a looper we are already running on would deadlock `runBlocking`.
+     */
+    /**
+     * [dv25-A06] The resident ViewModel for [sessionId], or null.
+     *
+     * `peekViewModel` is main-thread-only (it walks the ViewModelStore) and
+     * non-creating (a read for a chat that is not on screen must not
+     * materialise one) — both properties are load-bearing here, which is why
+     * the read path uses the same lookup as the write path.
+     */
+    private fun residentViewModel(sessionId: String): ChatViewModel? =
+        runOnMainThread { ChatViewModelStore.peekViewModel(sessionId) }
+
+    /**
+     * [dv25-A06] The binding token the resident VM is currently on, in the same
+     * `entry:<uuid>` / `group:<id>` syntax [formatBinding] renders from the row
+     * (empty = no explicit pin).
+     *
+     * Only consulted when the session has NO row (see
+     * `modelBindingReadSource`): a draft's write lands in the VM, so the VM is
+     * the only place that can answer. `selectedGroupId` first — a group-bound
+     * VM also carries a concrete `activeEntryId` (the rotated member), and
+     * reporting that member as an `entry:` pin would be a different fact.
+     */
+    private fun residentBindingToken(vm: ChatViewModel): String {
+        val groupId = vm.selectedGroupId.value
+        if (!groupId.isNullOrEmpty()) return "group:$groupId"
+        val entryId = vm.activeEntryId.value
+        if (!entryId.isNullOrEmpty()) return "entry:$entryId"
+        return ""
+    }
+
+    /**
+     * [dv25-A06] Fail-closed availability gate for `session.primaryModel`
+     * (entry branch). Same decision as the runtime gate
+     * ([decideSessionModelResolution]) — a binding the chat would refuse to
+     * restore must not be reported as written.
+     */
+    private fun requireUsableEntry(
+        providerRepo: ProviderRepository,
+        entry: com.rikkaminis.app.data.model.ModelEntry,
+        what: String,
+    ) {
+        val instance = providerRepo.instance(entry.providerInstanceId)
+        val apiKey = instance?.let { providerRepo.loadApiKey(it.id) }
+        val decision = decideSessionModelResolution(entry, instance, apiKey)
+        if (decision is SessionModelResolution.Unusable) {
+            throw ConfigError.InvalidValue("$what is not usable — ${unusableReasonMessage(decision.reason)}")
+        }
+    }
+
+    /**
+     * [dv25-A06] The first member of [group] that the runtime would actually
+     * use, or [ConfigError.InvalidValue] when there is none.
+     *
+     * Mirrors `ProviderRepository.enabledMemberEntries` +
+     * `resolveProviderFromGroup`'s credential check in ONE place, so the
+     * validation and the later restore cannot disagree.
+     */
+    private fun firstUsableGroupMember(
+        providerRepo: ProviderRepository,
+        group: com.rikkaminis.app.data.model.ModelGroup,
+    ): com.rikkaminis.app.data.model.ModelEntry {
+        if (group.memberEntryIds.isEmpty()) {
+            throw ConfigError.InvalidValue("Group ${group.id} has no member entries")
+        }
+        val cfg = providerRepo.config.value
+        val members = group.memberEntryIds.mapNotNull { id -> cfg.modelEntries.find { it.id == id } }
+        if (members.isEmpty()) {
+            throw ConfigError.InvalidValue(
+                "Group ${group.id} references no existing model entry — " +
+                    "every member id in ${group.memberEntryIds} is gone"
+            )
+        }
+        members.firstOrNull { member ->
+            val instance = providerRepo.instance(member.providerInstanceId)
+            decideSessionModelResolution(
+                member,
+                instance,
+                instance?.let { providerRepo.loadApiKey(it.id) },
+            ) is SessionModelResolution.Use
+        }?.let { return it }
+        throw ConfigError.InvalidValue(
+            "Group ${group.id} has no usable member — every member's provider " +
+                "instance is disabled or has no API key"
+        )
+    }
+
+    /** [dv25-A06] Human-readable cause for a rejected `session.primaryModel`. */
+    private fun unusableReasonMessage(reason: UnusableModelReason): String = when (reason) {
+        UnusableModelReason.MISSING_INSTANCE ->
+            "its provider instance no longer exists"
+        UnusableModelReason.PROVIDER_DISABLED ->
+            "its provider instance is disabled (enable it in Settings → Providers)"
+        UnusableModelReason.MISSING_API_KEY ->
+            "its provider instance has no API key"
+    }
+
+    private fun <T> runOnMainThread(block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        return runBlocking { withContext(Dispatchers.Main) { block() } }
     }
 
     /** iOS uses lowercase tokens (`off`/`low`/…); Android `ThinkingLevel.name`
@@ -1140,7 +1471,28 @@ internal object ConfigBuiltins {
         )
         // [T-android-config-feature-unavailable] Live Updates / "dynamic
         // island" was removed 2026-08-17 — this feature (and its registration)
-        // is gone; nothing between the two notification fields references it.
+        // is gone; nothing here references it any more.
+        //
+        // [da1028-B / ISSUE-03] `background.overlay` ("show the floating
+        // tool-status overlay while backgrounded") is a real switch in
+        // Settings → Background with no registry entry: `minis-config set
+        // background.overlay true` answered "unknown field" while the same
+        // toggle was reachable by tap, and the value was in no backup scope.
+        // Same key convention as the notification fields above — the key and
+        // the default come from BackgroundSettingsRepository, never re-typed
+        // here.
+        r.register(
+            PrefsBoolField(
+                path = "background.overlay",
+                displayName = "Background task overlay",
+                description = "Show a small floating capsule with the current tool while the app is in the background. Same switch as Settings → Background → Background Task Overlay; needs permission to display over other apps.",
+                prefs = prefs,
+                key = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .KEY_BG_OVERLAY_ENABLED,
+                defaultValue = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .DEFAULT_BG_OVERLAY_ENABLED,
+            )
+        )
     }
 
     // -- Logs --
@@ -1218,6 +1570,16 @@ internal object ConfigBuiltins {
                                     "appendV1Suffix" to ConfigValue.Bool(inst.appendV1Suffix),
                                     "useResponsesAPI" to ConfigValue.Bool(inst.useResponsesAPI),
                                     "azureMode" to ConfigValue.Bool(inst.azureMode),
+                                    // [da1030-C ISSUE-04] Same symmetry as the
+                                    // Debug RPC faces: the image-endpoint
+                                    // picker state is readable here too
+                                    // ([GH#68] keys, instance-field names).
+                                    "imageEndpointMode" to ConfigValue.Str(inst.imageEndpointMode.name),
+                                    "imageEndpointResolved" to (inst.imageEndpointResolved?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+                                    // [fix/da1020-memory-gate-provider-fields]
+                                    // Same read shape as the per-instance field
+                                    // (empty override → Null = branded default).
+                                    "customUserAgent" to (inst.customUserAgent?.let { ConfigValue.Str(it) } ?: ConfigValue.Null),
                                 )
                             )
                         }
@@ -1265,7 +1627,7 @@ internal object ConfigBuiltins {
             ReadOnlyField(
                 path = "envvars",
                 displayName = "Environment variables (summary)",
-                description = "Read-only list of env var keys with note and createdAt. Values are never exposed.",
+                description = "Read-only list of env var keys with group, note and createdAt. Values are never exposed.",
                 valueSchema = ConfigSchema.Json,
                 reader = {
                     ConfigValue.Arr(
@@ -1273,6 +1635,7 @@ internal object ConfigBuiltins {
                             ConfigValue.Obj(
                                 linkedMapOf(
                                     "key" to ConfigValue.Str(e.key),
+                                    "group" to ConfigValue.Str(e.group),
                                     "note" to ConfigValue.Str(e.note),
                                     "created_at" to ConfigValue.Str(isoFormatter.format(java.time.Instant.ofEpochMilli(e.createdAt))),
                                 )
@@ -1326,7 +1689,11 @@ internal object ConfigBuiltins {
                     ConfigValue.Arr(
                         cfg.modelGroups.map { g ->
                             val entries = g.memberEntryIds.map { entryId ->
-                                val e = entriesById[entryId]
+                                // [dv20-a1 A-02] System voice members are
+                                // virtual (never in config.modelEntries) but
+                                // resolve to a real entry — surface the normal
+                                // shape instead of a "missing" stub.
+                                val e = entriesById[entryId] ?: SystemVoiceEntries.resolve(entryId)
                                 if (e == null) {
                                     ConfigValue.Obj(
                                         linkedMapOf(
@@ -1353,6 +1720,24 @@ internal object ConfigBuiltins {
                                     "name" to ConfigValue.Str(g.name),
                                     "strategy" to ConfigValue.Str(g.strategy.name),
                                     "fallback_strategy" to ConfigValue.Str(g.fallbackStrategy.name),
+                                    // [fix/da1026-H] The two per-group session
+                                    // defaults were write-only on this face:
+                                    // `minis-config get groups` hid them, so an
+                                    // agent could set them at add time and never
+                                    // read them back. Same read shape as the
+                                    // sibling providers summary (carrier field,
+                                    // Null = "no override") — the `add` payload
+                                    // accepts null/absent for both keys, so a
+                                    // summary round-trips through add unchanged.
+                                    // Token vocabulary matches the
+                                    // `groups.<id>.defaultThinkingLevel` field
+                                    // reader (lowercase, `thinkingLevelToToken`).
+                                    "default_thinking_level" to (g.defaultThinkingLevel?.let {
+                                        ConfigValue.Str(thinkingLevelToToken(it))
+                                    } ?: ConfigValue.Null),
+                                    "context_limit_tokens" to (g.contextLimitTokens?.let {
+                                        ConfigValue.Int(it)
+                                    } ?: ConfigValue.Null),
                                     "entries" to ConfigValue.Arr(entries),
                                 )
                             )
@@ -1406,6 +1791,55 @@ internal object ConfigBuiltins {
                             throw ConfigError.InvalidValue("No group with id $s")
                         }
                         repo.defaultSubGroupId = s
+                    }
+                },
+            )
+        )
+        // [da1031-A] The two voice-group bindings are defaults.* references
+        // exactly like primaryGroup/subGroup above. They were never
+        // registered, so ConfigRegistry.exportJSON() — the source of the
+        // backup's `fields` section — could not carry them and a restore
+        // silently dropped both bindings.
+        r.register(
+            ClosureField(
+                path = "defaults.voiceInputGroup",
+                displayName = "Default voice input group",
+                description = "Group that resolves the voice-INPUT model. Empty string clears the default.",
+                valueSchema = ConfigSchema.Str(maxLength = 200),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                reader = { ConfigValue.Str(repo.voiceInputGroupId ?: "") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    if (s.isEmpty()) {
+                        repo.voiceInputGroupId = null
+                    } else {
+                        if (repo.config.value.modelGroups.none { it.id == s }) {
+                            throw ConfigError.InvalidValue("No group with id $s")
+                        }
+                        repo.voiceInputGroupId = s
+                    }
+                },
+            )
+        )
+        r.register(
+            ClosureField(
+                path = "defaults.voiceOutputGroup",
+                displayName = "Default voice output group",
+                description = "Group that resolves the voice-OUTPUT model. Empty string clears the default.",
+                valueSchema = ConfigSchema.Str(maxLength = 200),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                reader = { ConfigValue.Str(repo.voiceOutputGroupId ?: "") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    if (s.isEmpty()) {
+                        repo.voiceOutputGroupId = null
+                    } else {
+                        if (repo.config.value.modelGroups.none { it.id == s }) {
+                            throw ConfigError.InvalidValue("No group with id $s")
+                        }
+                        repo.voiceOutputGroupId = s
                     }
                 },
             )

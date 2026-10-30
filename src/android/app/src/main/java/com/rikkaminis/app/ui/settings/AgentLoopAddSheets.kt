@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -28,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,13 +36,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.ui.components.QuickTestSheet
 import com.rikkaminis.app.ui.components.modelEntryPickerItems
+import com.rikkaminis.app.ui.components.rememberCollapsedInstanceIds
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 import com.rikkaminis.app.ui.theme.ChatColors
@@ -81,9 +83,14 @@ fun AddAgentLoopModelsScreen(
 
     val searchQuery = remember { mutableStateOf("") }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
-    val collapsedInstanceIds = remember(config) {
-        mutableStateOf(config.instances.map { it.id }.toSet())
-    }
+    // [deep-audit-1039 B-08] This screen renders the SAME modelEntryPickerItems
+    // as AddModelsToGroupScreen, so it owes the user the same lightning-bolt
+    // Quick Test: the shared row only draws the button when a caller passes
+    // `onQuickTest`. Target held as an id and re-resolved from the live list
+    // (see AddModelsToGroupScreen's liveQuickTestEntry) for the same
+    // stale-snapshot reason.
+    var quickTestEntryId by remember { mutableStateOf<String?>(null) }
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
 
     Scaffold(
         topBar = {
@@ -148,8 +155,25 @@ fun AddAgentLoopModelsScreen(
                 emptySearchTextRes = R.string.add_models_to_group_no_match,
                 searchPlaceholderRes = R.string.add_models_to_group_search_models,
                 clearContentDescriptionRes = R.string.add_models_to_group_clear,
+                // System virtual entries have no cloud endpoint to smoke-test.
+                onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntryId = it.id },
             )
         }
+    }
+
+    // [deep-audit-1039 B-08] Mirror AddModelsToGroupScreen: resolve the target
+    // live and dismiss the sheet (via LaunchedEffect, never during composition)
+    // once the id stops resolving.
+    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+    quickTestEntry?.let { entry ->
+        QuickTestSheet(
+            entry = entry,
+            providerRepository = providerRepository,
+            onDismiss = { quickTestEntryId = null },
+        )
     }
 }
 
@@ -260,9 +284,12 @@ fun AddAgentLoopGroupsScreen(
                             // user remembers what the group contains
                             // without tapping into detail. Mirrors iOS
                             // AddAgentLoopGroupsSheet preview row.
+                            // [deep-audit-1043 B-06] System voice members are
+                            // virtual — resolving only through `config.modelEntries`
+                            // rendered an empty preview for them.
                             val memberNames = group.memberEntryIds
                                 .mapNotNull { mid ->
-                                    config.modelEntries.find { it.id == mid }?.model?.displayName
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, mid)?.model?.displayName
                                 }
                             val preview = when {
                                 memberNames.isEmpty() ->

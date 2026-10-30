@@ -37,6 +37,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,7 +47,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -76,15 +76,39 @@ fun ProviderListScreen(
     val instances = config.instances
     val context = LocalContext.current
 
+    // [deep-audit-1041 B-01] The stored credentials are NOT part of
+    // `ProviderInstance` (they live in EncryptedSharedPreferences), so no config
+    // field carries them. The snapshot therefore has to observe the config
+    // revision — the signal every credential-writing path bumps (instancesUpdate
+    // RPC / provider import / backup restore) — AND to be read OFF the
+    // composition thread: `loadApiKey()` is synchronous encrypted I/O, and
+    // calling it from a `remember` initializer (the pre-fix shape) ran it on the
+    // main thread once per key change, stalling the frame during navigation
+    // ([perf-provider-detail] contract). Read it in an effect, then derive the
+    // rows from the resulting map so the derivation stays cheap.
+    var apiKeyByInstanceId by remember { mutableStateOf<Map<String, String?>>(emptyMap()) }
+    LaunchedEffect(instances, config.revision) {
+        apiKeyByInstanceId = withContext(Dispatchers.IO) {
+            instances.associate { it.id to providerRepository.loadApiKey(it.id) }
+        }
+    }
+
     // [perf-provider-list] Pre-compute per-instance display data once per
     // `instances` change. loadApiKey() hits EncryptedSharedPreferences
     // (synchronous encrypted I/O); naive inline calls inside the forEach
     // re-ran them for EVERY row on EVERY recomposition, stalling the frame
     // during navigation transitions. Caching here means the I/O happens once
     // per instances change, not once per row per recomposition.
-    val providerRows: List<ProviderRowData> = remember(instances) {
+    // [da1025-F] Key on (instances, config.modelEntries), not instances alone:
+    // refreshModels changes config.modelEntries WITHOUT changing instances,
+    // so keying on instances alone kept the stale snapshot here and a freshly
+    // added provider showed modelCount = 0 until an unrelated recomposition.
+    // [deep-audit-1041 B-01] Also key on the asynchronously-loaded key map: an
+    // external credential write changes neither `instances` nor `modelEntries`,
+    // so without this key the configured badge / masked key stayed stale.
+    val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries, apiKeyByInstanceId) {
         instances.map { instance ->
-            val apiKey = providerRepository.loadApiKey(instance.id)
+            val apiKey = apiKeyByInstanceId[instance.id]
             val isConfigured = !apiKey.isNullOrBlank()
             ProviderRowData(
                 instance = instance,
@@ -106,7 +130,10 @@ fun ProviderListScreen(
     // scroll. The reorder path below is the deliberate asymmetry —
     // ProviderRepository.permuteById REFUSES a list holding duplicate ids, so
     // on a corrupted config drags just no-op until the duplicate is gone.
-    val reorderableRows = remember(instances) { providerRows.distinctBy { it.instance.id } }
+    // [da1025-F] Key on providerRows (its actual derivation source), not
+    // instances: providerRows recomputes when modelEntries changes too, and
+    // keying on instances alone kept this derived list stale with it.
+    val reorderableRows = remember(providerRows) { providerRows.distinctBy { it.instance.id } }
     val pinnedRows = reorderableRows.filter { it.instance.pinned }
     val groupedRows = reorderableRows.filter { !it.instance.pinned }.groupBy { it.instance.providerType }
 
@@ -202,13 +229,23 @@ fun ProviderListScreen(
                         // the old `if (jsonStr != null)` fell through it with no
                         // toast at all — the user picked a file and nothing
                         // happened. Report it like any other read error.
-                        val jsonStr = context.contentResolver.openInputStream(uri)
-                            ?.bufferedReader()?.use { it.readText() }
-                        if (jsonStr == null) {
-                            val msg = context.getString(R.string.provider_import_read_error)
+                        //
+                        // [deep-audit-1045 B-07] Bounded read. This branch used
+                        // to stream the whole document into one String with no
+                        // upper limit, while the `.zip` branch beside it was
+                        // capped by ProviderImportZip — so a user-pickable 2 GB
+                        // .json hit OutOfMemoryError before validation.
+                        val read = readSafBytes(context.contentResolver, uri, MAX_PROVIDER_JSON_BYTES)
+                        if (read !is SafRead.Ok) {
+                            val msg = if (read is SafRead.TooLarge) {
+                                safTooLargeText(MAX_PROVIDER_JSON_BYTES)
+                            } else {
+                                context.getString(R.string.provider_import_read_error)
+                            }
                             importToastHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
                             return@withContext
                         }
+                        val jsonStr = String(read.bytes, Charsets.UTF_8)
                         val label = providerRepository.importInstanceJSON(jsonStr)
                         if (label != null) {
                             val toastMsg = context.getString(R.string.provider_import_success, label)
@@ -315,7 +352,7 @@ fun ProviderListScreen(
                                         apiKey = row.apiKey,
                                         isConfigured = row.isConfigured,
                                         pinned = row.instance.pinned,
-                                        onTogglePinned = remember(row.instance.id) {
+                                        onTogglePinned = remember(row.instance.id, row.instance.pinned) {
                                             { providerRepository.setInstancePinned(row.instance.id, !row.instance.pinned) }
                                         },
                                         onClick = remember(row.instance.id) { { onProviderClick(row.instance.id) } },
@@ -349,7 +386,7 @@ fun ProviderListScreen(
                                         apiKey = row.apiKey,
                                         isConfigured = row.isConfigured,
                                         pinned = row.instance.pinned,
-                                        onTogglePinned = remember(row.instance.id) {
+                                        onTogglePinned = remember(row.instance.id, row.instance.pinned) {
                                             { providerRepository.setInstancePinned(row.instance.id, !row.instance.pinned) }
                                         },
                                         onClick = remember(row.instance.id) { { onProviderClick(row.instance.id) } },

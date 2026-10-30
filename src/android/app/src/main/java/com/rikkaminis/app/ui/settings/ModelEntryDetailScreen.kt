@@ -1,7 +1,6 @@
 package com.rikkaminis.app.ui.settings
 
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
@@ -19,14 +18,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelOverrides
 import com.rikkaminis.app.data.model.inferContextWindowTokens
 import com.rikkaminis.app.data.model.normalizeModalityName
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.ui.components.RowLabel
 import com.rikkaminis.app.ui.components.SectionTextField
 import com.rikkaminis.app.R
@@ -54,6 +56,7 @@ fun ModelEntryDetailScreen(
     val config by providerRepository.config.collectAsState()
     val entry = config.modelEntries.find { it.id == entryId && it.providerInstanceId == instanceId }
     val instance = config.instances.find { it.id == instanceId }
+    val context = LocalContext.current
 
     if (entry == null) {
         // [S6-composition-back] onBack() during composition is a Compose
@@ -66,10 +69,35 @@ fun ModelEntryDetailScreen(
     val baseModel = entry.baseModel
     val overrides = entry.overrides
 
-    var modelId by remember { mutableStateOf(baseModel.id) }
-    var displayName by remember { mutableStateOf(overrides.displayName ?: baseModel.displayName) }
-    var maxOutputTokensText by remember { mutableStateOf(overrides.maxOutputTokens?.toString() ?: "") }
-    var contextWindowText by remember {
+    // [meta-audit-1028 E5 / B06 F-07] `updateEntry` answers "did the write
+    // land?" with String? — null means it REFUSED (a rename collided with
+    // another entry of the same instance, or the id is blank) and nothing was
+    // persisted. The old code called it and then `onBack()` unconditionally,
+    // so a refused rename looked exactly like a saved one: the screen popped
+    // and the user's edit was gone with no signal at all. Stay put and say so.
+    var saveError by remember(entry.id) { mutableStateOf<String?>(null) }
+
+    // [da1026-C] Every editable field below is keyed on (entry identity, the
+    // exact sources its initial value derives from). A keyless `remember`
+    // froze the FIRST composition's values for the lifetime of the screen: an
+    // external write while this page was open (minis-config / backup restore /
+    // provider RPC) left the old snapshot rendered, and Save then wrote those
+    // stale values back over the external change. Keys stay field-level
+    // (never the whole `entry` object) so an unrelated external edit cannot
+    // discard what the user is currently typing.
+    var modelId by remember(entry.id, baseModel.id) { mutableStateOf(baseModel.id) }
+    var displayName by remember(entry.id, baseModel.displayName, overrides.displayName) {
+        mutableStateOf(overrides.displayName ?: baseModel.displayName)
+    }
+    var maxOutputTokensText by remember(entry.id, overrides.maxOutputTokens) {
+        mutableStateOf(overrides.maxOutputTokens?.toString() ?: "")
+    }
+    var contextWindowText by remember(
+        entry.id,
+        baseModel.contextWindow,
+        baseModel.id,
+        overrides.contextWindow,
+    ) {
         mutableStateOf(
             (overrides.contextWindow ?: baseModel.contextWindow?.takeIf { it > 0 })
                 ?.toString()
@@ -82,11 +110,11 @@ fun ModelEntryDetailScreen(
                 ?: inferContextWindowTokens(baseModel).toString()
         )
     }
-    var thinkingEnabled by remember {
+    var thinkingEnabled by remember(entry.id, baseModel.supportsReasoning, overrides.supportsReasoning) {
         mutableStateOf(overrides.supportsReasoning ?: baseModel.supportsReasoning ?: false)
     }
-    var isHidden by remember { mutableStateOf(entry.isHidden) }
-    var showQuickTest by remember { mutableStateOf(false) }
+    var isHidden by remember(entry.id, entry.isHidden) { mutableStateOf(entry.isHidden) }
+    var showQuickTest by remember(entry.id) { mutableStateOf(false) }
 
     // Modality state — derive from override-or-base so the toggles reflect
     // what the model actually supports today, then let the user flip from
@@ -96,16 +124,23 @@ fun ModelEntryDetailScreen(
     // Defensive normalization: pre-T213 SharedPreferences may hold suffixed strings
     // (`image_input`) saved before the parse-boundary fix, which would silently fail
     // the bare-name `"image" in effectiveInput` checks below.
-    val effectiveInput = (overrides.inputModalities ?: baseModel.inputModalities ?: emptyList())
+    // [dv22/B-03] Capability base = models.dev enrichment under the RAW base,
+    // WITHOUT the user's overrides (the derivation below applies those first, and
+    // so does the save-time diff). Only the modality fields are taken from the
+    // enriched model: displayName / supportsReasoning / contextWindow must keep
+    // comparing against the base the entry actually inherits, otherwise a no-op
+    // save would materialize a registry value as a user override.
+    val capabilityBase = enrichCapabilityBase(baseModel)
+    val effectiveInput = (overrides.inputModalities ?: capabilityBase.inputModalities ?: emptyList())
         .map { it.normalizeModalityName() }
-    val effectiveOutput = (overrides.outputModalities ?: baseModel.outputModalities ?: emptyList())
+    val effectiveOutput = (overrides.outputModalities ?: capabilityBase.outputModalities ?: emptyList())
         .map { it.normalizeModalityName() }
-    var imageInput by remember { mutableStateOf("image" in effectiveInput) }
-    var pdfInput by remember { mutableStateOf("pdf" in effectiveInput) }
-    var audioInput by remember { mutableStateOf("audio" in effectiveInput) }
-    var videoInput by remember { mutableStateOf("video" in effectiveInput) }
-    var imageOutput by remember { mutableStateOf("image" in effectiveOutput) }
-    var audioOutput by remember { mutableStateOf("audio" in effectiveOutput) }
+    var imageInput by remember(entry.id, effectiveInput) { mutableStateOf("image" in effectiveInput) }
+    var pdfInput by remember(entry.id, effectiveInput) { mutableStateOf("pdf" in effectiveInput) }
+    var audioInput by remember(entry.id, effectiveInput) { mutableStateOf("audio" in effectiveInput) }
+    var videoInput by remember(entry.id, effectiveInput) { mutableStateOf("video" in effectiveInput) }
+    var imageOutput by remember(entry.id, effectiveOutput) { mutableStateOf("image" in effectiveOutput) }
+    var audioOutput by remember(entry.id, effectiveOutput) { mutableStateOf("audio" in effectiveOutput) }
 
     SettingsScaffold(
         title = stringResource(R.string.model_entry_model_detail),
@@ -129,38 +164,64 @@ fun ModelEntryDetailScreen(
         actions = {
             MinisButton(
                 onClick = {
-                    val baseInputs = baseModel.inputModalities ?: emptyList()
-                    val baseOutputs = baseModel.outputModalities ?: emptyList()
-                    val newInputs = buildList {
-                        if (imageInput) add("image")
-                        if (pdfInput) add("pdf")
-                        if (audioInput) add("audio")
-                        if (videoInput) add("video")
-                    }
-                    val newOutputs = buildList {
-                        if (imageOutput) add("image")
-                        if (audioOutput) add("audio")
-                    }
-                    val newOverrides = ModelOverrides(
-                        displayName = displayName.trim().takeIf { it.isNotEmpty() && it != baseModel.displayName },
-                        maxOutputTokens = maxOutputTokensText.trim().toIntOrNull()?.takeIf { it > 0 },
-                        contextWindow = contextWindowText.trim().toIntOrNull()?.takeIf { it > 0 },
-                        // supportsReasoning: persist only when user diverged from base.
-                        supportsReasoning = thinkingEnabled.takeIf { it != (baseModel.supportsReasoning ?: false) },
-                        // Modality lists: persist only when user-edited set differs
-                        // from baseModel's set; otherwise leave null so the entry
-                        // tracks future provider updates to the base modalities.
-                        inputModalities = if (newInputs.toSet() != baseInputs.toSet()) newInputs else null,
-                        outputModalities = if (newOutputs.toSet() != baseOutputs.toSet()) newOutputs else null,
+                    // [da1023-B] Derivation lives in ModelEntryOverrideBuilder.kt
+                    // (pure, JVM-tested). The inline version had four defects:
+                    // switches alone rebuilt the lists so "text" was dropped
+                    // (and output "video"), the diff comparison ran against the
+                    // RAW base list while the switches were normalized (suffixed
+                    // bases forced a write on a no-op save), and the positional
+                    // `ModelOverrides(...)` constructor lost maxThinkingLevel —
+                    // `previous.copy(...)` keeps every field this screen does
+                    // not own.
+                    val newOverrides = buildModelEntryOverrides(
+                        // Same capability base the switches were seeded from, so
+                        // "user touched nothing" stays a no-op instead of writing
+                        // a modality override that freezes today's registry value.
+                        baseModel = capabilityBase,
+                        previous = overrides,
+                        displayName = displayName,
+                        maxOutputTokensText = maxOutputTokensText,
+                        contextWindowText = contextWindowText,
+                        thinkingEnabled = thinkingEnabled,
+                        imageInput = imageInput,
+                        pdfInput = pdfInput,
+                        audioInput = audioInput,
+                        videoInput = videoInput,
+                        imageOutput = imageOutput,
+                        audioOutput = audioOutput,
                     )
                     val updated = if (entry.isCustom) {
-                        entry.copy(baseModel = baseModel.copy(id = modelId), overrides = newOverrides, isHidden = isHidden)
+                        // [da1022-E] trim before persisting; the composite
+                        // entry key is minted from this id, so a whitespace
+                        // edge would mint a dangling key. Blank input is
+                        // blocked by the Save button's enabled gate below.
+                        entry.copy(baseModel = baseModel.copy(id = modelId.trim()), overrides = newOverrides, isHidden = isHidden)
                     } else {
                         entry.copy(overrides = newOverrides, isHidden = isHidden)
                     }
-                    providerRepository.updateEntry(updated)
-                    onBack()
+                    val persistedId = providerRepository.updateEntry(updated)
+                    // [meta-audit-1028 E5 / B06 F-07] `null` covers two
+                    // different refusals; they need different responses.
+                    val stillThere = providerRepository.config.value.modelEntries
+                        .any { it.id == entry.id && it.providerInstanceId == instanceId }
+                    when (classifyUpdateResult(persistedId, stillThere)) {
+                        EntrySaveOutcome.SAVED -> onBack()
+                        EntrySaveOutcome.ID_TAKEN -> {
+                            // Keep the editor open with the in-flight edits
+                            // intact and name the reason — popping here is
+                            // exactly what made the loss silent.
+                            saveError = context.getString(
+                                R.string.modeldetail_error_model_id_exists,
+                                modelId.trim(),
+                            )
+                        }
+                        EntrySaveOutcome.ENTRY_GONE -> onBack()
+                    }
                 },
+                // [da1022-E] fail-closed: block saving a blank/whitespace
+                // model id (same gate as AddCustomModelScreen's
+                // enabled = modelId.isNotBlank()).
+                enabled = !entry.isCustom || modelId.isNotBlank(),
                 modifier = Modifier.padding(end = 8.dp),
             ) { Text(stringResource(R.string.common_save)) }
         },
@@ -175,7 +236,14 @@ fun ModelEntryDetailScreen(
                 RowLabel(text = stringResource(R.string.add_custom_model_model_id))
                 SectionTextField(
                     value = modelId,
-                    onValueChange = { if (entry.isCustom) modelId = it },
+                    // Typing is the user acting on the refusal, so clear it
+                    // here; the next Save re-evaluates against fresh state.
+                    onValueChange = {
+                        if (entry.isCustom) {
+                            modelId = it
+                            saveError = null
+                        }
+                    },
                     singleLine = true,
                     readOnly = !entry.isCustom,
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
@@ -193,6 +261,19 @@ fun ModelEntryDetailScreen(
                 value = instance?.label ?: instanceId,
                 showDivider = false,
             )
+            // [meta-audit-1028 E5 / B06 F-07] Refusal is surfaced in the
+            // section that owns the field which caused it (the Model ID), not
+            // as a toast: the user must still be looking at what to change.
+            // (Local capture: a `by`-delegated property cannot smart-cast.)
+            saveError?.let { message ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 32.dp),
+                )
+            }
         }
 
         // ── Capabilities ────────────────────────────────────────────────
@@ -342,4 +423,20 @@ fun ModelEntryDetailScreen(
             onDismiss = { showQuickTest = false },
         )
     }
+}
+
+/**
+ * [dv22/B-03] The raw base model with only its modality fields replaced by the
+ * models.dev-registry values. Every other field is left untouched on purpose:
+ * the entry-edit screen compares displayName / supportsReasoning / contextWindow
+ * against what the entry inherits, and enrichment must not turn "unchanged" into
+ * a written override there.
+ */
+private fun enrichCapabilityBase(baseModel: LLMModel): LLMModel {
+    val enriched = ModelsDevApi.enrichModel(baseModel)
+    if (enriched === baseModel) return baseModel
+    return baseModel.copy(
+        inputModalities = enriched.inputModalities ?: baseModel.inputModalities,
+        outputModalities = enriched.outputModalities ?: baseModel.outputModalities,
+    )
 }

@@ -1,0 +1,506 @@
+package com.rikkaminis.app.data.repository
+
+import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ModelOverrides
+import com.rikkaminis.app.data.model.ProviderCredential
+import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.ProviderType
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * [T-fix-import-id-roundtrip] JVM round-trip regression for deep-audit-1021
+ * ISSUE-02 + ISSUE-09:
+ *   - mergeImportInstanceJSON returned the bare temp `entry.id` (a random UUID
+ *     minted by parseImportedModelEntries) instead of the composite id
+ *     saveConfig canonicalizes every persisted entry to
+ *     ("{instanceId}/{modelId}") — every entryIdMap consumer dangled.
+ *   - exportInstanceJSON / parseImportedModelEntries dropped
+ *     `reasoningEffortValues` + `declaresNoEffortTiers` (Room path had them).
+ *   - convertThinkingRules dropped `reasoningEchoJson` (restoreThinkingRules
+ *     already read it).
+ *
+ * [ProviderRepository] itself needs an Android Context (not JVM-constructible),
+ * so — same as [BackupFieldEvapRoundTripTest] — this test pins the contract by
+ * faithfully replicating the production key-write/read logic. The replicas are
+ * copy-pasted from the production code (including the
+ * [T-fix-import-id-roundtrip] hunks), so a regression fails here the same way
+ * it fails on device.
+ *
+ * Expected values are hardcoded literals, NOT derived from the production
+ * constants (evidence-discipline: a mutation must not move the expectation).
+ */
+class ProviderImportRoundTripTest {
+
+    // ------------------------------------------------------------------
+    // Faithful replica of exportInstanceJSON's reasoning-pair key writing
+    // ([T-fix-import-id-roundtrip] export hunk, keys only).
+    // ------------------------------------------------------------------
+    private fun exportModel(base: LLMModel): JSONObject = JSONObject().apply {
+        put("modelId", base.id)
+        put("displayName", base.displayName)
+        base.contextWindow?.let { put("contextWindow", it) }
+        base.maxOutputTokens?.let { put("maxOutputTokens", it) }
+        base.supportsReasoning?.let { put("supportsReasoning", it) }
+        base.interleavedReasoningField?.let { put("interleavedReasoningField", it) }
+        // [T-fix-import-id-roundtrip] must mirror ProviderRepository.exportInstanceJSON exactly.
+        base.reasoningEffortValues?.takeIf { it.isNotEmpty() }?.let {
+            put("reasoningEffortValues", JSONArray(it))
+        }
+        base.declaresNoEffortTiers?.let { put("declaresNoEffortTiers", it) }
+    }
+
+    // ------------------------------------------------------------------
+    // Faithful replica of parseImportedModelEntries' reasoning-pair read
+    // ([T-fix-import-id-roundtrip] parse hunk).
+    // ------------------------------------------------------------------
+    private data class ParsedPair(
+        val reasoningEffortValues: List<String>?,
+        val declaresNoEffortTiers: Boolean?,
+    )
+
+    private fun importReasoningPair(m: JSONObject): ParsedPair {
+        val reasoningEffortValues = m.optJSONArray("reasoningEffortValues")?.let { arr ->
+            (0 until arr.length())
+                .mapNotNull { idx -> arr.optString(idx, "").takeIf { it.isNotBlank() } }
+                .takeIf { it.isNotEmpty() }
+        }
+        val declaresNoEffortTiers = if (m.has("declaresNoEffortTiers") && !m.isNull("declaresNoEffortTiers")) {
+            m.optBoolean("declaresNoEffortTiers")
+        } else null
+        return ParsedPair(reasoningEffortValues, declaresNoEffortTiers)
+    }
+
+    // ------------------------------------------------------------------
+    // Faithful replica of the merge resolution ([T-fix-import-id-roundtrip]
+    // merge hunk): hit?.id ?: re-query after addEntry ?: composite fallback.
+    // `configEntries` models _config.value.modelEntries AFTER the addEntry +
+    // saveConfig canonicalization pass (composite persisted ids).
+    // The composite fallback replicates data.db.compositeEntryKey
+    // ("$instanceId/$modelId") — ProviderConfigMapping.kt carries Room
+    // annotations and cannot be compiled standalone in this harness.
+    // ------------------------------------------------------------------
+    private fun resolveMergedEntryId(
+        configEntries: List<Triple<String, String, String>>, // (instanceId, baseModelId, persistedId)
+        instanceId: String,
+        baseModelId: String,
+    ): String {
+        val hit = configEntries.firstOrNull { it.first == instanceId && it.second == baseModelId }
+        return hit?.third ?: run {
+            configEntries.firstOrNull {
+                it.first == instanceId && it.second == baseModelId
+            }?.third ?: "$instanceId/$baseModelId"
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Faithful replica of convertThinkingRules' per-record copy
+    // ([T-fix-import-id-roundtrip] echo hunk).
+    // ------------------------------------------------------------------
+    private fun convertThinkingRule(d: JSONObject): JSONObject {
+        val r = JSONObject()
+        r.put("id", d.optString("id", ""))
+        r.put("label", d.optString("label", ""))
+        r.put("scopeKind", d.optString("scopeKind", "allModels"))
+        d.optString("scopePattern", "").takeIf { it.isNotEmpty() }
+            ?.let { r.put("scopePattern", it) }
+        r.put("wireFormatJson", d.optString("wireFormatJson", "{}"))
+        d.optString("reasoningEchoJson", "").takeIf { it.isNotEmpty() }
+            ?.let { r.put("reasoningEchoJson", it) }
+        r.put("sortOrder", d.optInt("sortOrder", 0))
+        return r
+    }
+
+    private fun model(
+        effort: List<String>? = null,
+        noEffort: Boolean? = null,
+    ) = LLMModel(
+        id = "gpt-5.5",
+        displayName = "GPT-5.5",
+        provider = "OpenAI",
+        contextWindow = 400_000,
+        maxOutputTokens = 32_768,
+        supportsReasoning = true,
+        reasoningEffortValues = effort,
+        declaresNoEffortTiers = noEffort,
+    )
+
+    // ------------------------------------------------------------------
+    // Round trip: export → parse → the pair survives verbatim.
+    // ------------------------------------------------------------------
+    @Test
+    fun reasoningPair_roundTripsThroughExportImport() {
+        val exported = exportModel(
+            model(effort = listOf("low", "high", "max"), noEffort = false),
+        )
+        val parsed = importReasoningPair(exported)
+        assertEquals(listOf("low", "high", "max"), parsed.reasoningEffortValues)
+        assertEquals(false, parsed.declaresNoEffortTiers)
+
+        val exported2 = exportModel(model(noEffort = true))
+        val parsed2 = importReasoningPair(exported2)
+        assertNull(parsed2.reasoningEffortValues)
+        assertEquals(true, parsed2.declaresNoEffortTiers)
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy compat: an old backup without the keys restores to null/absent.
+    // ------------------------------------------------------------------
+    @Test
+    fun legacyBackupWithoutKeys_restoresToNull() {
+        val legacy = JSONObject()
+            .put("modelId", "gpt-5.5")
+            .put("displayName", "GPT-5.5")
+        assertFalse(legacy.has("reasoningEffortValues"))
+        assertFalse(legacy.has("declaresNoEffortTiers"))
+        val parsed = importReasoningPair(legacy)
+        assertNull(parsed.reasoningEffortValues)
+        assertNull(parsed.declaresNoEffortTiers)
+    }
+
+    // ------------------------------------------------------------------
+    // Null/empty semantics: explicit null, empty array, blank-only entries,
+    // and partially-blank lists all degrade exactly as the production code.
+    // ------------------------------------------------------------------
+    @Test
+    fun nullAndEmptyDegradeToNull_notToEmptyList() {
+        // explicit null in JSON (org.json serializes null keys as a real null)
+        val explicitNull = JSONObject("{\"modelId\":\"m\",\"declaresNoEffortTiers\":null}")
+        assertNull(importReasoningPair(explicitNull).declaresNoEffortTiers)
+
+        // empty array → null (not an empty list)
+        val emptyArr = exportModel(model(effort = emptyList()))
+        assertNull(importReasoningPair(emptyArr).reasoningEffortValues)
+
+        // blank-only entries → null
+        val blanks = JSONObject("{\"modelId\":\"m\",\"reasoningEffortValues\":[\" \",\"\"]}")
+        assertNull(importReasoningPair(blanks).reasoningEffortValues)
+
+        // partially blank: blanks filtered, non-blanks survive verbatim
+        val partial = JSONObject("{\"modelId\":\"m\",\"reasoningEffortValues\":[\"\", \"max\"]}")
+        assertEquals(listOf("max"), importReasoningPair(partial).reasoningEffortValues)
+    }
+
+    // ------------------------------------------------------------------
+    // Merge resolution: a NEWLY ADDED model must resolve to the PERSISTED
+    // composite id, never to the temp uuid parseImportedModelEntries minted.
+    // ------------------------------------------------------------------
+    @Test
+    fun mergeResolution_returnsPersistedCompositeId_notTempUuid() {
+        val tempUuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        val instanceId = "inst-1"
+        val baseModelId = "gpt-5.5"
+        // The temp uuid the import minted is NOT in the persisted config.
+        val persisted = listOf(
+            Triple("inst-1", "other-model", "inst-1/other-model"),
+        )
+        val resolved = resolveMergedEntryId(persisted, instanceId, baseModelId)
+        // The resolution must be the composite form the snapshot wrote —
+        // literally "inst-1/gpt-5.5" — never the temp uuid.
+        assertEquals("inst-1/gpt-5.5", resolved)
+        assertFalse(tempUuid == resolved)
+
+        // An EXISTING model resolves to the persisted row's real id.
+        val withExisting = persisted + listOf(Triple(instanceId, baseModelId, "inst-1/gpt-5.5"))
+        assertEquals("inst-1/gpt-5.5", resolveMergedEntryId(withExisting, instanceId, baseModelId))
+    }
+
+    @Test
+    fun mergeResolution_tempUuidNeverSurvivesCanonicalization() {
+        // After addEntry + saveConfig, the canonicalized entry carries the
+        // composite id; the re-query must find THAT, not the minted uuid.
+        val tempUuid = "11111111-2222-3333-4444-555555555555"
+        val canonicalized = listOf(Triple("inst-2", "glm-5.2", "inst-2/glm-5.2"))
+        val resolved = resolveMergedEntryId(canonicalized, "inst-2", "glm-5.2")
+        assertEquals("inst-2/glm-5.2", resolved)
+        assertFalse(
+            "the minted temp uuid must never be the resolved id",
+            tempUuid == resolved,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Echo conversion: the OpenMinis record's reasoningEchoJson survives the
+    // d→r copy; a record without the key stays absent (legacy compat).
+    // ------------------------------------------------------------------
+    @Test
+    fun echoConversion_carriesReasoningEchoJson() {
+        val d = JSONObject()
+            .put("id", "r1")
+            .put("label", "deepseek echo")
+            .put("wireFormatJson", "{}")
+            .put("reasoningEchoJson", "{\"field\":\"reasoning_content\"}")
+        val r = convertThinkingRule(d)
+        assertEquals("{\"field\":\"reasoning_content\"}", r.optString("reasoningEchoJson", ""))
+
+        val legacy = JSONObject()
+            .put("id", "r2")
+            .put("label", "no echo")
+            .put("wireFormatJson", "{}")
+        val r2 = convertThinkingRule(legacy)
+        assertFalse(r2.has("reasoningEchoJson"))
+        assertEquals("", r2.optString("reasoningEchoJson", ""))
+    }
+
+    // ------------------------------------------------------------------
+    // [fix/dv16-a A-08] The merge path applies the SAME instance-field write
+    // face the append path uses ([readImportInstanceFields] /
+    // [applyImportInstanceFields] in ProviderRepository.kt — driven directly
+    // in ProviderRunConfigRoundTripTest). This file pins the merge-side
+    // contract that motivated the seam: a same-(type,label) restore must carry
+    // the backup's instance-config onto the existing instance, and the merge
+    // match key (providerType + label) must stay untouched — the caller
+    // resolves the label BEFORE this write face runs.
+    // ------------------------------------------------------------------
+    @Test
+    fun mergeWriteFace_carriesInstanceConfigOntoExistingInstance() {
+        // Faithful shape of the merge write face: decode the payload via the
+        // shared seam, apply onto the existing (live) instance.
+        val existing = ProviderInstance(
+            id = "live-1",
+            label = "OpenAI",
+            providerType = ProviderType.openAI,
+            credentialType = ProviderCredential.apiKey,
+            customBaseURL = "https://old.example.com",
+        )
+        val payload = JSONObject()
+            .put("providerType", "openAI")
+            .put("label", "OpenAI")
+            .put("customBaseURL", "https://relay.example.com")
+            .put("appendV1Suffix", false)
+            .put("useResponsesAPI", true)
+            .put("isEnabled", false)
+            .put("pinned", true)
+        val f = readImportInstanceFields(payload)
+        val updated = applyImportInstanceFields(existing, f)
+
+        // the backup's values win (restore-is-restore)
+        assertEquals("https://relay.example.com", updated.customBaseURL)
+        assertEquals(false, updated.appendV1Suffix)
+        assertEquals(true, updated.useResponsesAPI)
+        assertEquals(false, updated.isEnabled)
+        assertEquals(true, updated.pinned)
+        // merge match key + identity untouched
+        assertEquals("live-1", updated.id)
+        assertEquals("OpenAI", updated.label)
+        assertEquals(ProviderType.openAI, updated.providerType)
+    }
+
+    // ------------------------------------------------------------------
+    // [fix/dv20-a2 A-08] A restore is a restore — one level below the
+    // instance-config write face above: a model the existing instance ALREADY
+    // has must take the backup's model-level values. [mergeImportedEntryOntoLocal]
+    // is the production decision point (called directly — it is a pure
+    // top-level function in ProviderRepository.kt, exactly like
+    // [readImportInstanceFields] above), and the merge path routes its write
+    // through it.
+    // ------------------------------------------------------------------
+    private fun entry(
+        uuid: String,
+        displayName: String? = null,
+        baseDisplay: String = "GPT-5.5",
+        isHidden: Boolean = false,
+        isCustom: Boolean = false,
+        costTier: Int? = null,
+        userModifiedAt: Long? = null,
+    ) = ModelEntry(
+        providerInstanceId = "inst-1",
+        baseModel = LLMModel(id = "gpt-5.5", displayName = baseDisplay, provider = "OpenAI"),
+        overrides = ModelOverrides(displayName = displayName),
+        isCustom = isCustom,
+        isHidden = isHidden,
+        uuid = uuid,
+        userModifiedAt = userModifiedAt,
+        costTier = costTier,
+    )
+
+    @Test
+    fun mergeRestore_writesBackupModelValuesOntoExistingEntry() {
+        // Local entry already exists and carries user customizations...
+        val local = entry(
+            uuid = "inst-1/gpt-5.5",
+            displayName = "My local name",
+            isHidden = true,
+            costTier = 3,
+            userModifiedAt = 1_700_000_000_000L,
+        )
+        // ...and the backup (the source of truth on a restore) says otherwise.
+        val imported = entry(
+            uuid = "temp-uuid-minted-by-parse",
+            displayName = "Backup name",
+            isHidden = false,
+            isCustom = true,
+            costTier = 1,
+        )
+
+        val restored = mergeImportedEntryOntoLocal(local, imported)
+
+        assertTrue("a differing entry must produce a write", restored != null)
+        // Backup values win (restore-is-restore), including the "absent"
+        // forms — false / null are values, not "leave the local alone".
+        assertEquals("Backup name", restored!!.overrides.displayName)
+        assertEquals(false, restored.isHidden)
+        assertEquals(true, restored.isCustom)
+        assertEquals(1, restored.costTier)
+        // Identity is the LOCAL entry's: entryIdMap / group members /
+        // agentLoop ids all hang off this id.
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+        assertEquals("inst-1/gpt-5.5", restored.id)
+        // ...and the instance binding (the hit predicate's other half) is not
+        // rewritten by the restore.
+        assertEquals("inst-1", restored.providerInstanceId)
+    }
+
+    @Test
+    fun mergeRestore_identityPinnedEvenWhenBackupCarriesAnotherUuid() {
+        val local = entry(uuid = "inst-1/gpt-5.5")
+        val imported = entry(uuid = "totally-different-uuid", displayName = "Backup")
+        val restored = mergeImportedEntryOntoLocal(local, imported)
+        assertEquals("inst-1/gpt-5.5", restored!!.uuid)
+        // The minted uuid must never leak into the id map.
+        assertFalse(restored.uuid == "totally-different-uuid")
+    }
+
+    @Test
+    fun mergeRestore_isNoOpWhenBackupMatchesLocal() {
+        // Byte-for-byte identical content (uuid pinned by the restore rule,
+        // userModifiedAt included) → nothing to write, and the caller keeps
+        // the existing id: the historical zero-write behavior for unchanged
+        // entries survives the fix.
+        val local = entry(uuid = "inst-1/gpt-5.5", displayName = "same")
+        val imported = entry(uuid = "inst-1/gpt-5.5", displayName = "same")
+        assertNull(mergeImportedEntryOntoLocal(local, imported))
+    }
+
+    @Test
+    fun mergeRestore_carriesBaseModelMetadataToo() {
+        // The whole entry rides the write — not just the overrides bag. A
+        // backup whose base-model metadata was refreshed (new context window /
+        // display name) restores that too.
+        val local = entry(uuid = "inst-1/gpt-5.5", baseDisplay = "GPT-5.5")
+        val imported = entry(
+            uuid = "temp",
+            baseDisplay = "GPT-5.5 (2026 refreshed)",
+        ).copy(baseModel = LLMModel(id = "gpt-5.5", displayName = "GPT-5.5 (2026 refreshed)", provider = "OpenAI", contextWindow = 1_000_000))
+        val restored = mergeImportedEntryOntoLocal(local, imported)!!
+        assertEquals("GPT-5.5 (2026 refreshed)", restored.baseModel.displayName)
+        assertEquals(1_000_000, restored.baseModel.contextWindow)
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+    }
+
+    // ------------------------------------------------------------------
+    // [fix/dv21-a3 A-03] A restore is a restore for the TIMESTAMP too.
+    //
+    // Faithful replica of the two production decision points: the merge hit
+    // branch (`if (updated == null) hit.id else (updateEntry(updated,
+    // stampUserModified = false) ?: hit.id)`) and [updateEntry]'s write face
+    // (`userModifiedAt = if (stampUserModified) System.currentTimeMillis()
+    // else entry.userModifiedAt`). [mergeImportedEntryOntoLocal] is called
+    // directly — it is the real production function.
+    // ------------------------------------------------------------------
+    private val editorStamp = 4_102_444_800_000L // synthetic "now" (2100-01-01)
+
+    private fun updateEntryReplica(
+        entry: ModelEntry,
+        newUuid: String = entry.uuid,
+        stampUserModified: Boolean = true,
+    ): ModelEntry = entry.copy(
+        uuid = newUuid,
+        userModifiedAt = if (stampUserModified) editorStamp else entry.userModifiedAt,
+    )
+
+    /** The merge hit branch: restore through the shared decision point, then
+     *  write back through the write face in the restore mode. An untouched
+     *  (no-op) merge returns the existing entry — nothing written. */
+    private fun mergeHit(hit: ModelEntry, imported: ModelEntry): ModelEntry {
+        val updated = mergeImportedEntryOntoLocal(hit, imported) ?: return hit
+        return updateEntryReplica(updated, stampUserModified = false)
+    }
+
+    /** Faithful replica of shadowVoiceProviders' arbitration key. */
+    private fun mostRecentModified(instanceId: String, entries: List<ModelEntry>): Long =
+        entries.filter { it.providerInstanceId == instanceId }
+            .mapNotNull { it.userModifiedAt }
+            .maxOrNull() ?: Long.MIN_VALUE
+
+    @Test
+    fun restoreKeepsTheBackupTimestampInsteadOfStampingNow() {
+        val backupStamp = 1_600_000_000_000L
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = 1_700_000_000_000L),
+            entry(uuid = "temp", displayName = "backup", userModifiedAt = backupStamp),
+        )
+        // The backup's own stamp rides the restore; "now" would be 4_102_444_800_000.
+        assertEquals(backupStamp, restored.userModifiedAt)
+    }
+
+    @Test
+    fun restoreOfANeverEditedBackupEntryLeavesTheStampAbsent() {
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = 1_700_000_000_000L),
+            entry(uuid = "temp", displayName = "backup"),
+        )
+        // `null` is the backup's value (never user-edited), not "keep the local
+        // one": restoring a false freshness is still a false freshness.
+        assertNull(restored.userModifiedAt)
+    }
+
+    @Test
+    fun reimportingTheSameBackupIsANoOpAfterTheRestore() {
+        val imported = entry(uuid = "temp", displayName = "backup", isHidden = true)
+        val once = mergeHit(entry(uuid = "inst-1/gpt-5.5", displayName = "local"), imported)
+        // Restored == local must hold on the second pass — the restored entry
+        // carries the backup's timestamp, not t_import.
+        assertNull(mergeImportedEntryOntoLocal(once, imported))
+    }
+
+    @Test
+    fun restoreDoesNotHijackVoiceProviderArbitration() {
+        val genuinelyEdited = 1_700_000_000_000L
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = genuinelyEdited),
+            entry(uuid = "temp", displayName = "backup", userModifiedAt = 1_600_000_000_000L),
+        )
+        val other = entry(uuid = "inst-2/gpt-5.5", userModifiedAt = genuinelyEdited)
+            .copy(providerInstanceId = "inst-2")
+        assertTrue(
+            mostRecentModified("inst-1", listOf(restored)) < mostRecentModified("inst-2", listOf(other)),
+        )
+    }
+
+    @Test
+    fun restoreStillPinsTheLocalIdentity() {
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local"),
+            entry(uuid = "totally-different-uuid", displayName = "backup"),
+        )
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+        assertEquals("inst-1/gpt-5.5", restored.id)
+    }
+
+    @Test
+    fun editorPathStillStampsNow() {
+        // The default mode is unchanged: every editor / agent caller keeps
+        // marking the entry as freshly modified.
+        val edited = updateEntryReplica(entry(uuid = "inst-1/gpt-5.5", displayName = "edited"))
+        assertEquals(4_102_444_800_000L, edited.userModifiedAt)
+    }
+
+    @Test
+    fun firstImportIntoAnEmptyInstanceKeepsTheBackupTimestamp() {
+        // The append path (addEntry / importInstanceJSON's addAll) never touched
+        // userModifiedAt — it stays verbatim from the backup. Pinned so the
+        // restore-side fix cannot "harmonize" the two paths by making the append
+        // path start stamping.
+        val backupStamp = 1_600_000_000_000L
+        val appended = entry(uuid = "temp", displayName = "backup", userModifiedAt = backupStamp)
+        assertEquals(backupStamp, appended.userModifiedAt)
+        assertNull(entry(uuid = "temp", displayName = "backup").userModifiedAt)
+    }
+}

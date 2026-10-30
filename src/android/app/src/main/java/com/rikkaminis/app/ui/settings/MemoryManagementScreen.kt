@@ -3,10 +3,8 @@ package com.rikkaminis.app.ui.settings
 import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.MinisTextButton
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,17 +14,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.input.TextFieldState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -35,7 +28,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -45,12 +37,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.repository.MemoryRepository
@@ -61,8 +53,9 @@ import com.rikkaminis.app.ui.components.MemoryFileViewerContent
 import com.rikkaminis.app.ui.components.buildEditWindow
 import com.rikkaminis.app.ui.components.chunkText
 import com.rikkaminis.app.ui.components.spliceEditWindow
-import java.util.Date
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * [FIX-6 / F-224] Reserved file name that lives in the memory directory but is
@@ -129,8 +122,14 @@ fun MemoryManagementScreen(
         onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
 
+    val scope = rememberCoroutineScope()
+
+    // [deep-audit-1023 ISSUE-07] listAllFiles()/deleteFile() are plain blocking
+    // file IO (MemoryRepository has no suspend surface), and they used to run on
+    // the composition thread here — with 76+ daily logs this reads every file's
+    // first line inside the frame. Same rule now applies to the delete path below.
     LaunchedEffect(Unit) {
-        files = memoryRepository.listAllFiles()
+        files = withContext(Dispatchers.IO) { memoryRepository.listAllFiles() }
     }
 
     // top-level page: rely on system back gesture / bottom nav (no back arrow)
@@ -231,11 +230,25 @@ fun MemoryManagementScreen(
             text = { Text(stringResource(R.string.memory_delete_confirm_text)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    deleteFileName?.let {
-                        memoryRepository.deleteFile(it)
-                        files = memoryRepository.listAllFiles()
-                    }
+                    // [deep-audit-1023 ISSUE-07] Two defects in one block: the
+                    // confirm used to run blocking delete + full re-list on the
+                    // main thread, and — because `deleteFileName` was only
+                    // cleared after the IO finished — a second tap re-entered
+                    // the same delete. Clear the dialog state first, then do the
+                    // IO on Dispatchers.IO and publish the refreshed list back
+                    // on the composition thread (scope is tied to this screen,
+                    // so leaving the screen cancels the pending work).
+                    val name = deleteFileName
                     deleteFileName = null
+                    if (name != null) {
+                        scope.launch {
+                            val refreshed = withContext(Dispatchers.IO) {
+                                memoryRepository.deleteFile(name)
+                                memoryRepository.listAllFiles()
+                            }
+                            files = refreshed
+                        }
+                    }
                 }) {
                     Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error)
                 }
@@ -309,6 +322,23 @@ private fun MemoryFileRow(
             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             modifier = Modifier.size(20.dp),
         )
+        // [deep-audit-1023 ISSUE-07] `onDelete` was a parameter this row never
+        // consumed: the caller at MemoryFileRow(...) builds a real callback for
+        // every non-global, non-SOUL file and the screen has a full delete
+        // confirmation AlertDialog, but nothing rendered a handle for it — the
+        // daily-log delete feature was 100% unreachable. `null` still means
+        // "not deletable" (GLOBAL.md / SOUL.md), so the data-layer and UI-layer
+        // protections keep their exact shape: no button at all is rendered.
+        if (onDelete != null) {
+            IconButton(onClick = onDelete) {
+                Icon(
+                    Icons.Filled.Delete,
+                    contentDescription = stringResource(R.string.common_delete),
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
     }
 }
 
@@ -350,9 +380,26 @@ fun MemoryFileEditScreen(
     // fullBase is the file text captured at entry (source of truth for the
     // read-only viewer AND for splice-back); the editor state only holds the
     // chunk window built at Edit tap from the viewer's visible range, so text
-    // layout stays O(window) instead of O(file). readFile is non-suspend so
-    // it can run directly in remember; remember(fileName) reloads on switch.
-    var fullBase by remember(fileName) { mutableStateOf(memoryRepository.readFile(fileName)) }
+    // layout stays O(window) instead of O(file).
+    //
+    // [deep-audit-1029 ISSUE-03 裂口 A] The read used to run inside this
+    // `remember { }` — i.e. on the composition thread of the first frame, and
+    // this screen exists precisely for 200KB+ files. MemoryRepository has no
+    // suspend surface, so the blocking `readFile()` now rides a
+    // `withContext(Dispatchers.IO)` inside a `LaunchedEffect(fileName)` (which
+    // also re-reads on file switch, matching the old `remember(fileName)` key).
+    var fullBase by remember(fileName) { mutableStateOf("") }
+    // [deep-audit-1029 ISSUE-03] With the read now async, `fullBase` is "" for
+    // the first frame(s). Without a gate, a tap on Edit before the read lands
+    // would open the editor against the empty base and a Save would splice the
+    // user's keystrokes into "" and overwrite the real file. Deliberately a
+    // single flag (no state machine): it only disables the Edit action until
+    // the load completes; the viewer already renders "" harmlessly.
+    var isLoaded by remember(fileName) { mutableStateOf(false) }
+    LaunchedEffect(fileName) {
+        fullBase = withContext(Dispatchers.IO) { memoryRepository.readFile(fileName) }
+        isLoaded = true
+    }
     val chunks = remember(fullBase) { chunkText(fullBase) }
     val listState = remember(fileName) { LazyListState() }
     val state = remember(fileName) { TextFieldState() }
@@ -361,6 +408,11 @@ fun MemoryFileEditScreen(
     // [T-android-memory-file-jank] false = virtualized read-only viewer.
     var isEditing by remember(fileName) { mutableStateOf(false) }
     val context = LocalContext.current
+    // [deep-audit-1029 ISSUE-03] Save runs through this scope so the blocking
+    // saveFile() can be moved to Dispatchers.IO while the Toast / state writes
+    // stay on the composition (Main) dispatcher. Tied to the screen, so
+    // leaving cancels any in-flight write.
+    val scope = rememberCoroutineScope()
     // [T-memory-save-toast-feedback] Confirm Save actually committed by
     // flashing a toast — previously the Save tap silently closed nothing,
     // showed no state change, and the user had no signal that the edit
@@ -383,7 +435,10 @@ fun MemoryFileEditScreen(
                     // read-only mode we show the pencil; while editing we show
                     // Save (always visible — see the KDoc note above).
                     if (!isEditing) {
-                        IconButton(onClick = {
+                        // [deep-audit-1029 ISSUE-03] Gated on the async read:
+                        // the edit window is built from `fullBase`/`chunks`, so
+                        // entering before the load would edit an empty base.
+                        IconButton(enabled = isLoaded, onClick = {
                             // [fix-memory-editor-windowed-edit] Window = the
                             // chunks the user was looking at ± margin
                             // (clamped inside buildEditWindow). The editor
@@ -410,28 +465,52 @@ fun MemoryFileEditScreen(
                         // [T-global-memory-save-always-visible] Always render Save —
                         // no hasChanges gate (see KDoc above).
                         MinisTextButton(onClick = {
-                            try {
-                                // [fix-memory-editor-windowed-edit] Splice the
-                                // edited window back into the full file
-                                // (byte-exact, offsets captured at edit
-                                // entry), then refresh the viewer's source.
-                                val newText = state.text.toString()
-                                val full = editWindow
-                                    ?.let {
-                                        spliceEditWindow(fullBase, it.startOffset, it.endOffset, newText)
+                            // [deep-audit-1029 ISSUE-03 裂口 A] saveFile() is
+                            // blocking file IO on a screen built for 200KB+
+                            // files; it used to run on the click thread. The
+                            // splice + write now ride Dispatchers.IO, while the
+                            // Toast / state writes stay on the composition
+                            // thread (scope is Main-dispatched) so the visible
+                            // sequence is unchanged.
+                            //
+                            // [deep-audit-1029 ISSUE-03 裂口 B] A SOUL.md write
+                            // through this raw saveFile() bypasses
+                            // SoulStore.save(), so refresh the cache here —
+                            // exactly like the twin chat memory sheet does —
+                            // otherwise cachedMetadata / writeVersion stay on
+                            // the pre-edit values for the chat header and the
+                            // Settings → Soul editors.
+                            val newText = state.text.toString()
+                            val window = editWindow
+                            val base = fullBase
+                            scope.launch {
+                                try {
+                                    // [fix-memory-editor-windowed-edit] Splice
+                                    // the edited window back into the full file
+                                    // (byte-exact, offsets captured at edit
+                                    // entry), then refresh the viewer's source.
+                                    val full = window
+                                        ?.let {
+                                            spliceEditWindow(base, it.startOffset, it.endOffset, newText)
+                                        }
+                                        ?: newText
+                                    withContext(Dispatchers.IO) {
+                                        memoryRepository.saveFile(fileName, full)
+                                        if (fileName == SOUL_FILE_NAME) {
+                                            com.rikkaminis.app.agent.SoulStore.refreshCache(context)
+                                        }
                                     }
-                                    ?: newText
-                                memoryRepository.saveFile(fileName, full)
-                                fullBase = full
-                                saveError = null
-                                android.widget.Toast.makeText(
-                                    context,
-                                    savedToastText,
-                                    android.widget.Toast.LENGTH_SHORT,
-                                ).show()
-                                isEditing = false
-                            } catch (e: Exception) {
-                                saveError = e.message
+                                    fullBase = full
+                                    saveError = null
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        savedToastText,
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                    isEditing = false
+                                } catch (e: Exception) {
+                                    saveError = e.message
+                                }
                             }
                         }) {
                             Text(stringResource(R.string.common_save))

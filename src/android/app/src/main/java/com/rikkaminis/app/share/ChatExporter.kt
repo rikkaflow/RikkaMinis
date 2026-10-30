@@ -1,7 +1,6 @@
 package com.rikkaminis.app.share
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.data.db.ChatSessionEntity
@@ -108,6 +107,10 @@ object ChatExporter {
 
             // Build zip under shared/ so FileProvider can hand it out.
             val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
+            // [da1024-G] Nothing else ever deletes cacheDir/shared/: the zip
+            // carries a full transcript, so prune entries older than the same
+            // 24h TTL cache/share/ uses before staging the new one.
+            com.rikkaminis.app.ui.components.pruneShareDir(sharedDir)
             val safeTitle = (session.title ?: "conversation")
                 .replace(Regex("[^A-Za-z0-9_-]+"), "_")
                 .take(64)
@@ -294,19 +297,14 @@ object ChatExporter {
         partsJson
     }
 
-    /** Best-effort `(images, videos)` count by walking parts_json. */
+    /**
+     * Best-effort `(images, videos)` count by walking parts_json.
+     *
+     * The counting itself lives in [countPartsAttachments] — Android-free, so
+     * a plain JVM test can pin the classification.
+     */
     private fun countAttachments(partsJson: String): Pair<Int, Int> = try {
-        val arr = JSONArray(partsJson)
-        var img = 0
-        var vid = 0
-        for (i in 0 until arr.length()) {
-            val obj = arr.optJSONObject(i) ?: continue
-            when (obj.optString("type")) {
-                "image", "image_url" -> img += 1
-                "video", "video_url" -> vid += 1
-            }
-        }
-        img to vid
+        countPartsAttachments(JSONArray(partsJson))
     } catch (_: Throwable) {
         0 to 0
     }

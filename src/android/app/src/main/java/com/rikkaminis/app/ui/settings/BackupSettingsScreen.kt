@@ -23,11 +23,11 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Upload
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -68,7 +68,10 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -143,13 +146,24 @@ fun BackupSettingsScreen(
     // reported via a system notification if the screen is gone by then.
     val application = remember { context.applicationContext as MinisApp }
     val notifier = remember { application.backgroundTaskNotifier }
-    var webDavConfig by remember { mutableStateOf(webDavStore.load()) }
+    // [deep-audit-1033 I08] Starts null: `webDavStore.load()` opens
+    // EncryptedSharedPreferences (Keystore unwrap) and must not run on the
+    // composition (Main) thread. The LaunchedEffect below fills it.
+    var webDavConfig by remember { mutableStateOf<WebDavConfig?>(null) }
     // [T-auto-backup-assets] Persist a restored WebDAV server config and
     // refresh Compose state. Declared AFTER webDavConfig so the lambda can
     // reference it (local-variable ordering).
+    // [deep-audit-1033 I08] The save is a blocking EncryptedSharedPreferences
+    // commit() and this callback runs inside the config-import path
+    // (ConfigBackup.import), which may outlive this screen — so it runs on the
+    // app-scoped scope (a screen scope cancelled by navigation would silently
+    // drop a restored server config) and hops back to Main for the Compose
+    // state write, which used to happen on the caller's thread.
     val applyWebDavConfig: (WebDavConfig) -> Unit = { cfg ->
-        runCatching { webDavStore.save(cfg) }
-        webDavConfig = cfg
+        application.applicationScope.launch {
+            withContext(Dispatchers.IO) { runCatching { webDavStore.save(cfg) } }
+            withContext(Dispatchers.Main) { webDavConfig = cfg }
+        }
     }
     var showWebDavConfig by remember { mutableStateOf(false) }
     var showRemoteList by remember { mutableStateOf(false) }
@@ -175,18 +189,35 @@ fun BackupSettingsScreen(
     // — see AutoBackupManager class doc. Local auto copies restore through
     // the same snapshotRestoreTarget dialog + restoreWithSnapshot path as
     // pre-restore snapshots (both are full JSON payloads with rollback).
-    var autoBackupEnabled by remember {
-        mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.isEnabled(context))
-    }
+    // [deep-audit-1033 I08] Both of these read SharedPreferences, which parses
+    // the XML file on first access — off the composition thread, filled by the
+    // entry LaunchedEffect below (same shape as the two list loads).
+    var autoBackupEnabled by remember { mutableStateOf(false) }
     var autoBackupRunning by remember { mutableStateOf(false) }
-    var autoBackupFiles by remember { mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)) }
+    // [fix/da1023-backup-streaming-fetch] `listLocal` lists filesDir — it must
+    // not run inside `remember` on the composition (Main) thread. Start empty
+    // and load on IO, same shape as the snapshot list below.
+    var autoBackupFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     // [fix-autobackup-keep-3] Local auto-backup copies collapse by default —
     // same treatment as the pre-restore snapshot list: they are a rollback
     // utility, not a primary surface. Tap the toggle row to expand the list.
     var autoBackupsExpanded by remember { mutableStateOf(false) }
-    var autoBackupLastRun by remember {
-        mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context))
-    }
+    var autoBackupLastRun by remember { mutableStateOf<String?>(null) }
+    // [feat/auto-backup-external-mirror] External mirror state. Same IO
+    // rule as the row above: both values read SharedPreferences, so they
+    // start at the defaults and are filled by the entry LaunchedEffect.
+    var mirrorEnabled by remember { mutableStateOf(false) }
+    var mirrorRunning by remember { mutableStateOf(false) }
+    var mirrorLastSync by remember { mutableStateOf<String?>(null) }
+    // §5 of the behaviour spec: the operator's liveness signal is freshness
+    // PLUS the pending count. A stale timestamp alone cannot distinguish
+    // "nothing changed" from "the trigger stopped firing".
+    var mirrorPending by remember { mutableStateOf<Int?>(null) }
+    // [silent-mirror] Raw inputs for the status row's verdict. The formatted
+    // label cannot drive MirrorPlan.classifyHealth — it needs the epoch and the
+    // last recorded outcome text (kind + diagnostic reason).
+    var mirrorLastMs by remember { mutableStateOf(0L) }
+    var mirrorOutcomeRaw by remember { mutableStateOf<String?>(null) }
     // [T-auto-backup-remote-dir] Remote automatic-backup management state:
     // the WebDAV `auto/` subdirectory listing (plus legacy root stragglers),
     // managed from a dedicated dialog inside the auto-backup section so the
@@ -218,6 +249,62 @@ fun BackupSettingsScreen(
         snapshotFiles = withContext(Dispatchers.IO) { ConfigBackup.listSnapshots(snapshotDir) }
     }
 
+    // [fix/da1023-backup-streaming-fetch] Entry load for the local automatic
+    // backup list. Listing filesDir is disk IO, so it runs on IO — the state
+    // starts empty — instead of inside the `remember` on the composition
+    // (Main) thread it used to sit in. Same shape as the snapshot refresh.
+    LaunchedEffect(Unit) {
+        autoBackupFiles = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.AutoBackupManager.listLocal(context) }
+    }
+
+    // [deep-audit-1033 I08] Entry load for the WebDAV server config and the
+    // auto-backup row. `webDavStore.load()` opens EncryptedSharedPreferences
+    // (Keystore unwrap, blocking) and the other two are SharedPreferences
+    // reads — all three used to run inline in `remember { … }`, i.e. on the
+    // composition (Main) thread, on every entry to this screen. Start from the
+    // "not configured / never ran" defaults and load them here.
+    LaunchedEffect(Unit) {
+        webDavConfig = withContext(Dispatchers.IO) { webDavStore.load() }
+        val autoRow = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.backup.AutoBackupManager.isEnabled(context) to
+                com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context)
+        }
+        autoBackupEnabled = autoRow.first
+        autoBackupLastRun = autoRow.second
+        // [feat/auto-backup-external-mirror] Same off-composition load for the
+        // external mirror row (SharedPreferences: enabled flag + last label).
+        // [silent-mirror] Plus the two inputs the status row's verdict needs.
+        val mirrorRow = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.backup.MirrorStore.isEnabled(context) to
+                com.rikkaminis.app.backup.MirrorStore.lastSyncLabel(context)
+        }
+        mirrorEnabled = mirrorRow.first
+        mirrorLastSync = mirrorRow.second
+        mirrorLastMs = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.MirrorStore.lastSyncMs(context) }
+        mirrorOutcomeRaw = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.MirrorStore.lastResult(context) }
+    }
+    // [silent-mirror] The row is passive by design (the "sync now" button is
+    // gone — 2026-10-29), so it has to keep itself current or it stops being
+    // the aliveness signal: refresh pending count + freshness + last outcome
+    // once a minute while this screen is open. pendingCount walks the source
+    // tree (~1810 stats) on IO — one walk a minute is the price of a row that
+    // answers "is it alive" without being asked.
+    LaunchedEffect(mirrorEnabled) {
+        if (!mirrorEnabled) {
+            mirrorPending = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            mirrorPending = withContext(Dispatchers.IO) {
+                com.rikkaminis.app.backup.MirrorStore.pendingCount(context)
+            }
+            mirrorLastMs = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.MirrorStore.lastSyncMs(context) }
+            mirrorLastSync = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.MirrorStore.lastSyncLabel(context) }
+            mirrorOutcomeRaw = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.MirrorStore.lastResult(context) }
+            delay(60_000L)
+        }
+    }
+
     val refreshSnapshots: () -> Unit = {
         // [audit-0917] listSnapshots reads the dir - off the Main thread
         // like the entry refresh above.
@@ -234,17 +321,33 @@ fun BackupSettingsScreen(
 
     // Restore-with-safety-net: before applying an imported config (local file
     // or WebDAV) snapshot the CURRENT config so the user can always roll back
-    // after a mistaken restore. Best-effort: a failed snapshot never blocks
-    // the restore, it only reports via snapshotNote.
+    // after a mistaken restore.
+    // [FIX-P1A / RT-S3] This used to be "best-effort: a failed snapshot never
+    // blocks the restore". That inverted the point of a rollback point: the
+    // import went on to overwrite the config with NO way back, while the
+    // "one-tap rollback" list was populated from whatever half-written file
+    // the failed snapshot had left behind. Writes are atomic now (no truncated
+    // JSON can appear), and a failure ABORTS the restore instead — the user is
+    // told, nothing was applied, and retrying after freeing space is safe.
     // Declared before the launchers below because their callbacks invoke it.
-    val restoreWithSnapshot: (String) -> Unit = doRestore@{ json ->
+    // [meta-audit-1028 D4 F-02] [preClaimed] says the caller already holds the shared
+    // gate (see [claimRestorePayload]): every restore that has to BUILD a payload — a
+    // WebDAV download, a local snapshot/auto-backup read, the SAF import — now claims it
+    // BEFORE the download/read and hands the claim over here. Without the flag this
+    // function's own check would refuse the very restore that already holds the lock —
+    // the self-collision the [refactor-backup-gate] comment further down works around.
+    //
+    // (A lambda, not a nested `fun`, on purpose: `ime_inset_guard`'s B01-CALLS registry
+    // attributes a `SettingsScaffold(` call to the nearest preceding `fun`, so a nested
+    // one would orphan this screen's own exemption entry.)
+    val restoreWithSnapshot: (String, Boolean) -> Unit = doRestore@{ json, preClaimed ->
         // [fix restore-mutex] Reject a restore while any backup/restore path is
         // already in flight. The pre-restore snapshot export builds another full
         // 70MB+ payload; two such exports concurrently (e.g. restoring while a
         // local backup upload is running) stacks two payloads and blows the
         // 512MB heap. This is the last line of defense behind the button-level
         // guards — the snapshot-restore dialog and WebDAV sheet reach here too.
-        if (operationBusy) {
+        if (!preClaimed && operationBusy) {
             errorMessage = context.getString(R.string.backup_err_busy)
             return@doRestore
         }
@@ -258,7 +361,7 @@ fun BackupSettingsScreen(
         // applicationScope dispatcher), racing recomposition. The export
         // path in this same file already did withContext(Dispatchers.Main);
         // this restores the same discipline here.
-        application.applicationScope.launch {
+        application.applicationScope.launch snapshotBeforeRestore@{
             try {
                 // [T-backup-streaming-export] Stream the pre-restore snapshot
                 // straight to disk — the in-memory String variant OOMs on a
@@ -271,9 +374,12 @@ fun BackupSettingsScreen(
                 // naming) that pollutes the remote list. The snapshot's only
                 // job is rolling back THIS device if the restore goes wrong, so
                 // it belongs in local storage, never on the remote.
-                // [fix-audit-p0-3] Second-precision name + keep SNAPSHOT_KEEP
+                // [fix-audit-p0-3] Second-precision base name + keep SNAPSHOT_KEEP
                 // newest (see ConfigBackup.writeSnapshot) so two restores in
                 // the same minute no longer overwrite the first rollback point.
+                // [FIX-P1A / RT-S3] The write itself is atomic and the name is
+                // resolved against the directory, so a same-second restore can
+                // neither truncate nor overwrite the existing rollback point.
                 val dir = File(context.filesDir, "backup-snapshots")
                 ConfigBackup.writeSnapshotStreaming(dir) { w ->
                     ConfigBackup.exportToWriter(
@@ -296,14 +402,40 @@ fun BackupSettingsScreen(
                     refreshSnapshots()
                 }
             } catch (t: Throwable) {
+                // [FIX-P1A / RT-S3] No rollback point ⇒ no restore. Continuing
+                // would overwrite a config the user cannot get back, which is
+                // strictly worse than "fix the cause and retry" (typically
+                // ENOSPC, or a document over the payload cap). The failure is
+                // reported through the existing error dialog + tray, so this
+                // adds no UI surface of its own.
+                val failed = context.getString(R.string.backup_snapshot_failed)
                 withContext(Dispatchers.Main) {
-                    snapshotNote = context.getString(R.string.backup_snapshot_failed)
+                    snapshotNote = failed
+                    errorMessage = failed
+                    operationBusy = false
                 }
+                notifier.notifyWorkCompleted(
+                    tag = "webdav-restore",
+                    title = context.getString(R.string.webdav_notify_title_failed),
+                    body = failed,
+                )
+                return@snapshotBeforeRestore
             }
             var restoredOk = true
             var restoredMsg: String? = null
             try {
                 val report = withContext(Dispatchers.Default) {
+                    // [D-B fix/backup-bootstrap-size] Read the CURRENT server
+                    // config first (EncryptedSharedPreferences → IO): the merge
+                    // in ConfigBackup.import has to run against what is actually
+                    // stored, not against Compose state that may still be null.
+                    // WebDavConfigStore.save() reads a blank password as "clear
+                    // the stored one", so a secrets-free backup's missing
+                    // password must be filled in from here — otherwise applying
+                    // it silently deletes the password the user just retyped.
+                    val existingWebDav = withContext(Dispatchers.IO) {
+                        runCatching { webDavStore.load() }.getOrNull()
+                    }
                     ConfigBackup.import(
                         providerRepo = providerRepository,
                         json = json,
@@ -317,6 +449,7 @@ fun BackupSettingsScreen(
                         onScheduledTasks = { doc ->
                             ScheduledTasksStore.importDocument(context, doc)
                         },
+                        existingWebDavConfig = existingWebDav,
                     )
                 }
                 withContext(Dispatchers.Main) {
@@ -349,6 +482,32 @@ fun BackupSettingsScreen(
         }
     }
 
+    // [meta-audit-1028 D4 F-02] The single claim entry for a restore that has to BUILD a
+    // payload first: the WebDAV manual/auto download, the local snapshot / auto-backup
+    // file read, and the SAF import. Claiming HERE — not inside restoreWithSnapshot — is
+    // what keeps two payloads from being resident at once, because the download/read
+    // window IS the window in which a second 70MB would be allocated. It is also why a
+    // download that finished second used to be thrown away: nothing had stopped it from
+    // starting, so restoreWithSnapshot's own check met "busy" and reported failure after
+    // the bytes were already in the heap.
+    //
+    // Returns false when the caller must not proceed; the reason has been reported.
+    val claimRestorePayload: () -> Boolean = claimRestorePayload@{
+        if (!canStartRestorePayload(
+                operationBusy = operationBusy,
+                minisbakConverting = minisbakConverting,
+            )
+        ) {
+            errorMessage = context.getString(R.string.backup_err_busy)
+            return@claimRestorePayload false
+        }
+        operationBusy = true
+        true
+    }
+
+    /** Lower the claim from [claimRestorePayload]. Never call it after a handoff. */
+    val releaseRestorePayload: () -> Unit = { operationBusy = false }
+
     // [fix-minisbak-import] .minisbak 转换 + 恢复交接的唯一入口：文件选择器
     //（明文包）与口令对话框（加密包）都走这里。
     //
@@ -380,9 +539,14 @@ fun BackupSettingsScreen(
                         pendingMinisbakBytes = pkg
                     }
                     is MinisbakImport.Plain -> {
-                        operationBusy = false
+                        // [meta-audit-1028 D4 F-02] Handoff, not release-then-recheck:
+                        // the old shape dropped the gate here and let restoreWithSnapshot
+                        // re-acquire it, which is a real (if narrow) window — another
+                        // restore could take the lock between the two statements and the
+                        // converted payload would be refused after it was already built.
+                        // Same Main frame, no suspension, so the claim never escapes.
                         handedOff = true
-                        restoreWithSnapshot(sniff.json)
+                        restoreWithSnapshot(sniff.json, true)
                     }
                 }
             } catch (t: Throwable) {
@@ -484,35 +648,56 @@ fun BackupSettingsScreen(
         // [audit-0909] SAF pick callback runs on the Main thread; the file
         // read below can be tens of MB (auto-backup files embed the artifact
         // zip), so hop the read to IO — same fix shape as the snapshot-restore
-        // dialog (568d87a). The query for byte size is a cheap metadata call
-        // and stays inline; errorMessage is Compose state, so it is written
+        // dialog (568d87a). errorMessage is Compose state, so it is written
         // back on this Main-dispatcher scope.
+        //
+        // [deep-audit-1047 B-02] Two holes were left by that hop:
+        //  * the `OpenableColumns.SIZE` query (a cross-process IPC) stayed
+        //    inline on Main — it is now inside the same IO block as the read;
+        //  * the declared size was the ONLY bound. A provider that reports no
+        //    size (or lies about it) fell through to `readBytes()` and pulled
+        //    the whole file into the heap, and a lying `SIZE` under the cap did
+        //    the same. The read now goes through [readSafBytes], which keeps
+        //    the declared-size precheck as a cheap early reject AND caps the
+        //    stream itself one byte past MAX_PAYLOAD_BYTES.
         scope.launch {
             try {
                 // [T-backup-import-memory] Reject oversized files BEFORE pulling
-                // them into memory. The exact char-count check (MAX_PAYLOAD_BYTES)
-                // inside ConfigBackup.import only runs after the whole file has
-                // been read into a String (UTF-16 doubles the allocation) and a
-                // full pre-restore snapshot export has been built — an OOM window
-                // for large backups. Byte size is a conservative bound (chars ≤
-                // bytes for UTF-8), so a file that passes here still gets the
-                // exact char check during import.
-                val sizeBytes = context.contentResolver.query(
-                    uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null,
-                )?.use { c ->
-                    if (c.moveToFirst()) {
-                        val idx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                        if (idx >= 0 && !c.isNull(idx)) c.getLong(idx) else null
-                    } else null
-                }
-                if (sizeBytes != null &&
-                    sizeBytes > com.rikkaminis.app.backup.ConfigBackup.MAX_PAYLOAD_BYTES
-                ) {
-                    val mb = sizeBytes / (1024 * 1024)
-                    val maxMb = com.rikkaminis.app.backup.ConfigBackup.MAX_PAYLOAD_BYTES / (1024 * 1024)
-                    throw IllegalStateException(
-                        context.getString(R.string.backup_import_too_large, mb, maxMb),
-                    )
+                // them into memory. The exact check inside ConfigBackup.import
+                // only runs after the whole file has been read into a String
+                // (UTF-16 doubles the allocation) and a full pre-restore
+                // snapshot export has been built — an OOM window for large
+                // backups.
+                //
+                // [D-C fix/backup-bootstrap-size] This cap and the one inside
+                // import() are now the SAME unit (UTF-8 bytes) and the same
+                // value, and the export budget packs against that unit too —
+                // so "export succeeded" implies "this read accepts it". Before
+                // the unit fix this read was bytes while export/import compared
+                // chars: a 71.4MB Chinese backup exported fine and was then
+                // rejected here on every attempt.
+                val bytes = withContext(Dispatchers.IO) {
+                    when (val read = readSafBytes(
+                        context.contentResolver,
+                        uri,
+                        ConfigBackup.MAX_PAYLOAD_BYTES.toLong(),
+                    )) {
+                        is SafRead.Ok -> read.bytes
+                        SafRead.TooLarge -> {
+                            // The verdict is already made on the STREAM; the
+                            // declared size is re-read only for the wording, and
+                            // falls back to the cap when the provider reported
+                            // nothing (that is exactly the case a declared-only
+                            // check used to let through).
+                            val declared = querySafSize(context.contentResolver, uri)
+                            val mb = (declared ?: ConfigBackup.MAX_PAYLOAD_BYTES.toLong()) / (1024 * 1024)
+                            val maxMb = ConfigBackup.MAX_PAYLOAD_BYTES / (1024 * 1024)
+                            throw IllegalStateException(
+                                context.getString(R.string.backup_import_too_large, mb, maxMb),
+                            )
+                        }
+                        SafRead.Failed -> throw IllegalStateException(errRead)
+                    }
                 }
                 // [fix-minisbak-import] 读**字节**，不是文本。
                 //
@@ -524,17 +709,30 @@ fun BackupSettingsScreen(
                 // 兼容层之前根本没被任何地方调用，属于死代码。
                 //
                 // 字节不能先 String 化：UTF-8 解码 ZIP 会丢信息。
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)
-                        ?.use { it.readBytes() }
-                        ?: throw IllegalStateException(errRead)
-                }
-                when {
-                    OpenMinisBackupCompat.looksLikeMinisBak(bytes) ->
-                        // [fix-minisbak-import] 嗅探/转换/恢复交接统一走
-                        // convertAndRestore（IO 线程 + 忙碌门禁 + 锁交接）。
-                        convertAndRestore(bytes, null)
-                    else -> restoreWithSnapshot(String(bytes, Charsets.UTF_8))
+                // [deep-audit-1047 B-02] 上面的 readSafBytes 就是这次读取——
+                // 字节已按 MAX_PAYLOAD_BYTES 封顶，这里不再有第二个读点。
+                // [meta-audit-1028 D4 F-02] `String(bytes, …)` lands on Main right here
+                // and is the exact same tens-of-MB UTF-16 resident as a snapshot read:
+                // one copy is the ByteArray, the other is the String, and the restore's
+                // own snapshot export is a THIRD. Claim the gate before decoding so the
+                // two-payload heap cannot be reached from this entry either (the import
+                // row's `enabled` guard covers only the tap, and the picker callback
+                // arrives after it has been checked).
+                if (OpenMinisBackupCompat.looksLikeMinisBak(bytes)) {
+                    // [fix-minisbak-import] 嗅探/转换/恢复交接统一走
+                    // convertAndRestore（IO 线程 + 忙碌门禁 + 锁交接）。
+                    convertAndRestore(bytes, null)
+                } else if (claimRestorePayload()) {
+                    try {
+                        restoreWithSnapshot(String(bytes, Charsets.UTF_8), true)
+                    } catch (t: Throwable) {
+                        // The claim is ours and the handoff did not happen (the decode
+                        // itself can fail on a big payload) — lower it before rethrowing,
+                        // or the whole backup screen stays wedged behind a gate nobody
+                        // holds.
+                        releaseRestorePayload()
+                        throw t
+                    }
                 }
             } catch (t: Throwable) {
                 errorMessage = t.message ?: errImport
@@ -636,11 +834,16 @@ fun BackupSettingsScreen(
                     operationBusy = true
                     application.applicationScope.launch {
                         try {
-                            withContext(Dispatchers.IO) {
-                                com.rikkaminis.app.backup.AutoBackupManager.runNow(application)
-                            }
+                            // [fix/da1023-backup-streaming-fetch] runNow and
+                            // the post-run local listing are both disk IO —
+                            // the listing used to run inside the
+                            // Dispatchers.Main block below; do it on IO and
+                            // hand only the result back to Main.
+                            val autoManager = com.rikkaminis.app.backup.AutoBackupManager
+                            withContext(Dispatchers.IO) { autoManager.runNow(application) }
+                            val refreshedFiles = withContext(Dispatchers.IO) { autoManager.listLocal(context) }
                             withContext(Dispatchers.Main) {
-                                autoBackupFiles = com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)
+                                autoBackupFiles = refreshedFiles
                                 autoBackupLastRun = com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context)
                                 android.widget.Toast.makeText(
                                     context, savedToast, android.widget.Toast.LENGTH_SHORT,
@@ -697,16 +900,183 @@ fun BackupSettingsScreen(
                         SettingsRow(
                             title = file.name.removePrefix(com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX)
                                 .removeSuffix(".json"),
+                            // [FIX-1028 / B-12] Same key this list is ORDERED
+                            // by (the stamp in the local backup's name), so a
+                            // rolled-back clock cannot make the row's time
+                            // contradict its position. Falls back to mtime only
+                            // for a fetched copy that keeps a foreign stamp.
                             subtitle = java.text.SimpleDateFormat(
                                 "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
-                            ).format(java.util.Date(file.lastModified())),
+                            ).format(
+                                java.util.Date(
+                                    com.rikkaminis.app.backup.AutoBackupManager.localStampMillis(file)
+                                        ?: file.lastModified(),
+                                ),
+                            ),
                             icon = Icons.Filled.Restore,
-                            onClick = { snapshotRestoreTarget = file },
+                            // [meta-audit-1028 D4 F-02] A restore row cannot open the
+                            // confirm dialog while a restore payload is already being
+                            // built: the dialog's read IS the second payload. `null` is
+                            // this row's own "disabled" (SettingsRow). The claim inside
+                            // the dialog is the real gate — this only stops the tap from
+                            // queueing work that would be refused.
+                            onClick = if (operationBusy || minisbakConverting) null else ({
+                                snapshotRestoreTarget = file
+                            }),
                         )
                     }
                 }
             }
         }
+        // [feat/auto-backup-external-mirror] The second copy, outside the app's
+        // own storage: `Download/RikkaMinis/backup/` via MediaStore. The
+        // 2026-10-29 incident rebuilt filesDir and took both the working copy
+        // and its only (in-filesDir) backup with it, so the daily snapshot
+        // above is not redundancy on its own. This block is a continuously
+        // updated mirror of the documents that cannot be regenerated —
+        // MirrorScope holds the exact selection, MirrorPlan the throttle and
+        // the `previous/` rotation.
+        SettingsSection(
+            header = stringResource(R.string.mirror_section_title),
+            footer = stringResource(R.string.mirror_section_footer),
+        ) {
+            SettingsRow(
+                title = stringResource(R.string.mirror_enable),
+                subtitle = stringResource(R.string.mirror_enable_sub),
+                trailing = {
+                    Switch(
+                        checked = mirrorEnabled,
+                        onCheckedChange = { on ->
+                            mirrorEnabled = on
+                            com.rikkaminis.app.backup.MirrorStore.setEnabled(context, on)
+                        },
+                    )
+                },
+                // Switch only, same double-fire reasoning as the daily row.
+                showDivider = true,
+            )
+            // [silent-mirror] Status row, passive by design (2026-10-29): the
+            // "sync now" row is gone. A mirror of app-generated documents has
+            // no human-initiated use case (the user cannot edit these trees by
+            // hand), and a button the coalescing window sometimes swallows
+            // silently trains distrust of the whole feature — the pending
+            // count is real, the button just does not answer it. The row
+            // instead answers "is it alive" by itself and turns into a
+            // warning with a retry ONLY on an unhealthy verdict, where the
+            // retry is a forced sync (bypasses the 60 s window; force is the
+            // right answer for a mirror that is already behind).
+            val mirrorHealth = com.rikkaminis.app.backup.MirrorPlan.classifyHealth(
+                enabled = mirrorEnabled,
+                lastSyncMs = mirrorLastMs,
+                pending = mirrorPending,
+                lastOutcome = mirrorOutcomeRaw,
+                nowMs = System.currentTimeMillis(),
+            )
+            val mirrorTitle: String
+            val mirrorSubtitle: String?
+            var mirrorUnhealthy = false
+            when (val h = mirrorHealth) {
+                is com.rikkaminis.app.backup.MirrorPlan.Health.Failed -> {
+                    mirrorTitle = stringResource(R.string.mirror_diag_failed)
+                    mirrorSubtitle = h.reason ?: stringResource(R.string.mirror_diag_unavailable)
+                    mirrorUnhealthy = true
+                }
+                is com.rikkaminis.app.backup.MirrorPlan.Health.Stale -> {
+                    mirrorTitle = stringResource(
+                        R.string.mirror_diag_stale,
+                        h.pending ?: 0,
+                        h.minutes,
+                    )
+                    mirrorSubtitle = null
+                    mirrorUnhealthy = true
+                }
+                is com.rikkaminis.app.backup.MirrorPlan.Health.Never -> {
+                    mirrorTitle = stringResource(R.string.mirror_never)
+                    val waiting = h.pending ?: 0
+                    mirrorSubtitle = if (waiting > 0) {
+                        stringResource(R.string.mirror_pending_count, waiting)
+                    } else null
+                    mirrorUnhealthy = waiting > 0
+                }
+                is com.rikkaminis.app.backup.MirrorPlan.Health.Healthy -> {
+                    val last = mirrorLastSync
+                    val waiting = h.pending ?: 0
+                    mirrorTitle = if (last != null) {
+                        stringResource(R.string.mirror_last_sync, last)
+                    } else {
+                        stringResource(R.string.mirror_never)
+                    }
+                    mirrorSubtitle = if (waiting > 0) {
+                        stringResource(R.string.mirror_pending_count, waiting)
+                    } else null
+                    mirrorUnhealthy = false
+                }
+                com.rikkaminis.app.backup.MirrorPlan.Health.Disabled -> {
+                    mirrorTitle = ""
+                    mirrorSubtitle = null
+                    mirrorUnhealthy = false
+                }
+            }
+            if (mirrorHealth != com.rikkaminis.app.backup.MirrorPlan.Health.Disabled) {
+                SettingsRow(
+                    title = mirrorTitle,
+                    subtitle = if (mirrorRunning) {
+                        stringResource(R.string.backup_progress_title)
+                    } else {
+                        mirrorSubtitle
+                    },
+                    icon = if (mirrorUnhealthy) Icons.Filled.Warning else null,
+                    iconColor = MaterialTheme.colorScheme.error,
+                    titleColor = if (mirrorUnhealthy) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                    trailing = if (mirrorUnhealthy) {
+                        {
+                            TextButton(
+                                onClick = {
+                                    mirrorRunning = true
+                                    application.applicationScope.launch {
+                                        try {
+                                            withContext(Dispatchers.IO) {
+                                                com.rikkaminis.app.backup.MirrorStore
+                                                    .syncNow(context, force = true)
+                                            }
+                                            val ms = withContext(Dispatchers.IO) {
+                                                com.rikkaminis.app.backup.MirrorStore.lastSyncMs(context)
+                                            }
+                                            val label = withContext(Dispatchers.IO) {
+                                                com.rikkaminis.app.backup.MirrorStore.lastSyncLabel(context)
+                                            }
+                                            val raw = withContext(Dispatchers.IO) {
+                                                com.rikkaminis.app.backup.MirrorStore.lastResult(context)
+                                            }
+                                            val pendingNow = withContext(Dispatchers.IO) {
+                                                com.rikkaminis.app.backup.MirrorStore.pendingCount(context)
+                                            }
+                                            withContext(Dispatchers.Main) {
+                                                mirrorLastMs = ms
+                                                mirrorLastSync = label
+                                                mirrorOutcomeRaw = raw
+                                                mirrorPending = pendingNow
+                                            }
+                                        } catch (t: Throwable) {
+                                            withContext(Dispatchers.Main) { errorMessage = t.message ?: errUnknown }
+                                        } finally {
+                                            withContext(Dispatchers.Main) { mirrorRunning = false }
+                                        }
+                                    }
+                                },
+                                enabled = !mirrorRunning && !operationBusy,
+                            ) { Text(stringResource(R.string.mirror_retry)) }
+                        }
+                    } else null,
+                    showDivider = false,
+                )
+            }
+        }
+
         SettingsSection(
             header = stringResource(R.string.backup_section_local),
             footer = stringResource(R.string.backup_section_footer),
@@ -715,7 +1085,7 @@ fun BackupSettingsScreen(
                 title = stringResource(R.string.backup_export),
                 subtitle = stringResource(R.string.backup_export_sub),
                 icon = Icons.Default.Download,
-                onClick = if (operationBusy) null else ({ showSecretWarning = true }),
+                onClick = if (operationBusy) null else ({ webDavUploadPending = false; showSecretWarning = true }),
             )
             SettingsRow(
                 title = stringResource(R.string.backup_chat_window_title),
@@ -758,11 +1128,25 @@ fun BackupSettingsScreen(
                     snapshotFiles.forEachIndexed { index, file ->
                         SettingsRow(
                             title = file.name,
+                            // [FIX-1028 / B-12] Display the key this list is
+                            // ORDERED by (the stamp in the file name), else the
+                            // mtime. Showing mtime on a name-ordered list made a
+                            // rolled-back clock look like the newest rollback
+                            // point was the oldest — and the one-tap rollback on
+                            // the fatal-restore dialog takes the FIRST row.
                             subtitle = java.text.SimpleDateFormat(
                                 "yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()
-                            ).format(java.util.Date(file.lastModified())),
+                            ).format(java.util.Date(ConfigBackup.snapshotDisplayMillis(file))),
                             icon = Icons.Filled.Restore,
-                            onClick = { snapshotRestoreTarget = file },
+                            // [meta-audit-1028 D4 F-02] A restore row cannot open the
+                            // confirm dialog while a restore payload is already being
+                            // built: the dialog's read IS the second payload. `null` is
+                            // this row's own "disabled" (SettingsRow). The claim inside
+                            // the dialog is the real gate — this only stops the tap from
+                            // queueing work that would be refused.
+                            onClick = if (operationBusy || minisbakConverting) null else ({
+                                snapshotRestoreTarget = file
+                            }),
                             showDivider = index < snapshotFiles.size - 1,
                         )
                     }
@@ -855,11 +1239,22 @@ fun BackupSettingsScreen(
                                     }
                                 }
                             }
-                            // Resolve config on Main (it reads SharedPreferences and
-                            // Compose state); bail with an inline error if unset.
-                            val cfg = webDavConfig
+                            // [deep-audit-1049 B-02] Resolve config ON Main: the
+                            // comment that used to sit here always claimed Main,
+                            // but the read sat on the applicationScope dispatcher
+                            // (Dispatchers.IO) and so did the `errorMessage` write
+                            // in the bail arm — both are Compose state. One hop
+                            // covers the read and the "not configured" report.
+                            val cfg = withContext(Dispatchers.Main) {
+                                val current = webDavConfig
+                                if (current == null) {
+                                    errorMessage = context.getString(
+                                        R.string.webdav_server_not_configured,
+                                    )
+                                }
+                                current
+                            }
                             if (cfg == null) {
-                                errorMessage = context.getString(R.string.webdav_server_not_configured)
                                 notifier.notifyWorkCompleted(
                                     tag = "webdav-upload",
                                     title = context.getString(R.string.webdav_notify_title_failed),
@@ -921,7 +1316,10 @@ fun BackupSettingsScreen(
             }
         }
         AlertDialog(
-            onDismissRequest = { showSecretWarning = false },
+            onDismissRequest = {
+                showSecretWarning = false
+                webDavUploadPending = false
+            },
             title = { Text(stringResource(R.string.backup_secret_title)) },
             text = { Text(stringResource(R.string.backup_secret_body)) },
             confirmButton = {
@@ -944,14 +1342,26 @@ fun BackupSettingsScreen(
             httpClient = webDavHttpClient,
             onDismiss = { showWebDavConfig = false },
             onSave = { cfg ->
-                webDavStore.save(cfg)
-                webDavConfig = webDavStore.load()
-                showWebDavConfig = false
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.webdav_saved),
-                    Toast.LENGTH_SHORT,
-                ).show()
+                // [deep-audit-1033 I08] save() commits to EncryptedSharedPreferences
+                // and the reload below reads it back — both are blocking keystore
+                // IO and used to run inline in this click handler, on the main
+                // thread. App-scoped for the same reason as applyWebDavConfig:
+                // navigating away must not lose a just-typed server config.
+                application.applicationScope.launch {
+                    val reloaded = withContext(Dispatchers.IO) {
+                        runCatching { webDavStore.save(cfg) }
+                        webDavStore.load()
+                    }
+                    withContext(Dispatchers.Main) {
+                        webDavConfig = reloaded
+                        showWebDavConfig = false
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.webdav_saved),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
             },
         )
     }
@@ -968,18 +1378,19 @@ fun BackupSettingsScreen(
                 onDismiss = { showRemoteList = false },
                 onRefresh = openRemoteList,
                 onRestore = { item ->
-                    // [refactor-backup-gate] Do NOT claim the global operationBusy
-                    // here. The async download must show progress (sheet busy) but
-                    // must not hold the single mutual-exclusion gate — restoreWith
-                    // Snapshot() is the one-and-only claim entry for restores, so
-                    // its own gate check (reject if a backup is already in flight)
-                    // still works. Holding the gate across the network gap would
-                    // make that check see "busy" and wrongly refuse this very
-                    // restore (self-collision). The download re-enables the sheet
-                    // via remoteLoading to prevent double-taps.
-                    if (!operationBusy) {
+                    // [meta-audit-1028 D4 F-02] Claim the shared gate for the WHOLE
+                    // download and hand it to restoreWithSnapshot (see
+                    // [claimRestorePayload]) instead of checking it only after the
+                    // download. The old shape left the window unguarded and used the
+                    // dialog-local `remoteLoading` for exclusion — which
+                    // `openRemoteList` clears in its own `finally`, so re-opening the
+                    // sheet mid-download re-enabled Restore and stacked a second 70MB
+                    // payload. Holding the gate also stops a download from finishing
+                    // into `backup_err_busy` (bytes paid for, restore refused).
+                    if (claimRestorePayload()) {
                         remoteLoading = true
                         application.applicationScope.launch {
+                            var handedOff = false
                             try {
                                 val json = withContext(Dispatchers.IO) {
                                     WebDavSync.restore(cfg, item, webDavHttpClient)
@@ -989,9 +1400,14 @@ fun BackupSettingsScreen(
                                 // this block must hop back to Main, exactly like
                                 // the sibling paths in this file (see
                                 // restoreWithSnapshot's [fix-audit-p1-1] note).
+                                // The handoff happens in the same Main frame as the
+                                // read result: no suspension between the download
+                                // ending and restoreWithSnapshot taking over the
+                                // claim, so it can never be dropped on the floor.
                                 withContext(Dispatchers.Main) {
                                     showRemoteList = false
-                                    restoreWithSnapshot(json)
+                                    handedOff = true
+                                    restoreWithSnapshot(json, true)
                                 }
                             } catch (t: Throwable) {
                                 withContext(Dispatchers.Main) {
@@ -1003,7 +1419,10 @@ fun BackupSettingsScreen(
                                     body = webDavErrorMessage(context, t),
                                 )
                             } finally {
-                                withContext(Dispatchers.Main) { remoteLoading = false }
+                                withContext(Dispatchers.Main) {
+                                    remoteLoading = false
+                                    if (!handedOff) releaseRestorePayload()
+                                }
                             }
                         }
                     }
@@ -1031,12 +1450,14 @@ fun BackupSettingsScreen(
                 onDismiss = { autoRemoteOpen = false },
                 onRefresh = openAutoRemoteList,
                 onRestore = { entry ->
-                    // Same gate rationale as the manual sheet: do NOT claim
-                    // the global operationBusy across the network gap —
-                    // restoreWithSnapshot is the single claim entry.
-                    if (!operationBusy) {
+                    // [meta-audit-1028 D4 F-02] Same claim-before-download shape as the
+                    // manual sheet above (twin site, same defect, same fix): the gate is
+                    // held across the network gap and handed to restoreWithSnapshot via
+                    // [claimRestorePayload] / preClaimed.
+                    if (claimRestorePayload()) {
                         autoRemoteLoading = true
                         application.applicationScope.launch {
+                            var handedOff = false
                             try {
                                 val json = withContext(Dispatchers.IO) {
                                     WebDavSync.restoreAuto(cfg, entry, webDavHttpClient)
@@ -1046,7 +1467,8 @@ fun BackupSettingsScreen(
                                 // missed by the same batch of fixes.
                                 withContext(Dispatchers.Main) {
                                     autoRemoteOpen = false
-                                    restoreWithSnapshot(json)
+                                    handedOff = true
+                                    restoreWithSnapshot(json, true)
                                 }
                             } catch (t: Throwable) {
                                 withContext(Dispatchers.Main) {
@@ -1058,13 +1480,29 @@ fun BackupSettingsScreen(
                                     body = webDavErrorMessage(context, t),
                                 )
                             } finally {
-                                withContext(Dispatchers.Main) { autoRemoteLoading = false }
+                                withContext(Dispatchers.Main) {
+                                    autoRemoteLoading = false
+                                    if (!handedOff) releaseRestorePayload()
+                                }
                             }
                         }
                     }
                 },
                 onFetch = { entry ->
                     if (!operationBusy) {
+                        // [deep-audit-1040 B-08] Claim the SAME single gate as
+                        // every other backup path (local SAF export, WebDAV
+                        // upload, restore, delete). This fetch pulls a full
+                        // payload into memory and then writes + rotates
+                        // `filesDir/backup-autos` — the very directory the
+                        // nightly run and every restore also touch — yet it
+                        // used to flip only the dialog-local
+                        // `autoRemoteLoading`. Dismissing the dialog mid-flight
+                        // (its OK button and the back gesture are never gated)
+                        // left "Run Now" / "Restore" / "Export" clickable and
+                        // let two full payloads land on that directory at once
+                        // (and stack on the 512MB heap).
+                        operationBusy = true
                         autoRemoteLoading = true
                         scope.launch {
                             try {
@@ -1076,36 +1514,93 @@ fun BackupSettingsScreen(
                                 // → local `rikkaminis-auto-<stamp>.json` so it
                                 // joins the local auto-backup rotation and can
                                 // be restored offline any time.
-                                val stamp = entry.item.displayName
+                                // [fix/da1023-backup-streaming-fetch] The
+                                // display name comes from the WebDAV server
+                                // and is NOT under our control — a hostile or
+                                // just odd name must never be concatenated
+                                // into a local path unfiltered
+                                // (`../../evil` would write through the
+                                // backup-autos directory). Sanitize
+                                // fail-closed: refuse to write on anything
+                                // that is not a clean filename token.
+                                val rawStamp = entry.item.displayName
                                     .removePrefix(WebDavSync.AUTO_BACKUP_PREFIX)
                                     .removeSuffix(WebDavSync.BACKUP_SUFFIX)
+                                val stamp = WebDavSync.sanitizeAutoBackupStamp(rawStamp)
+                                if (stamp == null) {
+                                    // ponytail: English-only rejection message for a hostile-input corner | 天花板: 非英文用户看到英文报错（极罕见：服务器侧名字被污染才会触发） | 升级触发: strings.xml 解冻或同类"拒绝输入"文案积累
+                                    throw IllegalArgumentException(
+                                        "Rejected unsafe auto-backup filename: ${entry.item.displayName}",
+                                    )
+                                }
                                 val local = File(
                                     dir,
-                                    com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json",
+                                    com.rikkaminis.app.backup.AutoBackupLocalStore.fileName(
+                                        com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX,
+                                        stamp,
+                                    ),
                                 )
-                                withContext(Dispatchers.IO) { local.writeText(json) }
+                                // [FIX-P1B / FINDING-14] Second writer into the
+                                // same directory: a plain writeText leaves a
+                                // truncated document after a kill mid-write, and
+                                // it looks like a legal backup to listLocal (the
+                                // nightly path had the same hole). Route it
+                                // through the repo's existing atomic write.
+                                withContext(Dispatchers.IO) {
+                                    com.rikkaminis.app.tools.AtomicFileWrite.write(local, json)
+                                }
+                                // [fix/da1023-backup-streaming-fetch] The
+                                // fetched copy joins the SAME local rotation
+                                // as the nightly writes — before this, every
+                                // fetch added an unbounded local copy with no
+                                // AUTO_BACKUP_KEEP cap applied.
+                                //
+                                // [FIX-R3-D / F-01] …and the fetched copy is
+                                // protected: a copy fetched from an OLDER date
+                                // sorts as the oldest by name, so the rotation
+                                // deleted it in the same breath as writing it
+                                // (the Toast said "fetched", the list showed
+                                // nothing new).
+                                withContext(Dispatchers.IO) {
+                                    com.rikkaminis.app.backup.AutoBackupManager.withFreshlyWritten(local) {
+                                        com.rikkaminis.app.backup.AutoBackupManager.rotateLocalAutoBackups(context)
+                                    }
+                                }
                                 // Refresh the local auto-backup list so the
                                 // fetched copy shows up immediately (state
                                 // write back on Main — scope.launch is Main).
-                                autoBackupFiles =
-                                    withContext(Dispatchers.IO) {
-                                        com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)
-                                    }
+                                autoBackupFiles = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.AutoBackupManager.listLocal(context) }
                                 android.widget.Toast.makeText(
                                     context,
                                     context.getString(R.string.auto_backup_fetched),
                                     android.widget.Toast.LENGTH_SHORT,
                                 ).show()
+                            } catch (t: CancellationException) {
+                                // [deep-audit-1040 B-08] The screen went away
+                                // mid-flight and cancelled this launch. Not a
+                                // failure: rethrow so the coroutine really ends
+                                // here instead of falling through to the list
+                                // refresh below (that refresh re-arms
+                                // autoRemoteLoading and fires its own load from
+                                // a scope that is already dead, leaving the
+                                // dialog on a spinner nobody can clear).
+                                throw t
                             } catch (t: Throwable) {
                                 errorMessage = webDavErrorMessage(context, t)
                             } finally {
                                 autoRemoteLoading = false
+                                operationBusy = false
                             }
                             // Refresh the remote list only AFTER the busy flag
                             // is cleared — openAutoRemoteList() re-arms it and
                             // fires its own async load, so ordering matters
                             // (finally above would otherwise clobber it).
-                            openAutoRemoteList()
+                            // `isActive` covers the window between the last
+                            // suspension point and this line: the parent scope
+                            // can be cancelled at any moment, and a refresh
+                            // started from a cancelled scope never reaches its
+                            // own `finally` (stuck spinner again).
+                            if (isActive) openAutoRemoteList()
                         }
                     }
                 },
@@ -1265,6 +1760,16 @@ fun BackupSettingsScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        // [meta-audit-1028 D4 F-02] Claim the gate BEFORE the read, not
+                        // after it: `file.readText()` is the same tens-of-MB heap
+                        // resident as a WebDAV download, and the row this dialog was
+                        // opened from (`onClick = { snapshotRestoreTarget = file }`) is
+                        // still on screen behind it — a second row could be tapped while
+                        // the first file was in memory. The claim is handed to
+                        // restoreWithSnapshot in the same Main frame as the read result,
+                        // so a read that succeeds can never be refused by the gate it
+                        // was waiting on.
+                        if (!claimRestorePayload()) return@TextButton
                         snapshotRestoreTarget = null
                         // [audit-0908] Auto-backup files embed the artifact
                         // zip and can be tens of MB — reading them on the
@@ -1276,10 +1781,13 @@ fun BackupSettingsScreen(
                             val content = withContext(Dispatchers.IO) {
                                 runCatching { file.readText() }.getOrNull()
                             }
-                            if (content != null) {
-                                restoreWithSnapshot(content)
-                            } else {
-                                errorMessage = errRead
+                            withContext(Dispatchers.Main) {
+                                if (content != null) {
+                                    restoreWithSnapshot(content, true)
+                                } else {
+                                    releaseRestorePayload()
+                                    errorMessage = errRead
+                                }
                             }
                         }
                     },
@@ -1434,7 +1942,7 @@ fun BackupSettingsScreen(
                             importReport = null
                             snapshotNote = null
                             val snap = snapshotFiles.firstOrNull()
-                            if (snap != null) {
+                            if (snap != null && claimRestorePayload()) {
                                 // [audit-0909 T6-M3] Same off-main-thread read
                                 // as the snapshot-restore dialog above
                                 // (audit-0908): auto-backup snapshots embed the
@@ -1442,12 +1950,23 @@ fun BackupSettingsScreen(
                                 // one sits on the "restore just failed, roll me
                                 // back NOW" path — freezing it is the worst
                                 // possible moment. Last sibling of the trio.
+                                // [meta-audit-1028 D4 F-02] Claimed before the
+                                // read like every other restore payload: this
+                                // button is reachable while a WebDAV download is
+                                // still in flight, which is exactly the two-payload
+                                // heap the gate exists to prevent.
                                 scope.launch {
                                     val content = withContext(Dispatchers.IO) {
                                         runCatching { snap.readText() }.getOrNull()
                                     }
-                                    if (content != null) restoreWithSnapshot(content)
-                                    else errorMessage = errRead
+                                    withContext(Dispatchers.Main) {
+                                        if (content != null) {
+                                            restoreWithSnapshot(content, true)
+                                        } else {
+                                            releaseRestorePayload()
+                                            errorMessage = errRead
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -1527,10 +2046,20 @@ private fun WebDavConfigDialog(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var url by remember { mutableStateOf(initial?.url.orEmpty()) }
-    var username by remember { mutableStateOf(initial?.username.orEmpty()) }
-    var password by remember { mutableStateOf(initial?.password.orEmpty()) }
-    var path by remember {
+    // [da1034-B4] The four form states are seeded from `initial`, which arrives
+    // ASYNCHRONOUSLY: the parent starts from `null` and fills it in from
+    // `webDavStore.load()` inside a LaunchedEffect ([deep-audit-1033 I08] — the
+    // load used to run inline in `remember { }`, i.e. on the Main thread). A
+    // keyless `remember` therefore froze the boxes at whatever `initial` held on
+    // the FIRST composition: opening the dialog in the null window showed four
+    // empty fields, and Save wrote those empties back over the real config. Same
+    // shape as the 1028-C form states and the 1033-A dialog seeds — every state
+    // seeded from `initial` re-seeds when `initial` moves. `testing` /
+    // `testResult` / `confirmClearPassword` derive from nothing and stay keyless.
+    var url by remember(initial) { mutableStateOf(initial?.url.orEmpty()) }
+    var username by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
+    var password by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
+    var path by remember(initial) {
         mutableStateOf(initial?.path ?: WebDavConfig.DEFAULT_BACKUP_DIR)
     }
     var testing by remember { mutableStateOf(false) }

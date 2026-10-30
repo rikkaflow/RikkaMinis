@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -42,8 +41,10 @@ import java.util.concurrent.TimeUnit
  *   - `transcribe` is the new canonical subcommand; `listen` is an alias kept
  *     for back-compat with prompts that learned the old form.
  *   - `--source <mic|path>` mirrors apple-speech: defaults to system mic,
- *     also accepts a Linux file path under /var/minis/... resolved via
- *     [PRootKernel.resolveHostPath]. **Audio-file transcription is not
+ *     also accepts a Linux file path — absolute (`/var/minis/...`) or
+ *     relative to the shell's cwd — joined by [resolveMaybeRelative] and
+ *     resolved session-scoped via [PRootKernel.resolvePathForSession].
+ *     **Audio-file transcription is not
  *     yet wired through the recognizer** — Android's [SpeechRecognizer]
  *     only exposes microphone input on most vendor implementations
  *     (the API 31 `EXTRA_AUDIO_SOURCE` extension is not honoured by
@@ -63,8 +64,10 @@ import java.util.concurrent.TimeUnit
 class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1))
+        // `--help` is a flag, so `positional` is empty for it too: the exit
+        // code has to be decided on the flag, or `--help` answers 2.
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
-            return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, HELP)
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, HELP)
         }
 
         // T330: tri-state agent gate before any work. [audit-0919 F-51]
@@ -75,7 +78,7 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
             when (val sub = args.positional[0]) {
                 "status" -> cmdStatus(args)
                 "languages" -> cmdLanguages(args)
-                "transcribe", "listen" -> cmdTranscribe(args, request.sessionId)
+                "transcribe", "listen" -> cmdTranscribe(args, request.sessionId, request.cwd)
                 else -> NativeOffloadResult(2, "android-speech: unknown subcommand '$sub'\n$HELP")
             }
         } catch (e: Throwable) {
@@ -101,7 +104,7 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         return NativeOffloadResult(0, OffloadOutput.formatBody(body, args) + "\n")
     }
 
-    private fun cmdTranscribe(args: OffloadArgs, sessionId: String?): NativeOffloadResult {
+    private fun cmdTranscribe(args: OffloadArgs, sessionId: String?, cwd: String?): NativeOffloadResult {
         val available = try { SpeechRecognizer.isRecognitionAvailable(context) } catch (_: Throwable) { false }
         if (!available) {
             val body = JSONObject()
@@ -118,7 +121,8 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
             return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
         }
 
-        // --source: default mic, accept "mic" / "system-mic" / any /var/minis/... path.
+        // --source: default mic, accept "mic" / "system-mic" / a path (absolute,
+        // or relative to the guest cwd the shell ran from).
         val source = args.get("source")
         if (source != null && !sourceIsMic(source)) {
             // T61: file-source path. Validate the path resolves and the
@@ -126,7 +130,10 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // SpeechRecognizer doesn't accept arbitrary audio file inputs
             // on the platforms we ship to. Reported path is what the
             // future implementation would consume.
-            val resolved = resolveSourcePath(source, sessionId)
+            // [da1033-C] `request.cwd` is forwarded so a relative --source
+            // (`--source note.wav` from /var/minis/workspace) resolves against
+            // the shell's cwd instead of being rejected outright.
+            val resolved = resolveSourcePath(source, sessionId, cwd)
             val exists = resolved?.exists() == true
             AppLogger.warning(
                 TAG,
@@ -157,7 +164,14 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val maxResults = args.getInt("max") ?: 3
         val durationSec = args.getInt("duration") ?: args.getInt("timeout") ?: 30
         val text = recognize(lang, maxResults, durationSec.toLong())
-        return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
+        // [dv18-A06] `recognize` reports every failure INSIDE the payload it
+        // returns (`{"error": …}` — "no result", recognizer_creation_failed,
+        // the onError message mapping, or the timeout sentence), and that
+        // payload used to be returned with exit 0 unconditionally: a caller
+        // checking `$?` could not tell a failed transcription from a
+        // successful one. The payload stays byte-for-byte what recognize
+        // produced; only the exit code is derived from it.
+        return NativeOffloadResult(transcribeExitCode(text), OffloadOutput.formatBody(text, args) + "\n")
     }
 
     /**
@@ -221,31 +235,34 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private fun sourceIsMic(source: String): Boolean {
-        val s = source.trim().lowercase()
-        return s.isEmpty() || s == "mic" || s == "system-mic" || s == "system_mic" || s == "microphone"
-    }
-
     /**
-     * Resolve a `/var/minis/...`-style Linux path to a host File via
-     * [PRootKernel]'s guarded resolvers only. Per-session paths
-     * (attachments / offloads / workspace / browser) work as long as the
-     * owning session is the most-recent shell to boot — last-writer-wins
-     * per the kernel's documentation.
+     * Resolve a guest Linux path to a host File via [PRootKernel]'s guarded
+     * resolvers only. With a session in scope the path is pinned to that
+     * session's tree; without one it resolves through the global bind mounts.
+     * [audit3 F-08] The session-vs-global decision is
+     * [PRootKernel.resolvePathForSession]'s — a path the session resolver
+     * rejects (escape out of the session tree) stays rejected instead of being
+     * re-resolved globally.
+     *
+     * [da1033-C] A relative path is joined onto the guest's [cwd] by the
+     * single join implementation ([resolveMaybeRelative]) — the same shape
+     * every other path-taking offload handler uses — and the joined path is
+     * what reaches the session-aware resolver. `..` out of the tree is
+     * therefore rejected *there*, not here.
      *
      * [fix/sweep1013-security] Fail-closed: no `File(trimmed)` fallback.
      * The previous `?: File(trimmed)` tail let an unresolvable absolute
      * path (e.g. /data/data/.../databases/minis.db) read through as a raw
-     * host File — a guest → host read escape past both guards. Relative
-     * paths are rejected too (never documented; `File(rel)` on the host
-     * process resolves against an arbitrary cwd, not the guest's).
+     * host File — a guest → host read escape past both guards. A blank
+     * source is still rejected outright; the mic spellings never reach this
+     * function at all ([sourceIsMic] gates the caller first).
      */
-    private fun resolveSourcePath(source: String, sessionId: String?): File? {
+    private fun resolveSourcePath(source: String, sessionId: String?, cwd: String?): File? {
         val trimmed = source.trim()
-        if (trimmed.isEmpty() || !trimmed.startsWith("/")) return null
+        if (trimmed.isEmpty()) return null
+        val guestPath = resolveMaybeRelative(trimmed, cwd)
         return try {
-            sessionId?.let { PRootKernel.resolveSessionHostPath(it, trimmed, context) }
-                ?: PRootKernel.resolveHostPath(trimmed)
+            PRootKernel.resolvePathForSession(sessionId, guestPath, context)
         } catch (e: Throwable) {
             AppLogger.warning(TAG, "resolveSourcePath('$trimmed') failed: ${e.message}")
             null
@@ -451,6 +468,7 @@ OPTIONS:
   --compact            Minimize JSON output
   -q, --quiet          Output only data field
   --source <mic|path>  Source: system mic (default) or audio file path
+                       (absolute, or relative to the shell's cwd)
   --duration <sec>     Recording duration for mic source (default: 30)
   --language <locale>  Recognition locale (e.g. en-US, zh-CN)
   --max <N>            Maximum number of result candidates (default: 3)
@@ -459,6 +477,7 @@ EXAMPLES:
   android-speech transcribe --duration 5
   android-speech transcribe --source mic --language zh-CN --duration 15
   android-speech transcribe --source /var/minis/attachments/meeting.m4a
+  android-speech transcribe --source note.wav   # relative to the shell cwd
   android-speech languages
   android-speech languages --language en
   android-speech status
@@ -470,4 +489,50 @@ Notes:
     can wire through without changing the CLI.
 """
     }
+}
+
+/**
+ * [da1033-C] True when `--source` names the microphone rather than a file:
+ * unset/blank, `mic`, the two `system[-_]mic` spellings, or `microphone`.
+ *
+ * Top-level (not a class member) so the JVM test source set can drive it
+ * directly — the same reason [resolveMaybeRelative] is top-level. The
+ * classifier must run BEFORE the file resolver: a mic spelling joined onto
+ * the cwd would otherwise be read as a file name.
+ */
+internal fun sourceIsMic(source: String): Boolean {
+    val s = source.trim().lowercase()
+    return s.isEmpty() || s == "mic" || s == "system-mic" || s == "system_mic" || s == "microphone"
+}
+
+/**
+ * [dv18-A06] Exit code for a transcribe payload from [SpeechOffloadHandler].
+ *
+ * `recognize` expresses every failure INSIDE the JSON it returns — an `error`
+ * key carrying "no result", "recognizer_creation_failed", the `onError`
+ * mapping ("No speech recognized", "Audio recording error", "Recognizer
+ * busy", …), or "speech recognition timed out after Ns". The payload is
+ * therefore the only signal a caller has, and returning it with exit 0 made a
+ * failure indistinguishable from a success. 1 = the recognition failed,
+ * 0 = the recognizer produced a text result.
+ *
+ * An empty `text` **without** an `error` stays exit 0: the recognizer reported
+ * that it completed, and "nothing was heard" is a result, not a failure of the
+ * call — unlike the `no result` / `ERROR_NO_MATCH` / `ERROR_SPEECH_TIMEOUT`
+ * paths, which arrive as an `error` payload and now exit 1.
+ *
+ * A payload that is not JSON at all exits 1 (fail-closed): the only payloads
+ * this function sees are produced by `recognize`, which always returns JSON,
+ * so anything else is a defect worth surfacing rather than reporting success.
+ *
+ * Top-level (not a companion member) so the JVM test source set can drive it
+ * directly — the same reason [sourceIsMic] and [resolveMaybeRelative] are.
+ */
+internal fun transcribeExitCode(payload: String): Int {
+    val obj = try {
+        JSONObject(payload)
+    } catch (_: Throwable) {
+        return 1
+    }
+    return if (obj.has("error")) 1 else 0
 }

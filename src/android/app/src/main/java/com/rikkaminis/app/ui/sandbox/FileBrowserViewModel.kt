@@ -1,6 +1,5 @@
 package com.rikkaminis.app.ui.sandbox
 
-import android.text.format.Formatter
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -9,21 +8,184 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import com.rikkaminis.app.ui.settings.SharedFolderRegistry
+import com.rikkaminis.app.ui.settings.invalidateStorageSnapshot
 import java.io.File
 import java.nio.file.Files
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /** Mirrors iOS FileSortKey. */
 enum class FileSortKey { NAME, MODIFIED, SIZE, KIND }
+
+/**
+ * Pure-Kotlin file size formatting (1024-based B/KB/MB/GB).
+ *
+ * [sweep1014-B29] Replaces `android.text.format.Formatter.formatFileSize`:
+ * AOSP Formatter returns "" when its `context` argument is null, and every
+ * call site here passed null — so every file size in the file browser and
+ * preview screens rendered as blank. No Android context is needed for the
+ * binary-unit format this UI uses, so the formatting lives in a pure
+ * function (also unit-testable on the JVM).
+ */
+fun formatFileSize(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    var value = bytes.toDouble()
+    var unit = 0
+    while (value >= 1024.0 && unit < 3) {
+        value /= 1024.0
+        unit += 1
+    }
+    val unitName = when (unit) {
+        1 -> "KB"
+        2 -> "MB"
+        else -> "GB"
+    }
+    val rounded = (value * 10).let { kotlin.math.round(it) } / 10.0
+    return if (rounded % 1.0 == 0.0) "${rounded.toLong()} $unitName" else "$rounded $unitName"
+}
+
+/**
+ * [FIX-FW-FILE-DATE] Which label [FileItem.formattedDate] shows for a file's
+ * mtime. Split out of the getter so the day arithmetic can be unit-tested with
+ * an injected `now` and an injected zone (the getter reads the device clock and
+ * the default zone, neither of which a JVM table test can pin).
+ */
+internal enum class FileDateBucket {
+    /** No usable mtime (`lastModified()` answers 0 for an unreadable entry). */
+    EMPTY,
+
+    /** mtime is AHEAD of the reader's clock. */
+    FUTURE,
+
+    SAME_DAY,
+
+    YESTERDAY,
+
+    /** 1–6 whole days back — shown as a weekday name. */
+    WITHIN_WEEK,
+
+    /** 7+ days back — shown as an absolute date. */
+    OLDER,
+}
+
+private const val DAY_MS = 24L * 60L * 60L * 1000L
+
+/**
+ * [FIX-FW-FILE-DATE] Bucket for [modifiedMs] as seen at [nowMs].
+ *
+ * The defect this replaces: `daysAgo in 0..6` was the last "recent" test, and
+ * `daysAgo` came from an integer division that Kotlin truncates TOWARD ZERO —
+ * so a timestamp a minute in the future (clock drift; sandbox / NFS / SMB
+ * mounts hand out the SERVER's mtime) produced `daysAgo == 0`, sailed past
+ * same-day and yesterday, and rendered a WEEKDAY NAME ("Thursday"). A file the
+ * user had just written read as if it were written last Thursday.
+ *
+ * FUTURE is therefore an explicit arm evaluated before any day arithmetic, not
+ * something the sign of `daysAgo` is trusted to catch. Consequently `daysAgo`
+ * here can only be ≥ 1, and [WITHIN_WEEK] starts at 1: a residual 0 (should the
+ * ordering ever change) degrades to an absolute date instead of inventing a
+ * weekday.
+ *
+ * [zone] is a parameter only so tests can pin UTC; production passes the
+ * device default via the caller.
+ */
+internal fun fileDateBucket(
+    modifiedMs: Long,
+    nowMs: Long,
+    zone: TimeZone = TimeZone.getDefault(),
+): FileDateBucket {
+    if (modifiedMs <= 0L) return FileDateBucket.EMPTY
+    if (modifiedMs > nowMs) return FileDateBucket.FUTURE
+    val then = Calendar.getInstance(zone).apply { timeInMillis = modifiedMs }
+    val now = Calendar.getInstance(zone).apply { timeInMillis = nowMs }
+    val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
+        now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
+    if (sameDay) return FileDateBucket.SAME_DAY
+    val yesterday = Calendar.getInstance(zone).apply {
+        timeInMillis = nowMs
+        add(Calendar.DAY_OF_YEAR, -1)
+    }
+    val isYesterday = yesterday.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
+        yesterday.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
+    if (isYesterday) return FileDateBucket.YESTERDAY
+    val daysAgo = (nowMs - modifiedMs) / DAY_MS
+    if (daysAgo in 1..6) return FileDateBucket.WITHIN_WEEK
+    return FileDateBucket.OLDER
+}
+
+/**
+ * [R5-F F-F-02] Host directory a listing must read for [hostDir], following a
+ * link whose target is a GUEST path at ANY depth.
+ *
+ * [resolveListedEntry] already maps a link's own target and [FileItem.from]
+ * uses it to DESCRIBE the entry — but entering the entry is a different
+ * question. `navigateTo` appends the link's *name* to the logical path, so the
+ * next listing asks the filesystem for `<root>/dirLink` (and later
+ * `<root>/dirLink/sub`), and `toRealPath()` cannot resolve either: PRoot stored
+ * `/var/minis/…` in the link, a path the Android host does not have. The old
+ * code fell back to the literal path, `listFiles()` returned `null` and the
+ * folder the user had just tapped opened EMPTY. Walking up to the deepest
+ * symlink ancestor and rebasing the remainder onto its mapped target is what
+ * makes both the one-level tap and sub-navigation work.
+ *
+ * Pure except for [mapGuest] (the browser's own guest→host mapper) and the
+ * filesystem reads, so the JVM test source set can pin every arm.
+ */
+internal fun resolveListingHostDir(
+    hostDir: File,
+    mapGuest: (String) -> File?,
+): File {
+    // Fast path — every non-link path, and every link whose target exists on
+    // the host under its literal spelling.
+    try {
+        return hostDir.toPath().toRealPath().toFile()
+    } catch (_: Exception) {
+        // Fall through: an unresolvable path may sit under a guest-path link.
+    }
+    var node: File? = hostDir
+    // Segments below [node], root-first; rebased onto the mapped target.
+    val tail = ArrayDeque<String>()
+    while (node != null) {
+        val linkTarget = try {
+            if (Files.isSymbolicLink(node.toPath())) {
+                Files.readSymbolicLink(node.toPath()).toString()
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+        val target = resolveListedEntry(node, linkTarget, mapGuest)
+        // `target != node` skips the unmappable case (resolveListedEntry then
+        // answers the link itself — refuse-instead-of-guess); `exists()` keeps
+        // a dangling link from being rebased onto a fabricated path.
+        if (target != node && target.exists()) {
+            var out = target
+            for (name in tail) out = File(out, name)
+            return out
+        }
+        tail.addFirst(node.name)
+        node = node.parentFile
+    }
+    return hostDir
+}
 
 /**
  * File item model — corresponds to iOS FileItem.
  */
 @Immutable
 data class FileItem(
+    /**
+     * The entry as it sits in the listing — for a symlink this is the LINK
+     * (lstat), never what it points at. Delete/unlink and every path-based
+     * gesture must keep reading this field: [R4-V F-11] removing a
+     * directory-shaped link has to unlink the NAME, and
+     * `deleteRecursively()` on the resolved tree would wipe the target.
+     */
     val file: File,
     val name: String,
     val isDirectory: Boolean,
@@ -31,6 +193,20 @@ data class FileItem(
     val size: Long,
     /** lastModified() in epoch ms, 0 when unavailable. */
     val modifiedMs: Long = 0L,
+    /**
+     * [R5-F F-F-02] Host-READABLE path — what the entry resolves to for
+     * reading, i.e. [resolveListedEntry]'s answer, which is [file] itself for
+     * every non-link entry (and for a link that cannot be mapped, the
+     * documented refuse-instead-of-guess answer).
+     *
+     * Consumers that OPEN the entry use this; consumers that remove or rename
+     * it use [file]. Keeping both on the item is what lets a container-absolute
+     * link (`ln -s /var/minis/workspace/x dirLink`) be listed AND opened: the
+     * preview route used to be handed [file]'s absolutePath — the host path of
+     * the link — and every content read followed it to a target the Android
+     * host does not have, so the preview screen came up empty.
+     */
+    val hostPath: File = file,
 ) {
     val iconRes: String
         get() {
@@ -57,7 +233,7 @@ data class FileItem(
         }
 
     val formattedSize: String
-        get() = Formatter.formatFileSize(null, size)
+        get() = formatFileSize(size)
 
     /** Whether this file can be previewed inline (text, image, etc.) */
     val isPreviewable: Boolean
@@ -111,23 +287,32 @@ data class FileItem(
             "xlsx", "xls", "docx", "doc", "pptx", "ppt", "odt", "ods", "odp",
         )
 
-    /** Mirrors iOS FileItem.formattedDate: today=time, yesterday="Yesterday", <7d=weekday, else short date. */
+    /**
+     * Mirrors iOS FileItem.formattedDate: today=time, yesterday="Yesterday", <7d=weekday, else short date.
+     *
+     * [FIX-FW-FILE-DATE] A timestamp in the FUTURE renders as `"Just now"`:
+     * a future mtime is almost always a clock that runs ahead of this device
+     * (sandbox/PRoot, NFS/SMB mounts stamp the SERVER's clock, a just-written
+     * file from a drifted guest), so "the file is new" is the honest reading.
+     * The alternative — an absolute date — would print tomorrow's (or next
+     * year's) date for a file that appeared a second ago, which is exactly the
+     * misreading this fix removes. `"Just now"` is distinguishable from the
+     * same-day label (`h:mm a`), and collapsing "1 s ago" and "1 s from now"
+     * onto it is intentional: the two are indistinguishable to the user anyway.
+     * Bucketing (and therefore the weekday fallthrough) lives in
+     * [fileDateBucket] where a JVM table test can pin it.
+     */
     val formattedDate: String
         get() {
-            if (modifiedMs <= 0L) return ""
             val date = Date(modifiedMs)
-            val now = Calendar.getInstance()
-            val then = Calendar.getInstance().apply { time = date }
-            val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
-                now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
-            if (sameDay) return timeFormatter.format(date)
-            val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
-            val isYesterday = yesterday.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
-                yesterday.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
-            if (isYesterday) return "Yesterday"
-            val daysAgo = (now.timeInMillis - then.timeInMillis) / (24L * 60 * 60 * 1000)
-            if (daysAgo in 0..6) return weekdayFormatter.format(date)
-            return shortDateFormatter.format(date)
+            return when (fileDateBucket(modifiedMs, System.currentTimeMillis())) {
+                FileDateBucket.EMPTY -> ""
+                FileDateBucket.FUTURE -> "Just now"
+                FileDateBucket.SAME_DAY -> timeFormatter.format(date)
+                FileDateBucket.YESTERDAY -> "Yesterday"
+                FileDateBucket.WITHIN_WEEK -> weekdayFormatter.format(date)
+                FileDateBucket.OLDER -> shortDateFormatter.format(date)
+            }
         }
 
     companion object {
@@ -135,17 +320,28 @@ data class FileItem(
         private val weekdayFormatter = SimpleDateFormat("EEEE", Locale.getDefault())
         private val shortDateFormatter = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
 
-        fun from(file: File): FileItem? {
-            if (!file.exists()) return null
+        fun from(file: File, resolveGuestAbsolute: (String) -> File? = { null }): FileItem? {
+            // [sweep1014-B29] Symlink check MUST precede the exists() check:
+            // exists() follows the link, so a broken (dangling) symlink reads
+            // as nonexistent and was dropped before the isSymlink handling
+            // below ever ran. Dangling symlinks are still listable entries.
             val isSymlink = Files.isSymbolicLink(file.toPath())
+            if (!isSymlink && !file.exists()) return null
+            // [R4-V F-11] PRoot writes the path the SHELL sees into the link
+            // (`/var/minis/…`, `/usr/bin/…`). The Android host root has no
+            // `/var/minis`, so resolving an absolute target as a host path made
+            // every container-absolute link read as a 0-byte NON-directory —
+            // no folder affordance, unopenable, and it exposed the trash icon.
+            // Absolute targets now go through the browser's own guest→host
+            // mapper; an unmappable target stays "unknown" (the link itself),
+            // never a fabricated file.
             val resolved = if (isSymlink) {
-                try {
-                    Files.readSymbolicLink(file.toPath()).toFile().let { target ->
-                        if (target.isAbsolute) target else File(file.parentFile, target.path)
-                    }
+                val rawTarget = try {
+                    Files.readSymbolicLink(file.toPath()).toString()
                 } catch (_: Exception) {
-                    file
+                    null
                 }
+                resolveListedEntry(file, rawTarget, resolveGuestAbsolute)
             } else file
 
             return FileItem(
@@ -155,6 +351,10 @@ data class FileItem(
                 isSymlink = isSymlink,
                 size = if (resolved.isDirectory) 0L else resolved.length(),
                 modifiedMs = resolved.lastModified(),
+                // [R5-F F-F-02] The resolved target — what opening the entry
+                // must read. `file` stays the link so delete/unlink keeps
+                // working on the name (see the field KDoc).
+                hostPath = resolved,
             )
         }
     }
@@ -254,17 +454,51 @@ class FileBrowserViewModel(
             // T147: prefer the session-scoped resolver when we know which
             // session's view we're rendering — global bindMounts is
             // last-writer-wins and points at whichever session's PRoot
-            // booted most recently.
+            // booted most recently. [audit3 F-08] Route the choice through
+            // resolvePathForSession: a path the SESSION resolver rejects
+            // (escape out of the session tree) must not fall through to the
+            // global resolver, which searches every minis-sessions/<id>/ tree
+            // — i.e. possibly another session's view. Non-session paths
+            // (/var/minis/skills, mounts) still resolve globally, inside
+            // resolveSessionHostPath itself.
             val sid = sessionId
             val ctx = appContext
-            if (sid != null && ctx != null) {
-                com.rikkaminis.app.sandbox.PRootKernel
-                    .resolveSessionHostPath(sid, linuxPath, ctx)
-                    ?.let { return it }
+            val scoped = if (sid != null && ctx != null) {
+                com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(sid, linuxPath, ctx)
+            } else {
+                com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
             }
-            com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)?.let { return it }
+            scoped?.let { return it }
         }
         return if (relativePath.isEmpty()) rootPath else File(rootPath, relativePath)
+    }
+
+    /**
+     * [R4-V F-11] Map a symlink's ABSOLUTE target — a GUEST path, because that
+     * is what PRoot stores when the shell creates the link — onto the host file
+     * the listing should describe.
+     *
+     * Same resolver the listing itself uses ([resolvePathForSession] when the
+     * screen knows its session, the global [PRootKernel.resolveHostPath]
+     * otherwise), so a link into `/var/minis/workspace` reads as THIS session's
+     * workspace rather than whichever session booted last.
+     *
+     * A host-absolute link (not written by PRoot) has no guest meaning: the
+     * guest mapping lands inside the rootfs, so when the mapped path does not
+     * exist we fall back to the raw path. When neither exists the answer is
+     * `null` — [resolveListedEntry] then keeps the entry as "unknown" and the
+     * UI treats it as a plain non-directory, which is the refuse-instead-of-
+     * guess shape this defect needs.
+     */
+    private fun resolveGuestAbsoluteTarget(rawTarget: String): File? {
+        val ctx = appContext
+        val mapped = if (ctx != null) {
+            com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(sessionId, rawTarget, ctx)
+        } else {
+            com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(rawTarget)
+        }
+        if (mapped != null && mapped.exists()) return mapped
+        return File(rawTarget).takeIf { it.exists() }
     }
 
     init {
@@ -356,14 +590,62 @@ class FileBrowserViewModel(
         loadItems()
     }
 
+    /**
+     * [da1031-C] Linux (PRoot) path of [item] — the same root + relativePath +
+     * name mapping [updatePathComponents] uses for currentLinuxPath, so the
+     * read-only-mount guard sees the path the agent / shell sees. Null when
+     * this browser has no linux root: nothing guest-visible to guard then.
+     */
+    private fun linuxPathOf(item: FileItem): String? =
+        (displayLinuxPrefix ?: linuxRootPath)?.let { root ->
+            val base = root.trimEnd('/')
+            if (relativePath.isEmpty()) "$base/${item.name}"
+            else "$base/$relativePath/${item.name}"
+        }
+
     fun deleteItem(item: FileItem) {
         viewModelScope.launch(Dispatchers.IO) {
+            // [da1031-C] ISSUE-04 A1: guard BEFORE deleting. T219's read-only
+            // mount lock is software-only (PRoot `-b` has no read-only
+            // modifier) and File.delete() works on the HOST path, which that
+            // lock never covers — without this check a Locked mount's files
+            // were really deleted from the UI. Same refusal wording family as
+            // DebugRPCHandler's handleWriteFile guard.
+            linuxPathOf(item)?.let { lp ->
+                if (com.rikkaminis.app.sandbox.PRootKernel.isLinuxPathUnderReadOnlyMount(lp)) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "Read-only mount: ${item.name} cannot be deleted",
+                    )
+                    return@launch
+                }
+                // [deep-audit-1033 I01] The browser also opens the two
+                // read-only shared folders (Settings → Shared Folders →
+                // Skills / Memory, and the agent's /var/minis/{skills,memory}
+                // shortcuts). Their `writable = false` reached the AccessBadge
+                // and nothing else, so the trash icon really removed SOUL.md /
+                // GLOBAL.md / SKILL.md from disk while the screen said
+                // Read-Only. Refusal shape is deliberately the same as the
+                // mount guard above; the predicate comes from the registry
+                // (single source), not a second path list here.
+                if (SharedFolderRegistry.isLinuxPathUnderReadOnlySharedDir(lp)) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "Read-only folder: ${item.name} cannot be deleted",
+                    )
+                    return@launch
+                }
+            }
             try {
                 // T10-L5: File.delete()/deleteRecursively() return false instead
                 // of throwing on a read-only mount or missing permission. The
                 // old code ignored the result, so loadItems() re-listed the
                 // still-present file and the user saw nothing happen.
-                val deleted = if (item.isDirectory) {
+                // [R4-V F-11] A SYMLINK is never deleted *through*: Kotlin's
+                // deleteRecursively() walks the RESOLVED tree (FileTreeWalk →
+                // File.listFiles(), which follows the link), so removing a
+                // directory-shaped link wiped the target directory's contents
+                // (measured: 2 files before, 0 after — report §3 arm A) while
+                // leaving the link's target in place. Unlink the name instead.
+                val deleted = if (shouldDeleteRecursively(item.isDirectory, item.isSymlink)) {
                     item.file.deleteRecursively()
                 } else {
                     item.file.delete()
@@ -374,6 +656,17 @@ class FileBrowserViewModel(
                     )
                     return@launch
                 }
+                // [deep-audit-1048 B-05] The Storage page keeps a
+                // process-lifetime snapshot (`StorageSnapshotCache`: rootfs
+                // lstat walk + per-session recursive sizing, ~minutes of work)
+                // and its re-entry path reuses the cached totals instead of
+                // re-walking. Deleting a file / a whole session directory here
+                // therefore left the Storage screen showing the pre-delete
+                // sizes for the rest of the process. Invalidate on the SUCCESS
+                // path only — the failure branch above (and the read-only
+                // guards) leave the tree untouched, so dropping the cache there
+                // would only cost a rescan.
+                invalidateStorageSnapshot()
                 loadItems()
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(errorMessage = e.message)
@@ -444,12 +737,13 @@ class FileBrowserViewModel(
         val hostPath = currentHostPath
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Resolve symlinks for listing but keep logical path for breadcrumbs
-                val resolvedPath = try {
-                    hostPath.toPath().toRealPath().toFile()
-                } catch (_: Exception) {
-                    hostPath
-                }
+                // Resolve symlinks for listing but keep logical path for breadcrumbs.
+                // [R5-F F-F-02] `toRealPath()` alone cannot resolve a PRoot link
+                // (it stores a GUEST path the Android host does not have), so a
+                // folder whose name the user just tapped listed as EMPTY. The
+                // helper walks up to the deepest symlink ancestor and rebases —
+                // see its KDoc for the shape.
+                val resolvedPath = resolveListingHostDir(hostPath, ::resolveGuestAbsoluteTarget)
 
                 // Dotfile filter is gated on the user-facing "Show Hidden
                 // Files" preference (T-hidden-files a3e7f1d0). Snapshot
@@ -458,7 +752,10 @@ class FileBrowserViewModel(
                 val showHidden = _uiState.value.showHidden
                 val files = resolvedPath.listFiles()
                     ?.filter { showHidden || !it.name.startsWith(".") }
-                    ?.mapNotNull { FileItem.from(it) }
+                    // [R4-V F-11] Pass the guest→host mapper so absolute link
+                    // targets (a PRoot link stores `/var/minis/…`) describe the
+                    // file the shell meant, not a nonexistent host path.
+                    ?.mapNotNull { FileItem.from(it, ::resolveGuestAbsoluteTarget) }
                     ?: emptyList()
 
                 rawItems = files

@@ -22,20 +22,25 @@ import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.provider.sanitizeToolPairing
+import com.rikkaminis.app.provider.hasWirePayload
+import com.rikkaminis.app.provider.sseDataPayload
+import com.rikkaminis.app.provider.nonStreamCeilingCutLogLine
+import com.rikkaminis.app.provider.nonStreamOutputCeilingCut
+import com.rikkaminis.app.provider.LegacyMediaPlan
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.StreamCancelBridge
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.openai.explicitOffEffortFor
 import com.rikkaminis.app.provider.thinking.EffortTierLearner
 import com.rikkaminis.app.provider.thinking.GatewayEffortTruth
+import com.rikkaminis.app.provider.thinking.ThinkingEffortLadder
 import com.rikkaminis.app.provider.thinking.ReasoningEchoDecider
 import com.rikkaminis.app.provider.thinking.ReasoningEchoPolicy
 import com.rikkaminis.app.provider.thinking.ThinkingResolveContext
 import com.rikkaminis.app.provider.thinking.ThinkingRuleResolver
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -45,23 +50,13 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Connection
-import okhttp3.EventListener
-import okhttp3.Handshake
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
 import java.io.IOException
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Proxy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -319,9 +314,13 @@ class OpenAIProvider constructor(
      * header; every other OpenAI-compatible endpoint uses `Authorization:
      * Bearer`. Centralized so the Azure branch can't accidentally set the wrong
      * one. Mirrors iOS OpenAIProvider.applyKeyAuth.
+     *
+     * [da1030 ISSUE-06] The body now delegates to the package-level
+     * [applyOpenAIKeyAuth] so the models-list fetcher (OpenAIModelsApi) shares
+     * this exact rule instead of keeping a second, hard-coded Bearer path.
      */
     private fun Request.Builder.applyKeyAuth(token: String): Request.Builder =
-        if (isAzure) header("api-key", token) else header("Authorization", "Bearer $token")
+        applyOpenAIKeyAuth(isAzure, token)
 
     /**
      * Build the request URL for Azure OpenAI, mirroring the official AzureOpenAI
@@ -586,6 +585,12 @@ class OpenAIProvider constructor(
         val textBuf = StringBuilder()
         var stopReason: String? = null
         var usage: LLMUsage? = null
+        // [r3-b08 F-05] The stream's own truncation verdict. `Finished.truncated`
+        // is what the EOF guards raise when the upstream cut a partial answer
+        // (dv28/dv29); dropping it here turned "half a reply" into a clean
+        // success for every non-streaming caller (minis-model-use), which read
+        // the partial text as the whole answer.
+        var truncated = false
         // [T-codex-gpt-image2-oauth-android] Collect model-generated media
         // (gpt-image-2 images) so non-streaming callers — notably
         // minis-model-use (ModelUseOffloadHandler) — get them on
@@ -615,12 +620,36 @@ class OpenAIProvider constructor(
             when (chunk) {
                 is LLMStreamChunk.Text -> textBuf.append(chunk.text)
                 is LLMStreamChunk.Usage -> usage = chunk.usage
-                is LLMStreamChunk.Finished -> stopReason = chunk.stopReason
+                is LLMStreamChunk.Finished -> {
+                    stopReason = chunk.stopReason
+                    truncated = chunk.truncated
+                }
                 is LLMStreamChunk.MediaAttachment -> media.add(chunk.attachment)
+                // [r3-b08 F-05, registered] Tool calls and thinking deltas are
+                // still dropped here: LLMResponse has no field to carry either
+                // (data/model/LLMMessage.kt is outside this branch's file set),
+                // so a tool-only non-streamed turn still returns "" — see the
+                // report's residual R-F05.
                 else -> Unit
             }
         }
-        LLMResponse(textBuf.toString(), stopReason, usage, media)
+        if (truncated) {
+            // Fail loudly instead of returning half an answer as if complete.
+            // TransientError is the same class the streaming path uses for an
+            // EOF-cut stream, so callers already treat it as retryable.
+            throw LLMError.TransientError(
+                "Stream ended before completion (no finish_reason): the reply is truncated"
+            )
+        }
+        val text = textBuf.toString()
+        // [FIX-FW-NONSTREAM C2] `finish_reason = length` is not an EOF signal
+        // and does not set [truncated], so this arm returned the cut-off prefix
+        // with no indication that it was cut. Deliberately NOT an exception —
+        // see nonStreamOutputCeilingCut — just a structured log line.
+        if (nonStreamOutputCeilingCut(stopReason)) {
+            android.util.Log.w(name, nonStreamCeilingCutLogLine(name, stopReason, text.length))
+        }
+        LLMResponse(text, stopReason, usage, media)
     }
 
     override fun streamMessageClamped(
@@ -647,7 +676,7 @@ class OpenAIProvider constructor(
         val body = if (usesChatCompletionsAPI) {
             buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
         } else {
-            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, tools = tools, thinkingLevel = thinkingLevel)
+            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, tools = tools, thinkingLevel = thinkingLevel, imageParts = imageParts)
         }
         // T302: serialize the request body exactly once. Pre-T302 we called
         // body.toString() three times per request (debug log + OAuth byte
@@ -727,66 +756,16 @@ class OpenAIProvider constructor(
         }
         // [fix/zero-chunk-cancel] Cancellation BRIDGE, registered BEFORE the
         // first blocking call (call.execute() below, then reader.readLine()).
-        //
-        // On a wedged upstream (accepted the request, sent nothing) the read
-        // loop blocks inside readLine(). A blocking read is NOT interruptible
-        // by coroutine cancellation — measured with a real wedged server:
-        // cancelling the outer job, the inner job, a wrapping coroutineScope,
-        // and a withTimeoutOrNull each still ran the full 60s budget, while
-        // call.cancel() stopped it in 324ms.
-        //
-        // `awaitClose { call.cancel() }` cannot cover that window: it is
-        // registered only AFTER the loop exits, so a wedged read never reaches
-        // it. This child coroutine is registered first, so cancelling the
-        // producer scope reaches it even while the parent body is stuck — its
-        // `finally` then closes the socket and unblocks the read.
-        //
-        // Measured with the real nesting (outer runBlocking -> inner
-        // runBlocking -> callbackFlow + flowOn(IO)): 335ms with the bridge vs
-        // 60018ms without, user cancel at 300ms.
+        // The bridge is what makes a user cancel land while the body is parked
+        // in a blocking read; the shared implementation carries the three
+        // load-bearing semantics (catch-not-finally, cause-recorded-first,
+        // cancel-only-when-cancelled) and its measurements — see
+        // [com.rikkaminis.app.provider.StreamCancelBridge].
         //
         // Pairs with the worker's cancel watcher (ModelExecutionService),
         // which cancels the collecting job when the user's cancel file
         // appears — that is what reaches this bridge.
-        // Set once the stream body has been fully consumed, so the bridge can
-        // tell "we finished normally" from "we are being cancelled".
-        val streamCompleted = java.util.concurrent.atomic.AtomicBoolean(false)
-        // [fix/zero-chunk-cancel] The bridge's OWN cancellation cause.
-        //
-        // Closing the socket makes the blocking read fail with
-        // `SocketException: Socket closed` — and that exception is what the
-        // catch below sees. It says "the socket was closed", NOT *why*, so the
-        // user cancel that F-177 taught us to classify as INFO arrives looking
-        // exactly like a transport failure and is logged as
-        // `stream parse exception` again (measured: healthy stream, user cancel
-        // -> ERROR; same on the wedged path).
-        //
-        // Capturing the cause here restores the distinction: the CE handed to
-        // this cancelled coroutine IS its cancellation cause (user cancel ->
-        // ModelExecutionCancelledException; consumer died of an IOException ->
-        // a CE carrying that IOException). Recorded BEFORE `call.cancel()`, so
-        // it is always visible to the catch that the socket error triggers.
-        val bridgeCancelCause = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
-        val cancelBridge = launch {
-            // `catch` rather than `finally`: a cancelled coroutine's
-            // CancellationException is its cancellation cause, and this is the
-            // only public way to read it (`Job.getCancellationException` is
-            // internal kotlinx API).
-            val cause: Throwable? = try {
-                awaitCancellation()
-                null
-            } catch (e: CancellationException) {
-                e
-            }
-            // Only tear the socket down when we are being CANCELLED. On a
-            // normal completion the body is already fully consumed and
-            // OkHttp may return the connection to the pool — cancelling
-            // then would throw away a reusable connection for no reason.
-            if (!streamCompleted.get()) {
-                bridgeCancelCause.set(cause)
-                try { call.cancel() } catch (_: Exception) {}
-            }
-        }
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         val response = try {
             call.execute()
         } catch (e: IOException) {
@@ -962,22 +941,20 @@ class OpenAIProvider constructor(
 
             while (reader.readLine().also { line = it } != null) {
                 val l = line ?: continue
-                if (l.startsWith("data:")) {
-                    // First SSE payload row proves the stream is live — disarm
-                    // the first-data watchdog before we parse the row.
-                    firstDataArrived.set(true)
-                    firstDataWatchdog.cancel()
-                }
                 // Tolerate `data:` with or without the optional space — the
                 // HTML5 SSE spec only treats one leading space as ignorable,
                 // and some OpenAI-compatible servers (e.g. China Telecom's
                 // eaichat.ctyun.cn deepseek-v4-oc endpoint) emit `data:{...}`
                 // with no space. Strict `data: ` matching dropped every
                 // chunk on those providers, surfacing as empty-stream errors.
-                if (!l.startsWith("data:")) continue
-                val payload = l.removePrefix("data:").let {
-                    if (it.startsWith(" ")) it.removePrefix(" ") else it
-                }
+                // [r3-b08 F-13] The rule now lives in [sseDataPayload] so the
+                // Anthropic and Gemini parsers share it instead of each
+                // rediscovering the same relay one provider at a time.
+                val payload = sseDataPayload(l) ?: continue
+                // First SSE payload row proves the stream is live — disarm
+                // the first-data watchdog before we parse the row.
+                firstDataArrived.set(true)
+                firstDataWatchdog.cancel()
                 if (payload == "[DONE]") {
                     // Flush any remaining buffered content from think tag extraction
                     if (hasThinkTags) {
@@ -1016,20 +993,28 @@ class OpenAIProvider constructor(
                     val delta = ev.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
                     val type = ev.optString("type", "")
                     if (delta != null) {
-                        val cLen = delta.optString("content", "").length
+                        // [R5-E1 E-C-01] Both counters now read through the SAME
+                        // readers the emitter uses. `optString` on an ARRAY
+                        // `content` answers the array's JSON source, so the
+                        // Mistral dialect used to book the visible-text counter
+                        // with `[{"type":"thinking",…}]` while crediting the
+                        // reasoning counter with 0 — and [T321]'s inconsistency
+                        // warning then fired on every healthy response.
+                        val cLen = chatCompletionsDeltaText(delta).length
                         val rcLen = delta.optString("reasoning_content", "").length
                         val rLen = delta.optString("reasoning", "").length
+                        val blockThinkingLen =
+                            chatCompletionsDeltaThinkingBlocks(delta).sumOf { it.length }
                         val tcLen = delta.optJSONArray("tool_calls")?.length() ?: 0
                         val role = delta.optString("role", "")
-                        if (cLen + rcLen + rLen + tcLen > 0 || delta.has("role")) {
+                        if (cLen + rcLen + rLen + blockThinkingLen + tcLen > 0 || delta.has("role")) {
                             com.rikkaminis.app.logging.AppLogger.debug(
                                 "OpenAIProvider",
                                 "[T321] SSE delta: contentLen=$cLen rcLen=$rcLen rLen=$rLen toolCalls=$tcLen role='$role'"
                             )
                         }
                         contentLen += cLen
-                        reasoningLen += rcLen + rLen
-                        if (tcLen > 0) toolCallEventCount += tcLen
+                        reasoningLen += rcLen + rLen + blockThinkingLen
                     } else if (type.isNotEmpty()) {
                         // Responses API event-typed diagnostics
                         val dLen = ev.optString("delta", "").length
@@ -1047,6 +1032,18 @@ class OpenAIProvider constructor(
                 if (isResponsesAPI) {
                     // Responses API SSE parsing
                     val type = event.optString("type", "")
+                    // [dv28 A-01] Second feed site of the SAME counter the EOF
+                    // guard reads. Before this, only the Chat Completions
+                    // `delta.tool_calls` shape fed it, so a tool-call-only
+                    // Responses turn cut by EOF looked like an EMPTY turn
+                    // (contentLen == reasoningLen == toolCallEventCount == 0),
+                    // emitted no Finished(truncated = true), and let a
+                    // half-streamed argument object reach the executor.
+                    toolCallEventCount += responsesToolCallEventWeight(
+                        eventType = type,
+                        itemType = event.optJSONObject("item")?.optString("type"),
+                        argsDeltaLen = event.optString("delta", "").length,
+                    )
                     when {
                         // Reasoning text deltas — both event variants the API emits.
                         // For Codex OAuth the actual content is encrypted (echoed via
@@ -1150,12 +1147,18 @@ class OpenAIProvider constructor(
                                 "OpenAIProvider",
                                 "Responses API response.failed — code=$code message=$message"
                             )
-                            if (code == "server_error" || code == "rate_limit_exceeded") {
-                                // Transient family: retry on the same model
-                                // rather than falling back through the group.
-                                throw LLMError.TransientError("[$code] $message")
-                            }
-                            throw LLMError.ProviderError("[$code] $message")
+                            // [dv28 A-08] Same single-source mapping as the Chat
+                            // Completions inline-error arm: the symbolic code is turned
+                            // into HTTP semantics first, so `rate_limit_exceeded` becomes
+                            // RateLimited (back off / fall back to another route) instead
+                            // of the TransientError it used to share with server_error
+                            // (retry on the SAME model). Response body handed over is the
+                            // error object itself, whose `message` field is what
+                            // extractHttpErrorMessage reads.
+                            throw mapHttpError(
+                                openAiStreamErrorStatus(code, err?.optString("type", "") ?: ""),
+                                err?.toString() ?: event.toString(),
+                            )
                         }
                         type == "response.incomplete" -> {
                             // [T-responses-terminal-events] The server ended the
@@ -1228,13 +1231,22 @@ class OpenAIProvider constructor(
                     // Check for inline error (OpenRouter sends error inside SSE with empty choices)
                     val inlineError = event.optJSONObject("error")
                     if (inlineError != null) {
-                        val code = inlineError.optInt("code", 0)
-                        val msg = inlineError.optString("message", "Unknown SSE error")
+                        // [dv28 A-08] The code token is read as a STRING and mapped to
+                        // HTTP semantics before it reaches mapHttpError: relays spell
+                        // it `{"code":"rate_limit_exceeded"}` or carry `type` only, and
+                        // the old `optInt("code", 0)` coerced every such payload to 0 —
+                        // which mapHttpError turns into a non-retryable ProviderError.
                         // [T-android-effort-self-learn] Same hook as the HTTP-400 path:
                         // some relays report the identical error inside a 200 stream, so
                         // the enum lands in the event instead of the status body.
                         EffortTierLearner.record(request.url.host, bodyStr, event.toString())
-                        val err = mapHttpError(code, event.toString())
+                        val err = mapHttpError(
+                            openAiStreamErrorStatus(
+                                inlineError.optString("code", ""),
+                                inlineError.optString("type", ""),
+                            ),
+                            event.toString(),
+                        )
                         throw err
                     }
                     val choices = event.optJSONArray("choices")
@@ -1270,30 +1282,33 @@ class OpenAIProvider constructor(
                             // {"type":"thinking","thinking":[{"type":"text","text":"…"}]}
                             // (NOT reasoning_content/reasoning). Absorbed from
                             // RikkaHub's ChatCompletionsStreamDecoder.
-                            d.optJSONArray("content")?.let { contentArr ->
-                                for (ci in 0 until contentArr.length()) {
-                                    val contentItem = contentArr.optJSONObject(ci) ?: continue
-                                    if (contentItem.optString("type", "") != "thinking") continue
-                                    val thinkingArr = contentItem.optJSONArray("thinking") ?: continue
-                                    for (ti in 0 until thinkingArr.length()) {
-                                        val thinkingItem = thinkingArr.optJSONObject(ti) ?: continue
-                                        val thinkingText = thinkingItem.safeOptString("text", "")
-                                        if (thinkingText.isNotEmpty()) {
-                                            reasoningAccum.append(thinkingText)
-                                            if (!sawReasoningDelta) {
-                                                sawReasoningDelta = true
-                                            }
-                                            send(LLMStreamChunk.ThinkingDelta(thinkingText))
-                                        }
-                                    }
+                            //
+                            // [R5-E1 E-C-01] The blocks come from the shared
+                            // [chatCompletionsDeltaThinkingBlocks] reader so the
+                            // [T321] counters above book exactly what is emitted
+                            // here — one reader, two consumers, no drift.
+                            for (thinkingText in chatCompletionsDeltaThinkingBlocks(d)) {
+                                reasoningAccum.append(thinkingText)
+                                if (!sawReasoningDelta) {
+                                    sawReasoningDelta = true
                                 }
+                                send(LLMStreamChunk.ThinkingDelta(thinkingText))
                             }
                         }
 
                         // Text content (with think-tag extraction — enabled for
                         // all models; extractThinkTags is a no-op when no tags
                         // are present, so this path is safe for plain text)
-                        delta?.safeOptString("content", "")?.let { text ->
+                        //
+                        // [r3-b08 F-01] The field is read through
+                        // [chatCompletionsDeltaText], NOT `safeOptString`: the
+                        // Mistral dialect above sends `content` as an ARRAY of
+                        // typed blocks, and `JSONObject.optString` on an array
+                        // returns the WHOLE array serialised as JSON — which
+                        // then went out as the assistant's visible reply while
+                        // the `{"type":"text"}` blocks inside it were skipped by
+                        // the thinking-only loop above.
+                        chatCompletionsDeltaText(delta).let { text ->
                             if (text.isNotEmpty()) {
                                 val extracted = extractThinkTags(text, thinkState)
                                 if (extracted.thinking.isNotEmpty()) send(LLMStreamChunk.ThinkingDelta(extracted.thinking))
@@ -1304,6 +1319,13 @@ class OpenAIProvider constructor(
                         // Tool calls (parallel: keyed by index)
                         val toolCalls = delta?.optJSONArray("tool_calls")
                         if (toolCalls != null) {
+                            // [dv28 A-01] Feed the EOF guard's turn counter from the
+                            // Chat Completions flavour. The weight derivation lives in
+                            // OpenAiStreamSignals.kt (single source, shared with the
+                            // Responses arm) — a turn whose ONLY progress is a tool call
+                            // must still be readable as non-empty when the stream dies
+                            // without [DONE], or the truncated-tool-call guard never fires.
+                            toolCallEventCount += chatCompletionsToolCallEventWeight(toolCalls.length())
                             for (i in 0 until toolCalls.length()) {
                                 val tc = toolCalls.getJSONObject(i)
                                 val idx = tc.optInt("index", 0)
@@ -1409,7 +1431,14 @@ class OpenAIProvider constructor(
             // and silently save a half answer. Signal truncated so the
             // turnTruncated retry owns it. Only fires for non-empty EOF: a fully
             // empty EOF is already handled by failOnSilentEmptyCompletion.
-            if (!finishedSent && (contentLen > 0 || reasoningLen > 0)) {
+            // [deep-audit-1018 ISSUE-01] `toolCallEventCount` joins the guard
+            // (Anthropic's `toolChars` counterpart — same-family 2nd site): a
+            // tool-call-only turn (zero text/reasoning) cut by EOF used to emit
+            // no Finished at all, so `turnTruncated` stayed false downstream and
+            // the truncated-tool-call guard never fired — a half-streamed
+            // argument object then reached the executor (and ToolJsonRepair
+            // would happily close it into a valid-but-wrong payload).
+            if (!finishedSent && (contentLen > 0 || reasoningLen > 0 || toolCallEventCount > 0)) {
                 send(LLMStreamChunk.Finished(finishReason, truncated = !sawFinishReason))
             }
 
@@ -1470,7 +1499,7 @@ class OpenAIProvider constructor(
                 // erased. Deliberately the SAME predicate, so "consumer-side
                 // cancellation" keeps one definition: a cause-less CE is a
                 // teardown, while a CE carrying a real failure stays an error.
-                ?: bridgeCancelCause.get()?.asConsumerSideCancellation()
+                ?: cancelBridge.consumerCancellationCause?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "OpenAIProvider",
@@ -1496,13 +1525,13 @@ class OpenAIProvider constructor(
             // [fix/zero-chunk-cancel] The body was fully read (or failed) — mark
             // it so the cancellation bridge does not tear down a connection
             // OkHttp could otherwise return to the pool.
-            streamCompleted.set(true)
+            cancelBridge.markStreamCompleted()
             // [T-thinking-fold-leak] Always drop the per-stream tag state on
             // every exit (normal, error, cancellation) so a half-open tag can
             // never leak into the next stream served by this provider instance.
             thinkState.reset()
         }
-        cancelBridge.cancel()
+        cancelBridge.dispose()
         channel.close()
         // T171: when the coroutine is cancelled (user tapped stop), the
         // reader loop above is suspended inside the OkHttp source — only
@@ -1571,10 +1600,12 @@ class OpenAIProvider constructor(
     ): RawPassthroughResult = withContext(Dispatchers.IO) {
         // [T5-M3] This is a provider network entry point, so it must obey the
         // same process boundary as sendMessage/streamMessage: the app process
-        // must not fall back to an in-process provider call (TF-D). Its only
-        // caller (ModelUseOffloadHandler) runs in the main process, so a failed
-        // remote dispatch used to land here and allocate the raw response bytes
-        // on the app heap — exactly what the :modelservice worker prevents.
+        // must not fall back to an in-process provider call (TF-D).
+        // [fix/audit3-1015 F-03] The note that used to sit here said the only
+        // caller ran in the main process — which WAS the bug: `--passthrough`
+        // called this from :app, the enforce() below threw, and the mode could
+        // never succeed. The caller is ModelExecutionService's
+        // `passthrough_request` branch, so this runs in :modelservice.
         ProviderBoundary.enforce(ProviderBoundary.currentProcessName())
         val url: String = when {
             endpoint != null && endpoint.startsWith("/") ->
@@ -1604,6 +1635,10 @@ class OpenAIProvider constructor(
         // ctor extraHeaders, then user headers LAST — replace semantics.
         for ((k, v) in extraHeaders) builder.header(k, v)
         for ((k, v) in headers) builder.header(k, v)
+        // [da1030 ISSUE-06] Same last-wins placement as the chat/responses
+        // builders (:2390): after extraHeaders + user headers, so the
+        // per-provider override beats any UA a caller smuggled into `headers`.
+        builder.applyUserAgentOverride(customUserAgent)
 
         com.rikkaminis.app.logging.AppLogger.info(
             "OpenAIProvider",
@@ -1777,6 +1812,10 @@ class OpenAIProvider constructor(
 
         val attachments = mutableListOf<LLMMediaAttachment>()
         val revisedPrompts = mutableListOf<String>()
+        // [R5-E1 E-F-05] Last non-2xx status seen on a `url` download hop, for the
+        // terminal "nothing usable came back" error below. Per-call, not
+        // per-provider: every `generateImage` invocation starts clean.
+        var lastDownloadStatus: Int? = null
         for (i in 0 until dataArray.length()) {
             val item = dataArray.optJSONObject(i) ?: continue
             val hintMime = item.safeOptString("mime_type", "").ifEmpty { null } // xAI extension
@@ -1804,51 +1843,77 @@ class OpenAIProvider constructor(
                         // skipped it and leaked the connection instead of
                         // returning it to the pool.
                         client.newCall(dlReq).execute().use { dlResp ->
-                            // [FIX-1 / F-186] This is the only place we issue a
-                            // SECOND, self-initiated download on behalf of a
-                            // provider response, so the size ceiling has to be
-                            // ours. `body?.bytes()` read the whole thing into
-                            // memory with no bound at all — a relay that
-                            // answered an images request with a large (or
-                            // deliberately unbounded) payload could OOM the
-                            // process. Same practice as
-                            // ArtifactBackupScope.MAX_FILE_BYTES: declare the
-                            // ceiling, skip and log when exceeded.
-                            val declaredLen = dlResp.body?.contentLength() ?: -1L
-                            if (declaredLen > MAX_GENERATED_IMAGE_BYTES) {
+                            // [R5-E1 E-F-05] The SECOND hop carries its own
+                            // status code and nothing was reading it: only the
+                            // size ceiling and a non-empty body were checked, so
+                            // an expired signed URL (403), a vanished object
+                            // (404) or a gateway error page (500) had its ERROR
+                            // BODY wrapped into an [LLMMediaAttachment] — the
+                            // mime came from `hintMime` (xAI's `mime_type`) or
+                            // `Content-Type`, and `detectImageMime` answers
+                            // image/png for anything it cannot recognise. The
+                            // bubble then rendered a broken image with no error
+                            // anywhere: the classic M7 false success.
+                            if (!GeneratedImageVerdict.downloadAccepted(dlResp.code)) {
+                                lastDownloadStatus = dlResp.code
+                                // The URL itself is NOT logged here: a generated-image
+                                // link is usually a signed object URL, and its query
+                                // carries the credential. Status + body prefix is what
+                                // identifies the failure; the item's index names which.
                                 com.rikkaminis.app.logging.AppLogger.warning(
                                     "OpenAIProvider",
-                                    "[ModelUseRoute] image download skipped: declared ${declaredLen}B exceeds ${MAX_GENERATED_IMAGE_BYTES}B",
+                                    "[ModelUseRoute] image download HTTP ${dlResp.code} skipped item=$i body=${dlResp.body?.string()?.take(200).orEmpty()}",
                                 )
-                                // NOTE: this must NOT be a `continue` — the
-                                // enclosing `use { }` is an INLINE lambda and
-                                // `break`/`continue` across inline lambdas needs
-                                // Kotlin 2.2 (CI: "The feature break continue in
-                                // inline lambdas is only available since
-                                // language version 2.2"). Falling through with
-                                // dlBytes == null has exactly the same effect:
-                                // the attachment is not added.
+                                // Same inline-lambda rule as the size arm below:
+                                // no `continue` here (Kotlin < 2.2 rejects it).
+                                // Adding no attachment has exactly that effect.
                             } else {
-                                // contentLength is -1 for chunked responses, so
-                                // the declared check alone is not enough: stream
-                                // through a bounded buffer and abort as soon as
-                                // the ceiling is crossed.
-                                //
-                                // NOT `source.readByteArray(n)`: that call reads
-                                // EXACTLY n bytes and throws EOFException when the
-                                // body is shorter, so it would have rejected every
-                                // image smaller than the ceiling — i.e. all of
-                                // them.
-                                val dlBytes = readBodyBounded(dlResp.body, MAX_GENERATED_IMAGE_BYTES)
-                                val ctMime = dlResp.header("Content-Type")
-                                if (dlBytes != null && dlBytes.isNotEmpty()) {
-                                    val mime = hintMime ?: ctMime ?: detectImageMime(dlBytes)
-                                    attachments.add(LLMMediaAttachment(LLMMediaAttachment.MediaType.IMAGE, mime, dlBytes))
-                                } else if (dlBytes == null) {
+                                // [FIX-1 / F-186] This is the only place we issue a
+                                // SECOND, self-initiated download on behalf of a
+                                // provider response, so the size ceiling has to be
+                                // ours. `body?.bytes()` read the whole thing into
+                                // memory with no bound at all — a relay that
+                                // answered an images request with a large (or
+                                // deliberately unbounded) payload could OOM the
+                                // process. Same practice as
+                                // ArtifactBackupScope.MAX_FILE_BYTES: declare the
+                                // ceiling, skip and log when exceeded.
+                                val declaredLen = dlResp.body?.contentLength() ?: -1L
+                                if (declaredLen > MAX_GENERATED_IMAGE_BYTES) {
                                     com.rikkaminis.app.logging.AppLogger.warning(
                                         "OpenAIProvider",
-                                        "[ModelUseRoute] image download skipped: body exceeds ${MAX_GENERATED_IMAGE_BYTES}B",
+                                        "[ModelUseRoute] image download skipped: declared ${declaredLen}B exceeds ${MAX_GENERATED_IMAGE_BYTES}B",
                                     )
+                                    // NOTE: this must NOT be a `continue` — the
+                                    // enclosing `use { }` is an INLINE lambda and
+                                    // `break`/`continue` across inline lambdas needs
+                                    // Kotlin 2.2 (CI: "The feature break continue in
+                                    // inline lambdas is only available since
+                                    // language version 2.2"). Falling through with
+                                    // dlBytes == null has exactly the same effect:
+                                    // the attachment is not added.
+                                } else {
+                                    // contentLength is -1 for chunked responses, so
+                                    // the declared check alone is not enough: stream
+                                    // through a bounded buffer and abort as soon as
+                                    // the ceiling is crossed.
+                                    //
+                                    // NOT `source.readByteArray(n)`: that call reads
+                                    // EXACTLY n bytes and throws EOFException when the
+                                    // body is shorter, so it would have rejected every
+                                    // image smaller than the ceiling — i.e. all of
+                                    // them.
+                                    val dlBytes = readBodyBounded(dlResp.body, MAX_GENERATED_IMAGE_BYTES)
+                                    val ctMime = dlResp.header("Content-Type")
+                                    if (dlBytes != null && dlBytes.isNotEmpty()) {
+                                        val mime = hintMime ?: ctMime ?: detectImageMime(dlBytes)
+                                        attachments.add(LLMMediaAttachment(LLMMediaAttachment.MediaType.IMAGE, mime, dlBytes))
+                                    } else if (dlBytes == null) {
+                                        com.rikkaminis.app.logging.AppLogger.warning(
+                                            "OpenAIProvider",
+                                            "[ModelUseRoute] image download skipped: body exceeds ${MAX_GENERATED_IMAGE_BYTES}B",
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1865,6 +1930,17 @@ class OpenAIProvider constructor(
         }
 
         val text = revisedPrompts.joinToString("\n")
+        // [R5-E1 E-F-05] Terminal guard: the request DID declare image items, yet
+        // not one of them produced bytes. Returning an empty-attachment success
+        // here is the same false success one level up — the caller caches nothing
+        // but the UI shows a text-only reply for an image request. Throw through
+        // the existing [LLMError.ProviderError] (no new error type) and carry the
+        // failed hop's status so the message names the real cause.
+        GeneratedImageVerdict.noUsableImageMessage(
+            declaredItems = dataArray.length(),
+            attachmentCount = attachments.size,
+            lastDownloadStatus = lastDownloadStatus,
+        )?.let { throw LLMError.ProviderError(it) }
         return LLMResponse(text, "end_turn", null, attachments)
     }
 
@@ -1892,9 +1968,18 @@ class OpenAIProvider constructor(
         // OpenAI rejects an unanswered `tool_calls` entry (no following
         // role:"tool" message) and a role:"tool" message with an unknown
         // tool_call_id — both deterministic 400s.
-        val sanitizedMessages = sanitizeToolPairing(messages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(messages) { detail ->
             android.util.Log.i("OpenAIProvider", detail)
         }
+        // [deep-audit-1045 A-03] The request-level `imageParts` argument is
+        // attached to the LAST user turn (attachTopLevelImages below), and the
+        // `minis-model-use` CLI path builds that turn from text + media only —
+        // its `content` is empty whenever the CLI call carries a bare image or
+        // audio block. Keyed on the PRE-filter list on purpose: the filter's
+        // whole job is to drop entries, so an index taken afterwards is -1 in
+        // exactly the case this guard exists for.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val sanitizedMessages = sanitizedRaw
             // [FIX-1 / F-211] Drop messages the sanitizer emptied (only orphan
             // tool parts get stripped). An empty `content` is a shape OpenAI
             // rejects, so without this filter the sanitizer manufactures the
@@ -1908,7 +1993,18 @@ class OpenAIProvider constructor(
             // empty-dropping is provider policy, not pairing policy. Gemini's
             // serializer turns "" into " " (a valid empty turn) and
             // RequestSanitizersTest pins that the sanitizer itself keeps them.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            //
+            // [deep-audit-1045 A-03] "Empty" means no TEXT, not no payload: a
+            // media-only turn (audioParts / imageParts, or the last user turn
+            // whose bytes ride the top-level `imageParts` argument) still has
+            // something to put on the wire, and dropping it deleted the user's
+            // image / audio from the request entirely.
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         val body = JSONObject()
         body.put("model", model.id)
         // Defense-in-depth clamp (see AnthropicProvider): upstream
@@ -1976,7 +2072,16 @@ class OpenAIProvider constructor(
         // filled in by injectThinkingParams below and consumed by the message loop.
         var echoPolicy: ReasoningEchoPolicy? = null
         if (!isMistral) {
-            echoPolicy = injectThinkingParams(body, thinkingLevel, maxTokens)
+            // [deep-audit-1047 A-01] Feed the CLAMPED value, not the raw request
+            // value. `thinking_budget` is defined relative to `max_tokens`
+            // (`budget < max_tokens`, a deterministic 400), and the field two
+            // lines above writes `safeMaxTokens`. The resolver derived its
+            // ceiling from the raw number instead, so an out-of-band caller
+            // above the model ceiling (sub-agent budget, synthesized request —
+            // exactly the callers the clamp defends) emitted e.g.
+            // max_tokens=8192 with thinking_budget=32768. Same pair contract as
+            // AnthropicProvider's `cappedMaxTokens`, which was fixed in 1046.
+            echoPolicy = injectThinkingParams(body, thinkingLevel, safeMaxTokens)
         }
 
         // Tools
@@ -2066,6 +2171,12 @@ class OpenAIProvider constructor(
         }
 
         val lastUserIndex = sanitizedMessages.indexOfLast { it.role == LLMMessage.Role.USER }
+        // [R5-E1 E-F-06] The request-level list under a name the per-message loop
+        // cannot shadow: the USER branch binds `imageParts` to the turn's OWN
+        // `AgentContentPart.ImageData` parts, so the parameter is unreachable
+        // there — which is exactly how the top-level list came to be readable
+        // only in the legacy branch.
+        val requestTurnImages = imageParts
         for ((index, msg) in sanitizedMessages.withIndex()) {
             if (msg.contentParts.isNotEmpty()) {
                 // Structured content parts
@@ -2119,6 +2230,43 @@ class OpenAIProvider constructor(
                                 put("content", tr.content)
                             })
                         }
+                        // [da1017-01 / ISSUE-01] Tool-result images (read_image,
+                        // browser_use screenshots) used to be dropped here: a
+                        // role:"tool" entry only accepts a plain string, and
+                        // nothing else in this branch looked at
+                        // ToolResult.imageData. Emit them in the user message
+                        // right after the tool results — see
+                        // OpenAIToolResultImages. Capture-only results
+                        // (imageData == null) add no entry at all, so a
+                        // text-only history serializes byte-identically to
+                        // before this change.
+                        val toolResultImages = toolResults.mapNotNull { tr ->
+                            val bytes = tr.imageData
+                            val mime = tr.imageMimeType
+                            if (bytes != null && mime != null) {
+                                OpenAIToolResultImages.Entry(
+                                    caption = "[tool result image: ${capChatToolCallId(tr.id)}]",
+                                    bytes = bytes,
+                                    mimeType = mime,
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (toolResultImages.isNotEmpty()) {
+                            messagesArray.put(JSONObject().apply {
+                                put("role", "user")
+                                put(
+                                    "content",
+                                    OpenAIToolResultImages.chatUserContent(
+                                        entries = toolResultImages,
+                                        supportsImages = supportsImages,
+                                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                                    ),
+                                )
+                            })
+                        }
                         // T132: emit text + image_url parts as a structured user
                         // message. The previous structured-contentParts branch
                         // dropped AgentContentPart.ImageData entirely — only the
@@ -2127,14 +2275,39 @@ class OpenAIProvider constructor(
                         // populated (which is always now). Mirrors iOS
                         // OpenAIAgentProvider.swift L732-738.
                         val hasImages = imageParts.isNotEmpty()
-                        if (hasImages || textParts.isNotEmpty()) {
-                            if (hasImages) {
+                        // [R5-E1 E-F-06] The request-level images ride this turn too.
+                        // The old code read them ONLY in the legacy
+                        // `contentParts.isEmpty()` branch, so a last user turn that
+                        // already had parts (which is every agent turn) silently
+                        // dropped the caller's images. Deduplicated by CONTENT:
+                        // the composer writes the same bytes into both carriers,
+                        // and appending blindly would send every chat photo twice.
+                        val extraRequestImages =
+                            if (index == lastUserIndex) {
+                                TurnImageCarry.missingIndices(
+                                    turnImages = imageParts.map { it.data },
+                                    requestImages = requestTurnImages.map { it.data },
+                                ).map { requestTurnImages[it] }
+                            } else {
+                                emptyList()
+                            }
+                        if (hasImages || textParts.isNotEmpty() || extraRequestImages.isNotEmpty()) {
+                            if (hasImages || extraRequestImages.isNotEmpty()) {
                                 val contentArray = JSONArray()
+                                // [R5-E1 E-F-06] The request-level images ride this
+                                // SAME walk as the turn's own parts (no second
+                                // serializer, no extra helper call site — the
+                                // tool-result wiring test pins those counts).
+                                val wireTurnParts =
+                                    if (extraRequestImages.isEmpty()) msg.contentParts
+                                    else msg.contentParts + extraRequestImages.map {
+                                        AgentContentPart.ImageData(it.data, it.mimeType)
+                                    }
                                 // Walk contentParts in original order so the
                                 // [attached image: …] text caption that
                                 // precedes each ImageData part stays adjacent
                                 // to the right image, matching iOS.
-                                for (part in msg.contentParts) {
+                                for (part in wireTurnParts) {
                                     when (part) {
                                         is AgentContentPart.Text -> {
                                             if (part.text.isNotEmpty()) {
@@ -2197,29 +2370,42 @@ class OpenAIProvider constructor(
 
                 val attachTopLevelImages =
                     index == lastUserIndex && msg.role == LLMMessage.Role.USER && imageParts.isNotEmpty()
-                if (attachTopLevelImages || msg.audioParts.isNotEmpty()) {
+                // [deep-audit-1047 A-03] Per-message images ride the SAME branch as
+                // the request-level list and the message's own audio. The payload
+                // predicate (`hasWirePayload`) already declares
+                // `imageParts.isNotEmpty()` a reason to keep a turn — but until now
+                // no serializer ever read `msg.imageParts`, so a text-less turn that
+                // only the predicate let through went out as `content: ""` with the
+                // bytes dropped. Mirrors the audio arm, which has always been read
+                // from the message. Order (images → audio → text) is the order the
+                // wire sees for the top-level arm.
+                val legacyImages = (if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = attachTopLevelImages,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0 || LegacyMediaPlan.hasMedia(0, msg.audioParts.size)) {
                     val contentArray = JSONArray()
-                    if (attachTopLevelImages) {
-                        for (part in imageParts) {
-                            if (supportsImages) {
-                                // T-imgsize: provider-boundary backstop.
-                                val safeBytes = com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(part.data)
-                                val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
-                                val b64 = Base64.encodeToString(safeBytes, Base64.NO_WRAP)
-                                val imageUrl = JSONObject()
-                                imageUrl.put("url", "data:$safeMime;base64,$b64")
-                                contentArray.put(JSONObject().apply {
-                                    put("type", "image_url")
-                                    put("image_url", imageUrl)
-                                })
-                            } else {
-                                // T264: target model has no vision modality —
-                                // emit text placeholder (iOS-parity literal).
-                                contentArray.put(JSONObject().apply {
-                                    put("type", "text")
-                                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
-                                })
-                            }
+                    for (part in legacyImages) {
+                        if (supportsImages) {
+                            // T-imgsize: provider-boundary backstop.
+                            val safeBytes = com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(part.data)
+                            val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
+                            val b64 = Base64.encodeToString(safeBytes, Base64.NO_WRAP)
+                            val imageUrl = JSONObject()
+                            imageUrl.put("url", "data:$safeMime;base64,$b64")
+                            contentArray.put(JSONObject().apply {
+                                put("type", "image_url")
+                                put("image_url", imageUrl)
+                            })
+                        } else {
+                            // T264: target model has no vision modality —
+                            // emit text placeholder (iOS-parity literal).
+                            contentArray.put(JSONObject().apply {
+                                put("type", "text")
+                                put("text", VISION_UNSUPPORTED_PLACEHOLDER)
+                            })
                         }
                     }
                     // [GH#67] Official Chat Completions audio-input shape,
@@ -2236,7 +2422,14 @@ class OpenAIProvider constructor(
                     // Preserve the pre-GH#67 image-path behavior (text part
                     // always present); for audio-only messages skip an empty
                     // text block some servers reject.
-                    if (attachTopLevelImages || msg.content.isNotEmpty()) {
+                    // [deep-audit-1045 A-03] The `|| attachTopLevelImages` arm
+                    // used to be reachable only for turns that had text (the
+                    // empty filter dropped the rest), so it never emitted an
+                    // empty text part. Now that a media-only last user turn
+                    // survives the filter, the text part must be skipped when
+                    // there is no text — a server that rejects an empty text
+                    // block would 400 on a legitimate image-only request.
+                    if (msg.content.isNotEmpty()) {
                         contentArray.put(JSONObject().apply {
                             put("type", "text")
                             put("text", msg.content)
@@ -2437,23 +2630,12 @@ class OpenAIProvider constructor(
      * - DeepSeek (pre-V4) / GLM / Kimi / MiniMax: no params (model decides).
      */
     /**
-     * [T-android-xhigh-effort-clamp] Clamp the reasoning-effort string for
-     * model families whose backend only accepts low/medium/high and 400/422 on
-     * our `xhigh` tier: MiMo-2.5/Pro and Agnes. For these, `xhigh` → `high`;
-     * every other value passes through untouched, and every other model is
-     * unaffected. Applied at the single point where each branch would emit an
-     * effort string (Chat Completions reasoning_effort / reasoning.effort AND
-     * the Responses API reasoning.effort) so no branch can leak a raw xhigh.
-     * lowercase-contains match, mirroring the T-reasoning-effort-fallback keys.
+     * [T-android-xhigh-effort-clamp] The MiMo/Agnes `xhigh` clamp lived here as
+     * a private copy of [ThinkingEffortLadder.clampEffortForModel]. [r3-b08 F-08]
+     * routed the Responses path through the shared ladder, which left this copy
+     * with zero callers — two copies of one rule is how the two paths drifted
+     * apart, so it is gone rather than kept as a second source.
      */
-    private fun clampEffortForModel(effort: String): String {
-        val lid = model.id.lowercase()
-        // [T-fallback-thinking-preclamp] Match the FAMILY substring, not one
-        // spelling: catalog docs say "MiMo-2.5" but the live API returns
-        // "mimo-v2.5" / "mimo-v2.5-pro", which the old "mimo-2.5" match missed
-        // (mirrors iOS 72968c4f).
-        return if (effort == "xhigh" && (lid.contains("mimo") || lid.contains("agnes"))) "high" else effort
-    }
 
     /**
      * [T-relay-host-adaptation] Whether this model accepts an explicit
@@ -2496,8 +2678,9 @@ class OpenAIProvider constructor(
         // [T5-M4] AUTO means "let the vendor decide" — omit ALL thinking
         // control fields. The relay dialects below key off level.isEnabled, and
         // AUTO.isEnabled == true, so picking Auto silently forced thinking ON on
-        // every listed host. The sensenova branch already returns early for
-        // AUTO; these six predate AUTO and never followed the semantics.
+        // every listed host. The measured-gateway branch and the relay dialects
+        // below predate AUTO and never followed the semantics; AUTO is handled
+        // once, above both, by the single `level == AUTO` return.
         // [T-deepseek-v4-thinking-echo] Resolve the ctx (and the echo requirement the
         // rules declare for this model) BEFORE the relay-host table: the host branches
         // return early, and the vendor's echo demand is a property of the MODEL, not of
@@ -2528,6 +2711,51 @@ class OpenAIProvider constructor(
         val echo = ThinkingRuleResolver.echoPolicyFor(ctx)
 
         if (level == ThinkingLevel.AUTO) return echo
+
+        // [T-measured-gateway-effort] Every gateway whose `reasoning_effort` enum we
+        // measured by hand is dispatched HERE, off [GatewayEffortTruth.isMeasuredHost]
+        // — the truth table, not a second copy of the host list. Two gateways are
+        // measured today (sensenova: token.sensenova.cn / api.sensenova.cn;
+        // senseaudio: api.senseaudio.cn), and the enums differ PER MODEL *and* per
+        // gateway: `glm-5.2` takes `max` while `sensenova-6.8-flash-lite` rejects it,
+        // and `deepseek-v4.1-flash` takes `medium` on sensenova but is 400'd for it on
+        // senseaudio. Adding a third host is therefore a table edit, not an edit here.
+        //
+        // This branch used to be a `when (host)` arm listing sensenova's two hosts by
+        // hand, which meant senseaudio — measured, tabled, and reachable from the
+        // picker — silently fell through to the rule engine below: `medium` went out
+        // unclamped (HTTP 400, "reasoning_effort must be low, high, xhigh, max, or an
+        // integer within [1, 100]") and `xhigh`/`max` were clamped away by whatever
+        // stale tier set the catalog had declared. A table nobody consults is not a
+        // truth table.
+        //
+        // The clamp is applied PER TIER. Collapsing every enabled tier onto one value
+        // (the behaviour that preceded it: unconditional "xhigh") avoided the 400 but
+        // silently made LOW/MEDIUM/HIGH indistinguishable — the picker drew three
+        // options that produced one request, which is the bug users reported.
+        // clampEffort walks down then up, so a tier the model's enum lacks degrades to
+        // the strongest tier below it instead of failing the request.
+        if (GatewayEffortTruth.isMeasuredHost(host)) {
+            if (model.supportsReasoning == false) return echo
+            if (!level.isEnabled) {
+                // Measured live: `reasoning_effort:"none"` is accepted and really
+                // stops the reasoning stream; enable_thinking is honoured but does
+                // NOT suppress reasoning_content on deepseek-v4-flash.
+                body.put("reasoning_effort", "none")
+                return echo
+            }
+            // ON: emit the tier the user asked for, clamped onto the gateway's
+            // measured enum (see GatewayEffortTruth.resolveTier — measurement first,
+            // then whatever the catalog declared, then that gateway's own fallback).
+            body.put(
+                "reasoning_effort",
+                GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
+            )
+            return echo
+        }
+
+        // Every host below is an UNMEASURED relay dialect: its wire shape comes from
+        // live observation of one model, not from a probed effort enum.
         when (host) {
             "api.siliconflow.cn" -> {
                 // SiliconFlow: enable_thinking is honored only by an allowlist.
@@ -2571,44 +2799,6 @@ class OpenAIProvider constructor(
                 return echo
             }
 
-            // [T-sensenova-effort-enum] Sensenova's OpenAI-compat gateway
-            // (token.sensenova.cn / api.sensenova.cn) validates reasoning_effort against
-            // a STRICT per-model enum and 400s anything outside it:
-            //   400 field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none
-            // The enum is per MODEL, not per host — measured live 2026-09-23, glm-5.2
-            // accepts `max` while sensenova-6.8-flash-lite rejects it. See
-            // GatewayEffortTruth for the measured table and the probe that produced it.
-            //
-            // Re-measured 2026-09-23: an earlier note here claimed "non-streaming
-            // accepted max, streaming 400'd it". Both paths reject it now, so the only
-            // reason for a clamp is that the gateway's enum is strict — not a per-path
-            // difference. deepseek-v4-flash was the original observed victim.
-            //
-            // The clamp is applied PER TIER. Collapsing every enabled tier onto one
-            // value (the previous behaviour: unconditional "xhigh") avoided the 400 but
-            // silently made LOW/MEDIUM/HIGH indistinguishable — the picker drew three
-            // options that produced one request, which is the bug users reported.
-            // clampEffort walks down then up, so a tier the model's enum lacks degrades
-            // to the strongest tier below it instead of failing.
-            "token.sensenova.cn", "api.sensenova.cn" -> {
-                if (level == ThinkingLevel.AUTO) return echo
-                if (model.supportsReasoning == false) return echo
-                if (!level.isEnabled) {
-                    // Measured live: `reasoning_effort:"none"` is accepted and really
-                    // stops the reasoning stream; enable_thinking is honoured but does
-                    // NOT suppress reasoning_content on deepseek-v4-flash.
-                    body.put("reasoning_effort", "none")
-                    return echo
-                }
-                // ON: emit the tier the user asked for, clamped onto the gateway's
-                // measured enum (see GatewayEffortTruth.resolveTier — measurement first,
-                // then whatever the catalog declared, then the conservative fallback).
-                body.put(
-                    "reasoning_effort",
-                    GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
-                )
-                return echo
-            }
         }
 
         // [T-android-thinking-rules-phase2] Everything below the host table is now
@@ -2763,6 +2953,15 @@ class OpenAIProvider constructor(
         temperature: Double? = null,
         tools: List<AgentToolDefinition> = emptyList(),
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        // [da1017-01 / ISSUE-01] Top-level image attachments of the current
+        // turn. The Chat-Completions builder has taken this since T132; this
+        // one never did, so every Responses-API request that carried images
+        // (image-generation / image-edit via the `minis-model-use` CLI on a
+        // Codex-OAuth instance) went out with the bytes silently missing —
+        // the model only saw whatever caption the caller embedded in the
+        // prompt. Defaulted for the same reason the parameter above is:
+        // existing callers stay source-compatible.
+        imageParts: List<LLMMessage.ImagePart> = emptyList(),
     ): JSONObject {
         // T264: same vision-capability gate as buildRequestBody. Responses API
         // path (Codex OAuth) is currently always wired to a vision-capable
@@ -2776,12 +2975,23 @@ class OpenAIProvider constructor(
         // API rejects an unanswered function_call and a function_call_output
         // with an unknown call_id). Sanitize BEFORE deriving the prompt cache
         // key so the key reflects the payload that actually goes on the wire.
-        val sanitizedMessages = sanitizeToolPairing(messages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(messages) { detail ->
             android.util.Log.i("OpenAIProvider", detail)
         }
+        // [deep-audit-1045 A-03] Same pre-filter index as the Chat-Completions
+        // builder — see the note there; this file must not fork the decision.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val sanitizedMessages = sanitizedRaw
             // [FIX-1 / F-211] Same filter as the legacy serializer path above —
             // see the note there for why this lives at the call site.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            // [deep-audit-1045 A-03] and for why "empty" excludes media-only
+            // turns (audioParts / imageParts / top-level turn images).
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         val body = JSONObject()
         body.put("model", model.id)
         body.put("stream", stream)
@@ -2853,8 +3063,23 @@ class OpenAIProvider constructor(
         // [T-thinking-auto-level] AUTO maps to null effort; the effort branch
         // below skips, and the OFF branch is gated by !isEnabled (AUTO is
         // enabled), so AUTO emits NO reasoning object — vendor default applies.
+        // [r3-b08 F-08] The tier is snapped onto what the endpoint ACTUALLY
+        // accepts — the same two sources the Chat-Completions path reads (a
+        // gateway's own 400-measured enum via EffortTierLearner, then the
+        // catalog's declared set via model.reasoningEffortValues). Before this
+        // only the MiMo/Agnes family clamp ran, so a gateway that answers 400
+        // with its legal enum was recorded by the error path (`record` at the
+        // HTTP-error catch) and then IGNORED by the next request on this path —
+        // the retry re-sent the same illegal tier forever.
         val effort = if (thinkingLevel.isEnabled) {
-            mapThinkingLevelToResponsesEffort(thinkingLevel)?.let { clampEffortForModel(it) }
+            clampResponsesEffort(
+                effort = mapThinkingLevelToResponsesEffort(thinkingLevel),
+                modelId = model.id,
+                learnedEffortValues = EffortTierLearner.learned(
+                    basePath.toHttpUrlOrNull()?.host ?: "", model.id,
+                ),
+                declaredEffortValues = model.reasoningEffortValues,
+            )
         } else null
         when {
             // [T-android-mistral-reasoning-422] Mistral rejects the reasoning
@@ -2943,7 +3168,19 @@ class OpenAIProvider constructor(
         // structured content parts become typed input items — function_call /
         // function_call_output — instead of free-text role/content pairs.
         val input = JSONArray()
-        for (msg in sanitizedMessages) {
+        // [da1017-01] Same anchor the Chat-Completions builder uses: the
+        // top-level `imageParts` argument belongs to the CURRENT turn, which is
+        // the last user message in the list.
+        val lastUserIndex = sanitizedMessages.indexOfLast { it.role == LLMMessage.Role.USER }
+        for ((index, msg) in sanitizedMessages.withIndex()) {
+            // [deep-audit-1047 A-03] One flag for the whole legacy media path: the
+            // request-level images (last user turn only — unchanged contract), the
+            // message's own image parts, and its audio all share ONE branch. The
+            // last two used to be mutually exclusive `else if` arms.
+            val attachTopLevelImages =
+                index == lastUserIndex && msg.role == LLMMessage.Role.USER && imageParts.isNotEmpty()
+            val legacyMediaAttached =
+                attachTopLevelImages || msg.imageParts.isNotEmpty() || msg.audioParts.isNotEmpty()
             if (msg.contentParts.isNotEmpty()) {
                 when (msg.role) {
                     LLMMessage.Role.ASSISTANT -> {
@@ -2976,12 +3213,46 @@ class OpenAIProvider constructor(
                         }
                     }
                     LLMMessage.Role.USER -> {
-                        for (tr in msg.contentParts.filterIsInstance<AgentContentPart.ToolResult>()) {
+                        val toolResults = msg.contentParts.filterIsInstance<AgentContentPart.ToolResult>()
+                        for (tr in toolResults) {
                             val (callId, _) = splitResponsesAPIIds(tr.id)
                             input.put(JSONObject().apply {
                                 put("type", "function_call_output")
                                 put("call_id", capResponsesId(callId))
                                 put("output", tr.content)
+                            })
+                        }
+                        // [da1017-01 / ISSUE-01] Tool-result images. Same defect
+                        // as the Chat-Completions branch above and the same
+                        // remedy: `function_call_output.output` is a plain
+                        // string, so the bytes ride in the user message that
+                        // follows — via the input_image part type this path
+                        // already uses for composer attachments.
+                        val toolResultImages = toolResults.mapNotNull { tr ->
+                            val bytes = tr.imageData
+                            val mime = tr.imageMimeType
+                            if (bytes != null && mime != null) {
+                                OpenAIToolResultImages.Entry(
+                                    caption = "[tool result image: ${capResponsesId(splitResponsesAPIIds(tr.id).first)}]",
+                                    bytes = bytes,
+                                    mimeType = mime,
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (toolResultImages.isNotEmpty()) {
+                            input.put(JSONObject().apply {
+                                put("role", "user")
+                                put(
+                                    "content",
+                                    OpenAIToolResultImages.responsesUserContent(
+                                        entries = toolResultImages,
+                                        supportsImages = supportsImages,
+                                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                                    ),
+                                )
                             })
                         }
                         // T132: emit text + input_image content for the user
@@ -2995,9 +3266,33 @@ class OpenAIProvider constructor(
                         // convertMessagesResponsesAPI's image handling.
                         val textParts = msg.contentParts.filterIsInstance<AgentContentPart.Text>()
                         val imgParts = msg.contentParts.filterIsInstance<AgentContentPart.ImageData>()
-                        if (imgParts.isNotEmpty()) {
+                        // [R5-E1 E-F-06] Same defect, same remedy as the Chat
+                        // Completions branch: the request-level list used to be
+                        // readable only in the `contentParts.isEmpty()` arm, so a
+                        // structured last user turn dropped it. Content-deduped
+                        // because the composer writes the same bytes into both
+                        // carriers.
+                        val extraRequestImages =
+                            if (index == lastUserIndex) {
+                                TurnImageCarry.missingIndices(
+                                    turnImages = imgParts.map { it.data },
+                                    requestImages = imageParts.map { it.data },
+                                ).map { imageParts[it] }
+                            } else {
+                                emptyList()
+                            }
+                        if (imgParts.isNotEmpty() || extraRequestImages.isNotEmpty()) {
                             val contentArray = JSONArray()
-                            for (part in msg.contentParts) {
+                            // [R5-E1 E-F-06] Request-level images ride this SAME
+                            // walk as the turn's own parts — same branch, same
+                            // encoder, no extra helper call site (the wiring test
+                            // pins responsesUserContent at two call sites).
+                            val wireTurnParts =
+                                if (extraRequestImages.isEmpty()) msg.contentParts
+                                else msg.contentParts + extraRequestImages.map {
+                                    AgentContentPart.ImageData(it.data, it.mimeType)
+                                }
+                            for (part in wireTurnParts) {
                                 when (part) {
                                     is AgentContentPart.Text -> {
                                         if (part.text.isNotEmpty()) {
@@ -3054,13 +3349,51 @@ class OpenAIProvider constructor(
                         })
                     }
                 }
-            } else if (msg.audioParts.isNotEmpty()) {
-                // [GH#67] Legacy (non-contentParts) message carrying audio —
-                // the minis-model-use path. The Responses API keeps the SAME
-                // nested input_audio shape as Chat Completions ({data,
-                // format}), unlike input_image which flattens image_url to a
-                // string. Text rides along as input_text.
+            } else if (legacyMediaAttached) {
+                // [da1017-01 / ISSUE-01] Legacy (non-contentParts) message whose
+                // images arrive in the top-level `imageParts` argument — the
+                // `minis-model-use` CLI path, and the analogue of the
+                // `attachTopLevelImages` branch in buildRequestBody. Before
+                // this, the Responses builder had no image handling of any
+                // kind: a Codex-OAuth instance asked to do image generation or
+                // image editing sent the prompt text and none of the bytes.
+                // Mirrors the Chat flavour: images first, then the message text
+                // as an input_text part (an empty one is skipped, per GH#67's
+                // note about servers that reject it).
+                //
+                // [GH#67] The SAME branch carries `msg.audioParts` — the
+                // Responses API keeps the nested input_audio shape as Chat
+                // Completions ({data, format}), unlike input_image which
+                // flattens image_url to a string.
+                //
+                // [deep-audit-1047 A-03] These used to be two MUTUALLY EXCLUSIVE
+                // `else if` branches: a turn carrying both request-level images
+                // and message-level audio hit the image arm and every audio part
+                // was dropped silently. Chat Completions has always treated the
+                // two carriers as one list
+                // (`if (attachTopLevelImages || msg.audioParts.isNotEmpty())`);
+                // this is that shape — order images → audio → text included. The
+                // image arm also reads `msg.imageParts` for the same reason the
+                // Chat builder does (see hasWirePayload).
+                val legacyImages =
+                    (if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts
                 val contentArray = JSONArray()
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = attachTopLevelImages,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0 || LegacyMediaPlan.hasMedia(0, msg.audioParts.size)) {
+                    val imageArray = OpenAIToolResultImages.responsesUserContent(
+                        entries = legacyImages.map {
+                            OpenAIToolResultImages.Entry(caption = "", bytes = it.data, mimeType = it.mimeType)
+                        },
+                        supportsImages = supportsImages,
+                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                    )
+                    for (i in 0 until imageArray.length()) contentArray.put(imageArray.get(i))
+                }
                 for (audio in msg.audioParts) {
                     contentArray.put(JSONObject().apply {
                         put("type", "input_audio")
@@ -3262,3 +3595,276 @@ class OpenAIProvider constructor(
 
 // [refactor/split-provider] OkHttpNetTraceListener moved verbatim to
 // OkHttpNetTraceListener.kt (private -> internal).
+
+/**
+ * [da1017-01 / ISSUE-01] Wire encoding for images that reach the request
+ * through a **tool result** (`AgentContentPart.ToolResult.imageData` —
+ * `read_image` and `browser_use` screenshots) on the two OpenAI flavours.
+ *
+ * Why a user message instead of the tool message: OpenAI's `role:"tool"`
+ * entry (and the Responses API's `function_call_output`) carries a plain
+ * string, so there is no field to hang bytes on. The images therefore ride in
+ * the user message that immediately follows the tool results, carrying a
+ * caption text part so the model can pair each image back to the tool call.
+ *
+ * Why this object exists at all: `grep -n imageData` over this file used to
+ * return **0 hits** while both siblings had the branch already —
+ * AnthropicProvider `:789` (image block inside `tool_result.content`) and
+ * GeminiProvider `:431` (`inlineData` sibling part). Anthropic/Gemini can put
+ * the bytes *inside* the tool-result block because their schemas allow it;
+ * OpenAI cannot, which is the whole reason the shape differs. Same defect
+ * family as the earlier "[FIX-1 / F-192] read_image returns ToolResult
+ * imageData" fix — OpenAI was the third of three.
+ *
+ * The two platform edges are injected (`compress` =
+ * `ImageBudget.compressUnderBudget`, `encodeBase64` = `android.util.Base64`)
+ * so the wire shape — the part that the tests pin — stays JVM-testable; the
+ * budget/b64 choices at the call sites are identical to the ones the
+ * `ImageData` branches in both serializers already make.
+ */
+internal object OpenAIToolResultImages {
+    /**
+     * One image queued for the wire. [caption] is emitted as a text part
+     * immediately before the image part (same "caption precedes its image"
+     * ordering the composer uses for `[attached image: …]` parts); an empty
+     * caption is skipped.
+     */
+    class Entry(val caption: String, val bytes: ByteArray, val mimeType: String)
+
+    /** Chat Completions user content array (`text` + `image_url` object). */
+    fun chatUserContent(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+    ): JSONArray = build(entries, supportsImages, compress, encodeBase64, responsesFlavor = false)
+
+    /**
+     * Responses API user content array (`input_text` + `input_image` with the
+     * flattened `image_url` string) — see the T132 comment in the Responses
+     * serializer below the builders.
+     */
+    fun responsesUserContent(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+    ): JSONArray = build(entries, supportsImages, compress, encodeBase64, responsesFlavor = true)
+
+    private fun build(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+        responsesFlavor: Boolean,
+    ): JSONArray {
+        val textType = if (responsesFlavor) "input_text" else "text"
+        val out = JSONArray()
+        for (entry in entries) {
+            if (entry.caption.isNotEmpty()) {
+                out.put(JSONObject().apply {
+                    put("type", textType)
+                    put("text", entry.caption)
+                })
+            }
+            if (supportsImages) {
+                // T-imgsize: same belt-and-braces backstop the ImageData
+                // branches run — history tool-result screenshots can be raw
+                // 12-megapixel PNGs that never went through the composer's
+                // budget pass, and we would 413 on replay.
+                val safeBytes = compress(entry.bytes)
+                val safeMime = if (safeBytes === entry.bytes) entry.mimeType else "image/jpeg"
+                val dataUri = "data:$safeMime;base64,${encodeBase64(safeBytes)}"
+                out.put(if (responsesFlavor) {
+                    JSONObject().apply {
+                        put("type", "input_image")
+                        // Responses API takes image_url as a *string*, not the
+                        // {"url":…} object shape Chat Completions uses.
+                        put("image_url", dataUri)
+                    }
+                } else {
+                    JSONObject().apply {
+                        put("type", "image_url")
+                        put("image_url", JSONObject().apply { put("url", dataUri) })
+                    }
+                })
+            } else {
+                // T264: target model has no vision modality — one literal
+                // shared by every provider so they cannot drift apart.
+                out.put(JSONObject().apply {
+                    put("type", textType)
+                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
+                })
+            }
+        }
+        return out
+    }
+}
+
+/**
+ * [r3-b08 F-01] Text carried by one Chat-Completions `delta.content` field.
+ *
+ * `content` has TWO legal wire shapes:
+ *  - a STRING — every plain OpenAI-compatible vendor (the historical path);
+ *  - an ARRAY of typed blocks — the Mistral Magistral dialect:
+ *    `[{"type":"thinking","thinking":[{"type":"text","text":"…"}]},
+ *      {"type":"text","text":"…"}]`.
+ *
+ * `JSONObject.optString` (and therefore `safeOptString`) answers an array with
+ * the array's own JSON text, so the old string-only read put
+ * `[{"type":"thinking",…}]` into the assistant's VISIBLE reply while the
+ * `type:"text"` blocks — the actual answer — were skipped by the
+ * thinking-only loop that consumes the same array. Thinking blocks stay that
+ * loop's business; this function returns ONLY the visible text.
+ *
+ * Pure and top-level so the shape table is unit-testable
+ * (see ChatCompletionsDeltaTextTest) instead of being pinned by a streaming
+ * fixture.
+ */
+internal fun chatCompletionsDeltaText(delta: JSONObject?): String {
+    if (delta == null) return ""
+    if (delta.isNull("content")) return ""
+    val array = delta.optJSONArray("content") ?: return delta.optString("content", "")
+    val out = StringBuilder()
+    for (i in 0 until array.length()) {
+        val block = array.optJSONObject(i) ?: continue
+        if (block.optString("type", "") != "text") continue
+        out.append(block.optString("text", ""))
+    }
+    return out.toString()
+}
+
+/**
+ * [R5-E1 E-C-01] Thinking text carried by one Chat-Completions `delta.content` ARRAY.
+ *
+ * The Mistral Magistral dialect puts reasoning inside `content[]` as
+ * `{"type":"thinking","thinking":[{"type":"text","text":"…"}]}` — NOT in
+ * `reasoning_content`/`reasoning`. The emitter has always consumed that shape,
+ * but the [T321] activity counters read only the string fields, so with this
+ * dialect `contentLen` counted the array's JSON SOURCE (`optString` on an array
+ * answers its serialised text) and `reasoningLen` stayed 0 — which made
+ * `[T321] inconsistency: upstream billed N reasoning tokens but the stream
+ * carried 0 reasoning content` fire on every healthy response.
+ *
+ * Returning the blocks (rather than a joined string) keeps the emitter's
+ * per-block `ThinkingDelta` granularity exactly as it was: the loop below is the
+ * same loop, now sourced from here.
+ *
+ * Pure + top-level so both consumers — the counter and the emitter — provably
+ * read the same blocks instead of drifting (see ChatCompletionsDeltaTextTest).
+ */
+internal fun chatCompletionsDeltaThinkingBlocks(delta: JSONObject?): List<String> {
+    val array = delta?.optJSONArray("content") ?: return emptyList()
+    val out = mutableListOf<String>()
+    for (i in 0 until array.length()) {
+        val block = array.optJSONObject(i) ?: continue
+        if (block.optString("type", "") != "thinking") continue
+        val thinking = block.optJSONArray("thinking") ?: continue
+        for (j in 0 until thinking.length()) {
+            val item = thinking.optJSONObject(j) ?: continue
+            val text = item.safeOptString("text", "")
+            if (text.isNotEmpty()) out.add(text)
+        }
+    }
+    return out
+}
+
+/**
+ * [r3-b08 F-08] Tier resolution for the Responses API `reasoning.effort` field.
+ *
+ * The Chat-Completions builder resolves an effort string through
+ * `EffortTierLearner.learned(host, model)` (a gateway's own enum, learned from a
+ * 400 body) and `model.reasoningEffortValues` (the catalog's declaration), then
+ * snaps the requested tier with [ThinkingEffortLadder.clampEffort]. The
+ * Responses builder did none of that: it applied only the MiMo/Agnes family
+ * clamp, so a gateway that had already TOLD us its legal enum (via the same
+ * `EffortTierLearner.record` call the HTTP-error path makes) got the same
+ * rejected tier on every retry.
+ *
+ * Delegates both steps to [ThinkingEffortLadder] — the shared implementation —
+ * instead of copying the ladder here: two copies of "walk down, then up" is how
+ * the two paths drifted apart in the first place.
+ *
+ * `learned` outranks `declared`: a measured enum is one-hand truth, and with
+ * nothing learned the expression is exactly `declared`.
+ *
+ * Pure + top-level for direct JVM testing (see ResponsesEffortClampTest).
+ */
+internal fun clampResponsesEffort(
+    effort: String?,
+    modelId: String,
+    learnedEffortValues: List<String>?,
+    declaredEffortValues: List<String>?,
+): String? {
+    if (effort == null) return null
+    val familyClamped = ThinkingEffortLadder.clampEffortForModel(effort, modelId.lowercase())
+    return ThinkingEffortLadder.clampEffort(familyClamped, learnedEffortValues ?: declaredEffortValues)
+}
+
+/**
+ * [R5-E1 E-F-06] Which request-level images a structured turn still has to carry.
+ *
+ * `sendMessage`/`streamMessage` take TWO image carriers: the request-level
+ * `imageParts` argument (attached to the LAST user turn) and the turn's own
+ * `contentParts` (`AgentContentPart.ImageData`). The serializers only ever read
+ * the request-level list in the legacy `contentParts.isEmpty()` branch, so a
+ * last user turn that already had parts silently dropped the caller's images.
+ *
+ * Appending them unconditionally would be just as wrong the other way: the
+ * composer writes the SAME bytes into both carriers (ChatViewModel /
+ * ChatStreamToolHelpers), so a plain append would send every chat photo twice.
+ * Identity is therefore decided by CONTENT, not by position or reference — the
+ * worker decodes `contentParts` from JSON and the two lists never share array
+ * instances.
+ *
+ * Returns INDICES into [requestImages] so the caller keeps the original
+ * [LLMMessage.ImagePart] (mime type included) instead of rebuilding one from
+ * bare bytes. Pure + top-level for the JVM table (see TurnImageCarryTest).
+ */
+internal object TurnImageCarry {
+
+    fun missingIndices(
+        turnImages: List<ByteArray>,
+        requestImages: List<ByteArray>,
+    ): List<Int> {
+        if (requestImages.isEmpty()) return emptyList()
+        val out = mutableListOf<Int>()
+        for ((index, request) in requestImages.withIndex()) {
+            if (turnImages.any { it.contentEquals(request) }) continue
+            out.add(index)
+        }
+        return out
+    }
+}
+
+/**
+ * [R5-E1 E-F-05] Verdicts for the `url` download hop of `/images/generations`.
+ *
+ * Split out because the two decisions are the whole point of the fix and both
+ * are pure: (a) a non-2xx hop must never become an attachment, (b) a request
+ * that declared image items but produced none must not return success. The
+ * surrounding OkHttp plumbing stays in the provider; the table lives here so it
+ * can be pinned by literals (see GeneratedImageVerdictTest).
+ */
+internal object GeneratedImageVerdict {
+
+    /** Only 2xx bodies are image candidates; a 3xx is NOT followed for us here. */
+    fun downloadAccepted(status: Int): Boolean = status in 200..299
+
+    /**
+     * `null` = the parse result is acceptable; otherwise the message to throw.
+     *
+     * [declaredItems] comes from the response's `data` array length, so "0 items"
+     * (a provider that answered with neither `data` nor `choices`) keeps its
+     * existing empty-success behaviour — that shape was never claiming an image.
+     */
+    fun noUsableImageMessage(
+        declaredItems: Int,
+        attachmentCount: Int,
+        lastDownloadStatus: Int?,
+    ): String? {
+        if (attachmentCount > 0 || declaredItems <= 0) return null
+        val hop = if (lastDownloadStatus != null) " (last download HTTP $lastDownloadStatus)" else ""
+        return "images/generations declared $declaredItems image item(s) but none was usable:$hop"
+    }
+}

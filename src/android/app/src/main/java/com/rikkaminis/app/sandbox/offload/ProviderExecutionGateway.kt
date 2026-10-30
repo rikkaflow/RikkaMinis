@@ -153,7 +153,12 @@ object ProviderExecutionGateway {
             thinkingLevel = thinkingLevel,
             streaming = false,
         )
-        val raw = ModelExecutionDispatcher.dispatch(context, requestJson)
+        // [T-worker-key-intent-handoff] Resolve the CURRENT key here (the only
+        // layer holding the instance) so a mid-session key replacement reaches
+        // this dispatch instead of the worker's frozen prefs map.
+        val raw = ModelExecutionDispatcher.dispatch(
+            context, requestJson, WorkerKeyHandoff.keyFor(context, instance.id),
+        )
             ?: return SendResult.Unavailable("model service dispatch failed or timed out")
         return parseNonStreamingResult(raw)
     }
@@ -187,7 +192,11 @@ object ProviderExecutionGateway {
                     mimeType = m.optString("mime_type", "application/octet-stream"),
                     // [audit-0917] Malformed base64 -> skip the attachment, not an
                     // untyped IllegalArgumentException out of the typed-failure path.
-                    data = runCatching { java.util.Base64.getDecoder().decode(b64) }.getOrNull()
+                    // [fix/da1022-a1] MIME decoder: the worker encodes with
+                    // android.util.Base64 (RFC 2045 family), so tolerate line
+                    // terminators; the strict RFC 4648 decoder rejected any
+                    // wrapped payload (silently dropping every attachment).
+                    data = runCatching { java.util.Base64.getMimeDecoder().decode(b64) }.getOrNull()
                         ?: return@mapNotNull null,
                 )
             }
@@ -250,7 +259,10 @@ object ProviderExecutionGateway {
             streaming = true,
             enhancedCache = enhancedCache,
         )
-        return ChatStreamOffloadHandler.stream(context, requestJson, thinkingLevel.isEnabled, sessionId)
+        return ChatStreamOffloadHandler.stream(
+            context, requestJson, thinkingLevel.isEnabled, sessionId,
+            WorkerKeyHandoff.keyFor(context, instance.id),
+        )
     }
 
     /**

@@ -18,9 +18,11 @@ import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.data.db.AppDatabase
 import com.rikkaminis.app.data.db.DatabaseVersionGuard
 import com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+import com.rikkaminis.app.data.repository.badgeReconcileInput
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.ui.chat.KatexWebViewPool
 import com.rikkaminis.app.ui.chat.clearMarkdownParseCachesForMemoryPressure
+import com.rikkaminis.app.ui.markdown.KaTeXRendererCache
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.MountedFoldersStore
 import com.rikkaminis.app.data.repository.MemoryRepository
@@ -61,12 +63,14 @@ import com.rikkaminis.app.service.MemoryPressureGate
 import com.rikkaminis.app.service.MemoryPressureLevel
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.service.TrimPolicy
+import com.rikkaminis.app.service.TrimReclaimPolicy
 import com.rikkaminis.app.ui.MinisImageFetcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MinisApp : Application(), ImageLoaderFactory {
     /**
@@ -199,6 +203,12 @@ class MinisApp : Application(), ImageLoaderFactory {
         // .contentCaptureChangeChecker) at 10.45% of all app CPU — about a
         // quarter of the main thread, more than the frame work itself.
         //
+        // The cost only exists when a content-capture service is active:
+        // AOSP registers ContentCaptureManagerService only when the device
+        // declares FEATURE_CONTENT_CAPTURE (verified on a HyperOS 3 device:
+        // no such service and no such feature — there the walk never
+        // happens and this switch is a no-op).
+        //
         // Minis's own UI is unaffected: rendering, accessibility (a separate
         // path), autofill, IME and in-app selection all stay the same. What is
         // lost is system features that read app content through content
@@ -272,6 +282,10 @@ class MinisApp : Application(), ImageLoaderFactory {
             // issues chat requests, so it must be able to learn from their 400s.
             // The persistence file lives in filesDir, shared across processes.
             EffortTierLearner.init(this)
+            // [fix/prewindow-budget-1015] 校准窗口持久化（filesDir，跨进程共享
+            // 文件语义与 EffortTierLearner 同）。worker 进程只是被动读；
+            // observe 只发生在主进程的引擎循环里。
+            com.rikkaminis.app.conversation.ContextCalibration.prime(this)
             return
         }
 
@@ -330,6 +344,16 @@ class MinisApp : Application(), ImageLoaderFactory {
             Log.w("MinisApp", "NativeCrashHandler install failed: ${t.message}")
         }
 
+        // [feat/storage-budget-loop] The DECIDE edge. Everything this app owns
+        // lives in filesDir (rootfs + sessions + media + logs); until now the
+        // only reader of that number was the Storage screen, i.e. the user had
+        // to already suspect a problem. Sample at most once a day on IO, warn
+        // once past the budget, and expose the same sample to the system prompt
+        // so the agent (the producer) can see its own footprint.
+        applicationScope.launch {
+            com.rikkaminis.app.data.storage.StorageBudget.runDailyCheck(this@MinisApp)
+        }
+
         // [mem-spike-diag] 内存尖峰记录器。NativeCrashHandler 只记「崩的那一刻」，
         // 本记录器补上「一路上怎么涨的」：秒级采样 VmRSS / RssAnon / native heap /
         // Java heap / **PRoot 子进程聚合 RSS**（区分「涨在 app 自己」还是「涨在
@@ -364,8 +388,18 @@ class MinisApp : Application(), ImageLoaderFactory {
                         com.rikkaminis.app.service.AppMemoryGovernor.tick(
                             anonMb = com.rikkaminis.app.service.MemoryPressureGate.anonMb(),
                             nowMs = android.os.SystemClock.elapsedRealtime(),
-                            toolRunning = com.rikkaminis.app.service.SessionActivityTracker
-                                .isToolRunning.value,
+                            // [R4-U F-07] The governor's guard is "is anything in
+                            // flight", not "is a tool running": a second session
+                            // streaming with no tool executing was reported as
+                            // idle, so the governor ran the synchronous GC it
+                            // exists to avoid. `toolRunning` below therefore
+                            // carries stream-OR-tool (see [TrimReclaimPolicy]).
+                            toolRunning = com.rikkaminis.app.service.TrimReclaimPolicy.hasActiveWork(
+                                activeSessionIds = com.rikkaminis.app.service.SessionActivityTracker
+                                    .activeSessions.value,
+                                toolRunning = com.rikkaminis.app.service.SessionActivityTracker
+                                    .isToolRunning.value,
+                            ),
                         )
                     }
                 }
@@ -444,6 +478,9 @@ class MinisApp : Application(), ImageLoaderFactory {
         // `LoggingManager.startIfEnabled()` (called from MinisApp.swift:143).
         AppLogger.init(this)
         EffortTierLearner.init(this)
+        // [fix/prewindow-budget-1015] 主进程预热校准窗口 —— 引擎循环（唯一
+        // observe 写入方）与预检读数都跑在这里。
+        com.rikkaminis.app.conversation.ContextCalibration.prime(this)
 
         // Bug 2 (MIUI silent kill) diagnostic: write a launch-cycle beacon
         // so a subsequent launch can observe whether the previous run
@@ -500,14 +537,55 @@ class MinisApp : Application(), ImageLoaderFactory {
         }
 
         database = AppDatabase.getInstance(this)
+        // [fix/da1021-A] Build skill/mcp repositories BEFORE chatRepository so
+        // the cross-db session cleanup callback can reference these exact
+        // lateinit fields (same instances — they are process-wide singletons;
+        // constructing a second copy here would make the cleanup reap a
+        // repository the app doesn't use).
+        skillRepository = SkillRepository(this)
+        mcpRepository = MCPRepository(this)
         chatRepository = ChatRepository(
             database.chatDao(),
             com.rikkaminis.app.data.storage.SessionFileStore(this),
+            // [fix/da1021-A] Cross-db session cleanup: a deleted session's
+            // skill/mcp overrides (skill_session_overrides /
+            // mcp_session_overrides) leaked into later sessions reusing the
+            // id — both clearSessionOverrides functions had zero production
+            // callers. Attached here so every delete entry point
+            // (user delete, drawer, fork rollback, empty-session sweep) is
+            // covered by one hook. Each cleanup is independently contained.
+            onSessionDeleted = { sid ->
+                runCatching { skillRepository.clearSessionOverrides(sid) }
+                runCatching { mcpRepository.clearSessionOverrides(sid) }
+                // [R4-U F-02] Delete-side counterpart of the crash-recovery
+                // record: without it a deleted session stays the cold-start
+                // restore target (the read side cannot validate the id without
+                // a blocking DB read in onCreate) and the next launch synthesizes
+                // an OpenSession deep link to a row that no longer exists.
+                runCatching { com.rikkaminis.app.CrashRecoveryStore.clearIfMatches(this, sid) }
+                // [da1030-A ISSUE-01 裂缝B] Same one-hook-covers-all-entry-points
+                // contract for the session-list badge queue: without this, a
+                // deleted session's PAUSED badge stayed in SessionBadgeStore
+                // (memory + SharedPreferences) and reappeared on whatever
+                // session later reused the id. Safe before SessionBadgeStore
+                // .init() runs below — `clear` only touches the in-memory
+                // StateFlow when `prefs` is still null (mutate's `prefs?.let`),
+                // and this lambda only fires at runtime, long after onCreate.
+                runCatching { com.rikkaminis.app.service.SessionBadgeStore.clear(sid) }
+                // [da1031-B ISSUE-02 裂缝B] Third cleanup on the same hook: the
+                // session-scoped offload permission verdicts. `onCleared()` only
+                // covers the session the user is leaving the screen of, while
+                // this lambda fires for every delete entry point (user delete,
+                // drawer, fork rollback, empty-session sweep) — a session
+                // deleted from the list used to leave its grants/denials behind
+                // for whatever session later reused the id.
+                runCatching {
+                    com.rikkaminis.app.offload.OffloadPermissionManager.clearSessionGrants(sid)
+                }
+            },
         )
         providerRepository = ProviderRepository(this)
         envVarRepository = EnvVarRepository(this)
-        skillRepository = SkillRepository(this)
-        mcpRepository = MCPRepository(this)
         memoryRepository = MemoryRepository(java.io.File(filesDir, "minis-global/memory"))
 
         webAppShortcutRepository = WebAppShortcutRepository(database.webAppShortcutDao())
@@ -525,6 +603,10 @@ class MinisApp : Application(), ImageLoaderFactory {
         // ConfigRegistry.get() is safe from any thread for the rest of
         // the process. Mirrors iOS ConfigRegistry.shared.registerBuiltinsIfNeeded().
         com.rikkaminis.app.config.MinisConfigPermissionStore.init(this)
+        // [auto-approve] The user's opt-in "免确认模式" (routine writes skip the
+        // dialog; ASK_ONCE tool permissions behave as BYPASS). Read on hot paths
+        // in ConfigBridge / OffloadPermissionManager, so initialise eagerly.
+        com.rikkaminis.app.config.AutoApproveStore.init(this)
         com.rikkaminis.app.config.ConfigRegistry.init(
             this, providerRepository, envVarRepository, chatRepository,
             // [T8-2] Config layer no longer imports service/UI classes —
@@ -574,8 +656,17 @@ class MinisApp : Application(), ImageLoaderFactory {
         // is not in chat mid-command, so this restart is safe and user-invisible.
         PRootKernel.mountedFoldersStore = mountedFoldersStore
         mountedFoldersStore.onChange = {
-            PRootKernel.applyMountedFoldersSnapshot(this)
-            ExecutionCoordinator.stopCurrentCommand()
+            // [dv20-A4-A06] The snapshot does blocking host I/O (SAF resolution
+            // readdir, rootfs mkdirs, wrapper-script writes) and mount CRUD
+            // fires from Compose onClick on the main thread — hop off Main.
+            // stopCurrentCommand stays AFTER the snapshot so the shells that
+            // the next execute() rebuilds read the updated bind set (both
+            // containers it touches are ConcurrentHashMap, so calling it from
+            // an IO coroutine is safe).
+            applicationScope.launch {
+                withContext(Dispatchers.IO) { PRootKernel.applyMountedFoldersSnapshot(this@MinisApp) }
+                ExecutionCoordinator.stopCurrentCommand()
+            }
         }
         // T219-6: route launch-time seeding through applyMountedFoldersSnapshot
         // so it (a) reads the live store consistently and (b) materializes the
@@ -584,7 +675,11 @@ class MinisApp : Application(), ImageLoaderFactory {
         // applyMountedFoldersSnapshot tolerates that case (mkdirs fails silently
         // and PRootKernel.boot calls applyMountedFoldersSnapshot again at the
         // end of boot to materialize the targets once rootfs is on disk).
-        PRootKernel.applyMountedFoldersSnapshot(this)
+        // [dv20-A4-A06] Same blocking-I/O story as above — the seed hops off
+        // Main instead of freezing onCreate's first frame behind a FUSE readdir.
+        applicationScope.launch {
+            withContext(Dispatchers.IO) { PRootKernel.applyMountedFoldersSnapshot(this@MinisApp) }
+        }
 
         // Register native_offload handlers and start the server eagerly —
         // the server only needs the rootfs tmp directory, which can be
@@ -599,7 +694,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         NativeOffloadServer.register("android-notification", NotificationOffloadHandler(this))
         NativeOffloadServer.register("android-open", OpenOffloadHandler(this))
         NativeOffloadServer.register("android-photos", PhotosOffloadHandler(this))
-        NativeOffloadServer.register("android-player", PlayerOffloadHandler())
+        NativeOffloadServer.register("android-player", PlayerOffloadHandler(this))
         NativeOffloadServer.register("android-speak", SpeakOffloadHandler(this))
         NativeOffloadServer.register("android-speech", SpeechOffloadHandler(this))
         NativeOffloadServer.register("android-weather", WeatherOffloadHandler(this))
@@ -660,10 +755,18 @@ class MinisApp : Application(), ImageLoaderFactory {
             runCatching { ExecutionCoordinator.recycleIdleShells() }
             runCatching { sharedBrowserTabPool.evictIdleTabs() }
         }
-        MemoryPressureGate.pressureListener = { level, anonMB ->
+        MemoryPressureGate.pressureListener = { level, anonMB, src, crossed ->
+            // [LOOP-1030 R1-b] 1s tick 与准入路径分开记账：旧实现把每一行都标成
+            // "admission delayed 500ms"，四天 3881 行里真实准入 ≤29 行，审计据此
+            // 把「门升到 3875 次」读成事实。`crossed=false` 是滞回带续报
+            // （占 ELEVATED 行 96.2%），不是新的越线事件。
+            val effect = when {
+                src == MemoryPressureGate.SRC_TICK -> "observe-only tick sample (no admission effect)"
+                level == MemoryPressureLevel.CRITICAL -> "admission throttled (reclaim + 2s wait)"
+                else -> "admission delayed 500ms"
+            }
             AppLogger.warning("MemoryPressureGate", "level=$level anon=${anonMB}MB " +
-                "rss=${MemoryPressureGate.rssMb()}MB — " +
-                (if (level == MemoryPressureLevel.CRITICAL) "admission throttled (reclaim + 2s wait)" else "admission delayed 500ms"))
+                "rss=${MemoryPressureGate.rssMb()}MB src=$src crossed=$crossed — $effect")
         }
         // [fix/memory-gate-anon-metric] 档位跃迁落探针日志（含降档）。这是"正常重活
         // 会不会常穿越梯子"的经验依据——阈值 450/1200 后面靠穿越频率复核，不靠拍脑袋。
@@ -672,6 +775,20 @@ class MinisApp : Application(), ImageLoaderFactory {
                 com.rikkaminis.app.diagnostics.MemorySpikeRecorder.onEvent(
                     "gate:${to.name.lowercase()}",
                     "from=$from anon=${anonMB}MB rss=${MemoryPressureGate.rssMb()}MB",
+                )
+            }
+            Unit
+        }
+
+        // [SYMPTOM-A F-A1] 影子水线（800MB anon）：只观测，不驱动任何行为。
+        // 依据：三天 anon 峰值 1032/585/552MB，而 1200 的硬分支三天 0 次触发 ——
+        // "把硬门槛降到 800 会不会天天触发"只能靠这台影子机回答，不能靠猜。
+        // 它走自己的工作线程纪律（1s tick）与独立状态机，不动回收/准入。
+        com.rikkaminis.app.service.shadowTierListener = { src, from, to, anonMB, rssMB ->
+            runCatching {
+                AppLogger.info(
+                    "MemGateShadow",
+                    "src=$src from=$from to=$to anon=${anonMB}MB rss=${rssMB}MB — observe-only, no reclaim/admission change",
                 )
             }
             Unit
@@ -691,6 +808,10 @@ class MinisApp : Application(), ImageLoaderFactory {
             // KaTeX 缓存），GC 仍留给无工具在跑的时机。
             runCatching { clearMarkdownParseCachesForMemoryPressure() }
             runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+            // [ARCH-03] 两个「KaTeX 缓存」是不同对象、同名前缀：上面只回收
+            // pool 的渲染结果缓存，64 MB 的 KaTeXRendererCache（display 模式
+            // 位图）此前从不在任何回收路径里。它是纯派生状态，丢了下次重渲染。
+            runCatching { KaTeXRendererCache.clearForMemoryPressure() }
         }
 
         // [fix/memory-hardening-governor] 采样器只观测，这里给它「动手」的能力。
@@ -699,6 +820,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         com.rikkaminis.app.service.AppMemoryGovernor.dropCachesHook = {
             runCatching { clearMarkdownParseCachesForMemoryPressure() }
             runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+            runCatching { KaTeXRendererCache.clearForMemoryPressure() } // [ARCH-03] 同上，两个缓存都要丢
             runCatching { sharedBrowserTabPool.evictIdleTabs() }
             runCatching { ExecutionCoordinator.recycleIdleShells() }
         }
@@ -732,12 +854,25 @@ class MinisApp : Application(), ImageLoaderFactory {
             // the default handler, so an unguarded badge-store failure here
             // crashed the app at cold start.
             runCatching {
-                val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
-                // Exclude any session that is already actively streaming (defensive;
-                // at cold start this is empty, but keeps the rule "active ⇒ never
-                // paused" uniform with the foreground reconcile path).
-                val active = SessionActivityTracker.activeSessions.value
-                com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+                // [fix/meta1028-d1 F-03] `null` = the tail query failed. Skip the
+                // reconcile and keep the persisted badges: reconciling to an
+                // empty set (the pre-fix behaviour of the two swallowing
+                // runCatching layers) dropped EVERY PAUSED badge and persisted
+                // the pruned map. badgeReconcileInput also applies the
+                // "active ⇒ never paused" rule to the streaming set (empty at
+                // cold start, but shared with the foreground path).
+                val interrupted = badgeReconcileInput(
+                    chatRepository.interruptedSessionIds(),
+                    SessionActivityTracker.activeSessions.value,
+                )
+                if (interrupted == null) {
+                    android.util.Log.w(
+                        "MinisApp",
+                        "cold-start badge reconcile skipped: interrupted-tail query failed",
+                    )
+                } else {
+                    com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted)
+                }
             }.onFailure {
                 android.util.Log.w("MinisApp", "cold-start badge reconcile failed: ${it.message}")
             }
@@ -784,6 +919,33 @@ class MinisApp : Application(), ImageLoaderFactory {
             }
         }
 
+        // [dv20-A4-A05] Startup empty-session sweep. `cleanupIfEmptyOnExit()`
+        // hangs off Compose's `onDispose`, which never runs on process death,
+        // task-swipe or a crash — so a message-less row inserted before the
+        // first send lands is stranded forever, and the user sees "sometimes
+        // the empty chat disappears, sometimes it doesn't". The repository
+        // backstop for exactly that (`ChatRepository.deleteEmptySessions`)
+        // had zero production callers, and its exclusion-list source
+        // (`ChatViewModelStore.activeSessionIds()`) was equally unwired.
+        // Runs off-main (Room DELETE) with the live VM ids as the exclusion
+        // set: a cached store means the agent loop may still be streaming,
+        // so those rows are never swept even at zero messages.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            runCatching {
+                val swept = chatRepository.deleteEmptySessions(
+                    com.rikkaminis.app.ui.chat.ChatViewModelStore.activeSessionIds(),
+                )
+                if (swept > 0) {
+                    android.util.Log.i("MinisApp", "startup empty-session sweep: $swept row(s)")
+                }
+            }.onFailure {
+                // [audit-0917] Same guarded-scope rule as the badge reconcile:
+                // this scope uses the default handler, so an unguarded Room
+                // failure here would crash the app at cold start.
+                android.util.Log.w("MinisApp", "empty-session sweep failed: ${it.message}")
+            }
+        }
+
         // T180-bg-notif: background-settings + task-completion notifier.
         // The notifier is wired into SessionActivityTracker's completion
         // hook so any session whose stream finishes (success or error)
@@ -806,6 +968,12 @@ class MinisApp : Application(), ImageLoaderFactory {
                 sessionId,
                 isError,
             )
+            // [feat/auto-backup-external-mirror] A settled session is exactly
+            // when the work documents just changed, so this is the natural
+            // mirror trigger (the throttle inside MirrorStore collapses a
+            // burst of settlements into one stat walk). Same single-listener
+            // chain — appended here, never a second listener.
+            com.rikkaminis.app.backup.MirrorStore.runAsync(this@MinisApp)
         }
 
         // [T-android-config-confirm-timeout] Wire the config-confirm background
@@ -856,6 +1024,13 @@ class MinisApp : Application(), ImageLoaderFactory {
                 if (wasBackgrounded) {
                     com.rikkaminis.app.scheduled.ScheduledTaskRunner.runIfDue(this@MinisApp)
                 }
+                // [feat/auto-backup-external-mirror] The background→foreground
+                // beat is the second mirror trigger: a user switching away and
+                // back after working in another app is a natural "just edited"
+                // moment. runAsync self-gates on enabled + throttle.
+                if (wasBackgrounded) {
+                    com.rikkaminis.app.backup.MirrorStore.runAsync(this@MinisApp)
+                }
                 // T298: as soon as the app transitions background → foreground,
                 // clear any task-completed notifications still in the tray.
                 // The user is back in front of the app — there's no point
@@ -883,9 +1058,20 @@ class MinisApp : Application(), ImageLoaderFactory {
                         // foreground transition (badge store IO on a corrupt
                         // prefs file, etc.). A missed badge must never be fatal.
                         runCatching {
-                            val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
-                            val active = SessionActivityTracker.activeSessions.value
-                            com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
+                            // [fix/meta1028-d1 F-03] Same contract as the
+                            // cold-start path: null = unknown, keep the badges.
+                            val interrupted = badgeReconcileInput(
+                                chatRepository.interruptedSessionIds(),
+                                SessionActivityTracker.activeSessions.value,
+                            )
+                            if (interrupted == null) {
+                                android.util.Log.w(
+                                    "MinisApp",
+                                    "foreground badge reconcile skipped: interrupted-tail query failed",
+                                )
+                            } else {
+                                com.rikkaminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted)
+                            }
                         }.onFailure {
                             android.util.Log.w("MinisApp", "foreground badge reconcile failed: ${it.message}")
                         }
@@ -922,6 +1108,14 @@ class MinisApp : Application(), ImageLoaderFactory {
                     // while a config-confirm dialog may still be showing — nudge
                     // them so they can come back before the 120s timeout.
                     com.rikkaminis.app.config.confirm.ConfigConfirmationGate.notifyPending()
+                    // [feat/auto-backup-external-mirror] The foreground→background
+                    // beat is the third mirror trigger (2026-10-29 silent-mirror
+                    // revision: the settings row lost its manual sync button — the
+                    // mirror must flush on its own, and switching away is the one
+                    // moment after the last edit where the process is still alive).
+                    // Self-gates on enabled + single-flight + the coalescing
+                    // window inside MirrorStore.
+                    com.rikkaminis.app.backup.MirrorStore.runAsync(this@MinisApp)
                 }
             }
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
@@ -1261,18 +1455,16 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // pauses all threads and can stall/abort the very task that's
                 // driving the pressure — degrading the "peak-hour" experience the
                 // trim callback is supposed to protect.
-                val hasActiveWork =
-                    SessionActivityTracker.activeSessions.value.isNotEmpty() ||
-                        SessionActivityTracker.isToolRunning.value
+                val hasActiveWork = TrimReclaimPolicy.hasActiveWork(
+                    activeSessionIds = SessionActivityTracker.activeSessions.value,
+                    toolRunning = SessionActivityTracker.isToolRunning.value,
+                )
                 Log.w(
                     "MinisApp",
                     "onTrimMemory($level): reclaiming shells (foreground pressure, activeWork=$hasActiveWork)" +
                         (if (hasActiveWork) " — skipping sync gc" else " + gc"),
                 )
                 ExecutionCoordinator.recycleIdleShells()
-                if (!hasActiveWork) {
-                    System.gc()
-                }
             } else if (TrimPolicy.isBackground(level)) {
                 Log.i("MinisApp", "onTrimMemory($level): background/UI-hidden — skip aggressive reclaim (keep view state)")
             }
@@ -1287,9 +1479,34 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // acceptable when the alternative is being OOM-killed mid-voice-
                 // dictation.
                 runCatching { clearMarkdownParseCachesForMemoryPressure() }
-                // [fix/audit-b22 / T2-L2] The KaTeX render cache holds up to
-                // 64 MB of bitmaps and was not part of this reclaim pass.
+                // [fix/audit-b22 / T2-L2] The KaTeX render caches hold up to
+                // 64 MB of bitmaps each and were not part of this reclaim pass.
+                // [ARCH-03] There are TWO of them and they are different
+                // objects: `KatexWebViewPool`'s result cache (streaming chat)
+                // and `KaTeXRendererCache` (display-mode formulas). Only the
+                // first one used to be cleared here — the name prefix made the
+                // second look covered. Drop both; the next render re-renders.
                 runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+                runCatching { KaTeXRendererCache.clearForMemoryPressure() }
+            }
+            // [R4-U F-07] ONE synchronous collection per trim callback, and none
+            // while work is in flight. The two GC sites this replaces were in
+            // the two branches above: on a TRIM_MEMORY_RUNNING_CRITICAL emission
+            // that also satisfies `shouldReclaimShellsAndGc` (the foreground
+            // case) an IDLE process collected twice back-to-back, while a
+            // streaming one collected once regardless — the pause landing
+            // mid-generation, which is the stall the [P2-active-session-guard]
+            // comment above was written to prevent. The rule now lives in
+            // [TrimReclaimPolicy] so the governor tick has to obey it too.
+            if (TrimReclaimPolicy.shouldSyncGc(
+                    reclaimsShells = TrimPolicy.shouldReclaimShellsAndGc(level),
+                    engagesGate = TrimPolicy.shouldEngageMemoryGate(level),
+                    hasActiveWork = TrimReclaimPolicy.hasActiveWork(
+                        activeSessionIds = SessionActivityTracker.activeSessions.value,
+                        toolRunning = SessionActivityTracker.isToolRunning.value,
+                    ),
+                )
+            ) {
                 System.gc()
             }
         }.onFailure {

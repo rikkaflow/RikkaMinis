@@ -3,6 +3,7 @@ package com.rikkaminis.app.sandbox.offload
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import kotlinx.coroutines.Job
@@ -10,7 +11,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -40,8 +40,11 @@ import java.util.concurrent.atomic.AtomicLong
  * commits results atomically (result.tmp → flush/fsync → rename result.json),
  * waits for client.ack on non-streaming runs before self-reaping, and only
  * calls Process.killProcess (self-reap) after confirming quiescence. The main
- * process never kills us directly (only a shutdown REQUEST file); a worker
- * with in-flight work (active/queued/unacked/unflushed stream) NEVER dies.
+ * process has no way to kill (or ask for a drain of) this process: the former
+ * `shutdown` REQUEST marker was deleted because nothing in the state machine
+ * ever read it [FIX-FW-DEAD-SHUTDOWN-LEVER] — a worker with in-flight work
+ * (active/queued/unacked/unflushed stream) NEVER dies, and a quiescent one
+ * reaps itself.
  *
  * The old model — `stopSelf()` as reclamation proof with a 30s idle-kill —
  * is deliberately gone: stopSelf is not process death, and an idle window can
@@ -224,6 +227,12 @@ class ModelExecutionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val requestDir = intent?.getStringExtra(EXTRA_REQUEST_DIR)
             ?: run { stopSelf(startId); return START_NOT_STICKY }
+        // [T-worker-key-intent-handoff] The key the main process had at dispatch
+        // time. Present ⇒ this request is fresher than our cached prefs map, so
+        // the freshness abort is skipped for it (see WorkerKeyHandoff). Absent
+        // (older main process / callers without an instance_id) ⇒ unchanged
+        // legacy path. Never logged: plaintext secret.
+        val carriedApiKey = intent?.getStringExtra(WorkerKeyHandoff.EXTRA_API_KEY).orEmpty()
 
         val dir = File(requestDir)
         val requestFile = File(dir, "request.json")
@@ -253,7 +262,13 @@ class ModelExecutionService : Service() {
         val queuedNow = synchronized(lifecycleLock) {
             queuedRequests.get()
         }
-        val poisoned = keyCachePoisoned
+        // [T-worker-key-intent-handoff] A poisoned process is still usable for a
+        // request that carries its own key: the poison invalidates the CACHED
+        // prefs map, and such a request never consults it. Letting the poison
+        // reject those too would let one legacy (keyless) dispatch — e.g. a
+        // `minis-model-use` call without an instance_id — starve every pooled
+        // sibling that does supply a key.
+        val poisoned = keyCachePoisoned && !WorkerKeyHandoff.carriesKey(carriedApiKey)
         // [feat/runtime-limits-panel] 准入上限读 prefs 真值（每请求读，改完对
         // 存活 worker 立即生效——比槽位数更轻量，不需要换进程）。
         if (queuedNow >= ProviderExecSlotPolicy.liveQueueAdmission() || poisoned) {
@@ -271,7 +286,11 @@ class ModelExecutionService : Service() {
                     }
                 }
                 writeResultAtomically(dir, JSONObject().apply {
-                    put("error", if (poisoned) WorkerKeyFreshness.STALE_KEY_CACHE else "worker_queue_full")
+                    // [meta1028-D2 F-01] The code literal lives in the retry policy
+                    // (single source): it is the wire contract that decides whether
+                    // the non-streaming dispatcher re-dispatches onto a fresh
+                    // process, and an admission rejection never touched a provider.
+                    put("error", if (poisoned) WorkerKeyFreshness.STALE_KEY_CACHE else ModelExecutionRetryPolicy.WORKER_QUEUE_FULL)
                     put("message", "provider worker rejected: $why")
                     put("exit_code", 3)
                 }.toString())
@@ -367,9 +386,17 @@ class ModelExecutionService : Service() {
                 // and thread-parking inside the runBlocking thread (the
                 // request thread is dedicated to this run, so parking it is
                 // free). On timeout publish a frame and re-enter the queue.
-                val wantsQueueFrames = runCatching {
-                    JSONObject(requestFile.readText()).optBoolean("streaming", false)
-                }.getOrDefault(false)
+                // [ISSUE-12a] Read + parse the request body ONCE per run; every
+                // consumer below reuses this capture. request.json is written
+                // exactly once by ModelExecutionDispatcher before startService
+                // and deleted only after this worker's terminal marker (which is
+                // written after the ack barrier — after the last consumer), so
+                // one capture is faithful to what each site would have read.
+                // Per-site failure semantics are carried by CapturedRequestBody:
+                // the queue-frame/ack-barrier sites degrade to false, the formal
+                // read re-throws into the catch → model_use_failed below.
+                val requestBody = CapturedRequestBody.capture { requestFile.readText() }
+                val wantsQueueFrames = requestBody.streamingFlagOrFalse()
                 if (wantsQueueFrames) {
                     var lastPublished = -1
                     while (!executionSlots.tryAcquire(QUEUE_FRAME_POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
@@ -389,14 +416,14 @@ class ModelExecutionService : Service() {
                 try {
                     synchronized(lifecycleLock) { queuedRequests.decrementAndGet() }
                     try {
-                        val requestText = requestFile.readText()
-                        val isStreaming = JSONObject(requestText).optBoolean("streaming", false)
+                        val req = requestBody.jsonOrThrow()
+                        val isStreaming = req.optBoolean("streaming", false)
                         if (isStreaming) {
                             // TF-I: streaming exec writes the result and closes
                             // the stream INSIDE the lock (serialized provider
                             // network), but does NOT wait for the client ack —
                             // that barrier runs outside below.
-                            executeStreamingRun(requestText, dir)
+                            executeStreamingRun(req, dir, carriedApiKey)
                         } else {
                             // TF-J2: non-streaming worker beats liveness too.
                             // start() is idempotent; the beat is stopped in the
@@ -407,7 +434,7 @@ class ModelExecutionService : Service() {
                             // only once the beat goes silent after terminal.
                             heartbeat.start()
                             ModelExecutionRunDir.writeReady(dir)
-                            val result = executeRun(requestText, dir)
+                            val result = executeRun(req, dir, carriedApiKey)
                             writeResultAtomically(dir, result)
                             Log.i(TAG, "result written ($result.length bytes), pid=${android.os.Process.myPid()}")
                         }
@@ -438,9 +465,7 @@ class ModelExecutionService : Service() {
                 // call, never to a sleeping ack-wait. finalize must run after
                 // the barrier so its quiescence check sees the released (or
                 // held-on-timeout) ACK token.
-                val isStreaming = runCatching {
-                    JSONObject(requestFile.readText()).optBoolean("streaming", false)
-                }.getOrDefault(false)
+                val isStreaming = requestBody.streamingFlagOrFalse()
                 try {
                     if (isStreaming) {
                         awaitStreamAckBarrier(dir)
@@ -541,7 +566,6 @@ class ModelExecutionService : Service() {
             val next = ModelExecutionLifecycle.transition(
                 current = lifecycleState,
                 quiescence = quiescence,
-                shutdownRequested = false,
             )
             lifecycleState = next
             maybeSelfReapLocked(dir, next, quiescence, runId, generation)
@@ -554,11 +578,9 @@ class ModelExecutionService : Service() {
             unackedResponses = pendingAckTokens.size,
             streamFileFlushed = true,
         )
-        val shutdownRequested = shutdownRequested()
         val next = ModelExecutionLifecycle.transition(
             current = lifecycleState,
             quiescence = quiescence,
-            shutdownRequested = shutdownRequested,
         )
         lifecycleState = next
         // TF-H: final state + terminal are written under the lock. terminal is
@@ -577,7 +599,7 @@ class ModelExecutionService : Service() {
                 TAG,
                 "request finished (holding): state $next active=${activeRequests.get()} " +
                     "queued=${queuedRequests.get()} pendingAck=${pendingAckTokens.size} " +
-                    "shutdownRequested=$shutdownRequested pid=${android.os.Process.myPid()}",
+                    "pid=${android.os.Process.myPid()}",
             )
         }
         return next
@@ -637,22 +659,6 @@ class ModelExecutionService : Service() {
      */
     private fun generationMatches(capturedGeneration: Long): Boolean =
         capturedGeneration == requestGeneration.get()
-
-    /**
-     * True when the main process asked us to drain. On reclaim the main
-     * process writes the shutdown marker into the staging root; the worker
-     * checks the sibling marker file so we never kill while a new request
-     * could arrive (main process controls shutdown by the marker, we control
-     * the timing by quiescence).
-     */
-    private fun shutdownRequested(): Boolean {
-        return runCatching {
-            ModelExecutionMailbox.shutdownRequested(stagingRoot())
-        }.getOrElse { false }
-    }
-
-    /** Root staging dir the main process uses for model-exec requests. */
-    private fun stagingRoot(): File = File(cacheDir, "model-exec")
 
     /** Wait until the client wrote client.ack, or the timeout elapsed. */
     private fun waitClientAck(dir: File, timeoutMs: Long) {
@@ -741,6 +747,23 @@ class ModelExecutionService : Service() {
     @Volatile
     private var keyCachePoisoned = false
 
+    /**
+     * [T-worker-key-intent-handoff] True when this request must fall back to the
+     * legacy freshness handoff: it arrived WITHOUT its own key, and the main
+     * process has rewritten `provider_secrets` since this process was born.
+     *
+     * A request that CARRIES its key is fresher than our cached map by
+     * construction — aborting (and poisoning the process) for it would only
+     * punish its siblings, which is the multi-session failure this handoff
+     * exists to remove. Keep the fallback for callers that cannot supply a key
+     * (older main process, `minis-model-use` bundles without `instance_id`).
+     */
+    private fun staleKeyAbortNeeded(carriedApiKey: String): Boolean {
+        if (WorkerKeyHandoff.carriesKey(carriedApiKey)) return false
+        WorkerKeyFreshness.captureBaseline(getDataDir())
+        return WorkerKeyFreshness.isStaleNow(getDataDir())
+    }
+
     private fun abortOnStaleKeyCache(runId: String?, dir: File?) {
         val pid = android.os.Process.myPid()
         keyCachePoisoned = true
@@ -790,8 +813,9 @@ class ModelExecutionService : Service() {
         }
     }
 
-    private fun executeRun(requestJson: String, dir: File): String {
-        val req = JSONObject(requestJson)
+    private fun executeRun(req: JSONObject, dir: File, carriedApiKey: String = ""): String {
+        // [ISSUE-12a] `req` is pre-parsed by the caller (CapturedRequestBody) —
+        // the duplicate parse of the multi-MB body is gone.
         // [T-worker-thinking-rules-restore] Restore this instance's custom thinking
         // rules from the request JSON BEFORE building the provider — the worker
         // process never touches ProviderRepository, so the resolver cache is empty
@@ -903,31 +927,50 @@ class ModelExecutionService : Service() {
         } else null
         val imageParts = jsonObjList(req.optJSONArray("image_parts")).map { obj ->
             com.rikkaminis.app.data.model.LLMMessage.ImagePart(
-                data = obj.optString("data", "").let { b64 ->
-                    if (b64.isNotEmpty()) android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                    else ByteArray(0)
-                },
+                // [dv21-A06] Same decode entry as the streaming path and the
+                // `media_files` consumer — a wrapped (RFC 2045) payload used to be
+                // accepted here and rejected there.
+                data = OffloadWireBase64.decode(obj.optString("data", "")) ?: ByteArray(0),
                 mimeType = obj.optString("mime_type", "image/png"),
                 linuxPath = obj.optString("linux_path", "").ifEmpty { null },
             )
         }
 
-        // ── API key: read from EncryptedSharedPreferences (same uid) ──
-        // [T-stale-apikey-worker-cache] Detect a mid-lifetime rewrite of the
-        // secrets file BEFORE reading the key: SharedPreferences is a
-        // per-process singleton cache, so a key saved by the main process
-        // after THIS process first loaded the prefs is invisible here and we
-        // would send the OLD (quota-exhausted) key. Abort → client retries →
-        // fresh process reads the new key. See WorkerKeyFreshness.
-        WorkerKeyFreshness.captureBaseline(getDataDir())
-        if (WorkerKeyFreshness.isStaleNow(getDataDir())) {
+        // ── API key: carried on the Intent, else EncryptedSharedPreferences ──
+        // [T-worker-key-intent-handoff] The dispatch Intent carries the key the
+        // main process had AT DISPATCH TIME (Binder/RAM, never disk), so a key
+        // replaced mid-session is used by the very next request — no process
+        // handoff, no poisoned window. Only when it is absent (older main
+        // process, or a bundle with no instance_id) does the legacy path run:
+        // [T-stale-apikey-worker-cache] detect a mid-lifetime rewrite of the
+        // secrets file BEFORE reading the key, because SharedPreferences is a
+        // per-process singleton cache — a key saved by the main process after
+        // THIS process first loaded the prefs is invisible here and we would
+        // send the OLD (quota-exhausted) key. Abort → client retries → fresh
+        // process reads the new key. See WorkerKeyFreshness.
+        if (staleKeyAbortNeeded(carriedApiKey)) {
             abortOnStaleKeyCache(runIdOf(dir), dir)
-            return JSONObject().apply { put("error", WorkerKeyFreshness.STALE_KEY_CACHE) }.toString()
+            // [meta1028-D2 F-01] Same envelope shape as the streaming path's
+            // stale-key result (:1362): the code plus a human message, so a
+            // caller whose retries are EXHAUSTED (concurrent siblings kept the
+            // poisoned process alive past the retry budget) shows the user why
+            // instead of a bare `stale_key_cache`. exit_code stays the default
+            // 1 (runtime failure) — 2 means "invalid args" in this CLI family.
+            return JSONObject().apply {
+                put("error", WorkerKeyFreshness.STALE_KEY_CACHE)
+                put(
+                    "message",
+                    "The provider API key was replaced while this worker was alive; " +
+                        "retry the call so a fresh worker reads the new key.",
+                )
+            }.toString()
         }
-        val apiKey = try {
-            com.rikkaminis.app.util.EncryptedPrefsFactory.safeCreate(this, "provider_secrets")
-                .getString("apikey_${instance.id}", null) ?: ""
-        } catch (_: Exception) { "" }
+        val apiKey = WorkerKeyHandoff.pickKey(carriedApiKey) {
+            try {
+                com.rikkaminis.app.util.EncryptedPrefsFactory.safeCreate(this, "provider_secrets")
+                    .getString("apikey_${instance.id}", null)
+            } catch (_: Exception) { null }
+        }
         if (apiKey.isEmpty()) {
             return JSONObject().apply {
                 put("error", "missing_api_key")
@@ -970,23 +1013,102 @@ class ModelExecutionService : Service() {
 
         // ── Dispatch ──
         val outputExt = req.optString("output_ext", "").ifEmpty { null }
-        val isMediaOutput = outputExt in listOf("png", "jpg", "jpeg", "webp", "gif")
         val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
+        // [fix/audit3-1015 F-10] Set by the image route (auto probe). It rides
+        // along in whatever result this run returns so :app — the process that
+        // owns ProviderRepository/SharedPreferences — can persist it; the
+        // worker never touches prefs.
+        var imageEndpointCache: com.rikkaminis.app.data.model.ImageEndpointMode? = null
 
-        // 1) Image generation route (media output ext + OpenAI-compat provider)
-        if (openAI != null && isMediaOutput) {
-            val genConfig = parseImageGenConfig(inputJson)
-            val prompt = genConfig.prompt
-                ?: messages.lastOrNull { it.role == com.rikkaminis.app.data.model.LLMMessage.Role.USER }?.content?.takeIf { it.isNotEmpty() }
+        // 0) Raw passthrough route. [fix/audit3-1015 F-03] This is where the
+        // HTTP call is allowed to happen: ProviderBoundary rejects provider
+        // calls in :app, so the app assembles the request (shared pure body
+        // builder + shared envelope parser) and ships it here. The reply is NOT
+        // parsed — the raw bytes ride back to :app, which owns --output/inline
+        // shaping and the session-scoped file IO.
+        val passthroughReq = req.optJSONObject("passthrough_request")
+        if (passthroughReq != null) {
+            if (openAI == null) {
+                return JSONObject().put("error", "passthrough_unsupported")
+                    .put("message", "passthrough mode requires an OpenAI-compatible provider instance")
+                    .toString()
+            }
+            return try {
+                val ptBody = passthroughReq.opt("body")?.takeIf { it != JSONObject.NULL } as? JSONObject
+                val ptHeaders = LinkedHashMap<String, String>()
+                passthroughReq.optJSONObject("headers")?.let { h ->
+                    for (k in h.keys()) {
+                        val v = h.opt(k)
+                        if (v is String) ptHeaders[k] = v
+                    }
+                }
+                val ptResult = runBlocking {
+                    openAI.rawPassthroughRequest(
+                        endpoint = passthroughReq.optString("endpoint", "").ifEmpty { null },
+                        method = passthroughReq.optString("method", "POST"),
+                        headers = ptHeaders,
+                        bodyObject = ptBody,
+                    )
+                }
+                JSONObject()
+                    .put("passthrough", true)
+                    .put("http_status", ptResult.status)
+                    .put("content_type", ptResult.contentType ?: JSONObject.NULL)
+                    .put("endpoint_url", ptResult.url)
+                    .put("bytes", ptResult.data.size)
+                    .put("body_b64", Base64.encodeToString(ptResult.data, Base64.NO_WRAP))
+                    .toString()
+            } catch (t: Throwable) {
+                JSONObject().put("error", "passthrough_failed")
+                    .put("message", t.message ?: "passthrough request failed")
+                    .toString()
+            }
+        }
+
+        // 1) Image generation route. [fix/audit3-1015 F-10] The routing DECISION
+        // is shared with the CLI side (`ModelUseProtocol.decideImageRoute`)
+        // rather than an `outputExt` test here: this used to be the only image
+        // routing that ran, and it (a) sent a pure image generator without `-o`
+        // to the chat path, which cannot serve it, (b) dropped an input image
+        // into a text-to-image call instead of declining the route, and
+        // (c) fell through to chat on ANY failure, hiding terminal errors.
+        val imageConfig = ModelUseProtocol.parseImageGenConfig(inputJson)
+        val imageRoute = ModelUseProtocol.decideImageRoute(
+            displayName = model.displayName,
+            outputModalities = model.outputModalities.orEmpty(),
+            outputExt = outputExt,
+            hasInputImages = imageParts.isNotEmpty(),
+            providerType = instance.providerType,
+            credentialType = instance.credentialType,
+            isOpenAiCompatibleProvider = openAI != null,
+            imageEndpointMode = instance.imageEndpointMode,
+            imageEndpointResolved = instance.imageEndpointResolved,
+            endpointOverride = imageConfig.endpointOverride,
+        )
+        if (imageRoute is ModelUseProtocol.ImageRoute.Reject) {
+            return JSONObject().apply {
+                put("error", imageRoute.error)
+                put("message", imageRoute.message)
+                put("exit_code", 2)
+            }.toString()
+        }
+        if (imageRoute is ModelUseProtocol.ImageRoute.Generate && openAI != null) {
+            val prompt = imageConfig.prompt
+                ?: messages.lastOrNull { it.role == com.rikkaminis.app.data.model.LLMMessage.Role.USER }
+                    ?.content?.takeIf { it.isNotEmpty() }
                 ?: ""
             if (prompt.isNotEmpty()) {
-                // Apply image passthrough extras from inputJson (mirrors
-                // ModelUseOffloadHandler.tryImageGenerationRoute's passthrough
-                // injection).
+                // Apply image passthrough extras from inputJson.
                 applyImagePassthrough(openAI, inputJson, callWarnings)
+                // imagesGenerations (forced/pure/cached) → a failure is terminal;
+                // auto → a route-missing 4xx is a cacheable "no Images API".
+                val forced = imageRoute.mode == com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
                 try {
                     val imgResult = runBlocking {
-                        openAI.generateImage(prompt, genConfig.n, genConfig.size, genConfig.quality)
+                        openAI.generateImage(prompt, imageConfig.n, imageConfig.size, imageConfig.quality)
+                    }
+                    if (!forced) {
+                        imageEndpointCache = com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
                     }
                     return JSONObject().apply {
                         put("model", model.id)
@@ -1002,23 +1124,53 @@ class ModelExecutionService : Service() {
                                 put(JSONObject().apply {
                                     put("type", m.type.value)
                                     put("mime_type", m.mimeType)
-                                    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.DEFAULT))
+                                    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP))
                                 })
                             }
                         })
                         if (appliedExtras.length() > 0) put("applied_extras", appliedExtras)
                         if (callWarnings.isNotEmpty()) put("warnings", JSONArray(callWarnings))
+                        imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
                         put("exit_code", 0)
                     }.toString()
                 } catch (t: Throwable) {
-                    // Fall through to text path — mirror tryImageGenerationRoute's
-                    // route-missing fallback semantics.
-                    callWarnings.add("image_route_fallback: ${t.message}")
+                    val routeMissing = !forced &&
+                        (t is com.rikkaminis.app.data.model.LLMError.ProviderError ||
+                            t is com.rikkaminis.app.data.model.LLMError.InvalidApiKey) &&
+                        ModelUseProtocol.looksLikeEndpointMissing(t.message ?: "")
+                    if (routeMissing) {
+                        // Cache the answer and run the chat path below.
+                        Log.i(TAG, "[image-route] auto probe → route missing — caching chat_completions")
+                        imageEndpointCache = com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions
+                        callWarnings.add("image_route_fallback: ${t.message}")
+                    } else {
+                        // Forced/pure mode, or a real error (auth/moderation/
+                        // network) — surface it instead of falling through.
+                        Log.w(TAG, "[image-route] image generation failed: ${t.message}", t)
+                        val hint = ModelUseProtocol.imageParamHint(
+                            displayName = model.displayName,
+                            providerType = instance.providerType,
+                            outputModalities = model.outputModalities.orEmpty(),
+                        )
+                        val base = t.message ?: "image_generation_failed"
+                        return JSONObject().apply {
+                            put("error", "image_generation_failed")
+                            put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
+                            put("exit_code", 1)
+                        }.toString()
+                    }
                 }
             }
         }
 
         // 2) Standard sendMessage path
+        // [dv27-A02] Read the thinking level the same way the streaming path
+        // does — through the ONE shared parser. This path never read
+        // `thinking_level` at all, so every non-streamed offloaded request
+        // fell back to the `LLMProvider.sendMessage` default (OFF): the
+        // dispatcher serialized the level, the worker dropped it, and the
+        // model ran with reasoning explicitly disabled.
+        val thinkingLevel = thinkingLevelFromWire(req.optString("thinking_level", ""))
         val response = try {
             runBlocking {
                 provider.sendMessage(
@@ -1033,6 +1185,7 @@ class ModelExecutionService : Service() {
                     // them, so non-streaming function-calling turns ran with
                     // an empty tool surface.
                     tools = parseToolsJson(req.optJSONArray("tools")),
+                    thinkingLevel = thinkingLevel,
                 )
             }
         } catch (e: Throwable) {
@@ -1040,6 +1193,7 @@ class ModelExecutionService : Service() {
             return JSONObject().apply {
                 put("error", "model_use_failed")
                 put("message", e.message ?: "unknown")
+                imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
                 put("exit_code", 1)
             }.toString()
         }
@@ -1059,12 +1213,15 @@ class ModelExecutionService : Service() {
                     put(JSONObject().apply {
                         put("type", m.type.value)
                         put("mime_type", m.mimeType)
-                        put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.DEFAULT))
+                        put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP))
                     })
                 }
             })
             if (appliedExtras.length() > 0) put("applied_extras", appliedExtras)
             if (callWarnings.isNotEmpty()) put("warnings", JSONArray(callWarnings))
+            // [fix/audit3-1015 F-10] The auto probe's answer rides home with the
+            // chat result; :app persists it (this process must not touch prefs).
+            imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
             put("exit_code", 0)
         }.toString()
     }
@@ -1080,7 +1237,7 @@ class ModelExecutionService : Service() {
      *  - On cancel (main process creates [dir]/[CANCEL_FILE]): aborts the stream, writes an error line so
      *    the client's Flow terminates (hardened-3: cancellation propagation).
      */
-    private fun executeStreamingRun(requestJson: String, dir: File) {
+    private fun executeStreamingRun(req: JSONObject, dir: File, carriedApiKey: String = "") {
         val streamFile = File(dir, STREAM_FILE)
         val cancelFile = File(dir, CANCEL_FILE)
         val runId = runIdOf(dir)
@@ -1099,7 +1256,8 @@ class ModelExecutionService : Service() {
                 output!!.append(line).append('\n')
                 output!!.flush()
             }
-            val req = JSONObject(requestJson)
+            // [ISSUE-12a] `req` arrives pre-parsed (CapturedRequestBody) — this
+            // path used to re-parse the same multi-MB body a second time.
             // [T-worker-thinking-rules-restore] Same restore as executeRun — the
             // streaming path is the main chat path, where the sensenova clamp bug
             // was observed live.
@@ -1198,10 +1356,10 @@ class ModelExecutionService : Service() {
             } else null
             val imageParts = jsonObjList(req.optJSONArray("image_parts")).map { obj ->
                 com.rikkaminis.app.data.model.LLMMessage.ImagePart(
-                    data = obj.optString("data", "").let { b64 ->
-                        if (b64.isNotEmpty()) java.util.Base64.getDecoder().decode(b64)
-                        else ByteArray(0)
-                    },
+                    // [dv21-A06] The streaming entry used the strict RFC 4648 decoder
+                    // with no guard: a wrapped payload threw out of the run and a
+                    // malformed one killed the whole stream.
+                    data = OffloadWireBase64.decode(obj.optString("data", "")) ?: ByteArray(0),
                     mimeType = obj.optString("mime_type", "image/png"),
                     linuxPath = obj.optString("linux_path", "").ifEmpty { null },
                 )
@@ -1217,13 +1375,12 @@ class ModelExecutionService : Service() {
             // the default parameter expresses. A present-but-unparseable value
             // (newer enum case from a main-process-only build) still throws —
             // that strict contract is unchanged.
-            val thinkingLevel = req.optString("thinking_level", "").let {
-                if (it.isEmpty()) com.rikkaminis.app.data.model.ThinkingLevel.OFF
-                else safeEnum(it, com.rikkaminis.app.data.model.ThinkingLevel.OFF)
-            }
+            val thinkingLevel = thinkingLevelFromWire(req.optString("thinking_level", ""))
 
-            // ── API key: read from EncryptedSharedPreferences (same uid) ──
-            // [T-stale-apikey-worker-cache] Same guard as executeRun: if the
+            // ── API key: carried on the Intent, else EncryptedSharedPreferences ──
+            // [T-worker-key-intent-handoff] Same precedence as executeRun: a
+            // carried key wins verbatim and suppresses the freshness abort.
+            // [T-stale-apikey-worker-cache] Fallback guard only: if the
             // main process saved a new key after this worker was born, our
             // cached prefs map is stale — abort so the client's retry spawns a
             // fresh process that reads the new key. See WorkerKeyFreshness.
@@ -1236,8 +1393,7 @@ class ModelExecutionService : Service() {
             // the client classifies it as auto-retryable and re-dispatches
             // (onto a fresh worker that reads the new key), never as a
             // silent worker death.
-            WorkerKeyFreshness.captureBaseline(getDataDir())
-            if (WorkerKeyFreshness.isStaleNow(getDataDir())) {
+            if (staleKeyAbortNeeded(carriedApiKey)) {
                 abortOnStaleKeyCache(runId, dir)
                 appendLine(ChatStreamJsonl.errorLine(WorkerKeyFreshness.STALE_KEY_CACHE, ChatStreamErrorPolicyKind.KIND_TRANSIENT))
                 writeResultAtomically(dir, JSONObject().apply {
@@ -1246,10 +1402,12 @@ class ModelExecutionService : Service() {
                 }.toString())
                 return
             }
-            val apiKey = try {
-                com.rikkaminis.app.util.EncryptedPrefsFactory.safeCreate(this, "provider_secrets")
-                    .getString("apikey_${instance.id}", null) ?: ""
-            } catch (_: Exception) { "" }
+            val apiKey = WorkerKeyHandoff.pickKey(carriedApiKey) {
+                try {
+                    com.rikkaminis.app.util.EncryptedPrefsFactory.safeCreate(this, "provider_secrets")
+                        .getString("apikey_${instance.id}", null)
+                } catch (_: Exception) { null }
+            }
             ModelExecutionRunLog.log(dir, android.os.Process.myPid(), ModelExecutionRunLog.Phase.REQUEST_PARSED, "streaming=true model=${model.id}", runId = runIdOf(dir))
             if (apiKey.isEmpty()) {
                 appendLine(ChatStreamJsonl.errorLine("missing_api_key", ChatStreamErrorPolicyKind.KIND_INVALID_KEY))
@@ -1664,7 +1822,7 @@ class ModelExecutionService : Service() {
                         val error = p.optBoolean("isError", false)
                         val content = getString(p, "content")
                         val imageData: ByteArray? = p.optString("imageDataB64").takeIf { it.isNotBlank() }
-                            ?.let { runCatching { java.util.Base64.getDecoder().decode(it) }.getOrNull() }
+                            ?.let { OffloadWireBase64.decode(it) }
                         val imageMimeType = getString(p, "imageMimeType").ifEmpty { null }
                         val imageLinuxPath = getString(p, "imageLinuxPath").ifEmpty { null }
                         parts.add(com.rikkaminis.app.data.model.AgentContentPart.ToolResult(
@@ -1679,8 +1837,7 @@ class ModelExecutionService : Service() {
                     }
                     "image", "imagedata" -> {
                         val b64 = getString(p, "b64Data")
-                        val data = if (b64.isNotBlank()) { runCatching { java.util.Base64.getDecoder().decode(b64) }.getOrNull() ?: ByteArray(0) }
-                        else ByteArray(0)
+                        val data = OffloadWireBase64.decode(b64) ?: ByteArray(0)
                         val mimeType = getString(p, "mimeType").ifEmpty { "image/png" }
                         val linuxPath = getString(p, "linuxPath").ifEmpty { null }
                         parts.add(com.rikkaminis.app.data.model.AgentContentPart.ImageData(data = data, mimeType = mimeType, linuxPath = linuxPath))
@@ -1774,161 +1931,73 @@ class ModelExecutionService : Service() {
 
     // ── passthrough parsing (mirrors ModelUseOffloadHandler) ──
 
-    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any> {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return emptyMap()
-        val eb = obj.optJSONObject("extra_body") ?: return emptyMap()
-        val result = linkedMapOf<String, Any>()
-        for (key in eb.keys()) {
-            when (val v = eb.get(key)) {
-                is Int, is Long, is Double, is Boolean, is String -> result[key] = v
-                is JSONArray -> {
-                    val list = (0 until v.length()).mapNotNull { e ->
-                        e.let { if (it is Int || it is Long || it is Double || it is Boolean || it is String) it else null }
-                    }
-                    if (list.isNotEmpty()) result[key] = list
-                }
-                else -> warnings.add("extra_body.$key: unsupported type, dropped")
-            }
-        }
-        return result
-    }
+    /**
+     * [fix/audit3-1015 F-04] Delegates to the single shared dialect in
+     * [ModelUseProtocol]. This copy used to rebuild arrays from the loop
+     * *index* (`[0, 1, … N-1]`) and warn-and-drop nested objects, so the same
+     * `extra_body` produced one body from `:app` and a different one from
+     * `:modelservice`. One implementation, two callers — no dialect to drift.
+     */
+    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
+        ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
     /**
-     * [fix/audit0917-b8] Header values are JSON strings — the same dialect the
-     * in-process path (`ModelUseOffloadHandler.parseExtraHeaders`) documents
-     * and enforces. The worker path used to be silently *lax* (`optString`
-     * stringified numbers, and the image route dropped non-strings with no
-     * trace), so a typo'd header looked like it had been sent. Both routes now
-     * drop + warn identically.
+     * [da1019 ISSUE-01] Delegates to the single shared dialect in
+     * [ModelUseProtocol]. This copy used to read `extra_headers` with
+     * `optJSONObject` — a present-but-not-an-object value was dropped with
+     * **zero** warning while the in-process route warned — and its KDoc
+     * claimed "both routes now drop + warn identically".
      */
-    private fun jsonTypeName(v: Any?): String = when (v) {
-        null, JSONObject.NULL -> "null"
-        is String -> "string"
-        is Boolean -> "bool"
-        is Number -> "number"
-        is JSONArray -> "array"
-        is JSONObject -> "object"
-        else -> v.javaClass.simpleName
-    }
+    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
+        ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
 
-    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return emptyMap()
-        val eh = obj.optJSONObject("extra_headers") ?: return emptyMap()
-        val result = linkedMapOf<String, String>()
-        for (key in eh.keys()) {
-            val v = eh.opt(key)
-            if (v is String) {
-                result[key] = v
-            } else {
-                warnings.add(
-                    "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                        "this header was ignored. Header values must be JSON strings.",
-                )
-            }
-        }
-        return result
-    }
+    /**
+     * [da1019 ISSUE-01] Delegates to [ModelUseProtocol]. This copy used to
+     * accept ANY non-empty `endpoint` string as a path — including symbolic
+     * endpoint-mode values like `{"endpoint":"chat"}` — and write it into
+     * `provider.absoluteEndpointOverride` + `applied_extras.custom_endpoint`.
+     * The shared dialect requires a "/" prefix (and reads `image_endpoint`
+     * first, which the worker never saw at all).
+     */
+    private fun parseCustomEndpointPath(inputJson: String): String? =
+        ModelUseProtocol.parseCustomEndpointPath(inputJson)
 
-    private fun parseCustomEndpointPath(inputJson: String): String? {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return null
-        return obj.optString("endpoint", "").ifEmpty { null }
-    }
-
-    private fun parseImageGenConfig(inputJson: String): ImageGenConfig {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return ImageGenConfig()
-        var prompt: String? = null
-        var n = 1
-        var size: String? = null
-        var quality: String? = null
-        if (obj.has("prompt")) prompt = obj.optString("prompt", null)
-        if (obj.has("n")) n = obj.optInt("n", 1)
-        if (obj.has("size")) size = obj.optString("size", null)
-        if (obj.has("quality")) quality = obj.optString("quality", null)
-        val gc = obj.optJSONObject("generation_config")
-        if (gc != null) {
-            if (prompt == null && gc.has("prompt")) prompt = gc.optString("prompt", null)
-            if (gc.has("number_of_images")) n = gc.optInt("number_of_images", 1)
-            if (gc.has("image_size")) size = gc.optString("image_size", null)
-        }
-        return ImageGenConfig(prompt, n, size, quality)
-    }
-
-    private data class ImageGenConfig(
-        val prompt: String? = null,
-        val n: Int = 1,
-        val size: String? = null,
-        val quality: String? = null,
-    )
 
     /**
      * Parse image passthrough extras from the input JSON and apply them to
-     * the [OpenAIProvider]. Mirrors
-     * [ModelUseOffloadHandler.tryImageGenerationRoute] passthrough injection.
+     * the [OpenAIProvider].
+     *
+     * [dv14-A4] ISSUE-08: this used to carry its OWN copy of the dialect — a
+     * private `IMAGE_PASSTHROUGH_RESERVED_KEYS` mirroring the app side's
+     * `imageReservedKeys` (three copies of the same 17 keys, one of them
+     * dead), a local implicit-keys loop, and its own zero-warning
+     * `optJSONObject(…)` read of `extra_body` that dropped a
+     * present-but-not-an-object value — the exact silent shape da1019 fixed
+     * for `extra_headers` (the old comment below about a THIRD copy was true
+     * twice over, and this was one of them).
+     *
+     * [fix/audit-s3m2] Another earlier copy expected an `image_passthrough`
+     * envelope that NO caller ever wrote (dead dialect — grep found that line
+     * as the only reference to the key in the whole repo). The live dialect is
+     * implicit top-level keys (not in the reserved set) + explicit
+     * extra_body / extra_headers / endpoint_path, so passthrough extras
+     * survive the worker path too (e.g. the Seedream image-to-image `image`
+     * body field) instead of being silently dropped.
+     *
+     * All of it now lives in [ModelUseProtocol.parseImagePassthrough] — one
+     * implementation, one key set, and warnings this process can surface.
      */
     private fun applyImagePassthrough(
         openAI: com.rikkaminis.app.provider.openai.OpenAIProvider,
         inputJson: String,
         warnings: MutableList<String>,
     ) {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return
-        // [fix/audit-s3m2] This reader used to expect an `image_passthrough`
-        // envelope that NO caller ever wrote (dead dialect — grep found this
-        // line as the only reference to the key in the whole repo). The
-        // in-process ModelUseOffloadHandler.parseImagePassthrough uses a
-        // different dialect: implicit top-level keys (not in the reserved
-        // set) + explicit extra_body / extra_headers / endpoint_path. Parse
-        // the SAME dialect here so passthrough extras survive the worker
-        // path too (e.g. Seedream image-to-image `image` body field),
-        // instead of being silently dropped.
-        val body = LinkedHashMap<String, Any?>()
-        for (key in obj.keys()) {
-            if (key in IMAGE_PASSTHROUGH_RESERVED_KEYS) continue
-            body[key] = obj.opt(key)
-        }
-        obj.optJSONObject("extra_body")?.let { eb ->
-            for (key in eb.keys()) body[key] = eb.opt(key)
-        }
-        if (body.isNotEmpty()) openAI.imageExtraBody = body
-        val headers = LinkedHashMap<String, String>()
-        obj.optJSONObject("extra_headers")?.let { eh ->
-            for (key in eh.keys()) {
-                val v = eh.opt(key)
-                if (v is String) {
-                    headers[key] = v
-                } else {
-                    // [fix/audit0917-b8] Same dialect + same visibility as the
-                    // in-process path; the old `if (v is String)` dropped
-                    // these without a trace, so a non-string header looked
-                    // like it had been sent.
-                    warnings.add(
-                        "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                            "this header was ignored. Header values must be JSON strings.",
-                    )
-                }
-            }
-        }
-        if (headers.isNotEmpty()) openAI.imageExtraHeaders = headers
-        obj.optString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }?.let {
-            openAI.imagePathOverride = it
-        }
+        val spec = ModelUseProtocol.parseImagePassthrough(inputJson)
+        if (spec.body.isNotEmpty()) openAI.imageExtraBody = spec.body
+        if (spec.headers.isNotEmpty()) openAI.imageExtraHeaders = spec.headers
+        spec.endpointPath?.let { openAI.imagePathOverride = it }
+        warnings.addAll(spec.warnings)
     }
-
-    /**
-     * Keys consumed by the image-gen schema itself (parseImageGenConfig) or
-     * the chat schema — mirrors ModelUseOffloadHandler.imageReservedKeys.
-     * Any OTHER top-level key in inputJson folds into the passthrough body.
-     */
-    private val IMAGE_PASSTHROUGH_RESERVED_KEYS: Set<String> = setOf(
-        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
-        "size", "image_size", "quality", "generation_config", "endpoint",
-        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
-        "stream", "temperature", "max_tokens",
-    )
 }
 
 /**
@@ -1986,18 +2055,50 @@ private class LivenessHeartbeat(
 }
 
 /**
- * [T-model-exec-strict-enum] Thrown when the worker receives an enum value
- * it doesn't recognize — typically because the main process serialized a
- * NEWER enum case that this (older) worker build doesn't know about. The
- * outer catch in executeRun / executeStreamingRun writes an error result /
- * stream error line; the main process's dispatch() retry then spawns a
- * fresh worker that reads the correct enum on its first-ever prefs load.
- *
- * Replaces the old silent-fallback-to-default behavior which could route
- * an Anthropic request through the OpenAI protocol (or vice versa) and
- * produce a confusing 400 / parse failure that looked like a provider bug.
+ * [T-model-exec-strict-enum] [UnknownEnumValueException] now lives in its own
+ * file (UnknownEnumValueException.kt) so the wire-level enum parsers can be
+ * compiled and unit-tested on a plain JVM.
  */
-internal class UnknownEnumValueException(
-    val enumClass: String,
-    val unknownValue: String,
-) : RuntimeException("unknown $enumClass value: $unknownValue")
+
+/**
+ * [ISSUE-12a] One run's request body, read from disk and parsed exactly once.
+ *
+ * The old flow read `request.json` three times (queue-frame decision, formal
+ * read, ack-barrier decision) and parsed it at each site — 2 redundant reads
+ * and 2 redundant parses of a body that can reach several MB (base64 input
+ * images). request.json is written exactly once by ModelExecutionDispatcher
+ * before startService, and is deleted only after this worker's terminal
+ * marker — which is written after the ack barrier, i.e. after the last
+ * consumer — so a single capture is faithful to what every site would have
+ * observed.
+ *
+ * Each consumer site's failure semantics are preserved exactly:
+ *  - [streamingFlagOrFalse]: a read OR parse failure degrades to `false`.
+ *    Matches the old `runCatching { JSONObject(readText()) }.getOrDefault(false)`
+ *    at the queue-frame and ack-barrier sites.
+ *  - [jsonOrThrow]: a read OR parse failure is re-thrown, landing in the
+ *    run's catch → `model_use_failed` result. Matches the old formal-read
+ *    site, where `readText()` / `JSONObject()` threw inside the try.
+ *
+ * The one deliberate delta: when the first read fails, the formal-read site
+ * no longer gets a second IO attempt. The file is write-once (see above), so
+ * a retry could only succeed through a transient fs hiccup — and the failure
+ * still converges to the same structured `model_use_failed` result the old
+ * code produced.
+ */
+internal class CapturedRequestBody private constructor(
+    private val json: Result<JSONObject>,
+) {
+    /** Queue-frame / ack-barrier sites: any read/parse failure → `false`. */
+    fun streamingFlagOrFalse(): Boolean =
+        json.map { it.optBoolean("streaming", false) }.getOrDefault(false)
+
+    /** Formal-read site: the original read/parse failure is re-thrown. */
+    fun jsonOrThrow(): JSONObject = json.getOrThrow()
+
+    companion object {
+        /** Reads via [read] exactly once and parses exactly once. */
+        fun capture(read: () -> String): CapturedRequestBody =
+            CapturedRequestBody(runCatching { JSONObject(read()) })
+    }
+}

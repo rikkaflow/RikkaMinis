@@ -1,9 +1,8 @@
 package com.rikkaminis.app.ui.chat
 
 import com.rikkaminis.app.agent.Level
-import com.rikkaminis.app.agent.ToolLoopDetector
 import com.rikkaminis.app.data.model.AgentContentPart
-import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.provider.ToolJsonRepair
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.tools.ToolConcurrencyPolicy
@@ -23,6 +22,10 @@ import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.conversation.ContextCalibration
+import com.rikkaminis.app.conversation.ContextEstimator
+import com.rikkaminis.app.conversation.PreflightVerdict
+import com.rikkaminis.app.conversation.preflightContextBudget
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.tools.AgentTraceRecorder
 import android.os.SystemClock
@@ -97,6 +100,398 @@ internal const val TOOL_INPUT_CHUNK_RING_MAX = 10
  *  1/2/4s cadence at the default 3); kept as the documented default. */
 internal val AUTO_RETRY_DELAYS_SEC = intArrayOf(1, 2, 4)
 
+/**
+ * [deep-audit-1016 6a] Re-derive a turn's request budget for the member that is
+ * about to serve it — the ONE definition of "what a provider switch does to the
+ * output budget and to the calibration".
+ *
+ * Why it must exist (field shape: HTTP 400 right after a fallback): a turn
+ * captures its budget ONCE, before the retry loop, from the member that serves
+ * the *first* attempt. Both fallback switches then replace
+ * `loopState.currentProvider` mid-turn and re-enter the retry loop, which
+ * re-uses that captured `maxTokens` — sized for the member we just left. A
+ * group whose first entry is a 64K-output model falling back to a 4K-output
+ * one therefore sent `max_tokens = 64000` to the 4K member, and the
+ * calibration sample was charged to the OLD member's per-(provider, model)
+ * key. [audit2 BUG-02] fixed exactly this for the turn-entry read; the two
+ * fallback switches are the same defect one level down (this audit's 6a).
+ *
+ * Pure by construction — every provider-dependent value is an argument, so the
+ * decision table is JVM-testable without an Android host
+ * (see `RequestBudgetRecomputeTest`).
+ */
+internal object RequestBudgetRecompute {
+
+    /** The recalculation for one provider: estimates + the output budget it implies. */
+    data class Result(
+        /** Provider-neutral estimate of the request input (before calibration). */
+        val rawEstimateTokens: Long,
+        /** [rawEstimateTokens] scaled by the provider's calibration coefficient. */
+        val calibratedEstimateTokens: Long,
+        val verdict: PreflightVerdict,
+        /** Output budget to send with the request. */
+        val maxTokens: Int,
+    )
+
+    /**
+     * @param messages the exact message list the request will carry.
+     * @param systemPrompt the same system prompt the request will carry.
+     * @param tools the same tool schemas the request will carry.
+     * @param calibrationRatioPercent the NEW provider's coefficient (100 = calibrated-equal).
+     * @param windowTokens the NEW provider's effective context window (0/negative = unknown).
+     * @param providerMaxTokens `dynamicMaxTokens(newProvider, …)` — what the member can emit.
+     * @param outputFloor minimum output budget (`MIN_MAX_TOKENS_CONST`).
+     */
+    fun forProvider(
+        messages: List<LLMMessage>,
+        systemPrompt: String?,
+        tools: List<AgentToolDefinition>,
+        calibrationRatioPercent: Long,
+        windowTokens: Int,
+        providerMaxTokens: Int,
+        outputFloor: Int,
+    ): Result {
+        val rawEstimate = ContextEstimator.estimateRequestTokens(
+            messages = messages,
+            systemPrompt = systemPrompt,
+            tools = tools,
+        )
+        val calibrated = rawEstimate * calibrationRatioPercent / 100
+        val verdict = preflightContextBudget(
+            window = windowTokens,
+            estimatedInput = calibrated,
+            requestedMaxTokens = providerMaxTokens,
+            outputFloor = outputFloor,
+        )
+        val maxTokens = when (verdict.decision) {
+            PreflightVerdict.Decision.PASS -> providerMaxTokens
+            PreflightVerdict.Decision.SHRINK_OUTPUT ->
+                verdict.suggestedMaxTokens ?: providerMaxTokens
+            // Mid-turn we do NOT re-run the offload → auto-compact → hard-trim
+            // pipeline (that is the turn entry's job and it needs the host).
+            // Floor the output instead — the same terminal answer the pipeline
+            // gives once the history has been shrunk as far as it goes; the
+            // next turn entry re-runs the full pipeline while still over.
+            PreflightVerdict.Decision.NEEDS_COMPACTION -> outputFloor
+        }
+        return Result(
+            rawEstimateTokens = rawEstimate,
+            calibratedEstimateTokens = calibrated,
+            verdict = verdict,
+            maxTokens = maxTokens,
+        )
+    }
+}
+
+/**
+ * [deep-audit-1017 ISSUE-03] Per-turn visible-content predicate for the
+ * `toolCalls.isEmpty()` tail of `runAgentLoop`.
+ *
+ * The tail used to ask this question of the RUN-scoped accumulators
+ * (`loopState.accumulatedText` / `loopState.allToolBlocks`): both are
+ * append-only for the whole run (cleared only by the queued-prompt interrupt
+ * checkpoint), so once ANY earlier turn streamed text or dispatched a tool
+ * they stayed non-empty forever and `if (!hasVisibleContent && finishedCleanly)`
+ * could never fire again. That made the empty-turn recovery — including
+ * `EmptyTurnRecovery.Plan.NudgeExistingPart(isToolResult = true)`, the arm the
+ * reminder exists for ("model stalled after a tool result") — unreachable from
+ * the engine: the run silently stopped on an empty reply with no nudge, no
+ * retry, no hint.
+ *
+ * The question is per turn, so the inputs are per turn: `turnText` is this
+ * turn's text (the seam-trimmed message body) and `turnBlocks` is this turn's
+ * block slice (`allToolBlocks.drop(turnStartBlockIndex)`). Mirrors iOS
+ * AIChatViewModel.swift, which asks the question of the current turn.
+ *
+ * Top-level + pure so the decision is directly unit-testable
+ * (`TurnVisibleContentTest`), same as [RequestBudgetRecompute] above.
+ */
+internal object TurnVisibleContent {
+
+    /** This turn showed the user something: streamed text or a rendered block. */
+    fun hasVisibleContent(turnText: String, turnBlocks: List<AssistantBlock>): Boolean =
+        turnText.isNotBlank() ||
+            turnBlocks.any { it.kind == "tool_use" || (it.kind == "text" && it.content.isNotBlank()) }
+
+    /**
+     * [T-truncated-stream-retry] A truncated turn (EOF without a
+     * `finish_reason`) is NOT a clean finish even when the stop reason is null
+     * or "stop" — the EOF retry branch owns it, so the empty-turn path must not
+     * swallow it with an error hint. Same for any non-terminal finish reason.
+     */
+    fun finishedCleanly(turnFinishReason: String?, turnTruncated: Boolean): Boolean =
+        (turnFinishReason == null ||
+            turnFinishReason == "stop" || turnFinishReason == "end_turn") &&
+            !turnTruncated
+
+    /** The empty-turn trigger: nothing visible this turn AND a clean finish. */
+    fun isEmptyTurn(
+        turnText: String,
+        turnBlocks: List<AssistantBlock>,
+        turnFinishReason: String?,
+        turnTruncated: Boolean,
+    ): Boolean = !hasVisibleContent(turnText, turnBlocks) &&
+        finishedCleanly(turnFinishReason, turnTruncated)
+}
+
+/**
+ * [deep-audit-1018 ISSUE-12c] Single source of truth for the stub-reminder
+ * STACKING guard, shared by the two eofStubReminder injection sites in the
+ * agent loop.
+ *
+ * The bug class (same family as the length-wall reminder guard): a second
+ * consecutive error-shaped / EOF-truncated turn re-enters the continuation
+ * branch. The previous iteration's reminder is still sitting in history —
+ * behind THIS turn's assistant message — so a blind add piles reminder on
+ * reminder: the model sees a stack of identical "continue where you left
+ * off" instructions (context noise, repeated-anchor confusion) instead of
+ * exactly one.
+ *
+ * The first stub branch (error-shaped, finish-path) shipped WITHOUT the
+ * guard while its EOF-stub sibling had it — this object is the extracted,
+ * testable form of that sibling's inline predicate. Judgement is shape-only:
+ * a USER message whose single part is Text containing the eofStubReminder
+ * marker string (`"cut off by a network error"`, from [eofStubReminder]'s
+ * literal wording — greppable, and textually distinct from
+ * [lengthWallReminder]'s "output token limit" wording so the two reminder
+ * families never cross-match).
+ */
+internal object EofStubReminderStackGuard {
+
+    /** Marker unique to eofStubReminder (vs lengthWallReminder). */
+    internal const val REMINDER_MARKER = "cut off by a network error"
+
+    /**
+     * True when [prevTail] is a stale stub reminder from a previous
+     * error-shaped/EOF continuation and must be removed before the new one is
+     * appended. Callers pass `agentHistory[size - 2]` — the entry BEHIND this
+     * turn's assistant message (the reminder always sits immediately behind
+     * it, which is also why a null/short history is a clean no-match).
+     */
+    fun isStaleEofStubReminder(prevTail: LLMMessage?): Boolean =
+        prevTail != null &&
+            prevTail.role == LLMMessage.Role.USER &&
+            prevTail.contentParts.size == 1 &&
+            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
+                ?.contains(REMINDER_MARKER) == true
+}
+
+/**
+ * [FIX-R4-Q F-08] Keeps the in-memory transcript in step with the single DB row
+ * a continuation run produces.
+ *
+ * A length-wall / EOF-stub continuation does not open a new bubble: the branches
+ * that decide to continue `continue` back into the same turn loop, keep streaming
+ * into `loopState.assistantId`, and the terminal persist writes ONE `assistant`
+ * row covering every segment (the run-scoped `unpersistedBlockStart` slice). The
+ * history, on the other hand, got one ASSISTANT entry per segment — plus the
+ * transient "<system-reminder>…continue where you left off" USER turn the branch
+ * injected, which then stayed in the transcript forever. Three segments meant
+ * three assistant turns (only the last one carrying the row's dbMessageId) and
+ * two leftover reminder turns, while the user saw one bubble.
+ *
+ * [mergeIntoPreviousAssistant] folds the segment into the previous assistant
+ * entry and drops those reminders, so the request sent to the next provider is
+ * "one assistant message per answer" — the same shape the DB and the UI have.
+ *
+ * Pure (no host/ViewModel access) so the fold is JVM-testable; the caller decides
+ * whether to append or to fold.
+ */
+internal object ContinuationHistoryMerge {
+
+    /** Marker unique to [lengthWallReminder] (vs the EOF-stub sibling). */
+    internal const val LENGTH_WALL_REMINDER_MARKER = "cut off mid-sentence"
+
+    private val CONTINUATION_REMINDER_MARKERS = listOf(
+        EofStubReminderStackGuard.REMINDER_MARKER,
+        LENGTH_WALL_REMINDER_MARKER,
+    )
+
+    /**
+     * True when [message] is one of the synthetic continuation reminders — a
+     * USER turn whose single Text part carries the EOF-stub or length-wall
+     * payload. Anything else (tool_result, user text, statement tails) is NOT
+     * a continuation anchor and must stop the peel.
+     */
+    fun isContinuationReminder(message: LLMMessage?): Boolean {
+        if (message == null || message.role != LLMMessage.Role.USER) return false
+        if (message.contentParts.size != 1) return false
+        val text = (message.contentParts.first() as? AgentContentPart.Text)?.text ?: return false
+        return CONTINUATION_REMINDER_MARKERS.any { text.contains(it) }
+    }
+
+    /**
+     * [R5-C2] The OTHER half of the stacking guard for the error-shaped
+     * continuation branch: that branch can equally follow a length-wall
+     * segment, and [EofStubReminderStackGuard] deliberately does not
+     * cross-match its family (a "cut off mid-sentence" reminder is not an
+     * "cut off by a network error" one — `EofStubStackingGuardTest` pins that
+     * separation). The injection site therefore ORs the two family predicates:
+     * one source per family, no composed predicate that would become a third
+     * copy to drift.
+     *
+     * The length-wall reminder's shape: a USER turn with one Text part carrying
+     * [LENGTH_WALL_REMINDER_MARKER]. Shape-only, mirroring the EOF predicate.
+     */
+    fun isLengthWallReminder(message: LLMMessage?): Boolean {
+        if (message == null || message.role != LLMMessage.Role.USER) return false
+        if (message.contentParts.size != 1) return false
+        val text = (message.contentParts.first() as? AgentContentPart.Text)?.text ?: return false
+        return text.contains(LENGTH_WALL_REMINDER_MARKER)
+    }
+
+    /**
+     * Fold [incoming] (the assistant turn a continuation just re-entered) into
+     * the previous assistant entry and drop the reminders that sat between the
+     * segments. Returns false and mutates nothing when this is not a
+     * continuation:
+     *
+     *  - [incoming] carries no content — an EMPTY restarted turn must stay a
+     *    separate entry: [EmptyTurnRecovery.plan] reads `history[size - 2]`, the
+     *    entry behind "the assistant turn just appended", and folding the empty
+     *    turn would make it nudge (and delete) the *previous* segment;
+     *  - the entry behind the reminders is not an ASSISTANT, or is already
+     *    persisted (`dbMessageId != null`) — folding into a persisted row would
+     *    re-create the memory/DB mismatch in the other direction.
+     */
+    fun mergeIntoPreviousAssistant(history: MutableList<LLMMessage>, incoming: LLMMessage): Boolean {
+        if (incoming.role != LLMMessage.Role.ASSISTANT) return false
+        if (incoming.content.isEmpty() && incoming.contentParts.isEmpty()) return false
+
+        val reminderIdx = mutableListOf<Int>()
+        var idx = history.lastIndex
+        while (idx >= 0 && isContinuationReminder(history[idx])) {
+            reminderIdx.add(idx)
+            idx--
+        }
+        if (idx < 0) return false
+        val prev = history[idx]
+        if (prev.role != LLMMessage.Role.ASSISTANT) return false
+        if (prev.dbMessageId != null) return false
+
+        history[idx] = prev.copy(
+            content = prev.content + incoming.content,
+            contentParts = mergeParts(prev.contentParts, incoming.contentParts),
+            reasoningContent = when {
+                prev.reasoningContent == null -> incoming.reasoningContent
+                incoming.reasoningContent == null -> prev.reasoningContent
+                else -> prev.reasoningContent + incoming.reasoningContent
+            },
+        )
+        // Indices above were collected tail-first and all sit above `idx`.
+        reminderIdx.forEach { history.removeAt(it) }
+        return true
+    }
+
+    /** Adjacent Text parts collapse into one, so the folded entry does not grow
+     *  a part boundary in the middle of a sentence. */
+    private fun mergeParts(
+        prev: List<AgentContentPart>,
+        next: List<AgentContentPart>,
+    ): List<AgentContentPart> {
+        if (prev.isEmpty()) return next
+        if (next.isEmpty()) return prev
+        val lastPrev = prev.last()
+        val firstNext = next.first()
+        return if (lastPrev is AgentContentPart.Text && firstNext is AgentContentPart.Text) {
+            prev.dropLast(1) + AgentContentPart.Text(lastPrev.text + firstNext.text) + next.drop(1)
+        } else {
+            prev + next
+        }
+    }
+}
+
+/**
+ * [R5-C2] Pure decision: does the run owe the DB a turn row before the
+ * post-loop finalize?
+ *
+ * The two finalize hand-holdings (`finalizeAtTurnLimit` / `finalizeBudgetStop`)
+ * write the banner through `updateLastAssistantError` = "the session's LAST
+ * assistant row". A run that exits on a turn/budget ceiling right after a
+ * continuation `continue` never persisted that segment — `unpersistedBlockStart`
+ * still points behind the blocks it already streamed and showed — so the old
+ * shape lost the text on reload AND stamped the banner onto the previous
+ * turn's row.
+ *
+ * The question is exactly "is there an un-persisted range", which is what the
+ * two in-loop terminals already answer with the same index pair; kept pure and
+ * top-level so the table can be pinned without driving the loop.
+ */
+internal object ContinuationFlushPolicy {
+
+    /**
+     * True when `[unpersistedBlockStart, blockCount)` is non-empty. Every value
+     * outside `0 until blockCount` is NO flush: `start == count` is the
+     * already-durable case, and a start beyond the list (or a negative one)
+     * would slice nothing, so writing a row for it would fabricate an empty
+     * assistant message.
+     */
+    fun mustFlushBeforeFinalize(unpersistedBlockStart: Int, blockCount: Int): Boolean =
+        unpersistedBlockStart in 0 until blockCount
+}
+
+/**
+ * [deep-audit-1019 ISSUE-02] Pure transition table for the tool-block status a
+ * dispatch publishes, for the three-pass tool dispatch in
+ * [AgentLoopEngine.runAgentLoop].
+ *
+ * Pass 1 decides whether a queued call may run at all (same-turn dedupe /
+ * truncation guard / loop detector / preflight); Pass 2 hands the survivors to
+ * `host.executeTool`. The PENDING → RUNNING flip belongs to Pass 2 — the moment
+ * a call is really dispatched — because until then the call is still QUEUED.
+ * Publishing it in Pass 1 (where it used to live, above BOTH refusal gates)
+ * broke two things at once:
+ *
+ *  * a call the loop detector refused with CRITICAL had already been shown as
+ *    RUNNING, and that refusal path edited the block in memory only — so the
+ *    card kept its spinner until the turn's next bulk publish, while every
+ *    sibling refusal path (dedupe / truncation / preflight) publishes its flip;
+ *  * the sequential branch's "waiting for previous tool(s)" cue is guarded on
+ *    PENDING, and Pass 1 had already flipped every queued call, so the guard
+ *    could never match — the cue was dead code.
+ *
+ * Unit-test expectations for these functions are written literals, never derived
+ * from them, so a mutation cannot move an expectation along with it and stay
+ * green.
+ */
+internal object ToolPassTransitionPolicy {
+
+    /** What a call queued behind an earlier one shows while the head still runs. */
+    const val QUEUE_CUE_TEXT = "⏳ Waiting for previous tool(s) to finish…"
+
+    /**
+     * Indices, within a SEQUENTIAL batch, of the calls that announce they are
+     * queued behind an earlier one. The head starts as soon as the batch does
+     * (no cue for it) and a single-call batch has nobody to wait for.
+     */
+    fun sequentialQueueCueIndices(pendingCount: Int): List<Int> =
+        if (pendingCount > 1) (1 until pendingCount).toList() else emptyList()
+
+    /**
+     * The status a block takes when the execution pass dispatches it, given the
+     * status it has as the pass reaches it — or null to leave it untouched.
+     *
+     * PENDING is the only state a dispatch may consume: anything else is either
+     * already published as RUNNING (the parallel branch flips its whole batch up
+     * front) or a terminal refusal Pass 1 published, which a dispatch must never
+     * resurrect into a spinner.
+     */
+    fun statusAtDispatch(current: ToolBlockStatus?): ToolBlockStatus? =
+        if (current == ToolBlockStatus.PENDING) ToolBlockStatus.RUNNING else null
+
+    /**
+     * The content a block carries the moment the execution pass flips it to
+     * RUNNING: [QUEUE_CUE_TEXT] is dispatch bookkeeping, not tool output, and the
+     * finalisation pass keeps `max(existingContent, resultContent)` **by length** —
+     * a leftover 38-character cue would out-length a short result and then be
+     * shown, and persisted, as that tool's output. Anything else (the empty
+     * content a freshly streamed call carries, or live output a tool has already
+     * written into its own block) is preserved.
+     */
+    fun contentAtDispatchFlip(current: String, queueCue: String): String =
+        if (current == queueCue) "" else current
+}
+
 internal class AgentLoopEngine(
     private val host: AgentLoopHost,
     private val traceObserver: ChatAgentTraceObserver,
@@ -104,6 +499,42 @@ internal class AgentLoopEngine(
     private companion object {
         private const val TAG_STREAM = "ChatVMStream"
         private const val TAG = "ChatViewModel"
+
+        /** [fix/prewindow-budget-1015] 预检输出下限（= ChatViewModel.MIN_MAX_TOKENS）。 */
+        private const val MIN_MAX_TOKENS_CONST = 1024
+
+        /** [fix/prewindow-budget-1015] 校准百分比换算（ratio 存 100×便于 Long 运算）。 */
+        private const val CALIB_PCT = 100L
+
+        /**
+         * [fix/prewindow-budget-1015] per-(providerType, baseUrl, model) 校准
+         * 系数。0 未校准 / 100 已校准且一致 / >100 provider 口径更大。估算
+         * 只乘一次，避免每消息重复读 prefs。
+         */
+        private fun calibrationRatioFor(provider: LLMProvider): Long {
+            val inst = provider.instanceContext ?: return CALIB_PCT
+            val key = ContextCalibration.keyFor(
+                providerType = inst.providerType.name,
+                baseUrl = inst.customBaseURL ?: "",
+                modelId = provider.model.id,
+            )
+            return (ContextCalibration.ratio(key) * CALIB_PCT).toLong().coerceAtLeast(CALIB_PCT)
+        }
+
+        /**
+         * [fix/prewindow-budget-1015] 当前 provider 的校准 key；instanceContext
+         * 缺失（mock provider / 非-offload 路径）返回 null —— 调用方跳过
+         * 失效检查与校准回填，行为退回旧世界。
+         */
+        private fun contextKeyOf(provider: LLMProvider): String? {
+            val inst = provider.instanceContext ?: return null
+            return ContextCalibration.keyFor(
+                providerType = inst.providerType.name,
+                baseUrl = inst.customBaseURL ?: "",
+                modelId = provider.model.id,
+            )
+        }
+
     }
 
     /** Verbatim lift of ChatViewModel.unwrapFlowException (used by the retry path). */
@@ -229,6 +660,74 @@ internal class AgentLoopEngine(
         loopState.lastOtherToolInputMs = 0L
     }
 
+    /**
+     * [R5-C2] Persist the run's un-persisted block range as ONE assistant row and
+     * hand the row id to [markTurnPersisted].
+     *
+     * Used by the pre-finalize flush: a turn/budget ceiling right after a
+     * continuation `continue` leaves blocks the user already watched with no row
+     * over them, and both finalizers write their banner through
+     * `updateLastAssistantError` = "the session's LAST assistant row".
+     *
+     * An empty range is NOT an error here — every exit that went through an
+     * in-loop terminal has one, and writing a row for it would fabricate a
+     * message. The two empty-reply terminals therefore keep writing their banner
+     * row directly through `TerminalErrorPlacement.partsForTerminalError`, which
+     * is the call order `TerminalErrorPlacementTest` pins.
+     *
+     * Returns the row id, or null when no row was written.
+     */
+    private suspend fun flushUnpersistedTurnRow(
+        loopState: AgentLoopState,
+        usage: LLMUsage?,
+        reasoningContent: String?,
+    ): String? {
+        val parts = host.buildTurnParts(
+            loopState.allToolBlocks,
+            loopState.unpersistedBlockStart,
+            loopState.allToolInputs,
+        )
+        if (parts.isEmpty()) return null
+        val flushedRowId = host.persistAssistantTurn(
+            parts, usage, reasoningContent, turnBlockMeta(loopState),
+            modelId = loopState.currentProvider.model.id,
+            entryId = host.activeEntryId,
+        )
+        markTurnPersisted(loopState, flushedRowId)
+        return flushedRowId
+    }
+
+    /**
+     * [R5-C2] Tool-block metadata for a persist — the same shape the two in-loop
+     * terminals build, lifted so the failure terminals cannot drift from it
+     * (a missing entry here strips a tool block of its result).
+     */
+    private fun turnBlockMeta(loopState: AgentLoopState): Map<String, AssistantBlock> =
+        loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
+
+    /**
+     * [R5-C2] After a row lands: advance the un-persisted cursor and anchor the
+     * transcript entry that stands for it.
+     *
+     * Advance ONLY on a real row id — a failed insert must leave the range
+     * un-covered, so the next persist (or the next run) still sees those blocks.
+     * The anchor is the same one the two in-loop terminals write: compaction
+     * resolves its boundary through this db id, so an un-anchored entry degrades
+     * the walk after a reload.
+     */
+    private fun markTurnPersisted(loopState: AgentLoopState, rowId: String?) {
+        if (rowId != null) {
+            loopState.unpersistedBlockStart = loopState.allToolBlocks.size
+            val lastAssistantIdx = host.agentHistory.indexOfLast {
+                it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null
+            }
+            if (lastAssistantIdx >= 0) {
+                host.agentHistory[lastAssistantIdx] =
+                    host.agentHistory[lastAssistantIdx].copy(dbMessageId = rowId)
+            }
+        }
+    }
+
     /** Verbatim lift of ChatViewModel.runAgentLoop entry (FE-5 route C step 3). */
     internal suspend fun runAgentLoop(
         provider: LLMProvider,
@@ -323,9 +822,9 @@ internal class AgentLoopEngine(
         // just-finished bubble is sealed and a fresh loopState.assistantId starts so the
         // queued user message renders BETWEEN them. `loopState.allToolBlocks` and
         // `loopState.accumulatedText` are also reset at that point so the new bubble
-        // starts empty and `host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex,
-        // toolInputMap)` continues to slice only the current turn's blocks
-        // (turnStartBlockIndex is captured at iteration start to 0 after reset).
+        // starts empty and the persistence slice continues to cover only the current
+        // bubble's unpersisted blocks (both the run-scoped unpersisted start and the
+        // per-turn turn-start index are reset to 0 right after the clear).
         val loopState = AgentLoopState(
             currentProvider = provider,
             remainingFallbacks = fallbackProviders.toMutableList(),
@@ -347,11 +846,48 @@ internal class AgentLoopEngine(
         // 此处不再重复 init —— 重复 `AgentRunState.initial()` 会重置已经把
         // RunStarted 消费掉的 reducer 回 IDLE，导致后续事件再次 REJECTED。
 
+        // [R5-C2] The last streamed segment's usage/reasoning, lifted out of the
+        // turn loop for the pre-finalize flush: that flush runs OUTSIDE the loop,
+        // while `lastUsage` / `turnReasoningContent` are per-turn locals. An exit
+        // with nothing to flush never reads them; an exit right after a
+        // continuation `continue` (the defect's shape) reads exactly the segment
+        // whose blocks are still un-persisted.
+        var lastSegmentUsage: LLMUsage? = null
+        var lastSegmentReasoning: String? = null
+
         try {
         // [feat/runtime-limits-panel] 循环上界从 prefs 读（默认 256）。取一次局部
         // 值保证整个 run 使用同一边界（与预算快照同理由：run 内一致性）。
-        val maxTurnsThisRun = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.maxTurns()
-        for (turn in 0 until maxTurnsThisRun) {
+        // [audit-1015 BUG-03D] 与 run 实际边界同源：observeBudget.maxTurns 已按
+        // scheduled-task ceiling 钳制（min(user, ceiling.maxTurns)，见上方
+        // AgentExecutionBudget 构造），run 内 t7ConsumeAndTrace→consumeTurn
+        // 也按它拒绝。循环上界改用同一值后，两条停机路径（for 上界耗尽 /
+        // 预算拒绝）永远指向同一个数字，退出横幅与 finalizeAtTurnLimit /
+        // finalizeBudgetStop 引用的 MAX_AGENT_TURNS 不再是裸 prefs 值
+        // （ceiling=30 的定时任务 run 退出时不会误报 "256 turns"）。
+        // 无 ceiling 时两者相等，行为不变。循环边界一致性：for(turn in 0
+        // until N) 恰好 consumeTurn N 次，全部 Allowed —— 上界不会比预算更
+        // 松也不会更紧。
+        val maxTurnsThisRun = observeBudget.maxTurns
+        // [audit3 F-02] LABELED loop — do not drop the `turnLoop@`.
+        // Two execution-budget gates live INSIDE this turn body's retry loop
+        // (`while (!collectDone)` further down): the deadline gate and the
+        // provider-attempt gate. Both set `t7BudgetStopReason` and then exit —
+        // but a bare `break` there only left the *retry* loop, so the turn fell
+        // through to the "the turn's stream completed without error" tail:
+        // it recorded `RouteOutcome.Success` for the very member whose attempt
+        // budget had just refused it (clearing that member's cooldown / circuit
+        // state, i.e. marking a throttled provider healthy), appended an empty
+        // ASSISTANT entry to agentHistory, and kept burning turns against a
+        // reducer already parked in FINALIZING (field log 2026-09-07: "3 empty
+        // turns burned in 4ms against a refused provider-attempt gate").
+        // `break@turnLoop` makes a budget stop exit the RUN, exactly like the
+        // two turn-entry gates just below (deadline / turn_limit), which sit at
+        // for-body depth and were therefore already correct.
+        // Machine-checked by scripts/scan/budget_stop_break_guard.py: a `break`
+        // inside a nested loop whose branch sets t7BudgetStopReason must carry
+        // the `@turnLoop` label.
+        turnLoop@ for (turn in 0 until maxTurnsThisRun) {
             // T7-C: deadline 到达后不发新 provider/tool 请求 —— turn 循环入口检查。
             // 中断标记后走统一 finalize（BudgetExhausted 不是静默失败）。
             if (traceObserver.activeRunBudget?.isExpired() == true) {
@@ -564,7 +1100,180 @@ internal class AgentLoopEngine(
             var turnFinishReason: String? = null
             var turnTruncated = false
             var lastUsage: LLMUsage? = null
-            val maxTokens = host.dynamicMaxTokens(provider, loopState.lastContextTokens)
+            // [fix/prewindow-budget-1015] 2026-10-15 T321（session 16c39966）：
+            // 同一份 ~4.9MB 历史在 deepseek 中转口径下记 191.9K，GLM 直连口径
+            // 记 920.6K。旧链路此时 lastContextTokens 仍持 deepseek 的 191.9K
+            // → dynamicMaxTokens 按 220K−191.9K 顶格放 128K 输出 →
+            // 920,577+128,000 > 1,048,576 必然 400，且本地所有闸门（offload/
+            // compact/trim）都看不见这次超支。预检用 provider 无关的本地估算
+            // 在请求组装完成后做一次硬性结构检查，裁决三档：PASS / 收缩输出
+            // 预算 / 禁止直发（走下方 compact+trim 管线再重估）。
+            // [fix/prewindow-budget-1015] 反向漏洞：换到"记账更大"的端点后，旧
+            // provider 的 lastContextTokens 偏大 → dynamicMaxTokens 把输出饿死
+            // （空 length-wall）。读数来源 key 与当前 provider 不匹配 → 视为
+            // 未知（0），本 turn 的输出预算按"无输入信息"分配；下一 turn 的
+            // usage 回包会以新端点口径重建读数。必须在 dynamicMaxTokens 之前
+            // 做 —— 清零晚了等于没清。
+            // [audit2 BUG-02] Compare against the provider this turn will
+            // ACTUALLY call (`loopState.currentProvider`), not the `provider`
+            // formal parameter: the parameter is never re-assigned, so after
+            // any fallback it names the member we already left. The writer
+            // further down (`lastContextTokensSourceKey = contextKeyOf(
+            // loopState.currentProvider)`) already uses the live one — using
+            // the parameter here made every post-fallback turn compare two
+            // different providers and wipe the reading.
+            val currentCtxKey = contextKeyOf(loopState.currentProvider)
+            if (loopState.lastContextTokensSourceKey != null &&
+                loopState.lastContextTokensSourceKey != currentCtxKey
+            ) {
+                AppLogger.info(
+                    TAG_STREAM,
+                    "[Preflight] turn=$turn context reading from stale provider " +
+                        "(${loopState.lastContextTokensSourceKey} → $currentCtxKey); treating as unknown",
+                )
+                loopState.lastContextTokens = 0
+                host.setLastTurnContextTokens(0)
+            }
+            // [fix/prewindow-budget-1015] var（非 val）：NEEDS_COMPACTION 分支在
+            // 下方管线里实际收缩历史后必须重捕——compact 只写 marker、trim 砍
+            // agentHistory，都不触碰这里已捕获的快照实例；不重捕则本 turn 请求
+            // 仍带全量未压缩历史 + 最小输出 → 仍然必然 400（该缺口会让
+            // "裁剪后按最小输出重试"的承诺在本 turn 落空）。SHRINK_OUTPUT /
+            // PASS 不进管线，值与 val 时代逐字一致。
+            var preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+            // [audit2 BUG-02] Window / output budget follow the provider that
+            // will actually serve this turn, same reason as `currentCtxKey`.
+            val preflightMaxTokens = host.dynamicMaxTokens(loopState.currentProvider, loopState.lastContextTokens)
+            // rawEstimate：provider 无关的本地原始口径 —— 校准观察（流结束/
+            // 400-teacher）只用它，否则校准学到"系数化的自己"，闭环坍缩到 1.0。
+            // [fix/prewindow-budget-1015] var：NEEDS_COMPACTION 分支重捕消息后
+            // 必须重算——400-teacher 与 usage 校准回填都拿它做 localEstimate，
+            // 若仍持压缩前的估算，观测比值 = 压缩后 usage / 压缩前估算，
+            // 系统性偏低且带内不可拒，会拖偏校准中位数。
+            var rawEstimate = ContextEstimator.estimateRequestTokens(
+                messages = preflightMessages,
+                systemPrompt = systemPrompt,
+                tools = host.agentTools,
+            )
+            // [audit2 BUG-02] Calibration is per (providerType, baseUrl, model)
+            // — charging this turn the OLD member's coefficient after a
+            // fallback both mis-estimates the window and re-observes samples
+            // under the wrong key.
+            var preflightEstimate = rawEstimate * calibrationRatioFor(loopState.currentProvider) / 100
+            val preflightVerdict = preflightContextBudget(
+                window = host.effectiveContextWindowTokens() ?: 0,
+                estimatedInput = preflightEstimate,
+                requestedMaxTokens = preflightMaxTokens,
+                outputFloor = MIN_MAX_TOKENS_CONST,
+            )
+            AppLogger.info(
+                TAG_STREAM,
+                "[Preflight] turn=$turn ${preflightVerdict.toLogLine()} " +
+                    "window=${host.effectiveContextWindowTokens() ?: 0} " +
+                    "providerEst=${loopState.lastContextTokens} calib=${calibrationRatioFor(loopState.currentProvider)}",
+            )
+            var maxTokens = when (preflightVerdict.decision) {
+                PreflightVerdict.Decision.SHRINK_OUTPUT -> preflightVerdict.suggestedMaxTokens ?: preflightMaxTokens
+                PreflightVerdict.Decision.NEEDS_COMPACTION -> {
+                    // 输入本身就装不下：先走既有的 offload → auto-compact →
+                    // hard-trim 管线（和上方窗口管理同一段），然后用裁剪后的
+                    // 历史重估一次；仍装不下 → 硬 trim 兜底后按最小输出发。
+                    // 这个分支替代旧世界"发出必然 400"的死法。
+                    // 读数用预检估算（loopState.lastContextTokens 可能刚被
+                    // window-mgmt 清零，而预检估算恰恰是此刻唯一可信的压力
+                    // 证据 —— 本地口径，与 provider 无关）。
+                    val windowNow = host.effectiveContextWindowTokens() ?: 0
+                    val pressureReading = preflightEstimate.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    val postOffload = host.offloadContextIfNeeded(
+                        contextWindow = windowNow,
+                        lastContextTokens = pressureReading,
+                        force = true,
+                    )
+                    val compacted = host.maybeAutoCompactInLoop(
+                        contextWindow = windowNow,
+                        lastContextTokens = postOffload ?: pressureReading,
+                    )
+                    if (!compacted) {
+                        host.trimContextHistoryWindow(
+                            contextWindow = windowNow,
+                            lastContextTokens = postOffload ?: pressureReading,
+                        )
+                    }
+                    // 裁剪后按最小输出重试一次：trim 的预算本身按 window 收，
+                    // 若裁后仍超（尾部太大），下一轮预检会再次禁发并走同样
+                    // 管线 —— 不会死循环（每轮都实际收缩历史）。
+                    // [fix/prewindow-budget-1015] 重捕请求消息：管线写入的
+                    // compact marker（effectiveAgentHistory 在请求时做
+                    // summary+tail 投影）与 trim 砍掉的历史，只有重新调用
+                    // effectiveAgentHistory 才能取到 —— 上面 :643 捕获的快照
+                    // 是管线前的投影，直接发出去等于压缩白跑（本 turn 仍 400）。
+                    // 重捕后同步重算本地估算：400-teacher 与流结束的 usage
+                    // 校准回填都以 rawEstimate 为 localEstimate，必须对应
+                    // 实际发出的（压缩后）请求，否则观测比值系统性失真。
+                    preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+                    rawEstimate = ContextEstimator.estimateRequestTokens(
+                        messages = preflightMessages,
+                        systemPrompt = systemPrompt,
+                        tools = host.agentTools,
+                    )
+                    preflightEstimate = rawEstimate * calibrationRatioFor(loopState.currentProvider) / 100
+                    MIN_MAX_TOKENS_CONST
+                }
+                PreflightVerdict.Decision.PASS -> preflightMaxTokens
+            }
+
+            // [deep-audit-1016 6a] ONE definition, consumed by both fallback
+            // switches below. A switch replaces the member that serves the next
+            // attempt, so everything the preflight captured from the OLD member
+            // has to be re-derived from the NEW one: the calibration key (its
+            // per-(provider, model) coefficient) and the output budget
+            // (`dynamicMaxTokens` reads the member's own output ceiling and the
+            // now-updated window). Leaving `maxTokens` as captured is what sent
+            // a 64K `max_tokens` to a 4K-output fallback member (HTTP 400).
+            //
+            // `preflightMessages` is deliberately NOT re-derived here: the image
+            // budget is provider-independent and the var already holds the exact
+            // list the next attempt will carry (it is what the request site
+            // reads), so re-fetching the history mid-retry could only introduce
+            // a divergence between the estimate and the bytes on the wire.
+            fun rebudgetForSwitchedProvider(site: String) {
+                // The member we left reported ITS input口径; carrying that
+                // reading into the new member's window is the T321 shape. The
+                // turn-entry gate treats a reading whose source key does not
+                // match the current provider as unknown (0) — a mid-turn switch
+                // must do the same, and it must happen BEFORE dynamicMaxTokens
+                // sizes the output from it.
+                loopState.lastContextTokens = 0
+                host.setLastTurnContextTokens(0)
+                val rebudget = RequestBudgetRecompute.forProvider(
+                    messages = preflightMessages,
+                    systemPrompt = systemPrompt,
+                    tools = host.agentTools,
+                    calibrationRatioPercent = calibrationRatioFor(loopState.currentProvider),
+                    windowTokens = host.effectiveContextWindowTokens() ?: 0,
+                    providerMaxTokens = host.dynamicMaxTokens(
+                        loopState.currentProvider,
+                        loopState.lastContextTokens,
+                    ),
+                    outputFloor = MIN_MAX_TOKENS_CONST,
+                )
+                // Re-derived from the same message list, so it stays the
+                // invariant `rawEstimate ⇔ preflightMessages` the calibration
+                // backfill and the 400-teacher both read.
+                rawEstimate = rebudget.rawEstimateTokens
+                preflightEstimate = rebudget.calibratedEstimateTokens
+                maxTokens = rebudget.maxTokens
+                AppLogger.info(
+                    TAG_STREAM,
+                    "[Preflight] re-budget after provider switch ($site) turn=$turn " +
+                        "${rebudget.verdict.toLogLine()} " +
+                        "window=${host.effectiveContextWindowTokens() ?: 0} " +
+                        "providerEst=${loopState.lastContextTokens} " +
+                        "calib=${calibrationRatioFor(loopState.currentProvider)} " +
+                        "member=${loopState.currentProvider?.model?.id ?: "?"}",
+                )
+            }
+
             val toolCalls = mutableListOf<Triple<String, String, JSONObject>>() // id, name, args
 
             // [T-dedupe-toolcallid 03fbcbfd] Per-turn dedupe of tool_call_id.
@@ -624,7 +1333,18 @@ internal class AgentLoopEngine(
                     )
                     // T7-D: 旁路验证 —— deadline 到达
                     traceObserver.t7Reduce(AgentRunEvent.DeadlineReached())
-                    break
+                    // [audit3 F-02] `break@turnLoop`, not `break`: leave the RUN,
+                    // not just this retry loop (see the labeled turn loop for
+                    // the fall-through damage: bogus route Success + empty
+                    // assistant entry + burned turns).
+                    // Skipping the post-while fold (`accumulatedText +=
+                    // turnTextSb`) loses nothing — this gate sits at the TOP of
+                    // the while body, and every path that re-enters the while
+                    // clears turnTextSb first (the retry path and the fallback
+                    // path both call `turnTextSb.setLength(0)` before looping),
+                    // so the buffer is empty here and the fold would be a no-op.
+                    // Pinned by AgentLoopBudgetStopExitTest.
+                    break@turnLoop
                 }
                 try {
                     // T7-A: provider attempt 开始（每次 retry/fallback 都会重新进入）
@@ -639,7 +1359,12 @@ internal class AgentLoopEngine(
                             "BudgetExhausted(provider_attempts)",
                         )
                         collectDone = true
-                        break
+                        // [audit3 F-02] Same as the deadline gate above: exit the
+                        // RUN. The while-exit assignment stays (it is the loop
+                        // condition's state, and the labeled break leaves the
+                        // loop either way) — the label is what stops the turn
+                        // from running on to the success tail.
+                        break@turnLoop
                     }
                     // T7-D: 旁路验证 —— ProviderAttemptStarted
                     traceObserver.t7Reduce(AgentRunEvent.ProviderAttemptStarted)
@@ -665,9 +1390,9 @@ internal class AgentLoopEngine(
                     var streamChunkCount = 0
                     host.streamChatTurnOffloaded(
                         provider = loopState.currentProvider,
-                        messages = host.applyRequestImageBudget(host.effectiveAgentHistory()),
+                        messages = preflightMessages,
                         systemPrompt = systemPrompt,
-                        maxTokens = host.dynamicMaxTokens(loopState.currentProvider, loopState.lastContextTokens),
+                        maxTokens = maxTokens,
                         temperature = null,
                         imageParts = emptyList(),
                         tools = host.agentTools,
@@ -1069,6 +1794,7 @@ internal class AgentLoopEngine(
                                 (chunk.usage.cacheCreationInputTokens ?: 0)
                         }
                         if (loopState.lastContextTokens > 0) {
+                            loopState.lastContextTokensSourceKey = contextKeyOf(loopState.currentProvider)
                             host.setLastTurnContextTokens(loopState.lastContextTokens)
                             if (prevContextTokens > 0 && loopState.lastContextTokens > prevContextTokens) {
                                 host.recordContextGrowth(loopState.lastContextTokens - prevContextTokens)
@@ -1161,6 +1887,32 @@ internal class AgentLoopEngine(
                 } catch (e: Exception) {
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowExceptionImpl(e)
+                    // [fix/prewindow-budget-1015] 400-teacher：上下文超限 400 的
+                    // 正文带着该端点自己报的精确 input_tokens（"your prompt
+                    // contains at least 920577 input tokens"）。预检的本地估算
+                    // 对同一请求算过 —— 这个比值是教科书级校准样本（带错误
+                    // 历史的估算必然偏低，正好把累计偏差一次学进去）。
+                    if (actual is com.rikkaminis.app.data.model.LLMError.ProviderError &&
+                        isContextTooLargeError(actual) && preflightEstimate > 0
+                    ) {
+                        Regex("""(\d{3,})\s*input tokens""").find(actual.detail)?.groupValues?.get(1)
+                            ?.toLongOrNull()?.let { reportedInput ->
+                                val inst = loopState.currentProvider.instanceContext
+                                if (inst != null) {
+                                    val ck = ContextCalibration.keyFor(
+                                        providerType = inst.providerType.name,
+                                        baseUrl = inst.customBaseURL ?: "",
+                                        modelId = loopState.currentProvider.model.id,
+                                    )
+                                    val obs = ContextCalibration.observe(ck, reportedInput, rawEstimate)
+                                    AppLogger.warning(
+                                        TAG_STREAM,
+                                        "[Calibration] $ck 400-teacher observed=$obs reported=$reportedInput " +
+                                            "localEst=$preflightEstimate ratio=${ContextCalibration.ratio(ck)}",
+                                    )
+                                }
+                            }
+                    }
                     val isRateLimit = actual is com.rikkaminis.app.data.model.LLMError.RateLimited
                     val is5xx = actual is com.rikkaminis.app.data.model.LLMError.ProviderError &&
                         actual.detail.contains(Regex("\\b[5][0-9]{2}\\b"))
@@ -1424,6 +2176,16 @@ internal class AgentLoopEngine(
                             willRetry = true,
                         )
                         loopState.currentProvider = next.provider
+                        // [audit2 BUG-03] Give the fallback member its own full
+                        // transient-retry allowance. `retryAttempt` is
+                        // per-turn and survives the member switch, so without
+                        // this the new member inherits a budget the failed
+                        // member already burned and a single transient blip on
+                        // it skipped straight to the next fallback. The
+                        // content-filter fallback path below already did this;
+                        // this path is the one that was missing it (only two
+                        // fallback switch points exist — see the report).
+                        retryAttempt = 0
                         // Also update class-level provider so the next sendMessage() starts from here
                         host.setCurrentProvider(next.provider)
                         // Update top bar model info + active entry. (For a same-
@@ -1479,7 +2241,15 @@ internal class AgentLoopEngine(
                         }
                         if (newEntry != null) {
                             host.setActiveEntryId(newEntry.id)
-                            host.updateCurrentModel(newEntry.model)
+                            // [FIX-R4-Q F-06] Publish the ENRICHED model, not the
+                            // raw entry model: `next.provider` was built with
+                            // `providerModelFor(entry)` (= ModelsDevApi.effectiveModel),
+                            // while `ModelEntry.model` carries only what the user
+                            // stored — no contextWindow / maxOutputTokens. Writing the
+                            // raw model here left `currentModel.contextWindow` null on
+                            // the fallback target, so CompactOrchestration's window
+                            // math silently lost the real ceiling after any fallback.
+                            host.updateCurrentModel(next.provider.model)
                             val newLabel = host.providerInstanceLabel(newEntry.providerInstanceId)
                             if (newLabel != null) {
                                 host.setProviderName(newLabel.ifEmpty { newEntry.model.provider })
@@ -1531,6 +2301,11 @@ internal class AgentLoopEngine(
                         // first delta coalesces against the failed attempt's
                         // clocks and the reply head stalls visibly.
                         resetStreamThrottle(loopState)
+                        // [deep-audit-1016 6a] The member that will serve the
+                        // next attempt is a different one — re-derive the
+                        // budget/calibration from IT before the retry loop
+                        // re-issues with the captured values.
+                        rebudgetForSwitchedProvider("error-fallback")
                         // loop continues — will retry collect with loopState.currentProvider
                     } else {
                         // All fallbacks exhausted. Surface the trail of tried
@@ -1582,15 +2357,67 @@ internal class AgentLoopEngine(
                 }
             }  // end while (!collectDone)
 
+            // [fix/prewindow-budget-1015] usage → 校准窗口回填，流结束后恰好
+            // 一次（移出 chunk 处理器：一次流可能吐多帧 usage，会把窗口灌成
+            // 近似重复样本）。用 lastUsage 的最终帧；本地端用预检时对同一
+            // wire 请求算的原始估算（未乘校准）。
+            run {
+                val usageNow = lastUsage
+                val latest = usageNow?.latestContextTokens ?: 0
+                if (latest > 0 && preflightEstimate > 0) {
+                    val inst = loopState.currentProvider.instanceContext
+                    if (inst != null) {
+                        val ck = ContextCalibration.keyFor(
+                            providerType = inst.providerType.name,
+                            baseUrl = inst.customBaseURL ?: "",
+                            modelId = loopState.currentProvider.model.id,
+                        )
+                        val obs = ContextCalibration.observe(
+                            key = ck,
+                            providerUsage = latest.toLong(),
+                            localEstimate = rawEstimate,
+                        )
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "[Calibration] $ck observed=$obs usage=$latest " +
+                                "localEst=$preflightEstimate ratio=${ContextCalibration.ratio(ck)}",
+                        )
+                    }
+                }
+            }
+
+            // [deep-audit-1016 6b] A content-filter / safety-block finish with NO
+            // usable output is a member-level refusal, not a healthy serve — the
+            // branch further down consumes the fallback chain for it. Recording
+            // `Success` for it cleared that member's cooldown and closed its
+            // half-open circuit, i.e. it marked a REFUSING member healthy.
+            // `RouteOutcome` has no member for "the member refused this prompt"
+            // (Success / RateLimited / ServerError / AuthError are all transport
+            // or credential verdicts, see its KDoc: outcomes that should not
+            // affect a member's health are deliberately absent), so the correct
+            // record is none — the member keeps whatever health it had, and a
+            // later genuinely-served turn restores it as usual.
+            // One definition, two consumers: this health record and the fallback
+            // branch that acts on it. It reads the raw turn buffer, which is the
+            // value `turnTextRaw` takes a few lines below — nothing writes the
+            // buffer between the two points (only the streaming collect above
+            // does), so the two spellings can never disagree.
+            val blockedEmptyReply = toolCalls.isEmpty() &&
+                turnTextSb.isEmpty() &&
+                ContentFilterFinishPolicy.isBlockedFinish(turnFinishReason)
+
             // [T-recovery] The turn's stream completed without error — the
             // member that served it is healthy. Clears any prior cooldown /
             // circuit state (also closes a half-open circuit: a successful
             // probe restores the member).
             host.activeEntryId?.let { entryId ->
-                host.groupRouter.recordResult(
-                    entryId,
-                    com.rikkaminis.app.data.routing.RouteOutcome.Success,
-                )
+                // [deep-audit-1016 6b] …except a blocked-empty reply, as above.
+                if (!blockedEmptyReply) {
+                    host.groupRouter.recordResult(
+                        entryId,
+                        com.rikkaminis.app.data.routing.RouteOutcome.Success,
+                    )
+                }
             }
 
             // T307: materialise the per-turn StringBuilder ONCE at the
@@ -1695,22 +2522,65 @@ internal class AgentLoopEngine(
                         // partial reply has NOT been added yet — the loop's
                         // single `agentHistory.add(ASSISTANT)` sits far below
                         // (after this branch, at the assistantParts build).
-                        // Without this add, the text the model just streamed
+                        // Without an entry, the text the model just streamed
                         // (already on screen) never enters history: the
                         // continuation request carries the previous USER turn
                         // immediately followed by our stub USER message (the
                         // model loses its own output and the turn is never
                         // persisted — reload drops it). Same shape as the
                         // EOF-stub branch below, which runs after the add.
-                        host.agentHistory.add(
-                            LLMMessage(
-                                role = LLMMessage.Role.ASSISTANT,
-                                content = turnText,
-                                contentParts = listOf(AgentContentPart.Text(turnText)),
-                                reasoningContent = turnReasoningBlob
-                                    ?: turnThinking.toString().takeIf { it.isNotEmpty() },
-                            )
+                        //
+                        // [R5-C2] A segment that CONTINUES an earlier one
+                        // belongs to the SAME assistant entry: this branch may
+                        // follow a length-wall / EOF-stub turn, whose assistant
+                        // entry is still un-persisted (`dbMessageId == null`).
+                        // The blind `add` used to open a SECOND entry for the
+                        // same answer — and because the terminals back-fill
+                        // only the LAST un-persisted entry, the first one kept
+                        // a null anchor forever while the next request carried
+                        // two assistant messages for one turn. Fold when the
+                        // tail is a continuation; otherwise append as before.
+                        val errContinuationMessage = LLMMessage(
+                            role = LLMMessage.Role.ASSISTANT,
+                            content = turnText,
+                            contentParts = listOf(AgentContentPart.Text(turnText)),
+                            reasoningContent = turnReasoningBlob
+                                ?: turnThinking.toString().takeIf { it.isNotEmpty() },
                         )
+                        if (!ContinuationHistoryMerge.mergeIntoPreviousAssistant(
+                                host.agentHistory,
+                                errContinuationMessage,
+                            )
+                        ) {
+                            host.agentHistory.add(errContinuationMessage)
+                            // [deep-audit-1018 ISSUE-12c] Stacking guard — the
+                            // EOF-stub branch below has had this since its own
+                            // introduction, but this error-shaped twin shipped
+                            // without it: consecutive error-shaped continuations
+                            // piled identical reminders into history (the model
+                            // saw N stacked "continue where you left off"
+                            // instructions). Drop the stale reminder sitting
+                            // behind this turn's assistant message before adding
+                            // the fresh one. Same off-by-one note as the EOF-stub
+                            // sibling: the previous reminder lives at size - 2,
+                            // BEHIND this turn's assistant message added just above.
+                            //
+                            // [R5-C2] The predicate covers BOTH reminder families
+                            // now: this branch can equally follow a length-wall
+                            // segment, and the EOF-only check left that reminder
+                            // in place (a folded continuation has already dropped
+                            // it through the merge, so this guard only matters
+                            // when the merge declined). One family predicate per
+                            // source — the shared EOF guard, and the length-wall
+                            // marker on [ContinuationHistoryMerge].
+                            val errPrevTailIdx = host.agentHistory.size - 2
+                            val errPrevTail = host.agentHistory.getOrNull(errPrevTailIdx)
+                            if (EofStubReminderStackGuard.isStaleEofStubReminder(errPrevTail) ||
+                                ContinuationHistoryMerge.isLengthWallReminder(errPrevTail)
+                            ) {
+                                host.agentHistory.removeAt(errPrevTailIdx)
+                            }
+                        }
                         val stubReminder = eofStubReminder(turnText.takeLast(80))
                         host.agentHistory.add(
                             LLMMessage(
@@ -1726,9 +2596,14 @@ internal class AgentLoopEngine(
                         TAG_STREAM,
                         "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) stub ceiling hit — giving up with visible error",
                     )
-                    withContext(Dispatchers.Main) {
-                        host.setInlineError(host.string(R.string.error_stream_interrupted))
-                    }
+                    // [deep-audit-1015 BUG-01b] Deferred, not inline: this
+                    // branch falls through to the turn-tail persist, and an
+                    // inline setInlineError persists through
+                    // updateLastAssistantError = "the session's LAST assistant
+                    // row" — with no row for this turn yet, that is the
+                    // PREVIOUS turn's row. The turn tail flushes the banner
+                    // once this turn's row exists.
+                    loopState.pendingInlineError = host.string(R.string.error_stream_interrupted)
                     // [audit-0907 B5] Failure-terminal with a specific banner
                     // already on screen — flag so the exit side does not
                     // misclassify this as a MAX_AGENT_TURNS runaway and
@@ -1771,14 +2646,32 @@ internal class AgentLoopEngine(
                     // Text("") keeps the parts list non-empty for
                     // persistAssistantTurn's guard; the row is the same empty
                     // assistant message the user sees.
-                    host.persistAssistantTurn(
-                        listOf(AgentContentPart.Text("")),
+                    //
+                    // [R5-C2] …but "empty" describes THIS turn only. A
+                    // continuation loop can still hold un-persisted segments
+                    // streamed by the earlier `continue` branches; writing the
+                    // blank row alone dropped them for good (the run breaks out
+                    // of the loop right here). Route the slice through
+                    // partsForTerminalError: an un-persisted range IS this
+                    // turn's row, an empty one still gets the blank row the
+                    // banner needs.
+                    val carriedTurnParts = TerminalErrorPlacement.partsForTerminalError(
+                        host.buildTurnParts(
+                            loopState.allToolBlocks,
+                            loopState.unpersistedBlockStart,
+                            loopState.allToolInputs,
+                        ),
+                        host.string(R.string.error_stream_interrupted),
+                    )
+                    val carriedRowId = host.persistAssistantTurn(
+                        carriedTurnParts,
                         lastUsage,
                         null,
-                        emptyMap(),
+                        turnBlockMeta(loopState),
                         modelId = loopState.currentProvider.model.id,
                         entryId = host.activeEntryId,
                     )
+                    markTurnPersisted(loopState, carriedRowId)
                     withContext(Dispatchers.Main) {
                         host.setInlineError(host.string(R.string.error_stream_interrupted))
                     }
@@ -1807,9 +2700,7 @@ internal class AgentLoopEngine(
             //    continuing (mirrors the empty-after-toolresult retry path);
             //  - the loopExitedNormally flow below is skipped entirely via
             //    `continue`.
-            if (toolCalls.isEmpty() && turnTextRaw.isEmpty() &&
-                ContentFilterFinishPolicy.isBlockedFinish(turnFinishReason)
-            ) {
+            if (blockedEmptyReply) {
                 // [feat/content-filter-fallback] A content-filter / safety-
                 // block finish with NO usable output is a DETERMINISTIC
                 // member-level refusal: this member will answer the same way
@@ -1835,7 +2726,10 @@ internal class AgentLoopEngine(
                     // different instances).
                     host.activeConfigModelEntries.find { it.id == next.entryId }?.let { newEntry ->
                         host.setActiveEntryId(newEntry.id)
-                        host.updateCurrentModel(newEntry.model)
+                        // [FIX-R4-Q F-06] Enriched model, same reason as the
+                        // error-path fallback above: `next.provider.model` came
+                        // from `providerModelFor(entry)`, `newEntry.model` did not.
+                        host.updateCurrentModel(next.provider.model)
                         val newLabel = host.providerInstanceLabel(newEntry.providerInstanceId)
                         if (newLabel != null) {
                             host.setProviderName(newLabel.ifEmpty { newEntry.model.provider })
@@ -1852,6 +2746,10 @@ internal class AgentLoopEngine(
                     // budget so the fallback member gets its own full
                     // transient-retry allowance.
                     retryAttempt = 0
+                    // [deep-audit-1016 6a] Same as the error-path fallback: the
+                    // next attempt is served by a different member, so the
+                    // captured budget/calibration must be re-derived from it.
+                    rebudgetForSwitchedProvider("content-filter-fallback")
                     // skip the rest of this turn's post-processing (history
                     // add / persist) — `continue` targets the OUTER for(turn)
                     // loop, same as the length-wall and EOF-stub branches.
@@ -1868,14 +2766,26 @@ internal class AgentLoopEngine(
                 // error-shaped empty branch: this turn has no persisted row
                 // yet, so updateLastAssistantError would stamp the previous
                 // turn's row. See that branch for the full rationale.
-                host.persistAssistantTurn(
-                    listOf(AgentContentPart.Text("")),
+                // [R5-C2] Same "empty means THIS turn" correction: any segment
+                // still un-persisted (a continuation `continue` above streamed
+                // it) rides this row instead of being dropped by the blank write.
+                val carriedTurnParts = TerminalErrorPlacement.partsForTerminalError(
+                    host.buildTurnParts(
+                        loopState.allToolBlocks,
+                        loopState.unpersistedBlockStart,
+                        loopState.allToolInputs,
+                    ),
+                    host.string(R.string.error_content_filtered),
+                )
+                val carriedRowId = host.persistAssistantTurn(
+                    carriedTurnParts,
                     lastUsage,
                     null,
-                    emptyMap(),
+                    turnBlockMeta(loopState),
                     modelId = loopState.currentProvider.model.id,
                     entryId = host.activeEntryId,
                 )
+                markTurnPersisted(loopState, carriedRowId)
                 withContext(Dispatchers.Main) {
                     host.setInlineError(host.string(R.string.error_content_filtered))
                 }
@@ -1896,16 +2806,15 @@ internal class AgentLoopEngine(
 
             // Map toolUseId -> input JSON string for persistence (accumulated across turns)
             toolCalls.forEach { (id, _, args) -> loopState.allToolInputs[id] = args.toString() }
-            // [feat/hermes-tier1] A tool-call turn clears the length-wall
-            // continuation budget AND the deterministic-empty streak: the
-            // model recovered and is doing new work, so future walls get a
-            // fresh allowance (mirrors Hermes resetting per-wall retry state).
-            loopState.lengthWallContinues = 0
-            loopState.deterministicEmptyStreak = 0
-            // [fix/eof-stub-continuation] A tool-call turn is proof the model
-            // produced new work after any EOF — reset the stub-continuation
-            // budget so long tool-heavy runs keep full allowance.
-            loopState.eofStubContinues = 0
+            // [audit2 BUG-01] The three continuation-counter resets that used
+            // to live HERE were moved down into the tool-call path (see the
+            // `if (toolCalls.isNotEmpty())` guard after the empty-turn branch).
+            // Sitting at this spot they ran unconditionally on every turn —
+            // including the length-wall / EOF-stub turns they were supposed to
+            // leave alone — so every counter was pinned back to 0 before it
+            // could reach its limit and all three guards were dead.
+            // Guarded so this exact regression cannot come back:
+            // scripts/scan/loop_counter_reset_guard.py.
             val toolInputMap = loopState.allToolInputs
             // Prefer the opaque blob from LLMStreamChunk.ReasoningContent when the
             // provider emitted one — that path preserves empty strings (DeepSeek V4
@@ -1914,13 +2823,27 @@ internal class AgentLoopEngine(
             // an empty buffer becomes null (no field to round-trip).
             val turnReasoningContent: String? = turnReasoningBlob
                 ?: turnThinking.toString().takeIf { it.isNotEmpty() }
+            // [R5-C2] Snapshot this segment for the pre-finalize flush (it runs
+            // outside the loop, where these per-turn locals are gone).
+            lastSegmentUsage = lastUsage
+            lastSegmentReasoning = turnReasoningContent
 
-            host.agentHistory.add(LLMMessage(
+            // [FIX-R4-Q F-08] A continuation (length wall / EOF stub) re-enters
+            // THIS loop and keeps streaming into the same bubble, so its segment
+            // belongs to the previous assistant entry — not to a new one. Folding
+            // here keeps the in-memory transcript in step with the single row the
+            // terminal persist writes (and drops the "<system-reminder>…continue"
+            // turns the continuation branch injected, which used to stay in the
+            // transcript forever). Non-continuation turns take the plain append.
+            val turnAssistantMessage = LLMMessage(
                 role = LLMMessage.Role.ASSISTANT,
                 content = turnText,
                 contentParts = assistantParts,
                 reasoningContent = turnReasoningContent,
-            ))
+            )
+            if (!ContinuationHistoryMerge.mergeIntoPreviousAssistant(host.agentHistory, turnAssistantMessage)) {
+                host.agentHistory.add(turnAssistantMessage)
+            }
 
             // T321: empty-turn diagnostic — fires when GPT-5.5 (or any other
             // provider) returns a turn with no visible text AND no tool calls.
@@ -1977,17 +2900,35 @@ internal class AgentLoopEngine(
                                     TAG_STREAM,
                                     "runAgentLoop turn=$turn finish=length empty ×$loopState.deterministicEmptyStreak with usage.outputTokens==0 — deterministic empty, skipping remaining retries",
                                 )
-                                withContext(Dispatchers.Main) {
-                                    host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                                }
+                                // [deep-audit-1015 BUG-01b] Deferred to the
+                                // turn tail (this branch falls through to the
+                                // persist): an inline setInlineError would
+                                // write the banner onto the PREVIOUS turn's
+                                // row. See the error-shaped stub-ceiling
+                                // branch above for the full rationale.
+                                loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                                 // [audit-0907 B5] Failure-terminal (specific
                                 // banner shown) — see the flag's KDoc; prevents
                                 // the exit-side runaway misclassification.
                                 loopState.terminalErrorSurfaced = true
-                                // Fall through to the normal break path (persist + exit).
-                                // Do NOT `break` here directly: it would skip
-                                // `loopState.loopExitedNormally = true` and misclassify as a
-                                // MAX_AGENT_TURNS runaway.
+                                // Fall through to the normal break path
+                                // (persist + exit).
+                                //
+                                // [deep-audit-1015 BUG-01a] This branch does
+                                // NOT claim a clean completion: the old
+                                // warning here said breaking directly "would
+                                // skip loopExitedNormally = true and
+                                // misclassify as a MAX_AGENT_TURNS runaway" —
+                                // true before audit-0907 B5, false since.
+                                // terminalErrorSurfaced is what keeps
+                                // finalizeAtTurnLimit away (see
+                                // AgentLoopExitDecision.shouldFinalizeAsRunaway),
+                                // and the tail now sets the clean-completion
+                                // flag only when no terminal error was
+                                // surfaced. The fall-through is still
+                                // REQUIRED — it is what persists the partial
+                                // reply — it just no longer lies about the
+                                // outcome.
                             }
                         } else {
                             loopState.deterministicEmptyStreak = 0
@@ -2010,7 +2951,20 @@ internal class AgentLoopEngine(
                         // followed by a fresh `chat stream offload ->
                         // :modelservice`. 2m33s of "thinking" for an error.
                         val contextExhausted = host.isContextExhausted()
-                        if (shouldRetryEmptyLengthWall(loopState.lengthWallEmptyHits, contextExhausted)) {
+                        // [audit-1015 BUG-03A] The deterministic-empty threshold
+                        // above may already have surfaced the terminal banner
+                        // (terminalErrorSurfaced=true, the ONLY setter that
+                        // falls through to this gate — every other setter in the
+                        // turn either breaks or continues before reaching it).
+                        // Letting the retry gate fire after the banner re-bills
+                        // the full input for one more provably identical empty
+                        // request — the fuse must actually stop the run.
+                        if (shouldContinueAfterDeterministicFuse(
+                                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                                hits = loopState.lengthWallEmptyHits,
+                                contextExhausted = contextExhausted,
+                            )
+                        ) {
                             // T9: log the wasted empty-length iteration
                             traceObserver.agentTraceRecorder.turnEnd(
                                 turn = turn,
@@ -2023,6 +2977,16 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length with empty output (wall hit $loopState.lengthWallEmptyHits/${LENGTH_WALL_EMPTY_MAX_HITS}), continuing",
                             )
+                            // [audit-1015 BUG-03B] The just-added ASSISTANT turn
+                            // (content="" + no parts) must not ride into the
+                            // retry request: the provider filters empty
+                            // assistant messages out (contentParts+content both
+                            // empty), so the shell is invisible to the model
+                            // anyway — and consecutive empty shells accrete in
+                            // history across retries. Same three-field predicate
+                            // as the nudge paths (a shell carrying
+                            // reasoningContent is NOT blank and is kept).
+                            dropTrailingBlankAssistantShell(host.agentHistory)
                             continue
                         }
                         if (contextExhausted) {
@@ -2039,17 +3003,24 @@ internal class AgentLoopEngine(
                         // below (gated on finishedCleanly) won't fire — surface
                         // a visible error explicitly so the user isn't left
                         // staring at a silent blank bubble.
-                        withContext(Dispatchers.Main) {
-                            host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                        }
+                        //
+                        // [deep-audit-1015 BUG-01b] Deferred to the turn tail
+                        // (this branch falls through to the persist): an inline
+                        // setInlineError would write the banner onto the
+                        // PREVIOUS turn's row. This is also the branch whose
+                        // turn has NO parts (empty output) — TerminalErrorPlacement
+                        // makes the tail persist an empty-text row for it, so
+                        // the banner has a row of its own to land on.
+                        loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                         // [audit-0907 B5] Failure-terminal (specific banner
                         // shown) — prevents the exit-side runaway
                         // misclassification from overwriting it.
                         loopState.terminalErrorSurfaced = true
-                        // Fall through to the normal break path (persist + exit).
-                        // Do NOT `break` here directly: it would skip
-                        // `loopState.loopExitedNormally = true` and misclassify as a
-                        // MAX_AGENT_TURNS runaway.
+                        // Fall through to the normal break path (persist +
+                        // exit) — the fall-through is what persists whatever
+                        // the turn produced. [deep-audit-1015 BUG-01a] It no
+                        // longer claims a clean completion; see the
+                        // deterministic-empty branch above.
                     } else {
                         // Truncated mid-answer: continue so the model finishes.
                         // [feat/hermes-tier1] Repetition guard FIRST (Hermes
@@ -2066,15 +3037,16 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length but output is repetition-dominated (${turnText.length} chars) — aborting instead of continuing the degenerate response",
                             )
-                            withContext(Dispatchers.Main) {
-                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                            }
+                            // [deep-audit-1015 BUG-01b] Deferred to the turn
+                            // tail (this branch falls through to the persist) —
+                            // see the error-shaped stub-ceiling branch above.
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
                             loopState.terminalErrorSurfaced = true
                             // Fall through to the normal break path (persist +
-                            // exit). NOT `loopExitedNormally` (this is an
+                            // exit). NOT a clean completion (this is an
                             // abort), but also NOT a runaway misclassification:
                             // see the deterministic-empty branch above for the
                             // same pattern.
@@ -2085,13 +3057,18 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length — continuation ceiling $lwMax reached, giving up (accumulated ${loopState.accumulatedText.length} chars)",
                             )
-                            withContext(Dispatchers.Main) {
-                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                            }
+                            // [deep-audit-1015 BUG-01b] Deferred to the turn
+                            // tail (this branch falls through to the persist) —
+                            // see the error-shaped stub-ceiling branch above.
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
                             loopState.terminalErrorSurfaced = true
+                            // Fall through to the normal break path (persist +
+                            // exit) — see the deterministic-empty branch above
+                            // for why the fall-through is required and why it
+                            // no longer claims a clean completion.
                         } else {
                             loopState.lengthWallContinues++
                             // T9: log the truncated turn before continuing
@@ -2151,11 +3128,11 @@ internal class AgentLoopEngine(
                         // back and drop it there.
                         val prevTailIdx = host.agentHistory.size - 2
                         val prevTail = host.agentHistory.getOrNull(prevTailIdx)
-                        val tailIsLengthWallReminder = prevTail != null &&
-                            prevTail.role == LLMMessage.Role.USER &&
-                            prevTail.contentParts.size == 1 &&
-                            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
-                                ?.contains("cut off mid-sentence") == true
+                        // [R5-C2] Same family predicate the error-shaped branch
+                        // ORs in — one source per reminder family, instead of a
+                        // second copy of the marker text drifting here.
+                        val tailIsLengthWallReminder =
+                            ContinuationHistoryMerge.isLengthWallReminder(prevTail)
                         if (tailIsLengthWallReminder) {
                             host.agentHistory.removeAt(prevTailIdx)
                         }
@@ -2193,14 +3170,28 @@ internal class AgentLoopEngine(
                 // [fix/verify-nudges-default-off] Read the live limit once and
                 // hand it to the policy — the log's denominator and the gate
                 // now provably share one read (0 = guard off, nudge is null).
+                // [deep-audit-1015 BUG-04] The gate the policy's KDoc always
+                // described: a PASSING verification newer than the last edit
+                // already answers the nudge, so do not demand it again.
+                // Without this the two evidence stamps were pure bookkeeping
+                // (write-only) and buildNudge fired on code edits alone —
+                // nudging for verification the run had just completed.
                 val verifyNudgeLimit = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.verifyNudges()
-                val verifyNudge = if (loopState.terminalErrorSurfaced) null else
+                val verifyNudge = if (loopState.terminalErrorSurfaced ||
+                    VerificationStopPolicy.hasFreshVerification(
+                        lastEditStamp = loopState.lastEditStamp,
+                        lastVerifyStamp = loopState.lastVerifyStamp,
+                    )
+                ) {
+                    null
+                } else {
                     VerificationStopPolicy.buildNudge(
                         changedPaths = loopState.changedCodePaths.toList(),
                         attempts = loopState.verifyNudgeAttempts,
                         lastEvidenceDetail = loopState.lastVerificationDetail,
                         nudgeLimit = verifyNudgeLimit,
                     )
+                }
                 if (verifyNudge != null) {
                     loopState.verifyNudgeAttempts++
                     // [fix/runtime-limits-audit] The log's denominator reads the
@@ -2227,6 +3218,14 @@ internal class AgentLoopEngine(
                     // yields two consecutive user roles (Anthropic hard 400
                     // `roles must alternate` / OpenAI silent merge that
                     // swallows the tool_result pairing). Bridge first.
+                    // [audit-1015 BUG-03C] A trailing BLANK assistant shell
+                    // (empty content + no parts + no reasoning) would be
+                    // filtered out of the outgoing request by the provider's
+                    // empty-message filter, turning [..., ASSISTANT-shell,
+                    // USER-nudge] into [..., USER, USER] — the exact Anthropic
+                    // 400 the bridge below exists to prevent. Drop the blank
+                    // shell BEFORE bridging so the bridge sees the real tail.
+                    dropTrailingBlankAssistantShell(host.agentHistory)
                     ensureRoleAlternationBeforeUserAppend(host.agentHistory)
                     host.agentHistory.add(nudgeMsg)
                     continue
@@ -2282,6 +3281,11 @@ internal class AgentLoopEngine(
                         // tail is user(tool_result). A blind USER append would
                         // yield two consecutive user roles (Anthropic hard 400
                         // / OpenAI silent merge).
+                        // [audit-1015 BUG-03C] Same trailing blank-shell drop
+                        // as the verify nudge (see that block) — the provider
+                        // filters blank assistant shells out of the request,
+                        // so an undropped shell yields consecutive USER roles.
+                        dropTrailingBlankAssistantShell(host.agentHistory)
                         ensureRoleAlternationBeforeUserAppend(host.agentHistory)
                         host.agentHistory.add(nudgeMsg)
                         continue
@@ -2289,16 +3293,19 @@ internal class AgentLoopEngine(
                 }
 
                 AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn no tool calls → break (finishReason=$turnFinishReason)")
-                withContext(Dispatchers.Main) {
-                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)
-                }
-                val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
-                val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-                host.persistAssistantTurn(
-                    turnParts, lastUsage, turnReasoningContent, blockMeta,
-                    modelId = loopState.currentProvider.model.id,
-                    entryId = host.activeEntryId,
-                )
+                // [deep-audit-1017 ISSUE-02] The row finalize (isStreaming=false)
+                // used to sit HERE, ~260 lines above the `break`, i.e. BEFORE the
+                // four `continue` branches below (empty-turn recovery ×2, EOF-stub
+                // continuation, EOF one-shot retry). Every one of those keeps
+                // streaming into THIS row — `loopState.assistantId` is minted once
+                // per run — and a finalized row rejects every later delta
+                // (StaleStreamPublishPolicy.DROP_FINALIZED: canonical
+                // isStreaming=false + the side channel drained by this very call,
+                // and nothing in `runAgentLoop` ever flips the row back — the
+                // isStreaming=true writers only touch `_streamingById`). So the
+                // bubble froze at the pre-recovery text for the rest of the run
+                // and only refreshed at the next terminal event. It now runs once,
+                // immediately before the `break` below.
                 // [T-error-persist-android] Empty-response hint: the model ended a
                 // turn (finish=stop/end_turn) with no visible text anywhere in the
                 // reply and no tool blocks — the user just sees a blank bubble.
@@ -2306,16 +3313,21 @@ internal class AgentLoopEngine(
                 // compaction; otherwise suggest retry/switch. host.setInlineError
                 // attaches + persists onto the (empty) assistant row so the hint
                 // survives a reload too.
-                val hasVisibleContent = loopState.accumulatedText.isNotBlank() ||
-                    loopState.allToolBlocks.any { it.kind == "tool_use" || (it.kind == "text" && it.content.isNotBlank()) }
-                val finishedCleanly = (turnFinishReason == null ||
-                    turnFinishReason == "stop" || turnFinishReason == "end_turn") &&
-                    // [T-truncated-stream-retry] a truncated turn (EOF without
-                    // finish_reason) is NOT a clean finish even though
-                    // stopReason is null — the retry branch below owns it, so
-                    // the empty-turn path must not swallow it with an error hint.
-                    !turnTruncated
-                if (!hasVisibleContent && finishedCleanly) {
+                // [deep-audit-1017 ISSUE-03] Per-TURN visible content, not the
+                // run-scoped accumulators. `loopState.accumulatedText` /
+                // `loopState.allToolBlocks` are append-only for the whole run,
+                // so reading them here answered "did ANY turn show something" —
+                // true from the first tool-call turn onward — and the empty-turn
+                // recovery below could never fire again. See [TurnVisibleContent].
+                val turnVisibleBlocks = loopState.allToolBlocks.drop(turnStartBlockIndex)
+                val hasVisibleContent = TurnVisibleContent.hasVisibleContent(turnText, turnVisibleBlocks)
+                // [T-truncated-stream-retry] a truncated turn (EOF without
+                // finish_reason) is NOT a clean finish even though stopReason is
+                // null — the retry branch below owns it, so the empty-turn path
+                // must not swallow it with an error hint. That rule lives inside
+                // TurnVisibleContent.finishedCleanly; the trigger itself is the
+                // one extracted decision:
+                if (TurnVisibleContent.isEmptyTurn(turnText, turnVisibleBlocks, turnFinishReason, turnTruncated)) {
                     // [T-android-empty-after-toolresult-reminder] Special case: the
                     // server returned an empty turn. The model owed a follow-up
                     // but stalled — the user sees a blank bubble with no explanation.
@@ -2358,16 +3370,14 @@ internal class AgentLoopEngine(
                         is EmptyTurnRecovery.Plan.AppendStandalone -> {
                             loopState.didInjectEmptyToolReminder = true
                             AppLogger.warning(TAG_STREAM, "empty turn — appending standalone reminder turn and retrying one round (turn=$turn)")
-                            // The empty assistant turn was just appended (above) — drop it.
-                            host.agentHistory.removeAt(host.agentHistory.size - 1)
-                            val reminder = EmptyTurnRecovery.REMINDER
-                            host.agentHistory.add(
-                                LLMMessage(
-                                    role = LLMMessage.Role.USER,
-                                    content = reminder,
-                                    contentParts = listOf(AgentContentPart.Text(reminder)),
-                                )
-                            )
+                            // [fix/rv1014-g2] The mutation lives in
+                            // EmptyTurnRecovery so it is JVM-testable: it drops
+                            // the empty assistant turn, bridges the USER tail
+                            // (a blind USER append yields two consecutive user
+                            // roles — Gemini maps messages 1:1 with no
+                            // consecutive-role merge on the request side),
+                            // then appends the standalone reminder turn.
+                            EmptyTurnRecovery.appendStandaloneReminderTurn(host.agentHistory, EmptyTurnRecovery.REMINDER)
                             continue
                         }
                         EmptyTurnRecovery.Plan.GiveUp -> {
@@ -2389,10 +3399,28 @@ internal class AgentLoopEngine(
                         else ->
                             host.string(R.string.error_empty_response_generic)
                     }
-                    withContext(Dispatchers.Main) { host.setInlineError(hint) }
+                    // [FIX-R4-Q F-01 closes deep-audit-1015 BUG-01b §116]
+                    // Deferred instead of written inline: the terminal flush now
+                    // sits BELOW this block (it moved below the continuation
+                    // `continue`s so a resumed turn persists one row), so there
+                    // is no "after the flush point" left to worry about. Queuing
+                    // here lets the flush create/own this turn's row first and
+                    // then surface the hint onto IT — the old inline write landed
+                    // on the PREVIOUS turn's row whenever this blank turn
+                    // persisted nothing.
+                    loopState.pendingInlineError = hint
                 }
-                // Auto-title after first exchange
-                if (turn == 0) host.generateSessionTitleIfNeeded()
+                // [fix/rv1014-g1] Auto-title: semantic condition, not
+                // positional. The old `turn == 0` guard fired the title
+                // generation only when the FIRST model round completed without
+                // recovery — but a first turn that came back empty (clean
+                // finish) goes through the recovery retry as turn 1, so by the
+                // time a clean round completed `turn == 0` was already false
+                // and the title was skipped until the next send (or forever if
+                // the user never sent again). The semantic condition fires
+                // while the title is genuinely ungenerated; the host
+                // function's own guards keep it idempotent.
+                if (host.sessionTitleNeedsGeneration) host.generateSessionTitleIfNeeded()
 
                 // [T-truncated-stream-retry] The provider signalled the model
                 // turn ended WITHOUT a server finish_reason (EOF / connection
@@ -2414,6 +3442,11 @@ internal class AgentLoopEngine(
                 // The stacking guard drops a stale stub reminder so consecutive
                 // EOFs do not pile up reminder turns (same pattern as the
                 // length-wall reminder below).
+                // [deep-audit-1017 ISSUE-03] `hasVisibleContent` is THIS turn's
+                // (see [TurnVisibleContent]) — the EOF ladder asks "did this
+                // truncated turn stream anything", and the run-scoped read made
+                // the `else if` below ("blank stream → nothing worth keeping")
+                // unreachable for any run whose earlier turns had shown text.
                 if (turnTruncated && hasVisibleContent) {
                     // [feat/runtime-limits-panel] 同上：上限改读 prefs（默认 2）。
                     val eofStubMax = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.eofStubContinues()
@@ -2428,14 +3461,12 @@ internal class AgentLoopEngine(
                         // [fix/audit-b20 / T1-LOW-2] Same off-by-one as the
                         // length-wall guard: the previous stub reminder lives
                         // behind this turn's assistant message.
+                        // [deep-audit-1018 ISSUE-12c] Predicate extracted to
+                        // [EofStubReminderStackGuard] — the error-shaped branch
+                        // above now shares it (it had no guard at all).
                         val prevTailIdx = host.agentHistory.size - 2
                         val prevTail = host.agentHistory.getOrNull(prevTailIdx)
-                        val tailIsEofStubReminder = prevTail != null &&
-                            prevTail.role == LLMMessage.Role.USER &&
-                            prevTail.contentParts.size == 1 &&
-                            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
-                                ?.contains("cut off by a network error") == true
-                        if (tailIsEofStubReminder) {
+                        if (EofStubReminderStackGuard.isStaleEofStubReminder(prevTail)) {
                             host.agentHistory.removeAt(prevTailIdx)
                         }
                         val stubReminder = eofStubReminder(turnText.takeLast(80))
@@ -2459,9 +3490,13 @@ internal class AgentLoopEngine(
                         TAG_STREAM,
                         "runAgentLoop turn=$turn EOF-truncated ×$loopState.eofStubContinues (ceiling $MAX_EOF_STUB_CONTINUES) — giving up with visible error",
                     )
-                    withContext(Dispatchers.Main) {
-                        host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                    }
+                    // [FIX-R4-Q F-01] Queue the banner instead of writing it now:
+                    // the terminal flush is below this branch, so nothing has been
+                    // persisted yet. Surfacing through pendingInlineError makes the
+                    // banner ride the row this fall-through persists (the same
+                    // idiom the length-wall branches above already use).
+                    loopState.pendingInlineError =
+                        host.string(R.string.error_output_truncated_repeated)
                     // [audit-0907 B5] Failure-terminal (specific banner shown)
                     // — prevents the exit-side runaway misclassification from
                     // overwriting it.
@@ -2483,6 +3518,73 @@ internal class AgentLoopEngine(
                     continue
                 }
 
+                // [FIX-R4-Q F-01] The terminal persist sits BELOW every no-tool
+                // continuation branch (empty-turn recovery, EOF stub continuation,
+                // EOF one-shot retry) on purpose: those branches `continue` and keep
+                // streaming into the SAME assistant bubble, so persisting above them
+                // wrote a first row for the head of the answer and appended a second
+                // row for the tail — one bubble in the UI, two `assistant` rows in
+                // the DB (reload seam + `retryLast` only rolls back the tail row).
+                // The run-scoped `unpersistedBlockStart` slice exists exactly to let
+                // the persist below pick up everything the continues streamed.
+                // [deep-audit-1016c ISSUE-01] Slice from the run-scoped
+                // unpersisted start, NOT from this turn's start: a continuation
+                // branch above (EOF-stub / length-wall / verify nudge / residue
+                // refill) may have streamed blocks that no persist ever picked
+                // up — they ride along in this terminal row instead of being
+                // skipped forever.
+                val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
+                val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
+                // [deep-audit-1015 BUG-01b] A failure branch above may have
+                // queued the turn's terminal banner. Persist THIS turn's row
+                // first and surface the banner from the row id that came back:
+                // setInlineError persists through updateLastAssistantError =
+                // "the session's LAST assistant row", so surfacing before the
+                // row exists stamps the banner onto the PREVIOUS turn (and,
+                // when the model streamed nothing, onto a turn the user knows
+                // succeeded). The empty-text filler keeps the row-present
+                // precondition true even for an empty-output failure — the
+                // same shape the two early-persist branches above already use.
+                val pendingInlineError = loopState.pendingInlineError
+                // Consume-once: the slot belongs to THIS turn. Clearing it
+                // before the persist (rather than after) means a throwing
+                // insert cannot leak the banner into the NEXT turn's row —
+                // a DB failure surfaces through the caller's
+                // reportAgentLoopError instead, which is the more urgent
+                // truth anyway.
+                loopState.pendingInlineError = null
+                val persistedRowId = host.persistAssistantTurn(
+                    TerminalErrorPlacement.partsForTerminalError(turnParts, pendingInlineError),
+                    lastUsage, turnReasoningContent, blockMeta,
+                    modelId = loopState.currentProvider.model.id,
+                    entryId = host.activeEntryId,
+                )
+                // [deep-audit-1016c ISSUE-01/A] Every block up to now is durable
+                // (the row above was written with parts covering the full
+                // unpersisted range). Advance only on success — if the DB write
+                // produced no row id, the next persist must re-cover this range
+                // rather than silently assume it landed.
+                if (persistedRowId != null) {
+                    loopState.unpersistedBlockStart = loopState.allToolBlocks.size
+                    // [deep-audit-1016c ISSUE-01/B] dbId backfill, same shape as
+                    // the tool-path terminal below — without it the assistant
+                    // message reloads with a null DB anchor and compaction falls
+                    // back to a degraded walk. Skip (do NOT invent an entry) when
+                    // no matching message exists.
+                    val lastAssistantIdx = host.agentHistory.indexOfLast {
+                        it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null
+                    }
+                    if (lastAssistantIdx >= 0) {
+                        host.agentHistory[lastAssistantIdx] =
+                            host.agentHistory[lastAssistantIdx].copy(dbMessageId = persistedRowId)
+                    }
+                }
+                TerminalErrorPlacement
+                    .terminalErrorToSurface(pendingInlineError, persistedRowId)
+                    ?.let { banner ->
+                        withContext(Dispatchers.Main) { host.setInlineError(banner) }
+                    }
+
                 // T9: close out the final turn (no tool calls → normal completion)
                 traceObserver.agentTraceRecorder.turnEnd(
                     turn = turn,
@@ -2491,10 +3593,71 @@ internal class AgentLoopEngine(
                     finishReason = turnFinishReason,
                     durationMs = System.currentTimeMillis() - turnStartMs,
                 )
-                loopState.loopExitedNormally = true
-                // T7-D: 旁路验证 —— 工具序列完成，进入收尾
-                traceObserver.t7Reduce(AgentRunEvent.WorkCompleted)
+                // [deep-audit-1015 BUG-01a] A clean completion is claimed only
+                // when the turn did not already surface a terminal error. The
+                // failure-terminal branches above deliberately fall through to
+                // this tail (that is how their partial reply gets persisted),
+                // and the old unconditional assignment rewrote their outcome as
+                // "the model finished its reply" — T7 then recorded
+                // SUCCEEDED/COMPLETED for a run the user was told had failed.
+                // The fall-through is preserved; only the claim is gated. The
+                // audit-0907 B5 runaway guard is unaffected: it reads
+                // terminalErrorSurfaced, not this flag (see
+                // AgentLoopExitDecision.shouldFinalizeAsRunaway).
+                // [deep-audit-1017 ISSUE-02] The single row finalize for this
+                // turn — after ALL four `continue` branches above, so the row
+                // stays streaming for the recovery/continuation that follows
+                // them (see the note at the head of this block). Ordering is
+                // unchanged for every path that reaches here: the turn was
+                // persisted above (persistAssistantTurn), banners
+                // (pendingInlineError / empty-response hint / EOF give-up)
+                // were surfaced above, and `updateAssistantMessage(false)` does
+                // not touch `error`, so a banner stamped on the row survives it.
+                //
+                // It sits ABOVE the clean-completion gate, not below the guard's
+                // closing brace: TerminalErrorSurfacedTest's negative control
+                // mutates the source by the exact adjacency of the guard's close
+                // followed by the break, so anything parked between that `}` and
+                // the `break` would silently disarm that control (2026-10-16 CI
+                // #2168: the control failed with "mutation must change the
+                // source" for exactly this reason).
+                withContext(Dispatchers.Main) {
+                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)
+                }
+                if (AgentLoopExitDecision.cleanCompletionFlag(loopState.terminalErrorSurfaced)) {
+                    loopState.loopExitedNormally = true
+                    // T7-D: 旁路验证 —— 工具序列完成，进入收尾
+                    traceObserver.t7Reduce(AgentRunEvent.WorkCompleted)
+                }
                 break
+            }
+            // [audit2 BUG-01] Only a turn that ACTUALLY produced tool calls may
+            // clear the continuation budgets — that is what the comments below
+            // always claimed ("a tool-call turn …"), and what this guard now
+            // enforces mechanically. Before the move, the three resets ran
+            // unconditionally ~640 lines above (before the empty-turn branch),
+            // so `lengthWallContinues` / `deterministicEmptyStreak` /
+            // `eofStubContinues` never got past 1 and the length-wall,
+            // deterministic-empty and EOF-stub guards were all dead; only
+            // `maxTurns` (default 256) still bounded the loop.
+            // The condition is written out rather than assumed: most paths
+            // through the empty-turn branch above leave the loop early
+            // (`continue`, e.g. the EOF one-shot retry at the tail) but not all
+            // of them — the normal-completion tail ends in `break` — so the
+            // reset must be guarded explicitly. The guard is what
+            // scripts/scan/loop_counter_reset_guard.py machine-checks; do not
+            // "simplify" it away on the strength of a comment.
+            if (toolCalls.isNotEmpty()) {
+                // [feat/hermes-tier1] A tool-call turn clears the length-wall
+                // continuation budget AND the deterministic-empty streak: the
+                // model recovered and is doing new work, so future walls get a
+                // fresh allowance (mirrors Hermes resetting per-wall retry state).
+                loopState.lengthWallContinues = 0
+                loopState.deterministicEmptyStreak = 0
+                // [fix/eof-stub-continuation] A tool-call turn is proof the model
+                // produced new work after any EOF — reset the stub-continuation
+                // budget so long tool-heavy runs keep full allowance.
+                loopState.eofStubContinues = 0
             }
             AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn dispatching ${toolCalls.size} tool call(s), continuing")
             // [fix/tool-call-copy-suppress] The turn DID dispatch: whatever
@@ -2517,7 +3680,12 @@ internal class AgentLoopEngine(
             // in place instead of inserting a second row for the same turn.
             var earlyAssistantDbId: String? = null
             run {
-                val livePreviewParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
+                // [deep-audit-1016c ISSUE-01] Live preview + early persist carry the
+            // same unpersisted range as the terminal slice: on a turn whose run
+            // already has unpersisted continuation blocks, the early row must
+            // include them (kill-during-tool-exec keeps the earlier text), and
+            // the terminal update below rewrites the row from the same basis.
+            val livePreviewParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
                 val liveMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 if (livePreviewParts.isNotEmpty()) {
                     host.updateSessionPreview(
@@ -2563,10 +3731,14 @@ internal class AgentLoopEngine(
             // Pass 1 (sequential): per-call preflight + loop-detect. CRITICAL /
             // preflight rejections synthesize their tool_result right here and
             // `continue` — exactly as the original loop did. Calls that pass are
-            // collected into `pending`.
+            // collected into `pending`. Pass 1 publishes ONLY refusals: it never
+            // flips a call to RUNNING ([deep-audit-1019 ISSUE-02] — see
+            // ToolPassTransitionPolicy for why the flip lives in Pass 2).
             // Pass 2 (execute): a batch of ONLY parallel-safe tools runs
             // concurrently (async, awaited in original order). Anything else runs
-            // sequentially — identical to the old single-loop behavior.
+            // sequentially — identical to the old single-loop behavior. This is
+            // where PENDING → RUNNING is published, at the moment each call is
+            // actually dispatched.
             // Pass 3 (sequential): per-call post-execution — loop-detect.record,
             // block content/status update, resultParts, UI refresh — kept in the
             // original tool-call order.
@@ -2662,6 +3834,14 @@ internal class AgentLoopEngine(
                 // Place it BEFORE ToolJsonRepair: refusing on the raw payload
                 // means the refusal can never depend on a repaired one.
                 //
+                // [deep-audit-1018 ISSUE-01] The guard consults BOTH truncation
+                // sources: turnFinishReason (the provider declared the ceiling)
+                // and this turn's `turnTruncated` flag (stream died mid-flight
+                // with no finish_reason — see OpenAIProvider's EOF guard, which
+                // had to learn to count tool-call events before a tool-call-only
+                // turn could set it). finishReason alone missed the EOF class
+                // entirely, which is exactly the half-streamed-argument case.
+                //
                 // Accepted residual risk: this branch does NOT charge the
                 // length-wall continuation budget (that counter is only
                 // advanced on the `toolCalls.isEmpty()` side), so a model that
@@ -2670,11 +3850,11 @@ internal class AgentLoopEngine(
                 // worth the extra state: the refusal message tells the model to
                 // re-issue with FULL arguments, and executing a prefix argument
                 // is strictly worse than spending turns.
-                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason)
+                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason, turnTruncated)
                 if (truncatedRefusal != null) {
                     AppLogger.warning(
                         TAG_STREAM,
-                        "runAgentLoop turn=$turn truncated tool call REFUSED name=$name id=$id finish=$turnFinishReason",
+                        "runAgentLoop turn=$turn truncated tool call REFUSED name=$name id=$id finish=$turnFinishReason eofTruncated=$turnTruncated",
                     )
                     val truncatedIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }
                     if (truncatedIdx >= 0) {
@@ -2741,15 +3921,13 @@ internal class AgentLoopEngine(
                 }
                 val argsStr = args.toString()
                 val paramsMap = parseToolParams(argsStr)
-                // Flip PENDING → RUNNING right before the execute dispatch so the UI
-                // (tool pill spinner) shows the exact moment execution begins.
-                val preIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }
-                if (preIdx >= 0 && loopState.allToolBlocks[preIdx].toolStatus == ToolBlockStatus.PENDING) {
-                    loopState.allToolBlocks[preIdx] = loopState.allToolBlocks[preIdx].copy(toolStatus = ToolBlockStatus.RUNNING)
-                    withContext(Dispatchers.Main) {
-                        host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
-                    }
-                }
+                // [deep-audit-1019 ISSUE-02] No status flip here any more. Pass 1
+                // only DECIDES whether a call may run; the PENDING → RUNNING flip
+                // belongs to the pass that actually dispatches it, because
+                // publishing RUNNING above the loop detector + preflight gates
+                // left a refused call spinning (the CRITICAL path retracts only in
+                // memory) and consumed the PENDING state that Pass 2's waiting cue
+                // is guarded on. See ToolPassTransitionPolicy.
 
                 // Loop-detector check BEFORE execution. CRITICAL outcomes short-circuit
                 // the call: synthesize an error result so the tool_use/tool_result pair
@@ -2769,6 +3947,14 @@ internal class AgentLoopEngine(
                             content = blockedMsg,
                             durationMs = elapsed,
                         )
+                        // [deep-audit-1019 ISSUE-02] Publish the refusal. Every
+                        // sibling Pass-1 refusal path does (dedupe / truncation /
+                        // preflight); this one published nothing, so with the flip
+                        // that used to run above it the card kept spinning and the
+                        // user never saw that the call had been blocked.
+                        withContext(Dispatchers.Main) {
+                            host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                        }
                     }
                     // Record the blocked attempt so consecutive blocks still
                     // count toward the unknown-tool / circuit-breaker windows.
@@ -2788,6 +3974,11 @@ internal class AgentLoopEngine(
                 // AIChatViewModel.swift. Synthesizes a tool_result error so the
                 // model can self-correct on the next turn without us spawning
                 // shells or touching the filesystem on `{}` args.
+                //
+                // [deep-audit-1019 ISSUE-02] That ordering promise is true again:
+                // the flip runs in Pass 2, below both refusal gates. Until this
+                // audit the flip sat ABOVE this check, so "before the UI flips to
+                // RUNNING" described a state the code never reached.
                 val preflightError = host.preflightValidateToolCall(name, args, host.agentTools)
                 if (preflightError != null) {
                     val chunkRing: List<String> = loopState.toolInputChunkRings.remove(id) ?: emptyList()
@@ -2854,36 +4045,106 @@ internal class AgentLoopEngine(
                 // All pending tools are parallel-safe pure reads. Launch them
                 // concurrently, then pull each result in the original order so
                 // Pass 3 observes the same sequence as the old sequential loop.
+                // [audit2 DESIGN-03] Each call gets its OWN block-list copy —
+                // the shared `loopState.allToolBlocks` is never handed to a
+                // coroutine on the IO pool. Edits (none today: the whitelist is
+                // read-only) are merged back once, in `pending` order, on this
+                // thread after the batch. See ParallelToolBatchBlocks.
+                val sharedBlocks = loopState.allToolBlocks
+                // [deep-audit-1019 ISSUE-02] A parallel batch dispatches every
+                // queued call at once, so the whole batch is RUNNING *here*, before
+                // the forks are taken — the baseline snapshot must carry the flip
+                // (Pass 3 finalises blocks that never showed a start otherwise),
+                // and it is published once from this thread because the point of
+                // the forks is that no coroutine touches this list.
+                var flippedForBatch = false
+                for (p in pending) {
+                    val flipIdx = sharedBlocks.indexOfFirst { it.id == p.id }
+                    if (flipIdx < 0) continue
+                    val flippedStatus = ToolPassTransitionPolicy.statusAtDispatch(sharedBlocks[flipIdx].toolStatus)
+                    if (flippedStatus != null) {
+                        sharedBlocks[flipIdx] = sharedBlocks[flipIdx].copy(toolStatus = flippedStatus)
+                        flippedForBatch = true
+                    }
+                }
+                if (flippedForBatch) {
+                    withContext(Dispatchers.Main) {
+                        host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                    }
+                }
+                val baseline = ParallelToolBatchBlocks.snapshot(sharedBlocks)
                 val deferred = coroutineScope {
                     pending.map { p ->
-                        p.id to async {
+                        val callBlocks = ParallelToolBatchBlocks.forkForCall(baseline)
+                        Triple(p.id, callBlocks, async {
                             val execStart = System.currentTimeMillis()
-                            val r = host.executeTool(p.name, p.argsStr, p.id, loopState.allToolBlocks, loopState.assistantId, loopState.accumulatedText)
+                            val r = host.executeTool(p.name, p.argsStr, p.id, callBlocks, loopState.assistantId, loopState.accumulatedText)
                             execMsById[p.id] = System.currentTimeMillis() - execStart
                             r
+                        })
+                    }
+                }
+                val workedLists = ArrayList<List<AssistantBlock>>(deferred.size)
+                for ((pid, callBlocks, d) in deferred) {
+                    resultsById[pid] = d.await()
+                    workedLists.add(callBlocks)
+                }
+                ParallelToolBatchBlocks.mergeBack(sharedBlocks, baseline, workedLists)
+            } else {
+                // Any non-parallel tool (or a single call) → sequential, exactly
+                // like the original loop.
+                //
+                // [deep-audit-1019 ISSUE-02] A queued call is published TWICE and
+                // the order carries the contract:
+                //   1. at batch entry — every call behind the head keeps PENDING
+                //      and says it is waiting, so the batch reads as a queue while
+                //      the head runs;
+                //   2. at that call's own turn — it flips PENDING → RUNNING and the
+                //      cue is retracted.
+                // Step 1 is the branch that used to be dead: Pass 1 flipped every
+                // queued call to RUNNING before Pass 2 ran, so the PENDING guard
+                // below matched nothing and the cue never appeared.
+                val cueIndices = ToolPassTransitionPolicy.sequentialQueueCueIndices(pending.size)
+                if (cueIndices.isNotEmpty()) {
+                    var cued = false
+                    for (index in cueIndices) {
+                        val queued = pending.getOrNull(index)
+                        if (queued == null) continue
+                        val cueIdx = loopState.allToolBlocks.indexOfFirst { it.id == queued.id }
+                        if (cueIdx < 0) continue
+                        val cueBlock = loopState.allToolBlocks[cueIdx]
+                        if (cueBlock.toolStatus != ToolBlockStatus.PENDING) continue
+                        loopState.allToolBlocks[cueIdx] = cueBlock.copy(
+                            content = ToolPassTransitionPolicy.QUEUE_CUE_TEXT,
+                        )
+                        cued = true
+                    }
+                    if (cued) {
+                        withContext(Dispatchers.Main) {
+                            host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
                         }
                     }
                 }
-                for ((pid, d) in deferred) {
-                    resultsById[pid] = d.await()
-                }
-            } else {
-                // Any non-parallel tool (or a single call) → sequential, exactly
-                // like the original loop. Each queued call gets a non-blocking
-                // "waiting" cue so the UI doesn't look hung while earlier tools
-                // still run — pure visibility, no status flip, no semantics.
-                pending.forEachIndexed { index, p ->
-                    if (index > 0) {
-                        val waitIdx = loopState.allToolBlocks.indexOfFirst { it.id == p.id }
-                        if (waitIdx >= 0) {
-                            val waitBlock = loopState.allToolBlocks[waitIdx]
-                            if (waitBlock.toolStatus == ToolBlockStatus.PENDING) {
-                                loopState.allToolBlocks[waitIdx] = waitBlock.copy(
-                                    content = "⏳ Waiting for previous tool(s) to finish…",
-                                )
-                                withContext(Dispatchers.Main) {
-                                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
-                                }
+                pending.forEach { p ->
+                    // Flip PENDING → RUNNING right before this call's own execute
+                    // dispatch so the UI (tool pill spinner) shows the exact moment
+                    // execution begins. Moved here from Pass 1 by
+                    // [deep-audit-1019 ISSUE-02] — see ToolPassTransitionPolicy; the
+                    // flip also retires this call's queue cue (contentAtDispatchFlip).
+                    val flipIdx = loopState.allToolBlocks.indexOfFirst { it.id == p.id }
+                    if (flipIdx >= 0) {
+                        val flippingBlock = loopState.allToolBlocks[flipIdx]
+                        val flippedStatus = ToolPassTransitionPolicy.statusAtDispatch(flippingBlock.toolStatus)
+                        if (flippedStatus != null) {
+                            loopState.allToolBlocks[flipIdx] = flippingBlock.copy(
+                                toolStatus = flippedStatus,
+                                content = ToolPassTransitionPolicy.contentAtDispatchFlip(
+                                    flippingBlock.content,
+                                    ToolPassTransitionPolicy.QUEUE_CUE_TEXT,
+                                ),
+                            )
+                            withContext(Dispatchers.Main) {
+                                host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
                             }
                         }
                     }
@@ -2921,19 +4182,22 @@ internal class AgentLoopEngine(
                 }
 
                 // [feat/verification-stop] edit/verify bookkeeping. Edit side:
-                // a SUCCESSFUL file_write/file_edit on a code path marks the
-                // run's evidence stale (bumps lastEditSeq). Verify side: a
-                // verification-shaped shell command records its outcome and,
-                // when it PASSED, bumps lastVerifySeq — the turn-end guard
-                // compares the two stamps. Non-code paths (prose/config) are
-                // filtered by the policy so a SKILL.md edit never demands a
-                // verification script.
+                // a SUCCESSFUL file_write/file_edit on a code path records the
+                // edit. Verify side: a verification-shaped shell command
+                // records its outcome and, when it PASSED, records the
+                // verification. Both stamps are readings of ONE monotonic clock
+                // so the turn-end guard can order them (see
+                // AgentLoopState.evidenceClock for why two independent
+                // counters could not answer "was the verification newer?").
+                // Non-code paths (prose/config) are filtered by the policy so
+                // a SKILL.md edit never demands a verification script.
                 when {
                     result.success && (name == "file_write" || name == "file_edit") -> {
                         VerificationStopPolicy.changedPathFromArgs(name, p.argsStr)?.let { path ->
                             if (!VerificationStopPolicy.isNonCodePath(path)) {
                                 loopState.changedCodePaths.add(path)
-                                loopState.lastEditSeq++
+                                loopState.evidenceClock++
+                                loopState.lastEditStamp = loopState.evidenceClock
                             }
                         }
                     }
@@ -2947,7 +4211,10 @@ internal class AgentLoopEngine(
                                 else -> "FAILED"
                             }
                             loopState.lastVerificationDetail = "${cmd.take(120)} → $outcome"
-                            if (result.success) loopState.lastVerifySeq++
+                            if (result.success) {
+                                loopState.evidenceClock++
+                                loopState.lastVerifyStamp = loopState.evidenceClock
+                            }
                             AppLogger.info(TAG_STREAM, "[verification-stop] evidence: kind=$kind outcome=$outcome cmd=${cmd.take(80)}")
                         }
                     }
@@ -3038,7 +4305,9 @@ internal class AgentLoopEngine(
             // hang between tool-END and the next REQ can be attributed to the
             // persist phase vs the next-turn dispatch.
             android.util.Log.i("ChatVMStream", "runAgentLoop turn=$turn persist-begin blocks=${loopState.allToolBlocks.size}")
-            val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
+            // [deep-audit-1016c ISSUE-01] Same unpersisted-start basis as the
+            // no-tool terminal slice (see that site).
+            val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
             val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
             // [fix/early-turn-persist] When the row already exists (written
             // before the tools ran) refresh it with the finished tool blocks
@@ -3061,6 +4330,10 @@ internal class AgentLoopEngine(
                 if (lastIdx >= 0) {
                     host.agentHistory[lastIdx] = host.agentHistory[lastIdx].copy(dbMessageId = assistantDbId)
                 }
+                // [deep-audit-1016c ISSUE-01/A] The row now durably carries every
+                // block in the unpersisted range (its slice starts there) — the
+                // next turn's persistence must not re-send them.
+                loopState.unpersistedBlockStart = loopState.allToolBlocks.size
             }
 
             // Persist tool results as user-role message (mirrors iOS)
@@ -3076,8 +4349,14 @@ internal class AgentLoopEngine(
                 dbMessageId = toolResultDbId,
             ))
 
-            // Auto-title after first exchange (mirrors iOS host.generateSessionTitleIfNeeded)
-            if (turn == 0) {
+            // [fix/rv1014-g1] Auto-title after first exchange — semantic
+            // condition (mirrors iOS host.generateSessionTitleIfNeeded). Same
+            // rationale as the no-tool path above: `turn == 0` skipped the
+            // title whenever the first round went through recovery or
+            // EOF-truncation continuation (turn already advanced); the
+            // semantic condition fires whenever the title is ungenerated and
+            // the host function's own guards keep it idempotent.
+            if (host.sessionTitleNeedsGeneration) {
                 host.generateSessionTitleIfNeeded()
             }
 
@@ -3140,6 +4419,9 @@ internal class AgentLoopEngine(
                     loopState.assistantId = handled.newAssistantId
                     loopState.accumulatedText = ""
                     loopState.allToolBlocks.clear()
+                    // [deep-audit-1016c ISSUE-01/A] New bubble ⇒ unpersisted range
+                    // restarts from 0, in lockstep with the cleared list.
+                    loopState.unpersistedBlockStart = 0
                     loopState.allToolInputs.clear()
                     loopState.toolInputChunkRings.clear()
                     host.setCanResume(false)
@@ -3148,6 +4430,38 @@ internal class AgentLoopEngine(
                 // null return = empty-after-build / drain rejected; fall
                 // through to normal next-turn dispatch so the queue doesn't
                 // pin the loop indefinitely.
+            }
+        }
+        // [R5-C2] Flush BEFORE any finalize hand-holding. Both finalizers below
+        // write their banner through `updateLastAssistantError` = "the session's
+        // LAST assistant row", and both run after a loop that may have left via a
+        // continuation `continue` — i.e. with blocks the user already watched but
+        // that no row covers. Without this, the text evaporated on reload AND the
+        // banner stamped the PREVIOUS turn's row; the row written here is what
+        // makes the banner land on the turn that actually stopped.
+        //
+        // Idempotent by construction: the two in-loop terminals advance
+        // `unpersistedBlockStart` past everything they wrote, so a clean exit has
+        // an empty range and this is a no-op. A failing insert is swallowed on
+        // purpose — the finalize hand-holding (UI teardown + banner + resume) is
+        // still the more urgent truth, and the caller's error path reports the DB
+        // failure.
+        if (ContinuationFlushPolicy.mustFlushBeforeFinalize(
+                loopState.unpersistedBlockStart,
+                loopState.allToolBlocks.size,
+            )
+        ) {
+            runCatching {
+                flushUnpersistedTurnRow(
+                    loopState = loopState,
+                    usage = lastSegmentUsage,
+                    reasoningContent = lastSegmentReasoning,
+                )
+            }.onFailure { e ->
+                AppLogger.warning(
+                    TAG_STREAM,
+                    "runAgentLoop EXIT — flushing the un-persisted continuation failed: ${e.message}",
+                )
             }
         }
         // Two ways to leave the for-loop above:
@@ -3159,7 +4473,12 @@ internal class AgentLoopEngine(
         // (b) is the only case that needs the inline-error/Resume hand-holding;
         // (a) must NOT be touched or every normal completion gets a fake "hit
         // 200 turns" sticker (the bug user hit at v1.4.0-dev tip).
-        if (!loopState.loopExitedNormally && !loopState.terminalErrorSurfaced && traceObserver.t7BudgetStopReason == null) {
+        if (AgentLoopExitDecision.shouldFinalizeAsRunaway(
+                loopExitedNormally = loopState.loopExitedNormally,
+                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                budgetStopReason = traceObserver.t7BudgetStopReason,
+            )
+        ) {
             AppLogger.warning(
                 TAG_STREAM,
                 "runAgentLoop EXIT — hit MAX_AGENT_TURNS=$maxTurnsThisRun, finalizing as resumable",
@@ -3202,30 +4521,24 @@ internal class AgentLoopEngine(
         // T7-C: 预算中断 → deadline 走 Interrupted(DEADLINE_EXCEEDED)，
         //       计数耗尽走 Failed(EXECUTION_FAILED) + error 标注具体维度
         val budgetStop = traceObserver.t7BudgetStopReason
+        // [deep-audit-1015 BUG-01a] The decision table lives in
+        // AgentLoopExitDecision (same package, JVM-testable) and is CALLED
+        // here rather than mirrored in the test — the old test carried a copy
+        // of these `when` blocks, so a change in either one left the other
+        // green and this defect stayed invisible.
         traceObserver.t7EndRun(
-            terminal = when {
-                budgetStop == "deadline_reached" -> AgentTerminal.INTERRUPTED
-                budgetStop != null -> AgentTerminal.FAILED
-                loopState.loopExitedNormally -> AgentTerminal.SUCCEEDED
-                else -> AgentTerminal.FAILED
-            },
-            reason = when {
-                budgetStop == "deadline_reached" -> AgentTerminalReason.DEADLINE_EXCEEDED
-                budgetStop != null -> AgentTerminalReason.EXECUTION_FAILED
-                loopState.loopExitedNormally -> AgentTerminalReason.COMPLETED
-                else -> AgentTerminalReason.EXECUTION_FAILED
-            },
+            terminal = AgentLoopExitDecision.terminal(budgetStop, loopState.loopExitedNormally),
+            reason = AgentLoopExitDecision.reason(budgetStop, loopState.loopExitedNormally),
             durationMs = System.currentTimeMillis() - traceStartMs,
-            error = when {
-                budgetStop != null -> "budget_exhausted($budgetStop)"
-                // [audit-0907 B5] A failure-terminal error was already
-                // surfaced inline (EOF stub ceiling / repetition abort / …) —
-                // label it as such, NOT as a runaway turn-loop (which it
-                // isn't: the loop exited via a typed failure branch).
-                loopState.terminalErrorSurfaced -> "terminal_error_surfaced"
-                !loopState.loopExitedNormally -> "MAX_AGENT_TURNS"
-                else -> null
-            },
+            // [audit-0907 B5] A failure-terminal error was already surfaced
+            // inline (EOF stub ceiling / repetition abort / …) — label it as
+            // such, NOT as a runaway turn-loop (which it isn't: the loop
+            // exited via a typed failure branch).
+            error = AgentLoopExitDecision.errorLabel(
+                budgetStopReason = budgetStop,
+                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                loopExitedNormally = loopState.loopExitedNormally,
+            ),
         )
         traceObserver.traceRunFile = null
         traceObserver.t7BudgetStopReason = null

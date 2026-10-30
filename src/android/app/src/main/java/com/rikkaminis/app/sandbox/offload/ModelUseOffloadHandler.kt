@@ -5,14 +5,16 @@ import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.ModelEntry
-import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.directionalModalities
+import com.rikkaminis.app.data.model.modalityNamesInOrder
 import com.rikkaminis.app.data.repository.ProviderRepository
-import com.rikkaminis.app.provider.ProviderFactory
-import com.rikkaminis.app.provider.safeOptString
+import com.rikkaminis.app.debug.LLMRequestLog
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.sandbox.hasDotDotSegment
+import com.rikkaminis.app.sandbox.normalizeLinuxPath
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,7 +27,7 @@ import java.io.File
  * Subcommands:
  *   minis-model-use list [--provider <name>] [--modality <m>]
  *   minis-model-use search <query> [--provider <name>] [--modality <m>]
- *   minis-model-use run --model <id_or_name> [--input <path>] [--output <path>]
+ *   minis-model-use run --model <id_or_name> [prompt] [--input <path>] [--output <path>]
  *                       [--system <text>] [--system-file <path>]
  *                       [--max-tokens N] [--temperature F]
  *
@@ -39,8 +41,10 @@ class ModelUseOffloadHandler(
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1))
+        // `--help` is a flag, so `positional` is empty for it too: the exit
+        // code has to be decided on the flag, or `--help` answers 2.
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
-            return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, HELP)
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, HELP)
         }
 
         return try {
@@ -61,14 +65,19 @@ class ModelUseOffloadHandler(
     }
 
     private fun cmdList(args: OffloadArgs): NativeOffloadResult {
-        val providerFilter = args.get("provider")?.lowercase()
+        val providerFilter = args.get("provider")
         val modalityFilter = args.get("modality")?.lowercase()
 
         var entries = providerRepository.resolvedAgentLoopEntries()
+        // [dv16-A04] The same single matcher as search/run. This used to be a
+        // case-sensitive substring match on model.provider/label — a filter
+        // that `run --provider` (exact label/id) would then refuse.
         if (providerFilter != null) {
-            entries = entries.filter {
-                it.model.provider.lowercase().contains(providerFilter) ||
-                    providerInstanceLabel(it).lowercase().contains(providerFilter)
+            entries = entries.filter { entry ->
+                val inst = providerRepository.instance(entry.providerInstanceId)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
             }
         }
         if (modalityFilter != null) {
@@ -91,12 +100,25 @@ class ModelUseOffloadHandler(
                 "minis-model-use search: no query. Usage: minis-model-use search <query>\n",
             )
         val q = query.lowercase()
+        val providerFilter = args.get("provider")
         val modalityFilter = args.get("modality")?.lowercase()
 
         var matches = providerRepository.resolvedAgentLoopEntries().filter { entry ->
             entry.model.id.lowercase().contains(q) ||
                 entry.model.displayName.lowercase().contains(q) ||
                 entry.model.provider.lowercase().contains(q)
+        }
+        // [dv16-A04] `--provider` was documented on this subcommand's help
+        // line but never read — the option was consumed into OffloadArgs and
+        // dropped, so `search gpt --provider X` returned every provider's
+        // gpt models. Same single matcher as list/run.
+        if (providerFilter != null) {
+            matches = matches.filter { entry ->
+                val inst = providerRepository.instance(entry.providerInstanceId)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
+            }
         }
         if (modalityFilter != null) {
             matches = matches.filter { matchesModality(it, modalityFilter) }
@@ -137,46 +159,61 @@ class ModelUseOffloadHandler(
         // Modality precheck: if --output extension implies a media modality
         // the model doesn't advertise, fail fast before hitting the API.
         // Mirrors iOS ModelUseOffloadBridge.performRun:208-228.
-        val outputPath = args.get("output")
-        // [T-android-model-use-relative-output] A relative --output can't be
-        // resolved reliably: this handler runs in-process and does NOT inherit
-        // the shell's cwd, so PRootKernel.resolveHostPath would silently drop a
-        // relative path onto the rootfs root (e.g. "gen_output.json" ->
-        // <rootfs>/gen_output.json) and report an unreadable bare-relative path
-        // that read_image later rejects. Fail fast with a clear message asking
-        // for an absolute path instead. `file://` URLs are already absolute.
-        if (outputPath != null && !outputPath.startsWith("/") && !outputPath.startsWith("file://")) {
+        // [da1024-I] `--output` now joins onto the shell cwd exactly like
+        // `--input`/`--system-file` above — [resolveMaybeRelative] is the single
+        // join implementation. A bare relative path only survives when the cwd
+        // itself is missing/relative; then we still fail closed with a clear
+        // "absolute path required" error instead of dropping it onto the rootfs
+        // root (which `read_image` would later reject).
+        //
+        // [meta1028-D2 F-02] `file://` used to be passed through UNSTRIPPED
+        // ("for downstream stripping" — no such stripping existed). Every later
+        // consumer of [outputPath] has PATH semantics: `isLinuxPathUnderReadOnlyMount`
+        // normalizes `file:///var/minis/x` to the RELATIVE `file:/var/minis/x`
+        // (never matches the `/var/minis/mounts/` prefix ⇒ the read-only guard
+        // silently passes), and `sessionAwareHostFile` matches its
+        // `/var/minis/(attachments|offloads|workspace|browser)` regex on the
+        // same relative form (⇒ session scoping lost) before falling back to
+        // `PRootKernel.resolveHostPath`'s rootfs branch — which really wrote
+        // `<rootfs>/file:/var/minis/workspace/out.png` while answering
+        // `output_file: file:///var/minis/workspace/out.png`. The user's file
+        // was nowhere and the bytes landed in the rootfs every session shares.
+        // Strip the scheme, then resolve. Percent-decoding is deliberately NOT
+        // added here — see FIX-FILEURL-CONTRACT §7-R2 (foreign input, no in-repo
+        // constructor; decoding would corrupt files literally named `%XX`).
+        val outputPath = args.get("output")?.let { raw ->
+            resolveMaybeRelative(stripFileUrlScheme(raw), request.cwd)
+        }
+        if (outputPath != null && !outputPath.startsWith("/")) {
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "invalid_output_path")
                     .put(
                         "message",
-                        "--output must be an absolute path (e.g. /var/minis/workspace/out.jpg). " +
-                            "Got the relative path '$outputPath', which cannot be resolved because " +
-                            "minis-model-use does not inherit the shell's working directory.",
+                        "--output must be an absolute path (e.g. /var/minis/workspace/out.jpg) or a " +
+                            "relative path resolvable against the shell cwd. Got the relative path " +
+                            "'$outputPath', which could not be resolved (no absolute guest cwd).",
                     )
                     .toString() + "\n",
             )
         }
         val outputExt = outputPath?.substringAfterLast('.', "")?.lowercase().orEmpty()
-        val outputs = entry.model.outputModalities.orEmpty()
+        // [dv21-A05] Effective modalities of this entry: models.dev-enriched BASE
+        // model + the user's overrides, canonicalized once through the shared
+        // resolver. Reading `entry.model.*` raw skipped enrichment entirely, and
+        // all 39 built-in models declare null modality fields by construction —
+        // so every image/TTS-capable built-in was refused here as incapable.
+        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
+        val modalities = effectiveModel.directionalModalities.toSet()
         val requiredModality = when {
-            isImageExt(outputExt) -> "image_output".takeIf { "image" !in outputs }
-            isAudioExt(outputExt) -> "audio_output".takeIf { "audio" !in outputs }
-            isVideoExt(outputExt) -> "video_output".takeIf { "video" !in outputs }
+            isImageExt(outputExt) -> "image_output".takeIf { "image_output" !in modalities }
+            isAudioExt(outputExt) -> "audio_output".takeIf { "audio_output" !in modalities }
+            isVideoExt(outputExt) -> "video_output".takeIf { "video_output" !in modalities }
             else -> null
         }
         if (requiredModality != null) {
-            val supported = buildList {
-                if ("text" in entry.model.inputModalities.orEmpty()) add("text_input")
-                if ("text" in outputs) add("text_output")
-                if ("image" in entry.model.inputModalities.orEmpty()) add("image_input")
-                if ("image" in outputs) add("image_output")
-                if ("audio" in entry.model.inputModalities.orEmpty()) add("audio_input")
-                if ("audio" in outputs) add("audio_output")
-                if ("video" in entry.model.inputModalities.orEmpty()) add("video_input")
-                if ("video" in outputs) add("video_output")
-            }
+            // Same canonical vocabulary (and order) as `minis-model-use list`.
+            val supported = modalityNamesInOrder.filter { it in modalities }
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "modality_not_supported")
@@ -188,7 +225,7 @@ class ModelUseOffloadHandler(
         // System prompt: --system takes precedence over --system-file
         // [audit-0917] A --system-file that cannot be read is an explicit error,
         // not a silent system-prompt drop (mirrors the --input branch below).
-        val sysFile = args.get("system-file")?.let { readLinuxPath(it, request.sessionId) }
+        val sysFile = args.get("system-file")?.let { readLinuxPath(it, request.sessionId, request.cwd) }
         if (args.get("system-file") != null && sysFile == null) {
             return NativeOffloadResult(
                 2,
@@ -197,17 +234,39 @@ class ModelUseOffloadHandler(
         }
         val explicitSystem = args.get("system") ?: sysFile
 
-        // Parse input messages: --input <path> | stdin
+        // Parse input messages: positional prompt | --input <path>
+        // [B14-fix-r14] stdin was NEVER a real channel: the native_offload
+        // protocol forwards argv/env/cwd only (no stdin pipe — the handler
+        // runs in-process inside the app, not in the shell), so a piped
+        // call like `echo 'q' | minis-model-use run --model X` used to
+        // silently send an empty-messages request (HTTP 400). The piped
+        // usage was documented in HELP/agent-prompt but never worked. Fix:
+        // accept the prompt as a positional argument (same plain-text →
+        // single user message path stdin would have taken), and fail fast
+        // with a clear message instead of sending an empty request.
+        val positionalPrompt = args.positional.getOrNull(1)
         val inputText = when {
-            args.get("input") != null -> readLinuxPath(args.get("input")!!, request.sessionId)
+            args.get("input") != null -> readLinuxPath(args.get("input")!!, request.sessionId, request.cwd)
                 ?: return NativeOffloadResult(
                     2,
                     "minis-model-use run: cannot read --input '${args.get("input")}'\n",
                 )
-            else -> ""
+            positionalPrompt != null -> positionalPrompt
+            else -> return NativeOffloadResult(
+                2,
+                JSONObject().put("error", "missing_input")
+                    .put(
+                        "message",
+                        "no input: minis-model-use does not read stdin (the native_offload protocol " +
+                            "has no stdin channel). Pass the prompt as a positional argument — " +
+                            "minis-model-use run --model <id> 'your prompt' — or write it to a file " +
+                            "and pass --input <path>.",
+                    )
+                    .toString() + "\n",
+            )
         }
         val parsed = try {
-            parseMessages(inputText, request.sessionId)
+            parseMessages(inputText, request.sessionId, request.cwd)
         } catch (e: ImageInputError) {
             return NativeOffloadResult(
                 2,
@@ -234,7 +293,7 @@ class ModelUseOffloadHandler(
         // modality — explicit error instead of the historical silent drop.
         // Mirrors iOS ModelUseOffloadBridge's hasAudioInput gate.
         if (nonSystem.any { it.audios.isNotEmpty() } &&
-            "audio" !in entry.model.inputModalities.orEmpty()
+            "audio_input" !in modalities
         ) {
             return NativeOffloadResult(
                 2,
@@ -269,24 +328,42 @@ class ModelUseOffloadHandler(
         val maxTokens = args.get("max-tokens")?.toIntOrNull() ?: 4096
         val temperature = args.get("temperature")?.toDoubleOrNull()
 
-        // Build provider + call — runBlocking is acceptable here: this handler
-        // is invoked off the main thread by the offload server.
-        val apiKey = providerRepository.loadApiKey(entry.providerInstanceId)
-            ?: return NativeOffloadResult(
+        // [fix/da1015-modeluse-proc] No provider is built in this process any
+        // more. `:app` never sends the request (the CLI dispatches to
+        // :modelservice, which builds its own provider), so
+        // `ProviderFactory.create` here only ever produced two side effects for
+        // a request somebody else makes:
+        //   • a [com.rikkaminis.app.data.KeyRoulette] draw — LRU state plus a
+        //     non-atomic rewrite of `key_roulette.json`, i.e. a SECOND draw
+        //     milliseconds before the worker's own, competing with it on the
+        //     same file; and
+        //   • a [com.rikkaminis.app.network.ConnectionWarmer] TLS/DNS warm-up.
+        // The object was then used for exactly one thing — the type gate below —
+        // so the gate is now answered from the instance's provider type, which
+        // is the same input ProviderFactory uses to pick the class
+        // (ModelUseProtocol.isOpenAiCompatibleProviderType).
+        //
+        // Key PRESENCE is still pre-checked here: it preserves the CLI's own
+        // fail-fast message and exit code instead of spending a dispatch round
+        // trip to learn the same thing. The value itself is not read or passed —
+        // the worker re-reads it from the same encrypted prefs.
+        if (providerRepository.loadApiKey(entry.providerInstanceId) == null) {
+            return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "missing_api_key")
                     .put("message", "No API key configured for provider ${entry.model.provider}.")
                     .toString() + "\n",
             )
+        }
         val instance = providerRepository.instance(entry.providerInstanceId)
             ?: return NativeOffloadResult(2, "minis-model-use run: provider instance not found\n")
-        val provider = ProviderFactory.create(instance, apiKey, entry.model, context)
+        val openAiCompatible = ModelUseProtocol.isOpenAiCompatibleProviderType(instance.providerType)
 
         // [GH#67] input_audio serialization is implemented for the OpenAI
         // chat/completions + responses paths only. Other provider types would
         // drop the audio at their own serialization layer — fail loudly here
         // instead. Mirrors iOS ModelUseOffloadBridge.
-        if (hasAudioInput && provider !is com.rikkaminis.app.provider.openai.OpenAIProvider) {
+        if (hasAudioInput && !openAiCompatible) {
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "audio_input_unsupported_provider")
@@ -305,10 +382,17 @@ class ModelUseOffloadHandler(
         // dispatch because body_mode=replace requests may carry no messages at
         // all. Only OpenAI-compatible providers; others error clearly. Mirrors
         // iOS ModelUseOffloadBridge passthrough branch.
-        val ptSpec = parsePassthroughEnvelope(inputText)
+        //
+        // [fix/audit3-1015 F-03] The HTTP call runs in :modelservice.
+        // ProviderBoundary forbids provider calls in this process and that
+        // boundary is load-bearing — the old in-process call could only ever
+        // come back `passthrough_failed`, so the mode was 100% dead. This
+        // branch assembles the request (shared pure body builder), dispatches
+        // it, and shapes the reply.
+        val ptSpec = ModelUseProtocol.parsePassthroughEnvelope(inputText)
         if (ptSpec.active) {
-            val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
-                ?: return NativeOffloadResult(
+            if (!openAiCompatible) {
+                return NativeOffloadResult(
                     2,
                     JSONObject().put("error", "passthrough_unsupported")
                         .put(
@@ -318,17 +402,52 @@ class ModelUseOffloadHandler(
                                 "providers. Use the standard OpenAI input format instead.",
                         ).toString() + "\n",
                 )
-            return performRawPassthrough(
+            }
+            val ptWarnings = ptSpec.warnings.toMutableList()
+            val ptBody = ModelUseProtocol.buildRawPassthroughBody(
                 spec = ptSpec,
-                entry = entry,
-                openAI = openAI,
+                modelId = entry.model.id,
                 systemPrompt = systemPrompt,
-                messages = messages,
+                messages = messages.map { it.role.value to it.content },
                 maxTokens = maxTokens,
+                warnings = ptWarnings,
+            )
+            // [dv23-A03] The serialized model must be the SAME enriched model the
+            // guards above judged: `entry.model` is only `baseModel + overrides`,
+            // so every capability field models.dev supplies (output-/inputModalities,
+            // maxOutputTokens, contextWindow, reasoning effort tiers) was dropped at
+            // the process boundary — :modelservice rebuilt an LLMModel with them
+            // null and e.g. never sent `responseModalities: ["TEXT","IMAGE"]`, so a
+            // --output out.png run that passed the gate here came back text-only.
+            // ponytail: 复用 :190 已算好的 `effectiveModel`，不在此处重新解析 —— 这正是
+            // 共享 resolver 的字面调用计数保持恰为 2（:190 与 :1007）的原因，
+            // ModelUseModalityParityTest 钉住了这个计数（该断言按原文计数，
+            // 因此本注释刻意不复述那个字面调用形式）。 | 天花板: 某个 buildRequestJson
+            // 调用点若移出 cmdRun（拿不到该局部变量）就必须自解析，届时该测试计数断言要同步改。
+            // | 升级触发: 出现第 3 个 buildRequestJson 调用点，或 cmdRun 被拆分。
+            val ptRequestJson = ModelExecutionDispatcher.buildRequestJson(
+                instance = instance,
+                model = effectiveModel,
+                messages = messages,
+                systemPrompt = systemPrompt,
+                maxTokens = maxTokens,
+                temperature = temperature,
+                imageParts = imageParts,
+                inputJson = inputText,
+                outputExt = outputExt,
+                passthroughRequest = ModelUseProtocol.buildPassthroughWireRequest(ptSpec, ptBody),
+            )
+            val ptRemote = runBlocking { ModelExecutionDispatcher.dispatch(context, ptRequestJson) }
+            return shapeRawPassthrough(
+                spec = ptSpec,
+                warnings = ptWarnings,
+                entry = entry,
+                remoteResult = ptRemote,
                 outputPath = outputPath,
                 sessionId = request.sessionId,
             )
         }
+
 
         // [T-android-model-use-passthrough-mode GH#72] Standard mode: promote the
         // explicit `extra_body` / `extra_headers` envelope (previously image-
@@ -338,26 +457,31 @@ class ModelUseOffloadHandler(
         // OpenAI top-level semantics. Mirrors iOS standard-mode promotion.
         // [T-model-use-passthrough-warnings] `callWarnings` collects every
         // provided-but-ignored/downgraded field (starting with envelope-
-        // lookalike warnings from the passthrough parser); `appliedExtras`
-        // confirms which passthrough capabilities actually took effect. Both
-        // are attached to the final result JSON. Mirrors iOS performRun.
+        // lookalike warnings from the passthrough parser); the worker's
+        // `applied_extras` confirms which passthrough capabilities actually took
+        // effect. Both are attached to the final result JSON. Mirrors iOS
+        // performRun.
         val callWarnings = ptSpec.warnings.toMutableList()
-        val appliedExtras = JSONObject()
-        (provider as? com.rikkaminis.app.provider.openai.OpenAIProvider)?.let { openAI ->
+        // [fix/da1015-modeluse-proc] The `extra_body` / `extra_headers` /
+        // `endpoint` envelope is INTERPRETED by `:modelservice`, which re-parses
+        // this same `input_json` with the same shared parsers and stamps the
+        // values onto the provider IT builds. Parsing it here as well only ever
+        // assigned those values to the (now gone) in-process provider object —
+        // assignments that reached no request, since this process no longer
+        // sends one.
+        //
+        // The parsing is kept for what it still uniquely provides: the
+        // CALLER-FACING WARNINGS. `extra_headers` present but not a JSON object
+        // is the case that proves it — the worker's copy of that parser returns
+        // silently for it, so without these lines that input error is invisible
+        // to the user (neither JSON body nor stderr mentions it).
+        if (openAiCompatible) {
             val chatExtra = parseChatExtraBody(inputText, callWarnings)
             if (chatExtra.isNotEmpty()) {
-                openAI.chatExtraBody = chatExtra
-                appliedExtras.put("extra_body_keys", JSONArray(chatExtra.keys.sorted()))
                 Log.i(TAG, "[ModelUseRoute] CHAT-PASSTHROUGH extra_body keys=[${chatExtra.keys.sorted().joinToString(",")}]")
             }
-            val chatHdrs = parseExtraHeaders(inputText, callWarnings)
-            if (chatHdrs.isNotEmpty()) {
-                openAI.chatExtraHeaders = chatHdrs
-                appliedExtras.put("extra_headers_keys", JSONArray(chatHdrs.keys.sorted()))
-            }
+            parseExtraHeaders(inputText, callWarnings)
             parseCustomEndpointPath(inputText)?.let { customPath ->
-                openAI.absoluteEndpointOverride = customPath
-                appliedExtras.put("custom_endpoint", customPath)
                 Log.i(TAG, "[ModelUseRoute] CUSTOM-ENDPOINT absolute path=$customPath")
             }
         }
@@ -378,9 +502,12 @@ class ModelUseOffloadHandler(
         // (logs showed Post-recycle GC freed 0MB). On any dispatch failure or
         // unparseable result the call falls back to the in-process path below
         // (behaviour unchanged, leak containment degraded).
+        // [dv23-A03] Same as the passthrough branch above: the model that crosses
+        // into :modelservice must be the enriched `effectiveModel`, not the raw
+        // `entry.model` (see the note there).
         val remoteRequestJson = ModelExecutionDispatcher.buildRequestJson(
             instance = instance,
-            model = entry.model,
+            model = effectiveModel,
             messages = messages,
             systemPrompt = systemPrompt,
             maxTokens = maxTokens,
@@ -393,6 +520,17 @@ class ModelUseOffloadHandler(
         if (remoteResult != null) {
             val remote = try { JSONObject(remoteResult) } catch (e: Throwable) { null }
             if (remote != null) {
+                // [fix/audit3-1015 F-10] The image endpoint auto-probe runs in
+                // :modelservice now; its answer rides back on the result and is
+                // persisted HERE, in the process that owns ProviderRepository —
+                // workers must not write SharedPreferences. Read before the error
+                // branch: the cache is valid even when the (follow-up) chat call
+                // then failed.
+                remote.optString("image_endpoint_resolved", "").takeIf { it.isNotEmpty() }?.let { cached ->
+                    com.rikkaminis.app.data.model.ImageEndpointMode.values()
+                        .firstOrNull { it.name == cached }
+                        ?.let { providerRepository.setImageEndpointResolved(instance.id, it) }
+                }
                 val remoteErr = remote.optString("error", "")
                 if (remoteErr.isNotEmpty()) {
                     Log.w(TAG, "remote run failed: $remoteErr")
@@ -412,7 +550,13 @@ class ModelUseOffloadHandler(
                                 .firstOrNull { it.value == m.optString("type", "") }
                                 ?: com.rikkaminis.app.data.model.LLMMediaAttachment.MediaType.IMAGE,
                             mimeType = m.optString("mime_type", "application/octet-stream"),
-                            data = Base64.decode(b64, Base64.DEFAULT),
+                            // [dv21-A06] Tolerant + non-throwing, via the ONE decode
+                            // entry for the offload wire. The bare
+                            // `Base64.decode(b64, Base64.DEFAULT)` here threw an
+                            // IllegalArgumentException on a single malformed
+                            // attachment, which escaped `mapNotNull` and discarded the
+                            // already-generated text reply plus every later attachment.
+                            data = OffloadWireBase64.decode(b64) ?: return@mapNotNull null,
                         )
                     }
                 }
@@ -437,32 +581,29 @@ class ModelUseOffloadHandler(
                     outputPath = outputPath,
                     outputExt = outputExt,
                     request = request,
-                    callWarnings = remoteWarnings,
+                    // [fix/da1015-modeluse-proc] MERGE, not replace. This line
+                    // used to be `callWarnings = remoteWarnings`, which threw
+                    // away every warning collected above — i.e. the ones only
+                    // this process can produce. Local first, then the worker's,
+                    // de-duplicated on first occurrence (both processes run the
+                    // same extra_body parser, so the overlap collapses).
+                    callWarnings = ModelUseProtocol.mergeCallWarnings(callWarnings, remoteWarnings),
                     appliedExtras = remoteExtras,
                 )
             }
             Log.w(TAG, "remote result unparseable — falling back in-process")
         }
-        val imageRouted = tryImageGenerationRoute(
-            entry = entry,
-            instance = instance,
-            provider = provider,
-            inputJson = inputText,
-            fallbackPromptMessages = nonSystem,
-            hasInputImages = imageParts.isNotEmpty(),
-            outputPath = outputPath,
-            outputExt = outputExt,
-            sessionId = request.sessionId,
-            callWarnings = callWarnings,
-        )
-        if (imageRouted != null) return attachCallFeedback(imageRouted, callWarnings, appliedExtras)
-
-        // TF-D: the remote (:modelservice) path was the primary executor but did
-        // not produce a usable result. The app process MUST NOT fall back to an
-        // in-process provider.sendMessage call (its native heap would climb in
-        // the main process — the exact problem this isolation exists to solve).
-        // Surface a structured error so the caller can retry via the gateway /
-        // switch provider / inform the user — no silent in-process fallback.
+        // TF-D: the remote (:modelservice) path IS the executor. The app process
+        // MUST NOT fall back to an in-process provider call — its native heap
+        // would climb in the main process, the exact problem this isolation
+        // exists to solve.
+        //
+        // [fix/audit3-1015 F-10] This is where the CLI-side image route used to
+        // run (`tryImageGenerationRoute`), i.e. the app re-decided image routing
+        // and made an in-process provider.generateImage call whenever the remote
+        // result was missing or unparseable. Routing now has exactly one owner
+        // (`ModelUseProtocol.decideImageRoute`, called by the worker) and the
+        // app never calls a provider, so the fallback is a structured error.
         Log.w(TAG, "remote model-use run produced no usable result — returning structured error")
         return NativeOffloadResult(
             1,
@@ -475,163 +616,16 @@ class ModelUseOffloadHandler(
         )
     }
 
-    /**
-     * [T-android-image-endpoint-mode] Parsed image-generation knobs from the
-     * input JSON top level (native /images/generations shape) with
-     * `generation_config` as a lower-priority fallback. Mirrors iOS
-     * ModelUseOffloadBridge.parseImageGenerationConfig.
-     */
-    private data class ImageGenConfig(
-        val prompt: String? = null,
-        val n: Int = 1,
-        val size: String? = null,
-        val quality: String? = null,
-        val endpointOverride: com.rikkaminis.app.data.model.ImageEndpointMode? = null,
-    )
-
-    private fun parseImageGenConfig(inputJson: String): ImageGenConfig {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return ImageGenConfig()
-
-        var prompt: String? = null
-        var n = 1
-        var size: String? = null
-        var quality: String? = null
-
-        // generation_config first (lower priority).
-        obj.optJSONObject("generation_config")?.let { gc ->
-            val gn = if (gc.has("n")) gc.optInt("n", 1)
-            else if (gc.has("number_of_images")) gc.optInt("number_of_images", 1) else 1
-            n = maxOf(1, gn)
-            size = gc.safeOptString("size", "").ifEmpty { gc.safeOptString("image_size", "").ifEmpty { null } }
-            quality = gc.safeOptString("quality", "").ifEmpty { null }
-        }
-        // Top-level overrides.
-        obj.safeOptString("prompt", "").takeIf { it.isNotEmpty() }?.let { prompt = it }
-        if (obj.has("n")) n = maxOf(1, obj.optInt("n", n))
-        obj.safeOptString("size", "").takeIf { it.isNotEmpty() }?.let { size = it }
-        obj.safeOptString("quality", "").takeIf { it.isNotEmpty() }?.let { quality = it }
-
-        // Endpoint override (image_endpoint / endpoint / generation_config.image_endpoint).
-        val rawEndpoint = obj.safeOptString("image_endpoint", "").ifEmpty {
-            obj.safeOptString("endpoint", "").ifEmpty {
-                obj.optJSONObject("generation_config")?.safeOptString("image_endpoint", "").orEmpty()
-            }
-        }
-        val endpoint = when (rawEndpoint.lowercase()) {
-            "auto" -> com.rikkaminis.app.data.model.ImageEndpointMode.auto
-            "images_generations", "images-generations", "images-gen" ->
-                com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
-            "chat_completions", "chat-completions", "chat" ->
-                com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions
-            else -> null
-        }
-        return ImageGenConfig(prompt, n, size, quality, endpoint)
-    }
-
-    /**
-     * [T-android-model-use-image-passthrough GH#62] Provider-specific extras
-     * forwarded verbatim to the /images/generations request.
-     */
-    private data class ImagePassthrough(
-        val body: Map<String, Any?> = emptyMap(),
-        val headers: Map<String, String> = emptyMap(),
-        val path: String? = null,
-    )
-
-    /**
-     * Keys the handler already interprets itself — never treated as implicit
-     * passthrough body fields, so existing callers' structure/behavior is
-     * unchanged. (Explicit `extra_body` can still re-introduce any of these.)
-     * Mirrors iOS ModelUseOffloadBridge.imageReservedKeys.
-     */
-    private val imageReservedKeys: Set<String> = setOf(
-        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
-        "size", "image_size", "quality", "generation_config", "endpoint",
-        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
-        "stream", "temperature", "max_tokens",
-    )
-
-    /**
-     * [T-android-model-use-image-passthrough GH#62] Parse passthrough extras from
-     * the input JSON. Two complementary modes, both fully optional and additive
-     * (absent → empty, old calls unaffected):
-     *   • Explicit envelope: `extra_body` (object), `extra_headers` (string map),
-     *     `endpoint_path` (string). Unambiguous; recommended in help.
-     *   • Implicit: any TOP-LEVEL key not in [imageReservedKeys] is folded into
-     *     the body — so `{"prompt":..,"image":"data:..","watermark":false}` just
-     *     works for Seedream-style image-to-image without an envelope.
-     * Explicit `extra_body` wins over implicit keys on conflict. Values are kept
-     * as raw org.json types so JSONObject.put() re-serializes them faithfully.
-     * Mirrors iOS ModelUseOffloadBridge.parseImagePassthrough.
-     */
-    private fun parseImagePassthrough(
-        inputJson: String,
-        warnings: MutableList<String> = mutableListOf(),
-    ): ImagePassthrough {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return ImagePassthrough()
-
-        val body = LinkedHashMap<String, Any?>()
-        // Implicit: unknown top-level keys → body.
-        for (key in obj.keys()) {
-            if (key in imageReservedKeys) continue
-            body[key] = obj.opt(key)
-        }
-        // Explicit envelope overrides/augments the implicit keys.
-        // [T-model-use-passthrough-warnings] Type mismatches warn instead of
-        // silently skipping (deduped against the standard-mode parser's copy).
-        obj.opt("extra_body")?.takeIf { it != JSONObject.NULL }?.let { raw ->
-            if (raw is JSONObject) {
-                for (key in raw.keys()) body[key] = raw.opt(key)
-            } else {
-                warnings.add(
-                    "extra_body is not a JSON object (actual type: ${jsonTypeName(raw)}) — ignored. " +
-                        "Wrap your fields in an object: \"extra_body\":{...}.",
-                )
-            }
-        }
-        val headers = LinkedHashMap<String, String>()
-        obj.opt("extra_headers")?.takeIf { it != JSONObject.NULL }?.let { raw ->
-            if (raw is JSONObject) {
-                for (key in raw.keys()) {
-                    val v = raw.opt(key)
-                    if (v is String) {
-                        headers[key] = v
-                    } else {
-                        warnings.add(
-                            "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                                "this header was ignored. Header values must be JSON strings.",
-                        )
-                    }
-                }
-            } else {
-                warnings.add(
-                    "extra_headers is not a JSON object (actual type: ${jsonTypeName(raw)}) — " +
-                        "all custom headers were ignored.",
-                )
-            }
-        }
-        val path = obj.safeOptString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }
-        return ImagePassthrough(body, headers, path)
-    }
+    // [dv14-A4] ISSUE-08: a private `imageReservedKeys` set used to sit here.
+    // It was DEAD — no call site in this file, and the app process no longer
+    // owns the image route (routing has one owner, `decideImageRoute`, called
+    // by the worker) — but it was the second of three copies of the same
+    // 17-key dialect, so the next change to it would have looked authoritative
+    // and gone nowhere. The set lives in [ModelUseProtocol] only; this file
+    // reads the dialect through [ModelUseProtocol.parseImagePassthrough] when
+    // it needs it at all.
 
     // MARK: - Call feedback [T-model-use-passthrough-warnings]
-
-    /** Human-readable JSON type name for warning messages. Mirrors iOS jsonTypeName. */
-    private fun jsonTypeName(v: Any?): String = when (v) {
-        null, JSONObject.NULL -> "null"
-        is String -> "string"
-        is Boolean -> "bool"
-        is Number -> "number"
-        is JSONArray -> "array"
-        is JSONObject -> "object"
-        else -> v.javaClass.simpleName
-    }
 
     /**
      * Append collected `warnings` and `applied_extras` to a result's JSON body.
@@ -664,187 +658,32 @@ class ModelUseOffloadHandler(
         return NativeOffloadResult(result.exitCode, body.toString(2) + "\n")
     }
 
-    // MARK: - Passthrough mode [T-android-model-use-passthrough-mode]
 
-    /**
-     * Explicit passthrough envelope: verbatim body/headers/endpoint, raw
-     * (unparsed) response output. Mirrors iOS ModelUseOffloadBridge.PassthroughSpec.
-     */
-    private data class PassthroughSpec(
-        val active: Boolean = false,
-        val endpoint: String? = null,        // "/abs/path?q" (absolute) or "rel/segment"
-        val method: String = "POST",
-        val headers: Map<String, String> = emptyMap(),
-        val body: Map<String, Any?> = emptyMap(),
-        val bodyMode: String = "merge",      // "merge" | "replace"
-        /** [T-model-use-passthrough-warnings] Ignored/downgraded-field feedback. */
-        val warnings: List<String> = emptyList(),
-    )
-
-    /**
-     * Parse the top-level `passthrough` object into a [PassthroughSpec].
-     * Mirrors iOS ModelUseOffloadBridge.parsePassthroughEnvelope.
-     */
-    private fun parsePassthroughEnvelope(inputJson: String): PassthroughSpec {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return PassthroughSpec()
-
-        val warnings = mutableListOf<String>()
-        val envRaw: Any? = obj.opt("passthrough")
-        val env = envRaw as? JSONObject
-        if (env == null) {
-            // [T-model-use-passthrough-warnings] Exact key absent or wrong
-            // type — surface the two silent failure shapes. Mirrors iOS.
-            if (envRaw != null && envRaw != JSONObject.NULL) {
-                warnings.add(
-                    "Top-level 'passthrough' is not a JSON object (actual type: ${jsonTypeName(envRaw)}) — " +
-                        "it was ignored and this call ran in STANDARD mode. " +
-                        "Expected shape: {\"passthrough\":{\"endpoint\":...,\"body\":{...}}}.",
-                )
-                return PassthroughSpec(warnings = warnings)
-            }
-            val envelopeKeys = setOf("endpoint", "body", "body_mode", "headers", "method")
-            for (key in obj.keys()) {
-                if (key == "passthrough" || key in imageReservedKeys) continue
-                val v = obj.opt(key) as? JSONObject ?: continue
-                val normalized = key.lowercase().replace("_", "").replace("-", "")
-                val looksLikeName = normalized in setOf("passthrough", "passthru", "passthough", "pathrough")
-                val looksLikeShape = v.keys().asSequence().any { it in envelopeKeys }
-                if (looksLikeName || looksLikeShape) {
-                    warnings.add(
-                        "Top-level key '$key' looks like a passthrough envelope, but the exact key " +
-                            "must be lowercase 'passthrough' — it was ignored and this call ran in STANDARD mode.",
-                    )
-                }
-            }
-            return PassthroughSpec(warnings = warnings)
-        }
-
-        var endpoint: String? = null
-        env.opt("endpoint")?.takeIf { it != JSONObject.NULL }?.let { epRaw ->
-            val ep = (epRaw as? String)?.trim()
-            if (!ep.isNullOrEmpty()) {
-                endpoint = ep
-            } else {
-                warnings.add(
-                    "passthrough.endpoint is not a non-empty string (actual type: ${jsonTypeName(epRaw)}) — " +
-                        "ignored; the default chat/completions path was used.",
-                )
-            }
-        }
-        var method = "POST"
-        env.opt("method")?.takeIf { it != JSONObject.NULL }?.let { mRaw ->
-            // PATCH included — provider-native update APIs use it. Mirrors iOS.
-            val allowed = setOf("GET", "POST", "PUT", "DELETE", "PATCH")
-            val m = (mRaw as? String)?.uppercase()
-            if (m != null && m in allowed) {
-                method = m
-            } else {
-                val desc = (mRaw as? String) ?: jsonTypeName(mRaw)
-                warnings.add("method value '$desc' is not supported (supported: GET/POST/PUT/DELETE/PATCH) — sent as POST.")
-            }
-        }
-        val headers = LinkedHashMap<String, String>()
-        env.opt("headers")?.takeIf { it != JSONObject.NULL }?.let { hRaw ->
-            if (hRaw is JSONObject) {
-                for (key in hRaw.keys()) {
-                    val v = hRaw.opt(key)
-                    if (v is String) {
-                        headers[key] = v
-                    } else {
-                        warnings.add(
-                            "passthrough.headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                                "this header was ignored. Header values must be JSON strings.",
-                        )
-                    }
-                }
-            } else {
-                warnings.add(
-                    "passthrough.headers is not a JSON object (actual type: ${jsonTypeName(hRaw)}) — " +
-                        "all custom headers were ignored.",
-                )
-            }
-        }
-        val body = LinkedHashMap<String, Any?>()
-        env.opt("body")?.takeIf { it != JSONObject.NULL }?.let { bRaw ->
-            if (bRaw is JSONObject) {
-                for (key in bRaw.keys()) body[key] = bRaw.opt(key)
-            } else {
-                warnings.add(
-                    "passthrough.body is not a JSON object (actual type: ${jsonTypeName(bRaw)}) — " +
-                        "ignored. Wrap your body fields in an object: \"body\":{...}.",
-                )
-            }
-        }
-        var bodyMode = "merge"
-        env.opt("body_mode")?.takeIf { it != JSONObject.NULL }?.let { bmRaw ->
-            val bm = (bmRaw as? String)?.lowercase()
-            if (bm != null && bm in setOf("merge", "replace")) {
-                bodyMode = bm
-            } else {
-                val desc = (bmRaw as? String) ?: jsonTypeName(bmRaw)
-                warnings.add("body_mode value '$desc' is invalid (only merge/replace are supported) — treated as merge.")
-            }
-        }
-        return PassthroughSpec(true, endpoint, method, headers, bodyMode = bodyMode, body = body, warnings = warnings)
-    }
 
     /**
      * Standard-mode chat `extra_body`: the EXPLICIT envelope only (implicit
      * unknown top-level keys stay image-path-only, per iOS). Values kept as raw
      * org.json types so JSONObject.put re-serializes them faithfully.
      */
-    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return emptyMap()
-        val raw = obj.opt("extra_body")?.takeIf { it != JSONObject.NULL } ?: return emptyMap()
-        val extra = raw as? JSONObject
-        if (extra == null) {
-            // [T-model-use-passthrough-warnings] type-mismatch feedback
-            warnings.add(
-                "extra_body is not a JSON object (actual type: ${jsonTypeName(raw)}) — ignored. " +
-                    "Wrap your fields in an object: \"extra_body\":{...}.",
-            )
-            return emptyMap()
-        }
-        val out = LinkedHashMap<String, Any?>()
-        for (key in extra.keys()) out[key] = extra.opt(key)
-        return out
-    }
+    /**
+     * [fix/audit3-1015 F-04] Delegates to the single shared dialect in
+     * [ModelUseProtocol] (this was the in-process copy the worker's parser was
+     * supposed to mirror; the mirror had drifted). Behavior here is unchanged —
+     * the worker now agrees with it instead of the other way round.
+     */
+    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
+        ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
-    /** Standard-mode `extra_headers` (string map). */
-    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return emptyMap()
-        val raw = obj.opt("extra_headers")?.takeIf { it != JSONObject.NULL } ?: return emptyMap()
-        val hdrs = raw as? JSONObject
-        if (hdrs == null) {
-            warnings.add(
-                "extra_headers is not a JSON object (actual type: ${jsonTypeName(raw)}) — " +
-                    "all custom headers were ignored.",
-            )
-            return emptyMap()
-        }
-        val out = LinkedHashMap<String, String>()
-        for (key in hdrs.keys()) {
-            val v = hdrs.opt(key)
-            if (v is String) {
-                out[key] = v
-            } else {
-                warnings.add(
-                    "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                        "this header was ignored. Header values must be JSON strings.",
-                )
-            }
-        }
-        return out
-    }
+    /**
+     * Standard-mode `extra_headers` (string map).
+     *
+     * [da1019 ISSUE-01] Delegates to the single shared dialect in
+     * [ModelUseProtocol]; the per-process copy here and the one in
+     * `ModelExecutionService` had drifted (the worker dropped a non-object
+     * `extra_headers` without a warning while this side warned).
+     */
+    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
+        ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
 
     /**
      * Parse a CUSTOM absolute endpoint path from top-level `endpoint` /
@@ -852,137 +691,113 @@ class ModelUseOffloadHandler(
      * replacing the entire URL path after scheme+host. Symbolic values
      * (auto/images-gen/chat) return null. Mirrors iOS parseCustomEndpointPath.
      *
-     * Note: on Android these arrive inside the input JSON (not as translated
-     * argv), so unlike iOS there is no rootfs-dataPath prefix to strip — the
-     * value is used verbatim.
+     * [da1019 ISSUE-01] Delegates to [ModelUseProtocol] — the worker's copy of
+     * this parser required nothing of the value, so it accepted a symbolic
+     * endpoint mode as a path.
      */
-    private fun parseCustomEndpointPath(inputJson: String): String? {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return null
-        val raw = obj.safeOptString("image_endpoint", "").ifEmpty { obj.safeOptString("endpoint", "") }
-            .trim()
-        return if (raw.startsWith("/")) raw else null
-    }
+    private fun parseCustomEndpointPath(inputJson: String): String? =
+        ModelUseProtocol.parseCustomEndpointPath(inputJson)
 
     /**
-     * Execute a raw passthrough request and build the metadata result. The
-     * response is NOT parsed — full raw bytes go to --output (or, when
-     * text-decodable and small, inline into the result). An unwritable --output
-     * degrades to inline text + `output_error` instead of failing a call whose
-     * HTTP request already completed. Mirrors iOS performRawPassthrough.
+     * Shape a passthrough reply that :modelservice executed into the CLI
+     * contract. Field names, exit codes, `--output` degradation and warnings
+     * are unchanged from the pre-F-03 in-process version — only the source of
+     * the bytes moved: the worker performs the HTTP call and returns the body
+     * as Base64, and file IO stays here, where session scoping lives.
      */
-    private fun performRawPassthrough(
-        spec: PassthroughSpec,
+    private fun shapeRawPassthrough(
+        spec: ModelUseProtocol.PassthroughSpec,
+        warnings: MutableList<String>,
         entry: ModelEntry,
-        openAI: com.rikkaminis.app.provider.openai.OpenAIProvider,
-        systemPrompt: String?,
-        messages: List<LLMMessage>,
-        maxTokens: Int,
+        remoteResult: String?,
         outputPath: String?,
         sessionId: String?,
     ): NativeOffloadResult {
-        // Baseline body for merge mode: the standard OpenAI-shape conversion
-        // (messages + system + max_tokens), so callers add ONLY their extras.
-        // replace mode: spec.body verbatim (model unlocked — user owns it).
-        val warnings = spec.warnings.toMutableList()
-        val bodyObject: JSONObject? = if (spec.bodyMode == "replace") {
-            if (spec.body.isEmpty()) {
-                // Legit for GET-style calls, but a common symptom of body
-                // content nested at the wrong JSON level — say so. Mirrors iOS.
-                warnings.add(
-                    "body_mode=replace but body is empty or missing — this request was sent with NO body. " +
-                        "If that is not what you intended, check that your fields are nested inside " +
-                        "passthrough.body (not at the top level).",
-                )
-                null
-            } else JSONObject().also {
-                for ((k, v) in spec.body) it.put(k, v ?: JSONObject.NULL)
+        val remote = try { remoteResult?.let { JSONObject(it) } } catch (_: Throwable) { null }
+        val remoteError = remote?.optString("error", "").orEmpty()
+        if (remote == null || remoteError.isNotEmpty()) {
+            val message = when {
+                remoteResult == null -> "model service did not return a result"
+                remote == null -> "model service returned an unparseable result"
+                else -> remote.optString("message", "passthrough request failed")
             }
-        } else {
-            val baseline = JSONObject().put("model", entry.model.id)
-            if (messages.isNotEmpty()) {
-                val arr = JSONArray()
-                if (!systemPrompt.isNullOrEmpty()) {
-                    arr.put(JSONObject().put("role", "system").put("content", systemPrompt))
-                }
-                for (m in messages) {
-                    arr.put(JSONObject().put("role", m.role.value).put("content", m.content))
-                }
-                baseline.put("messages", arr)
-                baseline.put("max_tokens", maxTokens)
-                baseline.put("stream", false)
-            }
-            for ((k, v) in spec.body) baseline.put(k, v ?: JSONObject.NULL)
-            baseline.put("model", entry.model.id)   // merge mode locks model
-            baseline
-        }
-
-        val result = try {
-            runBlocking {
-                openAI.rawPassthroughRequest(
-                    endpoint = spec.endpoint,
-                    method = spec.method,
-                    headers = spec.headers,
-                    bodyObject = bodyObject,
-                )
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "raw passthrough failed: ${e.message}", e)
+            Log.w(TAG, "raw passthrough failed: $message")
             return NativeOffloadResult(
                 1,
-                JSONObject().put("error", "passthrough_failed")
-                    .put("message", e.message ?: "passthrough request failed")
+                JSONObject().put("error", remoteError.ifEmpty { "passthrough_failed" })
+                    .put("message", message)
+                    .also { if (warnings.isNotEmpty()) it.put("warnings", JSONArray(warnings)) }
                     .toString() + "\n",
             )
         }
 
+        val status = remote.optInt("http_status", 0)
+        val url = remote.optString("endpoint_url", "")
+        val contentType = remote.optString("content_type", "").ifEmpty { null }
+        val data: ByteArray = try {
+            Base64.decode(remote.optString("body_b64", ""), Base64.NO_WRAP)
+        } catch (_: Throwable) {
+            ByteArray(0)
+        }
+
         val out = JSONObject()
             .put("passthrough", true)
-            .put("http_status", result.status)
-            .put("content_type", result.contentType ?: JSONObject.NULL)
-            .put("bytes", result.data.size)
-            .put("endpoint_url", result.url)
+            .put("http_status", status)
+            .put("content_type", contentType ?: JSONObject.NULL)
+            .put("bytes", data.size)
+            .put("endpoint_url", url)
             .put("body_mode", spec.bodyMode)
             .put("model_id", entry.model.id)
 
-        if (outputPath != null) {
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
+        if (outputPath != null && PRootKernel.isLinuxPathUnderReadOnlyMount(outputPath)) {
+            // [deep-audit-1016 FIX-C 2b] T219 read-only mount guard — same
+            // contract as tools/FileWriteTool.kt (refuse, never silently write
+            // elsewhere). Keeps the established `output_error` field so the
+            // existing JSON contract (and the tests asserting it) is unchanged;
+            // the body still comes back inline because the provider call itself
+            // succeeded and is not re-runnable for free.
+            out.put(
+                "output_error",
+                "'$outputPath' is inside a read-only mounted folder — nothing was written. " +
+                    "Toggle writability in Settings → Mount External Folders if this is a mistake.",
+            )
+            inlineTextIfPossible(data, out)
+        } else if (outputPath != null) {
+            val hostFile = sessionAwareHostFile(outputPath, sessionId)
             if (hostFile == null) {
                 out.put("output_error", "Could not resolve --output '$outputPath'")
-                inlineTextIfPossible(result.data, out)
+                inlineTextIfPossible(data, out)
             } else {
                 try {
                     hostFile.parentFile?.mkdirs()
-                    hostFile.writeBytes(result.data)
+                    hostFile.writeBytes(data)
                     logModelUseWrite(outputPath, hostFile, sessionId)
                     out.put("output_file", outputPath)
                 } catch (e: Throwable) {
                     // Don't fail the whole call over an unwritable --output — the
                     // request already succeeded. Surface it + fall back to inline.
                     out.put("output_error", "Could not write --output at $outputPath: ${e.message}")
-                    inlineTextIfPossible(result.data, out)
+                    inlineTextIfPossible(data, out)
                 }
             }
         } else {
-            inlineTextIfPossible(result.data, out)
+            inlineTextIfPossible(data, out)
         }
-        if (result.status < 200 || result.status >= 300) {
+        if (status < 200 || status >= 300) {
             out.put(
                 "error_hint",
-                "Provider returned HTTP ${result.status}; the raw response body (output file or inline) is unmodified.",
+                "Provider returned HTTP $status; the raw response body (output file or inline) is unmodified.",
             )
         }
         if (warnings.isNotEmpty()) {
             out.put("warnings", JSONArray(warnings))
         }
-        Log.i(TAG, "[ModelUseRoute] raw-passthrough done status=${result.status} bytes=${result.data.size} url=${result.url} warnings=${warnings.size}")
+        Log.i(TAG, "[ModelUseRoute] raw-passthrough done status=$status bytes=${data.size} url=${LLMRequestLog.redactURL(url)} warnings=${warnings.size}")
         // Non-2xx → non-zero exit code (raw body still delivered), else 0.
-        val code = if (result.status in 200..299) 0 else 1
+        val code = if (status in 200..299) 0 else 1
         return NativeOffloadResult(code, out.toString(2) + "\n")
     }
+
 
     /**
      * Inline a UTF-8-decodable response into the result (truncated at 64KB);
@@ -999,190 +814,6 @@ class ModelUseOffloadHandler(
         }
     }
 
-    /**
-     * [T-android-image-endpoint-mode] Heuristic: does this provider error mean
-     * the /images/generations route doesn't exist on this base URL? Only then
-     * does auto-mode fall back to chat completions — real errors (auth, content
-     * moderation, model-not-found) propagate unchanged. Mirrors iOS
-     * looksLikeEndpointMissing.
-     */
-    private fun looksLikeEndpointMissing(message: String): Boolean {
-        val m = message.lowercase()
-        return m.contains("404") ||
-            m.contains("not found") ||
-            m.contains("no such endpoint") ||
-            m.contains("unknown endpoint") ||
-            m.contains("invalid url") ||
-            m.contains("method not allowed") ||
-            m.contains("unsupported route") ||
-            m.contains("405")
-    }
-
-    /**
-     * [T-android-image-endpoint-mode] Attempt image-output routing through
-     * /v1/images/generations. Returns a completed [NativeOffloadResult] when
-     * the image path produced output, or null to fall through to the normal
-     * chat-completions sendMessage path (chatCompletions mode, auto-fallback,
-     * or "not an image route" — e.g. non-image model / OAuth / non-OpenAI).
-     * Mirrors iOS ModelUseOffloadBridge step 4.
-     */
-    private fun tryImageGenerationRoute(
-        entry: ModelEntry,
-        instance: com.rikkaminis.app.data.model.ProviderInstance,
-        provider: com.rikkaminis.app.provider.LLMProvider,
-        inputJson: String,
-        fallbackPromptMessages: List<ParsedMessage>,
-        hasInputImages: Boolean,
-        outputPath: String?,
-        outputExt: String,
-        sessionId: String?,
-        callWarnings: MutableList<String> = mutableListOf(),
-    ): NativeOffloadResult? {
-        val outputs = entry.model.outputModalities.orEmpty()
-        val wantsImageOutput = "image" in outputs
-        val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
-        // Only OpenAI-compatible API-key instances with an image-output model.
-        if (!wantsImageOutput || openAI == null) return null
-        val pType = instance.providerType
-        if (pType != ProviderType.openAI && pType != ProviderType.openRouter && pType != ProviderType.xAI) return null
-        if (instance.credentialType == com.rikkaminis.app.data.model.ProviderCredential.oauth) return null
-
-        val cfg = parseImageGenConfig(inputJson)
-        val prompt = cfg.prompt
-            ?: fallbackPromptMessages.lastOrNull { it.role == "user" }?.content
-            ?: ""
-
-        // [T-android-model-use-image-passthrough GH#62] Forward arbitrary
-        // provider-specific body fields, an endpoint-path override, and extra
-        // headers straight through to the /images/generations request — lets
-        // callers drive models our fixed schema never modeled (e.g. Volcengine
-        // Seedream image-to-image via the `image` body field) with no persisted
-        // config. Set on the per-call provider so every generateImage call site
-        // below picks them up; nothing leaks across runs (the provider is built
-        // fresh per model-use invocation).
-        val passthrough = parseImagePassthrough(inputJson, callWarnings)
-        openAI.imageExtraBody = passthrough.body
-        openAI.imagePathOverride = passthrough.path
-        openAI.imageExtraHeaders = passthrough.headers
-        if (passthrough.body.isNotEmpty() || passthrough.path != null || passthrough.headers.isNotEmpty()) {
-            Log.i(
-                TAG,
-                "[ModelUseRoute] PASSTHROUGH bodyKeys=[${passthrough.body.keys.sorted().joinToString(",")}] " +
-                    "pathOverride=${passthrough.path ?: "<nil>"} " +
-                    "extraHeaderKeys=[${passthrough.headers.keys.sorted().joinToString(",")}]",
-            )
-        }
-
-        // A pure image generator (image_output but NOT text_output) can ONLY
-        // use the Images API — never let a stale cached chatCompletions pin it
-        // to the chat endpoint (which 401s "Missing scopes"). Mixed text+image
-        // models keep auto/probe/fallback.
-        val isPureImageGenerator = "image" in outputs && "text" !in outputs
-
-        // [T-android-image-endpoint-edit-gap] iOS routes input-image requests to
-        // /v1/images/edits (image-to-image); Android has no editImage endpoint
-        // yet. Rather than silently DROP the input image into a text-to-image
-        // generateImage call (the model would ignore the reference image and
-        // the user wouldn't know), handle the two cases explicitly:
-        //   - mixed text+image model: decline the images route → fall through to
-        //     the chat path below, which forwards imageParts to the model so the
-        //     reference image is at least seen.
-        //   - pure image generator: chat can't serve it, so return a clear error
-        //     telling the caller image editing isn't supported here.
-        if (hasInputImages) {
-            if (isPureImageGenerator) {
-                return NativeOffloadResult(
-                    2,
-                    JSONObject().put("error", "image_edit_not_supported")
-                        .put(
-                            "message",
-                            "Image-to-image editing (input image + ${entry.model.displayName}) is not supported by minis-model-use on Android yet — only text-to-image generation. Omit the input image, or use a model that also supports text output so the image can be passed via chat.",
-                        )
-                        .toString() + "\n",
-                )
-            }
-            Log.i(
-                TAG,
-                "[ModelUseRoute] input images present for ${entry.model.id} — declining images route (no editImage), falling through to chat so images are forwarded",
-            )
-            return null
-        }
-
-        val effectiveMode = when {
-            cfg.endpointOverride != null -> cfg.endpointOverride
-            isPureImageGenerator -> com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
-            instance.imageEndpointMode == com.rikkaminis.app.data.model.ImageEndpointMode.auto &&
-                instance.imageEndpointResolved != null -> instance.imageEndpointResolved!!
-            else -> instance.imageEndpointMode
-        }
-        Log.i(
-            TAG,
-            "[ModelUseRoute] image route model=${entry.model.id} mode=${instance.imageEndpointMode} " +
-                "resolved=${instance.imageEndpointResolved} pure=$isPureImageGenerator override=${cfg.endpointOverride} " +
-                "effective=$effectiveMode",
-        )
-
-        // chatCompletions → no image route; fall through to normal sendMessage.
-        if (effectiveMode == com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions) return null
-
-        // imagesGenerations (forced/cached/pure) → call directly; a failure here
-        // is terminal (no silent fallback) so the caller sees the real error.
-        if (effectiveMode == com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations) {
-            val response = try {
-                runBlocking { openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality) }
-            } catch (e: Throwable) {
-                Log.w(TAG, "[ModelUseRoute] images/generations (forced) failed: ${e.message}", e)
-                val hint = imageParamHint(entry)
-                val base = e.message ?: "image_generation_failed"
-                return NativeOffloadResult(
-                    1,
-                    JSONObject().put("error", "image_generation_failed")
-                        .put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
-                        .toString() + "\n",
-                )
-            }
-            return writeImageResult(entry, response, outputPath, outputExt, "images_generations", sessionId)
-        }
-
-        // auto mode: probe /images/generations; cache the result; on a
-        // route-missing 4xx, cache chatCompletions and fall through to chat.
-        val response = try {
-            runBlocking { openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality) }.also {
-                providerRepository.setImageEndpointResolved(
-                    instance.id, com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations,
-                )
-            }
-        } catch (e: Throwable) {
-            val msg = e.message ?: ""
-            val routeMissing = (e is com.rikkaminis.app.data.model.LLMError.ProviderError ||
-                e is com.rikkaminis.app.data.model.LLMError.InvalidApiKey) && looksLikeEndpointMissing(msg)
-            if (routeMissing) {
-                Log.i(TAG, "[ModelUseRoute] auto probe → route missing (${msg.take(120)}) — caching chat_completions, falling back")
-                providerRepository.setImageEndpointResolved(
-                    instance.id, com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions,
-                )
-                return null // fall through to chat path
-            }
-            // Real error (auth/moderation/network) — surface it, don't fall through.
-            Log.w(TAG, "[ModelUseRoute] auto probe failed (non-route): ${e.message}", e)
-            val hint = imageParamHint(entry)
-            val base = e.message ?: "image_generation_failed"
-            return NativeOffloadResult(
-                1,
-                JSONObject().put("error", "image_generation_failed")
-                    .put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
-                    .toString() + "\n",
-            )
-        }
-        return writeImageResult(entry, response, outputPath, outputExt, "images_generations", sessionId)
-    }
-
-    /**
-     * [T-android-image-endpoint-mode] Write an image-generation [response] to
-     * --output (media-first when the path is an image extension) and build the
-     * standard model-use result JSON. Shared shape with cmdRun's media-write
-     * branch.
-     */
     /**
      * [ModelExecutionService] Shared output writer for both the remote and
      * in-process run paths: media-first if the model returned image/audio/
@@ -1203,8 +834,19 @@ class ModelUseOffloadHandler(
         val ts = System.currentTimeMillis() / 1000
         val modelSlug = entry.model.id.replace("/", "_")
         if (outputPath != null) {
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
+            // [deep-audit-1016 FIX-C 2b] T219 read-only mount guard — refuse
+            // before touching disk (same contract as tools/FileWriteTool.kt).
+            // Exit code 2 matches the neighbouring "cannot resolve --output"
+            // refusal: the established shape for "the --output target could not
+            // be used", which callers already branch on.
+            if (PRootKernel.isLinuxPathUnderReadOnlyMount(outputPath)) {
+                return NativeOffloadResult(
+                    2,
+                    "minis-model-use run: '$outputPath' is inside a read-only mounted folder and cannot be " +
+                        "written — toggle writability in Settings → Mount External Folders\n",
+                )
+            }
+            val hostFile = sessionAwareHostFile(outputPath, sessionId)
                 ?: return NativeOffloadResult(
                     2,
                     "minis-model-use run: cannot resolve --output '$outputPath'\n",
@@ -1231,8 +873,7 @@ class ModelUseOffloadHandler(
                 hostFile.writeText(response.text)
             }
         } else if (response.mediaAttachments.isNotEmpty()) {
-            val attachDir = sessionScopedHostFile("/var/minis/attachments", sessionId)
-                ?: PRootKernel.resolveHostPath("/var/minis/attachments")
+            val attachDir = sessionAwareHostFile("/var/minis/attachments", sessionId)
             if (attachDir != null) {
                 attachDir.mkdirs()
                 for ((idx, media) in response.mediaAttachments.withIndex()) {
@@ -1255,6 +896,16 @@ class ModelUseOffloadHandler(
         val body = JSONObject().apply {
             put("model", entry.model.id)
             put("text", response.text)
+            // [FIX-FW-NONSTREAM C2] The worker already answers with
+            // `stop_reason` (ModelExecutionService) and this handler already
+            // parses it back into LLMResponse — but the JSON the CALLER sees was
+            // rebuilt from scratch here, so the field died one line before the
+            // only place it could be acted on. Result: a `minis-model-use` run
+            // cut at the output ceiling was indistinguishable from a finished
+            // one (the text just stopped), with no way to tell without guessing
+            // from the character count. Null stays absent (a provider that
+            // reports no stop reason must not be given an invented one).
+            response.stopReason?.let { put("stop_reason", it) }
             response.usage?.let { u ->
                 put("usage", JSONObject().apply {
                     put("input_tokens", u.inputTokens)
@@ -1270,99 +921,30 @@ class ModelUseOffloadHandler(
         )
     }
 
-    private fun writeImageResult(
-        entry: ModelEntry,
-        response: com.rikkaminis.app.data.model.LLMResponse,
-        outputPath: String?,
-        outputExt: String,
-        endpointUsed: String,
-        sessionId: String?,
-    ): NativeOffloadResult {
-        val mediaFiles = JSONArray()
-        val firstMedia = response.mediaAttachments.firstOrNull()
-        val ts = System.currentTimeMillis() / 1000
-        val modelSlug = entry.model.id.replace("/", "_")
-        if (outputPath != null) {
-            // [T-android-model-use-session-scoped-write] Session-scoped first,
-            // global resolver as fallback. --output is absolute here (relative
-            // rejected in cmdRun before the API call).
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
-                ?: return NativeOffloadResult(
-                    2,
-                    "minis-model-use run: cannot resolve --output '$outputPath'\n",
-                )
-            val outputIsMedia = isImageExt(outputExt)
-            if (firstMedia != null && outputIsMedia) {
-                hostFile.parentFile?.mkdirs()
-                hostFile.writeBytes(firstMedia.data)
-                logModelUseWrite(outputPath, hostFile, sessionId)
-                mediaFiles.put(JSONObject().apply {
-                    put("type", firstMedia.type.value)
-                    put("mime_type", firstMedia.mimeType)
-                    put("path", outputPath)
-                    put("size", firstMedia.data.size)
-                })
-            } else {
-                hostFile.parentFile?.mkdirs()
-                hostFile.writeText(response.text)
-            }
-        } else if (response.mediaAttachments.isNotEmpty()) {
-            // [T-android-model-use-session-scoped-write] Auto-save to the caller
-            // session's attachments dir, not the global (last-writer-wins) mount.
-            val attachDir = sessionScopedHostFile("/var/minis/attachments", sessionId)
-                ?: PRootKernel.resolveHostPath("/var/minis/attachments")
-            if (attachDir != null) {
-                attachDir.mkdirs()
-                for ((idx, media) in response.mediaAttachments.withIndex()) {
-                    val ext = mimeToExt(media.mimeType)
-                    val fileName = "model-use-$modelSlug-$ts-$idx.$ext"
-                    val hostFile = File(attachDir, fileName)
-                    hostFile.writeBytes(media.data)
-                    val responsePath = "/var/minis/attachments/$fileName"
-                    logModelUseWrite(responsePath, hostFile, sessionId)
-                    mediaFiles.put(JSONObject().apply {
-                        put("type", media.type.value)
-                        put("mime_type", media.mimeType)
-                        put("path", responsePath)
-                        put("size", media.data.size)
-                    })
-                }
-            }
-        }
-        val body = JSONObject().apply {
-            put("model", entry.model.id)
-            put("text", response.text)
-            put("image_endpoint", endpointUsed)
-            if (outputPath != null) put("output_file", outputPath)
-            if (mediaFiles.length() > 0) put("media_files", mediaFiles)
-            if (firstMedia == null) put("warning", "Image endpoint returned no image data.")
-        }
-        return NativeOffloadResult(0, body.toString(2) + "\n")
-    }
-
     /**
      * [T-android-model-use-session-scoped-write] Resolve a `/var/minis/<sub>/...`
-     * Linux path to the caller session's OWN host directory, bypassing the
-     * global (last-writer-wins) PRootKernel.bindMounts map. That global map is
-     * overwritten by ExecutionCoordinator.buildSessionBindMounts on every shell
-     * build, so PRootKernel.resolveHostPath("/var/minis/attachments") returns
-     * whichever session built a shell most recently — a model-use call from
-     * session A could then write into session B's attachments dir while the
-     * response reports the abstract `/var/minis/attachments/...` path, which A's
-     * shell (mounted to A's dir) can't read. Mirrors iOS da4b6c5d, which routes
-     * the write to minisAttachmentsPersistentDir(for: callerSid).
+     * Linux path for THIS call, without ever answering with a different
+     * session's file.
      *
-     * Session-scoped subdirs are attachments/offloads/workspace/browser (see
-     * buildSessionBindMounts). For those, host dir = filesDir/minis-sessions/
-     * <sid>/<sub>/<rest>. Returns null when [sessionId] is null (caller then
-     * falls back to the global resolveHostPath and logs the degrade) or the path
-     * isn't a session-scoped `/var/minis/<sub>` path.
+     * The session-scoped view exists because `PRootKernel.bindMounts` is global
+     * and last-writer-wins: `ExecutionCoordinator.buildSessionBindMounts`
+     * overwrites `/var/minis/attachments` etc. on every shell build, so the
+     * global resolver returns whichever session built a shell most recently — a
+     * model-use call from session A could then write into session B's
+     * attachments dir while the response reports the abstract
+     * `/var/minis/attachments/...` path, which A's shell (mounted to A's dir)
+     * can't read. Mirrors iOS da4b6c5d, which routes the write to
+     * minisAttachmentsPersistentDir(for: callerSid).
+     *
+     * [fix/audit3-1015 F-08] Delegates the decision to
+     * [sessionAwareHostFile], which fails CLOSED: when the call carries a
+     * session id and the path is one of the per-session scopes, a refusal by
+     * the traversal guard is final — it is not re-resolved through the global
+     * resolver (which would search every session tree, then the rootfs). The
+     * global resolver is consulted only when no session view applies at all.
      */
-    private fun sessionScopedHostFile(linuxPath: String, sessionId: String?): File? {
-        if (sessionId == null) return null
-        return sessionScopedJoin(context.filesDir, sessionId, linuxPath)
-    }
+    private fun sessionAwareHostFile(linuxPath: String, sessionId: String?): File? =
+        sessionAwareHostFile(context.filesDir, sessionId, linuxPath) { PRootKernel.resolveHostPath(it) }
 
     /** [T-android-model-use-session-scoped-write] One-line audit of a model-use
      *  write so the response path vs on-disk host path vs session scoping is
@@ -1373,49 +955,6 @@ class ModelUseOffloadHandler(
             "[ModelUseWrite] path=$responsePath hostFile=${hostFile.absolutePath} " +
                 "sessionId=$sessionId globalAttachMount=${PRootKernel.bindMounts["/var/minis/attachments"]}",
         )
-    }
-
-    /**
-     * If [entry] is an image_output model, return a hint listing the params it
-     * actually accepts, so a failed sendMessage tells the caller how to retry.
-     * Empty string for non-image models.
-     */
-    private fun imageParamHint(entry: ModelEntry): String {
-        if ("image" !in entry.model.outputModalities.orEmpty()) return ""
-        val pType = providerRepository.instance(entry.providerInstanceId)?.providerType
-        return when (pType) {
-            ProviderType.gemini -> """
-                Hint — ${entry.model.displayName} is a Gemini image model. Pass image params under `generation_config` in the input JSON:
-                  aspect_ratio       "1:1" | "16:9" | "9:16" | "4:3" | "3:4"
-                  image_size         "512px" | "1K" | "2K" | "4K"
-                  number_of_images   1-4
-                  person_generation  "DONT_ALLOW" | "ALLOW_ADULT"
-                Example:
-                  {"messages":[{"role":"user","content":"<prompt>"}],
-                   "generation_config":{"aspect_ratio":"16:9","image_size":"2K"}}
-            """.trimIndent()
-            ProviderType.openAI, ProviderType.openRouter -> """
-                Hint — ${entry.model.displayName} is an OpenAI-compatible image model. Pass image params at the top level of the input JSON (matches /v1/images/generations):
-                  n         integer, number of images (default 1)
-                  size      "1024x1024" | "1792x1024" | "1024x1792" | etc.
-                  quality   "standard" | "hd"
-                  prompt    string (overrides last user message)
-                Example:
-                  {"prompt":"<prompt>","size":"1792x1024","quality":"hd","n":1}
-
-                Passthrough (topics: image-to-image, extra_body, extra_headers, endpoint_path) — any field our schema doesn't model is forwarded VERBATIM into the /images/generations JSON body, so you can drive provider-specific params (e.g. Volcengine Seedream image-to-image via an `image` field, `watermark`, `tools`). Two ways, both optional & additive:
-                  • implicit: any unknown TOP-LEVEL key → request body
-                  • explicit: `extra_body` (object, merged into body), `extra_headers` (string map, added to request headers), `endpoint_path` (string, overrides "/images/generations" for non-standard endpoints)
-                Your keys win over our defaults; `model` is always forced to the resolved id. If you set `response_format`, the b64_json auto-probe is skipped.
-                Image-to-image example (Seedream — image goes in the BODY, not messages):
-                  {"prompt":"make the eyes blue","image":"data:image/png;base64,<...>","size":"2K","watermark":false}
-                Explicit-envelope example:
-                  {"messages":[{"role":"user","content":"<prompt>"}],"extra_body":{"image":"<url-or-data-uri>","seed":42},"extra_headers":{"X-Custom":"1"},"endpoint_path":"/api/v3/images/generations"}
-            """.trimIndent()
-            // xAI (Grok) / Kimi Coding have no image-output models in the
-            // current catalog — fall through to empty hint like Anthropic.
-            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, null -> ""
-        }
     }
 
     private fun isImageExt(ext: String): Boolean =
@@ -1444,14 +983,18 @@ class ModelUseOffloadHandler(
     private fun resolveEntry(idOrName: String, providerFilter: String? = null): ModelEntry? {
         val all = providerRepository.resolvedAgentLoopEntries()
 
-        // Apply --provider filter first: match against instance label (case-insensitive)
-        // OR instance UUID. Restricts the lookup pool so the same model_id under
-        // multiple providers can be picked unambiguously.
+        // Apply --provider filter first. [dv16-A04] The same single matcher
+        // as list/search — this pool used to match label/id only, so
+        // `--provider OpenAI` (the value list/search print as their JSON
+        // "provider" field) resolved to nothing and run failed with
+        // "model not found". Restricts the lookup pool so the same model_id
+        // under multiple providers can be picked unambiguously.
         val pool = if (providerFilter.isNullOrEmpty()) all else {
-            val pf = providerFilter.lowercase()
             all.filter { entry ->
                 val inst = providerRepository.instance(entry.providerInstanceId)
-                inst != null && (inst.label.lowercase() == pf || inst.id.lowercase() == pf)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
             }
         }
         if (pool.isEmpty()) return null
@@ -1483,9 +1026,6 @@ class ModelUseOffloadHandler(
         return null
     }
 
-    private fun providerInstanceLabel(entry: ModelEntry): String =
-        providerRepository.instance(entry.providerInstanceId)?.label.orEmpty()
-
     private fun entryDict(entry: ModelEntry): JSONObject =
         com.rikkaminis.app.offload.ModelUseManager.entryDict(
             entry,
@@ -1496,22 +1036,30 @@ class ModelUseOffloadHandler(
      * Modality filter: matches iOS behavior. Terms are comma-separated and
      * checked against input/output modality lists. All requested terms must
      * be satisfied for an entry to pass.
+     *
+     * [dv21-A05] The modality lists come from the SAME effective-model resolver
+     * as the payload `list` emits and as the config collection — models.dev
+     * enrichment first, user overrides on top, canonical direction suffixes.
+     * This used to read `entry.model` raw, so `list` advertised `image_input`
+     * for a built-in model (its own path enriched) while
+     * `list --modality image_input` filtered that same model out (this path did
+     * not) — the two halves of one command disagreeing about one entry.
      */
     private fun matchesModality(entry: ModelEntry, filter: String): Boolean {
-        val inputs = entry.model.inputModalities.orEmpty()
-        val outputs = entry.model.outputModalities.orEmpty()
+        val modalities = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
+            .directionalModalities.toSet()
         val required = filter.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
         for (term in required) {
             val ok = when (term) {
-                "text", "text_input" -> "text" in inputs || inputs.isEmpty()
-                "text_output" -> "text" in outputs || outputs.isEmpty()
-                "image", "image_input" -> "image" in inputs
-                "image_output" -> "image" in outputs
-                "audio", "audio_input" -> "audio" in inputs
-                "audio_output" -> "audio" in outputs
-                "video", "video_input" -> "video" in inputs
-                "video_output" -> "video" in outputs
-                "pdf", "pdf_input" -> "pdf" in inputs
+                "text", "text_input" -> "text_input" in modalities
+                "text_output" -> "text_output" in modalities
+                "image", "image_input" -> "image_input" in modalities
+                "image_output" -> "image_output" in modalities
+                "audio", "audio_input" -> "audio_input" in modalities
+                "audio_output" -> "audio_output" in modalities
+                "video", "video_input" -> "video_input" in modalities
+                "video_output" -> "video_output" in modalities
+                "pdf", "pdf_input" -> "pdf_input" in modalities
                 else -> true
             }
             if (!ok) return false
@@ -1519,10 +1067,19 @@ class ModelUseOffloadHandler(
         return true
     }
 
-    private fun readLinuxPath(linuxPath: String, sessionId: String?): String? {
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath) ?: return null
+    // [B14-fix-r14] Relative --input/--system-file paths are resolved against
+    // the guest's cwd — the native_offload protocol forwards the shell's cwd
+    // (NativeOffloadRequest.cwd), so a relative path inherits it instead of
+    // silently dropping onto the rootfs root. The final path still goes
+    // through the same session-aware guard as every other model-use path
+    // (canonicalize + prefix check + fail-closed on refusal) — a hostile cwd
+    // string gets the same containment as an agent-supplied absolute path.
+    // [da1024-I] The join itself lives ONCE in [resolveMaybeRelative] (the
+    // same helper `minis-config`/`browser-use` use) — this file no longer keeps
+    // a private inline copy that could drift from the other handlers.
+    private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
+        val resolved = resolveMaybeRelative(linuxPath, cwd)
+        val hostFile: File = sessionAwareHostFile(resolved, sessionId) ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
     }
@@ -1558,7 +1115,7 @@ class ModelUseOffloadHandler(
      * - `[{"role":"...","content":"..."}, ...]` — array of messages
      * - Plain text → wrapped as a single user message
      */
-    private fun parseMessages(text: String, sessionId: String?): List<ParsedMessage> {
+    private fun parseMessages(text: String, sessionId: String?, cwd: String? = null): List<ParsedMessage> {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return emptyList()
         try {
@@ -1566,10 +1123,10 @@ class ModelUseOffloadHandler(
                 val obj = JSONObject(trimmed)
                 val arr = obj.optJSONArray("messages")
                     ?: return listOf(ParsedMessage("user", trimmed, emptyList()))
-                return parseMessageArray(arr, sessionId)
+                return parseMessageArray(arr, sessionId, cwd)
             }
             if (trimmed.startsWith("[")) {
-                return parseMessageArray(JSONArray(trimmed), sessionId)
+                return parseMessageArray(JSONArray(trimmed), sessionId, cwd)
             }
         } catch (e: ImageInputError) {
             // Deliberate hard errors from block parsing must NOT be swallowed
@@ -1585,7 +1142,7 @@ class ModelUseOffloadHandler(
         return listOf(ParsedMessage("user", trimmed, emptyList()))
     }
 
-    private fun parseMessageArray(arr: JSONArray, sessionId: String?): List<ParsedMessage> {
+    private fun parseMessageArray(arr: JSONArray, sessionId: String?, cwd: String? = null): List<ParsedMessage> {
         val out = mutableListOf<ParsedMessage>()
         for (i in 0 until arr.length()) {
             val m = arr.optJSONObject(i) ?: continue
@@ -1606,7 +1163,7 @@ class ModelUseOffloadHandler(
                             val url = imgObj.optString("url", "").takeIf { it.isNotEmpty() }
                                 ?: continue
                             try {
-                                imgs.add(resolveImageUrl(url, sessionId))
+                                imgs.add(resolveImageUrl(url, sessionId, cwd))
                             } catch (e: ImageInputError) {
                                 // Don't silently drop — surface to the agent so it
                                 // can correct the URL or fall back to text.
@@ -1654,17 +1211,20 @@ class ModelUseOffloadHandler(
      *  - `data:<mime>;base64,<...>` → inline base64
      *  - `file:///<host-path>` → direct host read
      *  - `/var/minis/<scope>/<path>` or `/<abs/linux/path>` → via
-     *    [PRootKernel.resolveHostPath] (which already handles
-     *    `/var/minis/` bind mounts longest-prefix)
+     *    [sessionAwareHostFile] (session-scoped first, global bind mounts for
+     *    paths with no session view, fail-closed on a refused scope path)
+     *  - a relative path → joined onto the guest cwd with [resolveMaybeRelative]
+     *    first, then resolved like an absolute path above (a relative path with
+     *    no absolute cwd stays relative and is rejected below)
      *  - `http(s)://` → throw with a hint to download via shell_execute
      *    first (matches iOS — avoids egressing user content)
-     *  - anything else (relative paths, unknown schemes) → throw
+     *  - anything else (unknown schemes) → throw
      *
      * Throws [ImageInputError] on any unresolvable URL so the CLI exits
      * non-zero with a descriptive message instead of silently feeding
      * the model an image-less request (the prior failure mode).
      */
-    private fun resolveImageUrl(url: String, sessionId: String?): LLMMessage.ImagePart {
+    private fun resolveImageUrl(url: String, sessionId: String?, cwd: String? = null): LLMMessage.ImagePart {
         // data:<mime>;base64,<base64>
         if (url.startsWith("data:")) {
             val rest = url.substring(5)
@@ -1698,14 +1258,14 @@ class ModelUseOffloadHandler(
         val linuxPath = when {
             url.startsWith("file://") -> url.removePrefix("file://")
             url.startsWith("/") -> url
-            else -> throw ImageInputError(
-                "Unsupported image_url '$url'. Use a data: URL, file:///host/path, " +
-                    "/var/minis/<scope>/<path>, or an absolute Linux path."
-            )
+            else -> resolveMaybeRelative(url, cwd).takeIf { it.startsWith("/") }
+                ?: throw ImageInputError(
+                    "Unsupported image_url '$url'. Use a data: URL, file:///host/path, " +
+                        "/var/minis/<scope>/<path>, an absolute Linux path, or a relative path " +
+                        "resolvable against the shell cwd."
+                )
         }
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath)
+        val hostFile: File = sessionAwareHostFile(linuxPath, sessionId)
             ?: throw ImageInputError(
                 "Image file not found at '$url'. Host-absolute paths outside " +
                     "the mounted scopes (/var/minis/*) are not readable from " +
@@ -1775,11 +1335,67 @@ class ModelUseOffloadHandler(
          * would resolve outside the session tree.
          */
         internal fun sessionScopedJoin(filesDir: File, sessionId: String, linuxPath: String): File? {
-            val m = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$").find(linuxPath)
-                ?: return null
+            val m = SESSION_SCOPED_PATH.find(linuxPath) ?: return null
             val base = File(filesDir, "minis-sessions/$sessionId/${m.groupValues[1]}")
             return PRootKernel.safeResolveWithin(base, m.groupValues[2].removePrefix("/"))
         }
+
+        /** `/var/minis/<per-session scope>[/...]` — the same four scopes as
+         *  GuestPathMapper.PER_SESSION_SUBDIRS (attachments/offloads/workspace/browser). */
+        private val SESSION_SCOPED_PATH = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$")
+
+
+        /**
+         * Pure classifier behind [sessionAwareHostFile] — kept here (like
+         * [sessionScopedJoin]) so the three-way decision is host-testable
+         * without a Context. [filesDir] is the app's `filesDir`.
+         *
+         * [deep-audit-1016 FIX-C 2a] Two additions, both on the *raw* string
+         * before any scope match:
+         *
+         *  1. A literal `..` segment is refused outright
+         *     ([hasDotDotSegment]). For a guest-supplied write target a `..` is
+         *     an escape attempt, not a request for the normalized destination —
+         *     FIX-08's decision is that a refusal here is FINAL (never re-asked
+         *     of the global resolver), and silently re-targeting
+         *     `workspace/../browser/c` to `browser/c` would be exactly the
+         *     "normalize an attack into a permission" move this guard exists to
+         *     prevent.
+         *  2. The scope match now runs on the normalized path. Pre-fix the raw
+         *     match meant `/var/minis/./workspace/out.txt` (or
+         *     `//var/minis/workspace/out.txt`) failed the regex, fell through to
+         *     `NotSessionScoped`, and the global resolver wrote the file into
+         *     the ROOTFS placeholder — a ghost the session's own shell cannot
+         *     see, shared with every other session.
+         */
+        internal fun classifySessionPath(filesDir: File, sessionId: String?, linuxPath: String): SessionScopedPathDecision {
+            if (sessionId == null) return SessionScopedPathDecision.NotSessionScoped
+            if (hasDotDotSegment(linuxPath)) return SessionScopedPathDecision.Rejected
+            val normalized = normalizeLinuxPath(linuxPath)
+                ?: return SessionScopedPathDecision.Rejected
+            if (SESSION_SCOPED_PATH.find(normalized) == null) return SessionScopedPathDecision.NotSessionScoped
+            val joined = sessionScopedJoin(filesDir, sessionId, normalized)
+                ?: return SessionScopedPathDecision.Rejected
+            return SessionScopedPathDecision.Resolved(joined)
+        }
+
+        /**
+         * [fix/audit3-1015 F-08] Resolve a Linux path to a host file for a call
+         * that may carry a session id, with the global resolver injected so the
+         * "was it consulted?" question is testable (a [SessionScopedPathDecision.Rejected]
+         * path must NOT consult it).
+         */
+        internal fun sessionAwareHostFile(
+            filesDir: File,
+            sessionId: String?,
+            linuxPath: String,
+            globalResolve: (String) -> File?,
+        ): File? = when (val d = classifySessionPath(filesDir, sessionId, linuxPath)) {
+            is SessionScopedPathDecision.Resolved -> d.file
+            SessionScopedPathDecision.NotSessionScoped -> globalResolve(linuxPath)
+            SessionScopedPathDecision.Rejected -> null
+        }
+
         private const val TAG = "ModelUseOffload"
         private const val NO_MODELS_HINT =
             "No models available. Go to Settings > Model Groups to add models that the agent can use."
@@ -1818,16 +1434,27 @@ class ModelUseOffloadHandler(
 Usage:
   minis-model-use list [--provider <name>] [--modality <mod>]
   minis-model-use search <query> [--provider <name>] [--modality <mod>]
-  minis-model-use run --model <id_or_name> [--provider <label_or_id>]
+  minis-model-use run --model <id_or_name> [prompt] [--provider <label_or_id>]
                       [--input <path>] [--output <path>]
                       [--system <text>] [--system-file <path>]
                       [--max-tokens N] [--temperature F]
+
+  NOTE: stdin is NOT read — the native_offload protocol has no stdin
+  channel. Pass the prompt as a positional argument (run --model <id> 'text')
+  or write it to a file and pass --input <path>.
 
 Run model selection:
   --model accepts: model_id, display name, entry_id (UUID), OR the qualified
   form `<instance_label>/<model_id>` (e.g. `deepseek/deepseek-v4-flash`) to
   disambiguate when the same model_id is configured under multiple providers.
   Equivalently, pass `--model <model_id> --provider <instance_label>`.
+
+Provider matching (--provider on list/search/run):
+  --provider matches (case-insensitive, exact) the instance label, its id,
+  or the provider type name (e.g. `OpenAI`, `Anthropic`) — the values
+  `list`/`search` print as `instance_label` / `provider_type` in their JSON.
+  A value that matches none of the three faces filters to zero rows (run
+  reports "not found") rather than falling back to unfiltered results.
 
 Input format (OpenAI Chat Completions JSON — the ONLY input format):
   Standard fields (messages, system, temperature, max_tokens,
@@ -1912,11 +1539,99 @@ Examples:
   minis-model-use list --modality image_input
   minis-model-use search gemini
   minis-model-use run --model claude-sonnet-4-6 --input /var/minis/workspace/prompt.json
-  minis-model-use run --model deepseek/deepseek-v4-flash --input msgs.json   # qualified form
+  minis-model-use run --model deepseek/deepseek-v4-flash --input msgs.json   # relative: resolved against the shell's cwd
   minis-model-use run --model deepseek-v4-flash --provider deepseek --input msgs.json   # equivalent
-  echo 'What is 2+2?' | minis-model-use run --model gpt-4o
+  minis-model-use run --model gpt-4o 'What is 2+2?'
   minis-model-use run --model gemini-2.5-flash --system 'You are a poet' \
                       --input msgs.json --output /var/minis/workspace/out.txt
+  minis-model-use run --model gpt-image-1 'a red panda' \
+                      --output file:///var/minis/workspace/panda.png   # file:// accepted, scheme stripped
 """
     }
 }
+
+/**
+ * [fix/audit3-1015 F-08] What a path means for THIS call. The three
+ * cases are the fix; collapsing any two of them reintroduces the bug.
+ *
+ *  - [Resolved]         session-scoped shape, traversal guard passed → use it.
+ *  - [NotSessionScoped] no session view applies (no sessionId, or the path
+ *                       is not one of the per-session scopes, e.g. `/tmp/x`
+ *                       or `/var/minis/shared/...`) → the global resolver
+ *                       is the honest answer and stays in use.
+ *  - [Rejected]         session-scoped SHAPE, refused by the guard (a `..`
+ *                       climb above the scope base, or a symlink pointing
+ *                       out of the session tree) → there is no legitimate
+ *                       second opinion.
+ *
+ * Why [Rejected] must not fall back: the global resolver searches every
+ * `minis-sessions/<id>/<scope>` tree for a file that exists and then the
+ * rootfs. So a path session A was refused could come back as session B's
+ * same-named file (a cross-session read the caller never asked for), or
+ * as a rootfs placeholder that the guest's mount makes invisible (a write
+ * that silently goes nowhere). Either way the containment decision the
+ * guard just made is overruled by a resolver that knows less.
+ */
+internal sealed class SessionScopedPathDecision {
+    class Resolved(val file: File) : SessionScopedPathDecision()
+    object NotSessionScoped : SessionScopedPathDecision()
+    object Rejected : SessionScopedPathDecision()
+}
+
+/**
+ * [dv16-A04] The single `--provider` matcher: one decision shared by `list`,
+ * `search` and `run` (resolveEntry). The three subcommands used to answer
+ * `--provider` differently — list matched model.provider/label as a
+ * case-sensitive substring, search never read the option despite its help
+ * line, and run resolved label/id exactly — so an agent reading `list`'s
+ * JSON and replaying its "provider" field into `run` could hit
+ * "model not found", and `search --provider x` silently returned other
+ * providers' models.
+ *
+ * Semantics: case-insensitive EXACT match (trim + lowercase) against the
+ * provider instance's label, its id, or the provider type's display name.
+ * Those are the three faces a caller can obtain verbatim: "instance_label" /
+ * "provider_type" from the `list`/`search` output, the instance UUID from
+ * `minis-config get models`, and the type name from the settings UI. An
+ * OpenAI-type instance's display name is "OpenAI", the same string the
+ * output prints as its "provider" field — so the read-then-replay workflow
+ * now round-trips. `list`'s old substring match was the historical
+ * coincidence, not a contract; exact is the explainable answer and the same
+ * rule `run` has always used (extended to the type name).
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps.
+ */
+internal fun providerMatches(query: String, label: String, id: String, typeName: String): Boolean {
+    val q = query.trim().lowercase()
+    if (q.isEmpty()) return false
+    return label.trim().lowercase() == q ||
+        id.trim().lowercase() == q ||
+        typeName.trim().lowercase() == q
+}
+
+/** `file://` scheme as it arrives on a `minis-model-use` path argument. */
+private const val FILE_URL_SCHEME = "file://"
+
+/**
+ * [meta1028-D2 F-02] Strip a leading `file://` scheme so `--output` reaches the
+ * path-semantics consumers (`isLinuxPathUnderReadOnlyMount`,
+ * `sessionAwareHostFile` → `PRootKernel.resolveHostPath`) as a real absolute
+ * Linux path.
+ *
+ * Why stripping alone is the whole fix: the guard, the session classifier and
+ * the rootfs fallback all call `normalizeLinuxPath`, which treats a string that
+ * does not START with `/` as RELATIVE — `file:///var/minis/x` became
+ * `file:/var/minis/x`, which matches neither the read-only-mount prefix nor the
+ * session-scope regex, so the write fell through to
+ * `<rootfs>/file:/var/minis/...` while the response claimed the original URL.
+ *
+ * Deliberately NOT percent-decoding: the path is foreign input with no in-repo
+ * `file://` constructor, and decoding would corrupt files literally named
+ * `%XX` (FIX-FILEURL-CONTRACT §7-R2 — same reasoning, same decision).
+ *
+ * Anything without the scheme is returned untouched (idempotent on plain
+ * paths), and `file://` is only recognized at the START: a path that merely
+ * CONTAINS it is a filenames problem, not a URL.
+ */
+internal fun stripFileUrlScheme(raw: String): String =
+    if (raw.startsWith(FILE_URL_SCHEME)) raw.removePrefix(FILE_URL_SCHEME) else raw

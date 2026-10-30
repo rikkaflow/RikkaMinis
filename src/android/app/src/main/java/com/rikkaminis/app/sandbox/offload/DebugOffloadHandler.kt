@@ -53,7 +53,8 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
-        val args = OffloadArgs(request.argv.drop(1), booleanFlags = BOOLEAN_FLAGS)
+        val raw = request.argv.drop(1)
+        val args = OffloadArgs(raw, booleanFlags = BOOLEAN_FLAGS)
         if (request.argv.size <= 1 || args.hasFlag("h", "help") && args.positional.isEmpty()) {
             return NativeOffloadResult(if (request.argv.size <= 1) 2 else 0, HELP)
         }
@@ -66,14 +67,71 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
             return NativeOffloadResult(0, HELP)
         }
 
-        val sub = args.positional.getOrNull(0)
+        // [da1028-A] A second, structural view of the same argv: globals /
+        // subcommand / the subcommand's own verbatim tail. `args` above is a
+        // GREEDY parse (every `-`-prefixed token anywhere is one of ITS flags),
+        // which is right for this command's own options and wrong for the
+        // pass-through subcommands — see [splitArgv].
+        val argv = splitArgv(raw)
+
+        val sub = argv.subcommand
             ?: return NativeOffloadResult(2, HELP)
 
         val rpc: RpcCall = try {
-            buildRpcCall(sub, args)
+            buildRpcCall(sub, args, argv.rawRest)
         } catch (e: BadArgsException) {
             return NativeOffloadResult(2, "minis-debug $sub: ${e.message}\n")
         }
+
+        // [da1031-C] ISSUE-04 B2: ls/read/write used to forward the raw
+        // positional as `path`, so a relative token reached the RPC handler and
+        // was joined onto the ROOTFS ROOT (`File(rootfsDir, path)`), not the
+        // session cwd — `minis-debug write notes.txt` landed at `/notes.txt`.
+        // Every sibling handler (Config / BrowserUse / ModelUse / Player) runs
+        // the same pure join before its resolver; keep the same instance-wide
+        // reading here. Done as a post-pass on the built RpcCall (buildRpcCall's
+        // signature and call site are pinned by offload_cli_args_check D7/D8 —
+        // do not inline this into it).
+        normalizeDebugRpcPaths(sub, rpc.params, request.cwd)
+
+        // [dv16-A03] ls/read/write are session-scoped in the PRoot layout:
+        // workspace/attachments/offloads/browser are PER-SESSION bind mounts,
+        // and the RPC handler's global resolveHostPath searches EVERY session
+        // tree then the rootfs placeholder — a session-relative
+        // `minis-debug ls .` (joined onto the caller's cwd above) would
+        // list/read/write another session's file, or a new file would vanish
+        // into the rootfs ghost dir the session shell cannot see. Forward the
+        // caller's session id so DebugRPCHandler resolves through
+        // resolvePathForSession (session hit ⇒ never falls back globally).
+        // Only the file-system subcommands carry it: `call` keeps its raw
+        // params verbatim, and a null session (interactive terminal) keeps
+        // the historical global behaviour in the handler's sessionId==null arm.
+        if (sub in SESSION_SCOPED_SUBCOMMANDS && !request.sessionId.isNullOrBlank()) {
+            rpc.params.put("sessionId", request.sessionId)
+        }
+
+        // [dv18-A05] `model-use` is session-scoped for the same reason
+        // ls/read/write are: ModelUseOffloadHandler joins a relative
+        // `--input` / `--system-file` onto request.cwd and resolves the join
+        // through the session-aware resolver — but this forwarder only ever
+        // sent the bare argv, so the RPC side rebuilt the request with
+        // cwd = "/" and no session, and `minis-debug model-use run --input
+        // notes.txt` resolved against the guest root instead of the caller's
+        // directory. The raw `call` escape hatch keeps its params verbatim
+        // and `shizuku` stays device-level: which subcommands carry the scope
+        // is [execScopeParams]'s decision, not an ad-hoc check here.
+        execScopeParams(sub, request.sessionId, request.cwd).forEach { (key, value) ->
+            rpc.params.put(key, value)
+        }
+
+        // [da1028-A] Output shaping for the pass-through subcommands reads the
+        // GLOBAL slice only (tokens before the subcommand): everything after
+        // `exec` / `shizuku` / `model-use` belongs to the child process, so a
+        // `-q` meant for the child (`minis-debug exec grep -q x`) must not strip
+        // this command's envelope. Every other subcommand keeps the historical
+        // whole-argv view (`minis-debug ls /sdcard --compact`).
+        val outArgs =
+            if (sub in PASSTHROUGH_SUBCOMMANDS) OffloadArgs(argv.globals, BOOLEAN_FLAGS) else args
 
         return try {
             val response = postJsonRpc(rpc.method, rpc.params)
@@ -85,27 +143,27 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
             val isError = obj?.has("error") == true
             NativeOffloadResult(
                 if (isError) 1 else 0,
-                OffloadOutput.formatBody(response, args) + "\n",
+                OffloadOutput.formatBody(response, outArgs) + "\n",
             )
         } catch (e: ConnectionRefused) {
             val body = JSONObject()
                 .put("error", "debug_server_unreachable")
                 .put("message", "Debug server not running on 127.0.0.1:5321. Is this a debug build?")
                 .toString()
-            NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+            NativeOffloadResult(1, OffloadOutput.formatBody(body, outArgs) + "\n")
         } catch (e: SocketTimeoutException) {
             val body = JSONObject()
                 .put("error", "debug_server_timeout")
                 .put("message", "Debug server did not respond within ${TIMEOUT_MS / 1000}s.")
                 .toString()
-            NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+            NativeOffloadResult(1, OffloadOutput.formatBody(body, outArgs) + "\n")
         } catch (e: Throwable) {
             Log.w(TAG, "uncaught: ${e.message}", e)
             val body = JSONObject()
                 .put("error", "internal")
                 .put("message", e.message ?: e.javaClass.simpleName)
                 .toString()
-            NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+            NativeOffloadResult(1, OffloadOutput.formatBody(body, outArgs) + "\n")
         }
     }
 
@@ -114,8 +172,17 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
     private data class RpcCall(val method: String, val params: JSONObject)
     private class BadArgsException(msg: String) : RuntimeException(msg)
 
-    private fun buildRpcCall(sub: String, args: OffloadArgs): RpcCall {
-        val rest = args.positional.drop(1)
+    // [dv16-A03] The subcommands whose `path` operand resolves through the
+    // per-session bind mounts (workspace/attachments/offloads/browser). Pass-
+    // through subcommands (`exec`/`shizuku`/`model-use`) and the raw `call`
+    // escape hatch are not path-scoped to the caller's session.
+    private val SESSION_SCOPED_SUBCOMMANDS = setOf("ls", "read", "write")
+
+    private fun buildRpcCall(sub: String, args: OffloadArgs, rawRest: List<String>): RpcCall {
+        // [da1028-A] `rest` is the argv slice this subcommand owns — for the
+        // pass-through subcommands that is the VERBATIM tail (see
+        // [forwardedArgv]), not the leftovers of the greedy parse.
+        val rest = forwardedArgv(sub, args, rawRest)
         return when (sub) {
             "discover" -> RpcCall("rpc.discover", JSONObject())
 
@@ -157,8 +224,7 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
             "exec" -> {
                 if (rest.isEmpty()) throw BadArgsException("missing <command...>")
-                val command = rest.joinToString(" ")
-                RpcCall("debug.shellExecute", JSONObject().put("command", command))
+                RpcCall("debug.shellExecute", JSONObject().put("command", execCommandLine(rest)))
             }
 
             // Android-only debug-build methods, exposed because they live
@@ -318,6 +384,95 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
          */
         private val BOOLEAN_FLAGS = setOf("recursive", "base64")
 
+        /**
+         * [da1028-A] Subcommands whose own argv is forwarded verbatim to a
+         * child process (or another CLI). For these, everything after the
+         * subcommand token belongs to the child — see [splitArgv] /
+         * [forwardedArgv].
+         */
+        private val PASSTHROUGH_SUBCOMMANDS = setOf("exec", "shizuku", "model-use", "modelUse")
+
+        /** [da1028-A] See [splitArgv]. */
+        internal data class DebugArgvSplit(
+            val globals: List<String>,
+            val subcommand: String?,
+            val rawRest: List<String>,
+        )
+
+        /**
+         * [da1028-A] Structural split of `request.argv.drop(1)`:
+         * `[globals…] <subcommand> [tail…]`.
+         *
+         * The greedy [OffloadArgs] view treats every `-`-prefixed token
+         * ANYWHERE as one of this command's own flags, and pairs `--key value`
+         * across the whole invocation. That is right for options this command
+         * owns (`--offset`, `--limit`, …) and wrong for the pass-through
+         * subcommands, where the tail is another program's argv:
+         * `minis-debug exec ls -l` lost the `-l` (it became this command's
+         * boolean flag "l") and the child ran a bare `ls`, and
+         * `minis-debug model-use run --model x` lost the whole `--model x`
+         * pair (it became this command's `--model` option). Neither failure is
+         * visible in the reply — the child just runs something slightly
+         * different from what was typed.
+         *
+         * `globals` (tokens before the subcommand) is what the output-shaping
+         * flags are read from for those subcommands, so a `-q` that belongs to
+         * the child (`exec grep -q x`) cannot strip this command's envelope.
+         * The subcommand is the first token that is neither an option this
+         * command owns nor the VALUE of one — the prefix is walked with the
+         * same `--key value` pairing [OffloadArgs] uses, so the historical
+         * `minis-debug --args '["pm","list"]' shizuku` ordering still finds
+         * `shizuku` instead of mistaking the JSON for a subcommand. A leading
+         * `--` is dropped as the end-of-options marker, and a `--` opening the
+         * tail is dropped too (`exec -- grep -v x` runs `grep -v x`); neither
+         * is ever the subcommand.
+         */
+        internal fun splitArgv(tokens: List<String>): DebugArgvSplit {
+            val globals = mutableListOf<String>()
+            var i = 0
+            while (i < tokens.size) {
+                val t = tokens[i]
+                if (t == "--") { i++; break }
+                if (!t.startsWith("-")) break
+                globals.add(t)
+                val isLong = t.startsWith("--")
+                val key = if (isLong) t.substring(2).substringBefore('=') else null
+                val carriesInlineValue = isLong && t.contains('=')
+                // Same rule as [OffloadArgs]: an undeclared `--key` takes the
+                // next token as its value unless that token is itself an
+                // option. The value is global, not the subcommand.
+                val takesNextValue = isLong && !carriesInlineValue &&
+                    key !in BOOLEAN_FLAGS && key !in OffloadOutput.OUTPUT_FLAGS &&
+                    i + 1 < tokens.size && !tokens[i + 1].startsWith("-")
+                if (takesNextValue) {
+                    globals.add(tokens[i + 1])
+                    i++
+                }
+                i++
+            }
+            if (i >= tokens.size) return DebugArgvSplit(globals, null, emptyList())
+            val tail = tokens.subList(i + 1, tokens.size).toList()
+            val rest = if (tail.firstOrNull() == "--") tail.drop(1) else tail
+            return DebugArgvSplit(globals, tokens[i], rest)
+        }
+
+        /**
+         * [da1028-A] The argv slice a subcommand may build its RPC from: the
+         * verbatim tail for the pass-through set, this command's parsed
+         * positionals (minus the subcommand token) for everything else.
+         */
+        internal fun forwardedArgv(
+            sub: String,
+            args: OffloadArgs,
+            rawRest: List<String>,
+        ): List<String> = if (sub in PASSTHROUGH_SUBCOMMANDS) rawRest else args.positional.drop(1)
+
+        /**
+         * [da1028-A] `exec`'s command line: the verbatim tail joined with single
+         * spaces (lang-exec semantics — the child's own shell splits it again).
+         */
+        internal fun execCommandLine(argv: List<String>): String = argv.joinToString(" ")
+
         private const val HELP = """minis-debug — CLI for the in-app DebugServer JSON-RPC (debug builds only)
 
 Usage:
@@ -357,6 +512,13 @@ EXAMPLES:
   minis-debug exec uname -a
   minis-debug call debug.logs.list --params '{}'
 
+PASS-THROUGH ARGUMENTS:
+  Everything after `exec` / `shizuku` / `model-use` is forwarded VERBATIM to the
+  child: `minis-debug exec grep -q x` runs `grep -q x`, and `-q` is the child's
+  flag, not this command's. Put global options BEFORE the subcommand
+  (`minis-debug --compact exec ls`). A leading `--` is dropped as the
+  end-of-options marker (`minis-debug exec -- grep -v x` runs `grep -v x`).
+
 The handler talks to 127.0.0.1:$DEBUG_SERVER_PORT (DebugServer). If the server
 isn't running you'll see `debug_server_unreachable` — Release builds don't
 ship this command at all.
@@ -367,4 +529,70 @@ included). The handler reads it from the same file the server uses
 configuration needed.
 """
     }
+}
+
+/**
+ * [da1031-C] Subcommands whose single positional IS a file path — the only ones
+ * `normalizeDebugRpcPaths` may rewrite (see there for why).
+ */
+internal val DEBUG_PATH_SUBCOMMANDS = setOf("ls", "read", "write")
+
+/**
+ * [da1031-C] Relative → absolute join for a `ls` / `read` / `write` positional:
+ * `null` when this subcommand takes no path positional, or the caller omitted
+ * it (such a call keeps the RPC default — resolve against the resolved cwd /
+ * rootfs — which is what `minis-debug ls` with no argument relies on). Pure
+ * String→String? so the subcommand scoping and the pass-through cases are
+ * JVM-testable without an RPC round trip.
+ */
+internal fun debugPathFor(sub: String, rawPath: String, cwd: String): String? =
+    if (sub in DEBUG_PATH_SUBCOMMANDS && rawPath.isNotEmpty()) {
+        resolveMaybeRelative(rawPath, cwd)
+    } else null
+
+/**
+ * [da1031-C] ISSUE-04 B2 — post-pass over the built RPC params: `ls` / `read` /
+ * `write` take a path positional, and a RELATIVE one used to reach
+ * DebugRPCHandler verbatim, where it was joined onto the rootfs ROOT instead of
+ * the session cwd. Normalizing here keeps DebugRPCHandler's own contract
+ * (absolute paths only) intact while making the CLI behave like every sibling
+ * handler (Config / BrowserUse / ModelUse / Player) — they all route file args
+ * through [resolveMaybeRelative], so the same relative token reads the same
+ * file from the same instance.
+ */
+internal fun normalizeDebugRpcPaths(sub: String, params: JSONObject, cwd: String) {
+    val normalized = debugPathFor(sub, params.optString("path"), cwd) ?: return
+    params.put("path", normalized)
+}
+
+/**
+ * [dv18-A05] Subcommands whose forwarded RPC call must carry the caller's
+ * session scope. `model-use` resolves its `--input` / `--system-file`
+ * operands through the same session-aware resolver as ls/read/write, so a
+ * relative operand has to join onto the caller's cwd, not the guest root.
+ *
+ * `call` is deliberately absent: its params are the caller's, verbatim.
+ * `shizuku` drives a device-level privileged shell where the guest cwd has
+ * no meaning. `exec` maps to `debug.shellExecute`, which owns its own
+ * `session` parameter.
+ */
+internal val EXEC_SCOPE_SUBCOMMANDS = setOf("model-use", "modelUse")
+
+/**
+ * [dv18-A05] The params a forwarded exec call adds for [sub]: the caller's
+ * session id (only when present — a session-less interactive terminal keeps
+ * the handler's global arm) and the cwd its relative operands resolve
+ * against. Every other subcommand gets an empty map, so `call` stays
+ * exactly as the caller wrote it.
+ *
+ * Pure String→Map so the membership decision and the blank-value handling
+ * are JVM-testable without an RPC round trip (the same reason
+ * [debugPathFor] is top-level).
+ */
+internal fun execScopeParams(sub: String, sessionId: String?, cwd: String?): Map<String, String> {
+    if (sub !in EXEC_SCOPE_SUBCOMMANDS) return emptyMap()
+    val scope = LinkedHashMap<String, String>()
+    if (!sessionId.isNullOrBlank()) scope["sessionId"] = sessionId
+    if (!cwd.isNullOrBlank()) scope["cwd"] = cwd
+    return scope
 }

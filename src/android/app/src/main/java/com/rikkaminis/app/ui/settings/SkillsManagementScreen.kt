@@ -23,9 +23,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,13 +37,9 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.IosShare
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Inventory2
-import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.outlined.ChatBubble
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material3.AlertDialog
@@ -57,9 +50,10 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import com.rikkaminis.app.ui.components.DialogTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -85,7 +79,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.res.stringResource
@@ -126,6 +119,10 @@ fun SkillsManagementScreen(
     var showAddMenu by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
     val context = LocalContext.current
+    // [deep-audit-1039 B-05] Scope for the repository writes the list screen
+    // triggers (delete confirm): they are disk/DB work and must not run on the
+    // Main thread, same rule the import sheet below follows.
+    val scope = rememberCoroutineScope()
 
     // Sort preference — persisted like the file browser's (SharedPreferences,
     // default name ascending). Mirrors iOS skillsList.sortKey/sortAscending.
@@ -152,8 +149,18 @@ fun SkillsManagementScreen(
     // the active chat (e.g. via shell `git clone` into skillsDir, which
     // bypasses the SKILL.md file_write hook) is picked up the moment the
     // user opens this list, instead of requiring a process restart.
+    // [fix/da1032-e] reloadFromDisk() re-scans the SQLite registry AND walks
+    // skillsDir on disk (SkillRepository.loadAll: rawQuery + per-row
+    // parseSkillMdOnDisk + listFiles). Doing that inline in LaunchedEffect ran
+    // the whole scan on the Main dispatcher every time the screen appeared —
+    // the Settings-screen jank/ANR shape [audit-1032 ISSUE-06]. Same treatment
+    // the paste-import branch below already uses: keep the call, move its
+    // thread. The StateFlow update inside is thread-safe, and nothing after
+    // this effect reads the result synchronously.
     LaunchedEffect(Unit) {
-        skillRepository.reloadFromDisk()
+        withContext(Dispatchers.IO) {
+            skillRepository.reloadFromDisk()
+        }
     }
 
     SettingsScaffold(
@@ -304,7 +311,19 @@ fun SkillsManagementScreen(
                                 Spacer(Modifier.width(8.dp))
                                 Switch(
                                     checked = skill.isEnabled,
-                                    onCheckedChange = { skillRepository.setEnabled(skill.id, it) },
+                                    // [deep-audit-1039 B-05] setEnabled is a
+                                    // SQLite UPDATE (+ a StateFlow rewrite of
+                                    // the list): off Main like every other
+                                    // repository write on this screen. The row
+                                    // re-renders through the `skills` flow the
+                                    // screen already collects.
+                                    onCheckedChange = { enabled ->
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                skillRepository.setEnabled(skill.id, enabled)
+                                            }
+                                        }
+                                    },
                                 )
                             }
                         },
@@ -369,7 +388,18 @@ fun SkillsManagementScreen(
             text = { Text(stringResource(R.string.skill_delete_confirm_text)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    deleteSkillId?.let { skillRepository.delete(it) }
+                    // [deep-audit-1039 B-05] skillRepository.delete does two
+                    // SQLite DELETEs plus a recursive directory walk — running
+                    // it inline on the click (Main) froze the list for the
+                    // whole delete. Same treatment the import sheet and the
+                    // detail-page delete already use: keep the call, move its
+                    // thread. The StateFlow update inside is thread-safe and
+                    // the row disappears through the collectAsState above.
+                    deleteSkillId?.let { id ->
+                        scope.launch {
+                            withContext(Dispatchers.IO) { skillRepository.delete(id) }
+                        }
+                    }
                     deleteSkillId = null
                 }) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
             },
@@ -381,6 +411,32 @@ fun SkillsManagementScreen(
 }
 
 // ─── Import Sheet (3 modes: URL / Paste / File) ─────────────────────────────
+
+/**
+ * [FIX-R22 B32a] Zip magic-byte sniff, shared by the import sheet
+ * (SkillImportSheet) and the detail-page update launcher (SkillDetailScreen)
+ * — the detail path used to lack any archive recognition, so picking a
+ * .zip/.skill to refresh an existing skill piped the raw bytes through
+ * readText() into garbage UTF-8 and surfaced as "Invalid SKILL.md".
+ *
+ * PK\x03\x04 = standard ZIP local file header; PK\x05\x06 is the
+ * empty-archive EOCD; PK\x07\x08 is a spanned/split archive. Accept all
+ * three so split exports from less-common zip tools don't fall into the
+ * text path. URI may not preserve the filename extension (some
+ * DocumentsProviders / share targets strip it), so magic-byte sniffing is
+ * more reliable than `.zip` / `.skill` checks. Pure — JVM-covered.
+ */
+internal fun isZipArchiveBytes(bytes: ByteArray): Boolean =
+    bytes.size >= 4 &&
+        bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
+        (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte())
+
+// [deep-audit-1045 B-07] `readUriBytes` lived here and ran a bare
+// `use { it.readBytes() }` — the picked bundle went into the heap whole before
+// `isZipArchiveBytes` could sniff it, so the 32 MiB expanded-size guard in
+// `SkillRepository.readZipEntries` never got a chance to matter. The bounded
+// replacement is `readSafBytes` in SafImportRead.kt (one cap, queried SIZE as a
+// cheap early reject, and a hard stop one byte past the cap).
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -402,63 +458,79 @@ private fun SkillImportSheet(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
+        // [F-13] The file tab had NO busy gate: loading a bundle reads up to
+        // MAX_SKILL_IMPORT_BYTES and may unzip it on IO while the sheet stayed
+        // fully interactive, so a second tap on "Choose File" started a second
+        // import that raced the first. `importFromContent` then hit the
+        // already-inserted id and the loser reported the *content* error
+        // ("invalid SKILL.md") for what was really "that one is still
+        // importing". Same single-flight flag the URL / paste rows disable
+        // their submit button with; it now also paints the button label.
+        if (isLoading) return@rememberLauncherForActivityResult
+        isLoading = true
         // [T6-M5] Reading a skill bundle (scripts/ + references/ + assets/) and
         // unzipping it ran on the activity-result callback thread (Main), so a
         // large import froze the sheet for its whole duration. Read + parse on
         // IO and apply the outcome back on Main.
         scope.launch {
-            var failure: String? = null
-            val imported = withContext(Dispatchers.IO) {
-                try {
-                    // [T-android-skill-import-zip] Read raw bytes so we can branch on
-                    // file magic. The previous code piped the InputStream straight
-                    // through `bufferedReader().readText()`, which corrupted any
-                    // .zip / .skill bundle into garbage UTF-8 and surfaced as
-                    // "Invalid SKILL.md content". Skills shared as bundles
-                    // (scripts/, references/, assets/) are the common case on iOS;
-                    // matching here aligns Android with iOS
-                    // `SkillsManagementView.documentPicker` + `SkillStore.importFromArchive`.
-                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            // [F-13] Failure text is a resource lookup, not an English literal
+            // (the four literals that used to live here showed English in every
+            // locale). Resolved inside the IO block through `context.getString`
+            // so the outcome stays a single value — the old `var failure: String?`
+            // was a shared mutable cell written on IO and read on Main.
+            val failure: String? = try {
+                withContext(Dispatchers.IO) {
+                    // [T-android-skill-import-zip] [FIX-R22 B32a] Byte read +
+                    // zip-magic sniff now live in the shared helpers
+                    // (readUriBytes / isZipArchiveBytes) so the detail-page
+                    // update launcher below reuses the same recognition
+                    // instead of a diverging copy.
+                    //
+                    // [deep-audit-1045 B-07] …and the read is bounded: the
+                    // picked bundle used to go into the heap whole. A refused
+                    // pick is reported as "too large", not as a read failure.
+                    val read = readSafBytes(context.contentResolver, uri, MAX_SKILL_IMPORT_BYTES)
+                    val bytes = (read as? SafRead.Ok)?.bytes
                     if (bytes == null) {
-                        failure = "Failed to read file"
-                        false
-                    } else {
-                        // PK\x03\x04 = standard ZIP local file header; PK\x05\x06 is the
-                        // empty-archive EOCD; PK\x07\x08 is a spanned/split archive. Accept
-                        // all three so split exports from less-common zip tools don't fall
-                        // into the text path. URI may not preserve the filename extension
-                        // (some DocumentsProviders / share targets strip it), so magic-byte
-                        // sniffing is more reliable than `.zip` / `.skill` checks.
-                        val isZip = bytes.size >= 4 &&
-                            bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
-                            (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte())
-                        if (isZip) {
-                            val result = skillRepository.importFromArchive(
-                                java.io.ByteArrayInputStream(bytes),
-                            )
-                            if (result != null) {
-                                true
-                            } else {
-                                failure = "Invalid skill archive — no SKILL.md found at the root or one directory deep"
-                                false
-                            }
+                        // safTooLargeText is the shared wording of the helper
+                        // that produced the refusal (its own i18n follow-up is
+                        // registered separately, outside this batch's file set).
+                        return@withContext if (read is SafRead.TooLarge) {
+                            safTooLargeText(MAX_SKILL_IMPORT_BYTES)
                         } else {
-                            val content = String(bytes, Charsets.UTF_8)
-                            val result = skillRepository.importFromContent(content, SkillRepository.ImportSource.FILE)
-                            if (result != null) {
-                                true
-                            } else {
-                                failure = "Invalid SKILL.md content"
-                                false
-                            }
+                            context.getString(R.string.skill_file_error_read)
                         }
                     }
-                } catch (e: Exception) {
-                    failure = "Failed to read file: ${e.message}"
-                    false
+                    if (isZipArchiveBytes(bytes)) {
+                        val result = skillRepository.importFromArchive(
+                            java.io.ByteArrayInputStream(bytes),
+                        )
+                        if (result == null) {
+                            return@withContext context.getString(R.string.skill_file_error_archive)
+                        }
+                        return@withContext null
+                    }
+                    val content = String(bytes, Charsets.UTF_8)
+                    val result = skillRepository.importFromContent(content, SkillRepository.ImportSource.FILE)
+                    if (result == null) {
+                        return@withContext context.getString(R.string.skill_import_error_format)
+                    }
+                    return@withContext null
                 }
+            } catch (e: Exception) {
+                // The throwable's own message is data, not prose: only the
+                // frame is localized.
+                context.getString(
+                    R.string.skill_file_error_detail,
+                    e.message ?: e.javaClass.simpleName,
+                )
             }
-            if (imported) onDismiss() else errorText = failure ?: "Failed to read file"
+            // [F-13] `isLoading` is cleared on the MAIN side of the launch and
+            // never inside the IO block: the sheet owns the flag, and a flag
+            // flipped from a background thread is a cross-thread state write
+            // (the read-modify-write shape this repo pins elsewhere).
+            isLoading = false
+            if (failure == null) onDismiss() else errorText = failure
         }
     }
 
@@ -524,8 +596,17 @@ private fun SkillImportSheet(
                     )
                     MinisTextButton(
                         onClick = { fileLauncher.launch("*/*") },
+                        // [F-13] Disabled while an import is in flight — the
+                        // label doubles as the progress indicator the file tab
+                        // never had (the other two tabs only disable Submit).
+                        enabled = !isLoading,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text(stringResource(R.string.skill_import_file_button)) }
+                    ) {
+                        Text(
+                            if (isLoading) stringResource(R.string.skill_import_in_progress)
+                            else stringResource(R.string.skill_import_file_button),
+                        )
+                    }
                 }
             }
 
@@ -552,7 +633,14 @@ private fun SkillImportSheet(
                                             // sibling python scripts never made it to local storage.
                                             val result = skillRepository.importFromGitHub(urlText.trim())
                                             if (result != null) onDismiss() else errorText = context.getString(R.string.skill_import_error_invalid)
-                                        } catch (e: Exception) { errorText = "Error: ${e.message}" }
+                                        } catch (e: Exception) {
+                                            // [F-13] localized frame; the
+                                            // throwable message stays as data.
+                                            errorText = context.getString(
+                                                R.string.skill_file_error_detail,
+                                                e.message ?: e.javaClass.simpleName,
+                                            )
+                                        }
                                         finally { isLoading = false }
                                     }
                                 }
@@ -564,10 +652,24 @@ private fun SkillImportSheet(
                                             // disk IO, so it must not run on the Main thread (ANR), and
                                             // an exception must be caught, not propagated out of a click
                                             // handler (crash).
-                                            val result = skillRepository.importFromContent(pasteContent)
+                                            // [fix/da1023-E] The comment asked for the mirror; the
+                                            // code never had it — parse + SQLite write + SKILL.md write
+                                            // all ran on Main (the URL tab above already wraps in
+                                            // withContext(Dispatchers.IO)). Same wrap now; catch /
+                                            // finally / error copy unchanged.
+                                            val result = withContext(Dispatchers.IO) {
+                                                skillRepository.importFromContent(pasteContent)
+                                            }
                                             if (result != null) onDismiss()
                                             else errorText = context.getString(R.string.skill_import_error_format)
-                                        } catch (e: Exception) { errorText = "Error: ${e.message}" }
+                                        } catch (e: Exception) {
+                                            // [F-13] localized frame; the
+                                            // throwable message stays as data.
+                                            errorText = context.getString(
+                                                R.string.skill_file_error_detail,
+                                                e.message ?: e.javaClass.simpleName,
+                                            )
+                                        }
                                         finally { isLoading = false }
                                     }
                                 }
@@ -612,7 +714,28 @@ fun SkillDetailScreen(
     // affordances and avoids the layout jiggle the inline OutlinedTextField
     // caused on a row that's otherwise quiet.
     var showEditNameDialog by remember { mutableStateOf(false) }
-    var editName by remember { mutableStateOf(skill.name) }
+    // Keys [skill.id, skill.name]: this screen re-resolves `skill` from the
+    // repository StateFlow, so the SAME composition can see skill.name change
+    // (an agent / CLI edit to the SKILL.md frontmatter is re-synced into the
+    // row by loadAll → SkillMetadataSync.reconcile, and the post-tool hook
+    // fires reloadFromDisk while this screen is open). The dialog drafts from
+    // skill.name at first composition, so an un-keyed remember handed the
+    // dialog the pre-edit name: confirming the rename wrote the OLD name back
+    // over the external edit (snapshot deadlock, [audit-1032 ISSUE-06]).
+    // Cross-skill staleness is NOT the path here — each skill detail is its own
+    // nav entry (composable(SKILL_DETAIL) per skillId), so it gets a fresh
+    // composition; skill.id is keyed anyway as the "keys the source" anchor.
+    var editName by remember(skill.id, skill.name) { mutableStateOf(skill.name) }
+    // [F-13] The rename used to be fire-and-forget: the click closed the dialog
+    // and dropped `skillRepository.update`'s Boolean, so a write that returned
+    // false (the id is no longer in the repository — the skill was deleted or
+    // reloaded out from under this detail screen) looked exactly like a
+    // successful rename that silently did nothing. Two states fix that shape:
+    // `isRenaming` is the busy gate (the write rewrites SKILL.md, so a
+    // double-tap must not fire two of them) and `renameError` is shown inline
+    // while the dialog STAYS OPEN so the user can retry or cancel.
+    var isRenaming by remember(skill.id, skill.name) { mutableStateOf(false) }
+    var renameError by remember(skill.id, skill.name) { mutableStateOf<String?>(null) }
 
     // T154: replace stub state. Each update action drives `updateStatus` which
     // surfaces inline feedback ("Updating…" / stringResource(R.string.skill_detail_updated) / "Failed: …") next to
@@ -635,30 +758,105 @@ fun SkillDetailScreen(
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         updateStatus = UpdateStatus.InProgress(context.getString(R.string.skill_detail_status_reading))
-        try {
-            val content = context.contentResolver.openInputStream(uri)
-                ?.bufferedReader()?.use { it.readText() }
-            if (content.isNullOrBlank()) {
-                updateStatus = UpdateStatus.Failed(context.getString(R.string.skill_detail_error_empty))
-            } else {
-                // Re-parse the supplied SKILL.md so we can push name +
-                // description + body into the existing skill record without
-                // creating a new entry.
-                val parsed = skillRepository.parseSkillMdPublic(content)
-                if (parsed == null) {
-                    updateStatus = UpdateStatus.Failed(context.getString(R.string.skill_detail_error_invalid))
-                } else {
-                    val ok = skillRepository.update(
-                        id = skill.id,
-                        name = parsed.name,
-                        description = parsed.description,
-                        body = parsed.body,
+        // [FIX-R22 B32a] Reading + parsing + the repository write all do disk
+        // IO; they used to run inline on the activity-result callback thread
+        // (Main), so a large update froze the screen — same fix as
+        // SkillImportSheet [T6-M5]. Read + parse on IO, apply the outcome
+        // back on Main.
+        scope.launch {
+            var failureRes: Int? = null
+            var failureMsg: String? = null
+            val ok = withContext(Dispatchers.IO) {
+                try {
+                    val read = readSafBytes(context.contentResolver, uri, MAX_SKILL_IMPORT_BYTES)
+                    val bytes = (read as? SafRead.Ok)?.bytes
+                    when {
+                        bytes == null -> {
+                            // [deep-audit-1045 B-07] Bounded now; an oversized
+                            // bundle gets its own wording.
+                            // [F-13] Same family as the import sheet: the
+                            // refusal wording stays in the shared helper
+                            // (its own i18n follow-up is registered
+                            // separately); everything else is a resource.
+                            if (read is SafRead.TooLarge) {
+                                failureMsg = safTooLargeText(MAX_SKILL_IMPORT_BYTES)
+                            } else {
+                                failureRes = R.string.skill_file_error_read
+                            }
+                            false
+                        }
+                        // [FIX-R22 B32a] A .zip/.skill bundle used to be piped
+                        // through readText() into garbage UTF-8 and surfaced as
+                        // "Invalid SKILL.md". Route archives through the shared
+                        // magic-byte sniff + importFromArchive with the
+                        // existing skill's id as preferredId — it replaces the
+                        // record in place and extracts bundled siblings
+                        // (scripts/, references/) alongside it.
+                        isZipArchiveBytes(bytes) -> {
+                            val result = skillRepository.importFromArchive(
+                                java.io.ByteArrayInputStream(bytes),
+                                preferredId = skill.id,
+                            )
+                            if (result != null) {
+                                true
+                            } else {
+                                failureRes = R.string.skill_file_error_archive
+                                false
+                            }
+                        }
+                        else -> {
+                            val content = String(bytes, Charsets.UTF_8)
+                            if (content.isBlank()) {
+                                failureRes = R.string.skill_detail_error_empty
+                                false
+                            } else {
+                                // Re-parse the supplied SKILL.md so we can push
+                                // name + description + body into the existing
+                                // skill record without creating a new entry.
+                                val parsed = skillRepository.parseSkillMdPublic(content)
+                                if (parsed == null) {
+                                    failureRes = R.string.skill_detail_error_invalid
+                                    false
+                                } else {
+                                    skillRepository.update(
+                                        id = skill.id,
+                                        name = parsed.name,
+                                        description = parsed.description,
+                                        body = parsed.body,
+                                        // [fix/audit-1015-b4-3] Carry the parsed
+                                        // version: the update() signature supports
+                                        // it but it was never passed, so a file
+                                        // update kept the old version string.
+                                        version = parsed.version,
+                                        // [fix/da1023-E] Same contract as
+                                        // updateFromURL: the picked document's
+                                        // frontmatter travels with the managed
+                                        // fields, so `subagent` / `max_turns` /
+                                        // `allowed_tools` land instead of being
+                                        // shadowed by whatever was on disk.
+                                        frontmatter = parsed.frontmatter.ifBlank { null },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Only the frame is localized; the throwable's message is
+                    // data.
+                    failureMsg = context.getString(
+                        R.string.skill_file_error_detail,
+                        e.message ?: e.javaClass.simpleName,
                     )
-                    updateStatus = if (ok) UpdateStatus.Done else UpdateStatus.Failed(context.getString(R.string.skill_detail_error_update_failed))
+                    false
                 }
             }
-        } catch (e: Exception) {
-            updateStatus = UpdateStatus.Failed("Failed to read file: ${e.message ?: "unknown"}")
+            updateStatus = if (ok) {
+                UpdateStatus.Done
+            } else if (failureRes != null) {
+                UpdateStatus.Failed(context.getString(failureRes!!))
+            } else {
+                UpdateStatus.Failed(failureMsg ?: context.getString(R.string.skill_detail_error_update_failed))
+            }
         }
     }
 
@@ -854,10 +1052,23 @@ fun SkillDetailScreen(
             // Re-list whenever the skill record changes (rescan/update bumps
             // updatedAt, so newly-extracted scripts appear without leaving the
             // screen).
-            val skillFiles = remember(skill.id, skill.updatedAt) {
-                skillRepository.listSkillFiles(skill.id)
-                    .ifEmpty { listOf("SKILL.md") }
+            // [deep-audit-1039 B-05] listSkillFiles is a synchronous
+            // walkTopDown() over the skill's directory — it used to run inside
+            // this remember, i.e. on the composition thread of every
+            // recomposition keyed on (skill.id, skill.updatedAt). Same shape
+            // and same fix as the sibling-file read below ([dv14-B5]): the walk
+            // rides a LaunchedEffect + withContext(Dispatchers.IO), and the
+            // rendered list derives from the loaded base (empty until the walk
+            // lands, which renders as an empty Files section for a few frames).
+            var loadedSkillFiles by remember(skill.id, skill.updatedAt) {
+                mutableStateOf<List<String>?>(null)
             }
+            LaunchedEffect(skill.id, skill.updatedAt) {
+                loadedSkillFiles = withContext(Dispatchers.IO) {
+                    skillRepository.listSkillFiles(skill.id).ifEmpty { listOf("SKILL.md") }
+                }
+            }
+            val skillFiles = loadedSkillFiles ?: emptyList()
             DetailSection(header = "Files") {
                 skillFiles.forEachIndexed { index, relativePath ->
                     if (index > 0) DetailDivider()
@@ -905,9 +1116,17 @@ fun SkillDetailScreen(
             confirmButton = {
                 MinisTextButton(onClick = {
                     deleted = true
-                    skillRepository.delete(skill.id)
-                    showDeleteDialog = false
-                    onBack()
+                    // [deep-audit-1039 B-05] delete = two SQLite DELETEs plus a
+                    // recursive directory walk; it ran inline on the click
+                    // (Main) here. Same treatment as the list-screen confirm and
+                    // the import sheet: move the thread, keep the sequence
+                    // (`deleted` first so the row stops re-resolving, then the
+                    // repository call, then the pop).
+                    scope.launch {
+                        withContext(Dispatchers.IO) { skillRepository.delete(skill.id) }
+                        showDeleteDialog = false
+                        onBack()
+                    }
                 }) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
@@ -925,24 +1144,52 @@ fun SkillDetailScreen(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             title = { Text(stringResource(R.string.skill_detail_edit_name_title)) },
             text = {
-                // ime-ok: host is an AlertDialog (independent Window,
-                // decorFitsSystemWindows=true -> SOFT_INPUT_ADJUST_UNSPECIFIED),
-                // so the platform pans/resizes to keep this single-line field
-                // visible; the bare Scaffold's missing IME inset does not apply.
-                // Not user-reported; re-verify on device before changing.
-                DialogTextField(
-                    value = editName,
-                    onValueChange = { editName = it },
-                    singleLine = true,
-                )
+                Column {
+                    // ime-ok: host is an AlertDialog (independent Window,
+                    // decorFitsSystemWindows=true -> SOFT_INPUT_ADJUST_UNSPECIFIED),
+                    // so the platform pans/resizes to keep this single-line field
+                    // visible; the bare Scaffold's missing IME inset does not apply.
+                    // Not user-reported; re-verify on device before changing.
+                    DialogTextField(
+                        value = editName,
+                        onValueChange = { editName = it; renameError = null },
+                        singleLine = true,
+                    )
+                    if (renameError != null) {
+                        Text(
+                            text = renameError!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
+                }
             },
             confirmButton = {
                 val trimmed = editName.trim()
-                val canSave = trimmed.isNotEmpty() && trimmed != skill.name
+                val canSave = trimmed.isNotEmpty() && trimmed != skill.name && !isRenaming
                 MinisTextButton(
                     onClick = {
-                        if (canSave) skillRepository.update(skill.id, name = trimmed)
-                        showEditNameDialog = false
+                        // [deep-audit-1039 B-05] update() re-reads the on-disk
+                        // SKILL.md frontmatter, writes the DB row and rewrites
+                        // SKILL.md — all of it ran on the Main thread on this
+                        // click. Wrap like the update-from-file launcher above
+                        // ([FIX-R22 B32a]); the refreshed row arrives through the
+                        // StateFlow the screen already collects.
+                        // [F-13] …and the result decides the exit: a `false`
+                        // (id gone from the repository) keeps the dialog open
+                        // with the reason instead of closing as if it worked.
+                        if (canSave) {
+                            isRenaming = true
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    skillRepository.update(skill.id, name = trimmed)
+                                }
+                                isRenaming = false
+                                if (ok) showEditNameDialog = false
+                                else renameError = context.getString(R.string.skill_detail_error_update_failed)
+                            }
+                        }
                     },
                     enabled = canSave,
                 ) { Text(stringResource(R.string.skill_file_save)) }
@@ -1132,6 +1379,18 @@ private fun relativeTime(millis: Long): String {
 
 // ─── Skill File Viewer Screen (full page, matching iOS) ─────────────────────
 
+// [dv14-B5] Pure single source for what the file viewer shows and what the
+// Edit button seeds: SKILL.md renders the in-memory frontmatter merge (the
+// lambda runs only in that case — the disk copy is never read for SKILL.md);
+// a sibling file renders the asynchronously loaded disk base (blank until the
+// read lands). Extracted so the isSkillMd × loaded matrix is JVM-testable.
+internal fun skillFileViewerBase(
+    isSkillMd: Boolean,
+    mergedFrontmatter: () -> String,
+    loadedDiskBase: String?,
+): String =
+    if (isSkillMd) mergedFrontmatter() else loadedDiskBase ?: ""
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SkillFileViewerScreen(
@@ -1152,31 +1411,98 @@ fun SkillFileViewerScreen(
     val isSkillMd = relativePath.equals("SKILL.md", ignoreCase = true)
     val fileName = relativePath.substringAfterLast('/')
 
+    // [dv14-B5] The sibling-file disk read moved off the composition thread,
+    // mirroring MemoryFileEditScreen ([deep-audit-1029 ISSUE-03]): the read
+    // rides a `withContext(Dispatchers.IO)` inside a `LaunchedEffect`, and
+    // `initialContent` derives from the loaded base. Keyed on the path (not
+    // updatedAt) so an out-of-band edit never blanks the base for the frames
+    // before the re-read lands; a skill/path switch does reset it, and
+    // `isLoaded` re-arms in the same breath.
+    var loadedDiskBase by remember(skillId, relativePath) { mutableStateOf<String?>(null) }
+
     // For SKILL.md, reconstruct from the in-memory record (so frontmatter
-    // edits stay in sync with DB metadata). For sibling files, read straight
-    // from disk.
-    val initialContent = remember(skillId, relativePath, skill.updatedAt) {
-        if (isSkillMd) {
-            buildString {
-                appendLine("---")
-                appendLine("name: ${skill.name}")
-                appendLine("version: ${skill.version}")
-                if (skill.description.isNotEmpty()) {
-                    appendLine("description: ${skill.description}")
-                }
-                appendLine("---")
-                appendLine()
-                append(skill.body)
-            }
-        } else {
-            skillRepository.readSkillFile(skillId, relativePath) ?: ""
-        }
+    // edits stay in sync with DB metadata). For sibling files the disk read
+    // used to run inside this remember — i.e. synchronously on the
+    // composition thread of every recomposition ([dv14-B5]) — so the remember
+    // now derives from the asynchronously loaded base (blank until the read
+    // lands, which renders harmlessly in the read-only viewer).
+    val initialContent = remember(skillId, relativePath, skill.updatedAt, loadedDiskBase) {
+        skillFileViewerBase(
+            isSkillMd = isSkillMd,
+            mergedFrontmatter = {
+                // [fix/da1023-E] Reconstruct through the repository's single merge
+                // exit instead of hand-splicing a 3-key block here. The splice was
+                // the READ half of the same bug as the write-side polarity
+                // inversion: it showed only name / version / description, so the
+                // block an edit handed back carried none of the extended keys and
+                // the editor could neither add nor delete one (and it rendered a
+                // literal "null" version for a skill whose row had none). Passing
+                // skill.frontmatter — the block loadAll read from disk and
+                // rescanFromDisk refreshes — through mergeFrontmatter makes the
+                // screen render byte-for-byte what writeSkillMd would write.
+                SkillRepository.mergeFrontmatter(
+                    existing = skill.frontmatter.ifBlank { null },
+                    name = skill.name,
+                    description = skill.description,
+                    version = skill.version ?: "1.0.0",
+                    body = skill.body,
+                )
+            },
+            loadedDiskBase = loadedDiskBase,
+        )
     }
 
     var isEditing by remember { mutableStateOf(false) }
-    var editContent by remember(skillId, relativePath) { mutableStateOf(initialContent) }
+    // Key [skill.updatedAt] added [fix/da1032-e]: initialContent re-derives
+    // from skill.updatedAt, but this remember didn't — so an out-of-band edit
+    // (agent file_write / shell sed while this screen is open) bumped
+    // updatedAt, initialContent recomputed fresh, and editContent kept the
+    // pre-edit snapshot forever (editor snapshot deadlock, [audit-1032
+    // ISSUE-06]); a same-path sibling edit also leaked into a freshly opened
+    // editor. key1/key2 line literals are pinned by
+    // skill_frontmatter_roundtrip_check.py / skill_file_save_result_check.py
+    // — keys were appended, prefixes untouched.
+    // [dv17-4] Key [loadedDiskBase] appended for the same reason one level up
+    // the chain: `initialContent` re-derives from it too (the async
+    // sibling-file read [dv14-B5] moved off the composition thread), yet this
+    // remember didn't carry it — so an out-of-band edit landing while the
+    // editor was OPEN left `initialContent` showing NEW_TEXT while
+    // `editContent` stayed frozen on the pre-read snapshot, and Save wrote
+    // that stale text back over the external write (silent rollback). The two
+    // seed-derived remembers now carry the same key set;
+    // skill_import_offmain_check.py asserts they stay aligned. `loadedDiskBase`
+    // itself deliberately keeps its (skillId, relativePath) keys (not
+    // updatedAt) — see the note at its declaration.
+    var editContent by remember(skillId, relativePath, skill.updatedAt, loadedDiskBase) { mutableStateOf(initialContent) }
+
+    // [dv14-B5] `isLoaded` gates the Edit button: a tap before the read lands
+    // would open the editor against a blank base and a Save could overwrite
+    // the real file with "" (the seed comes from `initialContent` below).
+    // Deliberately a single flag (no state machine); keyed on the same triple
+    // as the content remembers so any key change re-arms the gate.
+    var isLoaded by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(isSkillMd) }
+    LaunchedEffect(skillId, relativePath, skill.updatedAt) {
+        if (isSkillMd) return@LaunchedEffect
+        loadedDiskBase = withContext(Dispatchers.IO) {
+            skillRepository.readSkillFile(skillId, relativePath) ?: ""
+        }
+        isLoaded = true
+    }
+
+    // [fix/da1021-issue06] Save failures used to be silently discarded: the
+    // return values of importFromContent / writeSkillFile were dropped and the
+    // screen unconditionally popped, destroying the user's edits (a broken
+    // SKILL.md frontmatter made importFromContent return null without writing
+    // anything). Consume the result, run the write off the main thread, and
+    // surface a snackbar on failure instead of leaving the screen.
+    var isSaving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val invalidFormatMsg = stringResource(R.string.skill_detail_error_invalid)
+    val updateFailedMsg = stringResource(R.string.skill_detail_error_update_failed)
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text(fileName) },
@@ -1188,21 +1514,50 @@ fun SkillFileViewerScreen(
                 actions = {
                     if (isEditing) {
                         MinisTextButton(onClick = {
-                            if (isSkillMd) {
-                                // SKILL.md edits go through importFromContent so
-                                // YAML frontmatter changes flow back into DB metadata.
-                                skillRepository.importFromContent(editContent, skill.importSource)
-                            } else {
-                                skillRepository.writeSkillFile(skillId, relativePath, editContent)
+                            if (isSaving) return@MinisTextButton
+                            isSaving = true
+                            val contentToSave = editContent
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    if (isSkillMd) {
+                                        // SKILL.md edits go through importFromContent so
+                                        // YAML frontmatter changes flow back into DB metadata.
+                                        // [fix/audit-1015-b4-2] Pin the preferred id to the
+                                        // skill being edited: without it a renamed SKILL.md
+                                        // saved here resolved to a fresh slugify id and was
+                                        // added as a duplicate instead of refreshing the
+                                        // existing entry.
+                                        skillRepository.importFromContent(
+                                            contentToSave,
+                                            skill.importSource,
+                                            preferredId = skillId,
+                                        ) != null
+                                    } else {
+                                        skillRepository.writeSkillFile(skillId, relativePath, contentToSave)
+                                    }
+                                }
+                                isSaving = false
+                                if (ok) {
+                                    isEditing = false
+                                    onBack()
+                                } else {
+                                    snackbarHostState.showSnackbar(
+                                        if (isSkillMd) invalidFormatMsg else updateFailedMsg,
+                                    )
+                                }
                             }
-                            isEditing = false
-                            onBack()
                         }) { Text(stringResource(R.string.skill_file_save)) }
                     } else {
-                        MinisTextButton(onClick = {
-                            editContent = initialContent
-                            isEditing = true
-                        }) { Text(stringResource(R.string.skill_file_edit)) }
+                        // [dv14-B5] Gated on the async read: `initialContent`
+                        // is the loaded disk base, so entering before the read
+                        // lands would edit an empty base.
+                        MinisTextButton(
+                            enabled = isLoaded,
+                            onClick = {
+                                editContent = initialContent
+                                isEditing = true
+                            },
+                        ) { Text(stringResource(R.string.skill_file_edit)) }
                     }
                 },
             )

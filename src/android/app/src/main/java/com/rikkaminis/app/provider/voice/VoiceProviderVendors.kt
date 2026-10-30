@@ -1,7 +1,8 @@
 package com.rikkaminis.app.provider.voice
 
 import android.util.Base64
-import android.util.Log
+import com.rikkaminis.app.provider.applyUserAgentOverride
+import com.rikkaminis.app.provider.gemini.GeminiBasePath
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -187,7 +188,17 @@ class DoubaoVoiceProvider(providerId: String, baseUrl: String, apiKey: String?) 
         val out = ByteArrayOutputStream()
         for (line in String(raw, Charsets.UTF_8).split('\n')) {
             val frame = runCatching { JSONObject(line) }.getOrNull() ?: continue
-            if (frame.optInt("code", -1) != 0) continue
+            // [r3-b08 F-12] A non-zero `code` frame is the server REPORTING A
+            // FAILURE (bad speaker/resource id, quota, mid-stream timeout).
+            // `continue` swallowed it: the stream then ended "normally" and a
+            // half-synthesised clip was returned as a success, so the caller had
+            // no way to fall over to another voice and the user just heard the
+            // first half of the sentence. Xunfei (same file) throws for exactly
+            // this case. `code` defaults to 0: the audio frames are the ones
+            // that may carry no code field at all.
+            doubaoFrameError(frame.optInt("code", 0), frame.optString("message", ""))?.let { err ->
+                throw VoiceProviderException.Parse(err)
+            }
             val b64 = frame.optString("data").takeIf { it.isNotEmpty() } ?: continue
             val chunk = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull() ?: continue
             out.write(chunk)
@@ -331,7 +342,14 @@ class XunfeiVoiceProvider(
                 cw.optJSONObject(j)?.optString("w")?.let { sb.append(it) }
             }
         }
-        return VoiceInputResponse(text = sb.toString(), language = request.language)
+        // [da1027 ISSUE-04] Guard the ASSEMBLED transcript, not just the Base64
+        // envelope above: a decodable payload whose `ws` set carries no words
+        // assembled to "" and was still returned as a successful result, which
+        // the consumer pins sticky + NO_MATCH forever and never advances the
+        // fail-over chain. Same shape as Doubao/Deepgram.
+        val transcript = sb.toString().takeIf { it.isNotEmpty() }
+            ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+        return VoiceInputResponse(text = transcript, language = request.language)
     }
 
     /**
@@ -364,7 +382,15 @@ class XunfeiVoiceProvider(
         val result = withTimeoutOrNull(TTS_TIMEOUT_MS) {
             suspendCancellableCoroutine { cont ->
                 val pcm = ByteArrayOutputStream()
-                val wsRequest = Request.Builder().url(signedUrl).build()
+                // [da1029 I05] The TTS WebSocket is the ONE voice request that
+                // never passes through [VoiceProvider.executeRequest] (it goes
+                // to httpClient.newWebSocket), so it needs the override of its
+                // own. Purely a header — Xunfei authenticates with the signed
+                // URL, so no signature input changes.
+                val wsRequest = Request.Builder()
+                    .url(signedUrl)
+                    .applyUserAgentOverride(customUserAgent)
+                    .build()
                 val socket = httpClient.newWebSocket(
                     wsRequest,
                     object : WebSocketListener() {
@@ -505,8 +531,12 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
 
     override fun buildVoiceOutputRequest(request: VoiceOutputRequest): Request {
         val model = request.model ?: defaultVoiceOutputModel()
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1beta")) base = base.trimEnd('/') + "/v1beta"
+        // [deep-audit-1024 ISSUE-02] Same single source as the chat path. The local
+        // `if (!base.contains("/v1beta")) base += "/v1beta"` check only caught the
+        // bare-host shape: a base the user pasted as `.../v1` (→ `.../v1/v1beta/models`)
+        // or `.../v1beta/v1` (contains "/v1beta" → left alone → `.../v1beta/v1/models`)
+        // both 404'd here while the chat path worked.
+        val base = GeminiBasePath.normalize(effectiveBaseURL())
         val url = "$base/models/$model:generateContent?key=${apiKey ?: ""}"
         val body = JSONObject()
             .put(
@@ -579,8 +609,10 @@ class ElevenLabsVoiceProvider(providerId: String, baseURL: String, apiKey: Strin
         val voiceId = request.model?.takeIf { it.isNotEmpty() }
             ?: request.voice?.takeIf { it.isNotEmpty() }
             ?: DEFAULT_VOICE_ID
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1")) base += "/v1"
+        var base = VoiceBaseNormalizer.normalizeVersionSegment(
+            effectiveBaseURL(),
+            defaultBase = "https://api.elevenlabs.io",
+        )
         val body = JSONObject()
             .put("text", request.input)
             .put("model_id", MODEL_ID)
@@ -608,11 +640,11 @@ class DeepgramVoiceProvider(providerId: String, baseURL: String, apiKey: String?
         private const val DEFAULT_TTS_MODEL = "aura-asteria-en"
     }
 
-    private fun dgBase(): String {
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1")) base += "/v1"
-        return base
-    }
+    private fun dgBase(): String =
+        VoiceBaseNormalizer.normalizeVersionSegment(
+            effectiveBaseURL(),
+            defaultBase = "https://api.deepgram.com",
+        )
 
     override suspend fun synthesize(request: VoiceOutputRequest): ByteArray {
         val model = request.model?.takeIf { it.isNotEmpty() } ?: DEFAULT_TTS_MODEL
@@ -793,3 +825,21 @@ class MimoVoiceProvider(providerId: String, baseURL: String, apiKey: String?) :
             ?: throw VoiceProviderException.Parse("Unexpected MiMo TTS response format")
     }
 }
+
+/**
+ * [r3-b08 F-12] Error text for one Doubao v3 TTS response frame, or null when
+ * the frame is a normal one.
+ *
+ * Doubao's unidirectional TTS answers HTTP 200 and reports business errors
+ * INSIDE the frame stream (`{"code":30000001,"message":"invalid voice_type"}`),
+ * so the only place a failure can be noticed is here. `code == 20000000` is the
+ * vendor's "stream finished OK" sentinel and must not be read as an error.
+ *
+ * Pure + top-level for JVM testing (see DoubaoFrameErrorTest).
+ */
+internal fun doubaoFrameError(code: Int, message: String): String? =
+    if (code == 0 || code == 20000000) {
+        null
+    } else {
+        "Doubao v3 TTS error [$code]: ${message.ifBlank { "unknown error" }}"
+    }

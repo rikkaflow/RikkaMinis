@@ -2,186 +2,99 @@ package com.rikkaminis.app.ui.chat
 
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.SystemClock
-import android.provider.OpenableColumns
 import android.widget.Toast
 import com.rikkaminis.app.diagnostics.SessionIdAliases
 import java.io.File
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.asAndroidBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.AudioFile
-import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.VideoFile
-import androidx.compose.material.icons.automirrored.filled.Article
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.runtime.snapshotFlow
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.wrapContentWidth
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AppShortcut
-import androidx.compose.material.icons.filled.ArrowCircleUp
-import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Extension
-import androidx.compose.material.icons.filled.Block
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.CloseFullscreen
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.RadioButtonChecked
-import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Switch
 import com.rikkaminis.app.BuildConfig
 import com.rikkaminis.app.R
-import com.rikkaminis.app.config.AttachActionCatalog
 import com.rikkaminis.app.config.ChatActionCatalog
 import com.rikkaminis.app.config.ChatMenuPrefs
 import com.rikkaminis.app.config.isChatActionAvailable
-import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.ui.components.MinisAlertDialog
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisMenuDivider
 import com.rikkaminis.app.data.ChatTuningPrefs
 import com.rikkaminis.app.ui.settings.rememberChatTuning
-import com.rikkaminis.app.ui.chat.legacy.StableChatRowLedger
-import com.rikkaminis.app.ui.chat.legacy.buildFlatChatItems
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -192,9 +105,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -202,103 +113,46 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onPlaced
-import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.positionInWindow
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
-import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Undo
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Cancel
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.outlined.Public
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.EditNote
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.ArrowCircleDown
-import androidx.compose.material.icons.filled.AccountTree
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.style.TextDecoration
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
 import com.rikkaminis.app.offload.OffloadPermissionManager
-import com.mikepenz.markdown.compose.components.markdownComponents
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
-import org.intellij.markdown.ast.ASTNode
-import org.intellij.markdown.ast.getTextInNode
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
-import com.rikkaminis.app.data.model.ModelGroup
-import com.rikkaminis.app.data.model.ProviderConfig
-import com.rikkaminis.app.data.model.ProviderType
-import com.rikkaminis.app.data.model.RoutingStrategy
-import com.rikkaminis.app.data.model.ThinkingLevel
+import com.rikkaminis.app.data.model.normalizeModalities
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.theme.ChatColors
-import com.rikkaminis.app.ui.components.MinisTextButton
 
 // [refactor/split-chatscreen] Top-level color constants, scroll/sentinel
 // helpers, ScrollFollowKey moved verbatim to ChatScreenStatics.kt
@@ -416,32 +270,43 @@ fun ChatScreen(
     val shareBufferVersion by com.rikkaminis.app.share.ShareCoordinator.bufferVersion.collectAsState()
     androidx.compose.runtime.LaunchedEffect(shareBufferVersion) {
         if (shareBufferVersion == 0) return@LaunchedEffect
-        val pending = com.rikkaminis.app.share.ShareCoordinator.consumeBuffer(context)
-            ?: return@LaunchedEffect
+        // [fix/da1024-A] deep-audit-1024 ISSUE-01: draining a share is disk work —
+        // consumeBuffer itself cleans the staging dir when the buffered share has
+        // expired, the per-attachment copy is up to 100 MB (ShareReceiverActivity
+        // cap) and cleanSharedFiles walks + deletes the whole staging dir. All of
+        // it runs on IO; only the composer mutations below stay on Main.
+        val pending = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.ShareCoordinator.consumeBuffer(context)
+        } ?: return@LaunchedEffect
         com.rikkaminis.app.logging.AppLogger.info(
             "ChatScreen",
             "[Share] injecting ${pending.items.size} item(s) into chat session=${SessionIdAliases.resolve(sessionId)}",
         )
-        val sharedDir = com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
+        val sharedDir = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
+        }
         for (item in pending.items) {
             when (item.kind) {
                 com.rikkaminis.app.share.PendingShare.Item.Kind.INLINE_TEXT -> {
-                    val sep = if (viewModel.inputText.value.isNotEmpty()) "\n" else ""
                     val needsTrailingSpace = item.value.startsWith("http://") ||
                         item.value.startsWith("https://")
-                    val newText = viewModel.inputText.value + sep + item.value +
-                        if (needsTrailingSpace) " " else ""
-                    // [fix/setinputtext-caret-intent] Explicit caret to the end of
-                    // the appended text (caret lands after the just-injected text).
-                    viewModel.setInputText(newText, caretOverride = newText.length)
+                    // [dv24/B-05] Route the append as an intent: the composer owns
+                    // its live text. Resolving it here read `viewModel.inputText` —
+                    // the 150 ms-debounced snapshot — so text dictated or pasted
+                    // inside that window was overwritten by the stale string, and
+                    // an equal write was dropped by the StateFlow altogether.
+                    viewModel.requestComposerCommand(ComposerCommand.AppendText(item.value, separator = "\n", trimExistingEnd = false, trailingSpace = needsTrailingSpace))
                 }
                 com.rikkaminis.app.share.PendingShare.Item.Kind.ATTACHMENT -> {
+                    // Suspend: copies the staged bytes on IO, adds the attachment on Main.
                     viewModel.addAttachmentFromStagedShare(java.io.File(sharedDir, item.value))
                 }
             }
         }
         viewModel.markShareInjected()
-        com.rikkaminis.app.share.SharedShareStore.cleanSharedFiles(context)
+        withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.SharedShareStore.cleanSharedFiles(context)
+        }
     }
 
     // T311: publish "this is the active chat" while ChatScreen is composed,
@@ -533,11 +398,9 @@ fun ChatScreen(
         // injecting (mirrors iOS injectPendingTransferIfNeeded).
         viewModel.clearAttachments()
         if (transfer.inputText.isNotEmpty()) {
-            val sep = if (viewModel.inputText.value.isNotEmpty()) "\n" else ""
-            val appended = viewModel.inputText.value + sep + transfer.inputText
-            // [fix/setinputtext-caret-intent] Explicit caret to end of injected
-            // transfer text so the composer shows the tail after injection.
-            viewModel.setInputText(appended, caretOverride = appended.length)
+            // [dv24/B-05] Same intent as the share injection: the text being
+            // appended to is the composer's live one, never this VM snapshot.
+            viewModel.requestComposerCommand(ComposerCommand.AppendText(transfer.inputText, separator = "\n", trimExistingEnd = false, trailingSpace = false))
         }
         for (a in transfer.attachments) viewModel.addAttachment(a)
         viewModel.markShareInjected()
@@ -632,13 +495,12 @@ fun ChatScreen(
             ChatMenuPrefs.SESSION_MCPS -> showMcpsSheet = true
             ChatMenuPrefs.SESSION_MEMORY -> viewModel.toggleMemorySheet()
             ChatMenuPrefs.SLASH_COMMANDS -> {
-                if (viewModel.showSlashMenu.value) {
-                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
-                } else {
-                    viewModel.setInputText(viewModel.showSlashMenuOverInput(viewModel.inputText.value))
-                }
-                runCatching { inputFocusRequester.requestFocus() }
-                keyboardController?.show()
+                // [fix/dv23-b3] Resolved by the composer against its LIVE field
+                // text — `viewModel.inputText` lags it by the 150 ms IME-burst
+                // debounce, so computing "/ <text>" from it rolled a fresh
+                // dictation/paste back to a stale snapshot (or, when equal, was
+                // dropped by the StateFlow and left the "//" prefix behind).
+                viewModel.requestComposerCommand(ComposerCommand.ToggleSlashMenu)
             }
             ChatMenuPrefs.EXPORT -> showExportFormatSheet = true
             ChatMenuPrefs.TOKEN_USAGE -> showTokenUsageSheet = true
@@ -770,13 +632,18 @@ fun ChatScreen(
     }
 
     // App-icon quick action: when the user launched via
-    // `minis://action/camera_chat`, auto-open the camera on first compose.
-    // Consumed exactly once so re-entering the chat later does NOT re-trigger.
+    // `minis://action/camera_chat`, auto-open the camera.
+    // [da1028-C] Subscribe reactively (same shape as the pendingHtmlPreview
+    // block further down): the old `.value` snapshot was read only when the
+    // effect first composed, so a quick action delivered to an already-composed
+    // ChatScreen (warm start — Activity not recreated) was never observed and
+    // the camera never opened. Consumed exactly once so re-entering the chat
+    // later does NOT re-trigger.
     // (The old voice quick-action variant was removed with the mic button.)
-    LaunchedEffect(sessionId) {
-        val pending = com.rikkaminis.app.deeplink.DeepLinkCoordinator
-            .pendingChatAction.value
-        if (pending == com.rikkaminis.app.deeplink.DeepLinkCoordinator
+    val pendingChatActionState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingChatAction.collectAsState()
+    LaunchedEffect(sessionId, pendingChatActionState) {
+        if (pendingChatActionState == com.rikkaminis.app.deeplink.DeepLinkCoordinator
                 .ChatAction.OPEN_CAMERA
         ) {
             com.rikkaminis.app.deeplink.DeepLinkCoordinator
@@ -992,7 +859,12 @@ fun ChatScreen(
             } else {
                 val viewportEnd = info.viewportEndOffset
                 val last = info.visibleItemsInfo.maxByOrNull { it.index }
-                last != null && last.offset + last.size <= viewportEnd
+                // [B-03 deep-audit-1037] The threshold is now actually
+                // consumed: the old arm had no threshold term at all (the
+                // remember key was captured but never read inside this body),
+                // so the scrollNearBottomDp knob did nothing on this arm.
+                last != null &&
+                    isListAtBottom(last.offset, last.size, viewportEnd, nearBottomThresholdPx.toInt())
             }
             // T-android-jank-profile: was logging on every scroll frame (this
             // is a derivedStateOf body — it re-runs when any of
@@ -1348,15 +1220,29 @@ fun ChatScreen(
                     // letting the anchor-guard yank the reader (the observed
                     // "output-end jump"). Reading the raw index/offset is
                     // authoritative and settles in the same snapshot.
-                    val stoppedIdx = listState.firstVisibleItemIndex
-                    val stoppedTotal = listState.layoutInfo.totalItemsCount
-                    // [forward-stable] Forward list: at bottom ⇔ the viewport
-                    // reaches the last rows (sentinel index = total-1) with a
-                    // small scroll offset. Raw index/offset are authoritative
-                    // here — the cached isNearBottom can lag a snapshot.
-                    val stoppedAtBottom = stoppedTotal > 0 &&
-                        stoppedIdx >= stoppedTotal - 2 &&
-                        listState.firstVisibleItemScrollOffset <= nearBottomThresholdPx.toInt()
+                    // [B-03 deep-audit-1037] The old verdict compared the
+                    // viewport-TOP index (`firstVisibleItemIndex`) against
+                    // `total - 2` — a reversed formula left over from the
+                    // reverseLayout era. On a forward list with a multi-row
+                    // viewport it read FALSE at the true bottom (new rows no
+                    // longer auto-followed after a drag) and TRUE when a tall
+                    // last item's top was at the viewport top (a reader got
+                    // yanked back mid-read). The verdict now reads the same
+                    // raw layoutInfo snapshot as isNearBottom — authoritative
+                    // at drag-stop, unlike the cached derived state — through
+                    // the ONE shared bottom test (sentinel arm + threshold).
+                    val info = listState.layoutInfo
+                    val stoppedTotal = info.totalItemsCount
+                    val sentinel = if (stoppedTotal > 0) {
+                        info.visibleItemsInfo.firstOrNull { it.index == stoppedTotal - 1 }
+                    } else null
+                    val last = info.visibleItemsInfo.maxByOrNull { it.index }
+                    val stoppedAtBottom = stoppedTotal > 0 && (
+                        sentinel != null ||
+                            (last != null && isListAtBottom(
+                                last.offset, last.size, info.viewportEndOffset, nearBottomThresholdPx.toInt(),
+                            ))
+                        )
                     // [forward-stable] Drag end flips the mode: sentinel in
                     // view → follow; scrolled away → detach (nothing may yank).
                     // Maintains the mode for the explicit-intent consumer above.
@@ -1673,7 +1559,15 @@ fun ChatScreen(
             // Reuse the same WebViewHolder as long as the file path doesn't
             // change. Tapping the same html link twice should pick up wherever
             // the user left off rather than reloading from scratch.
-            val url = "file://${file.absolutePath}"
+            //
+            // [fix/fileurl-contract] Construct through the shared builder, not
+            // `"file://${file.absolutePath}"`: this URL crosses to the WebView /
+            // asset loader (system components), so its path must be percent-
+            // encoded. Every consumer of the resulting string decodes it back
+            // (`openExternalFromSheet`, `WebPreviewShortcut.pin`,
+            // `WebViewHolder`'s File root); a raw concatenation made a file
+            // literally named `50%23.html` arrive at them as `50#.html`.
+            val url = com.rikkaminis.app.ui.sandbox.fileUrlFor(file)
             val existing = htmlPreviewHolder
             if (existing == null || existing.currentUrl != url) {
                 existing?.destroy()
@@ -1688,18 +1582,47 @@ fun ChatScreen(
     // matching session; opens fullscreen HTML preview backed by a fresh
     // holder. Pending state is left untouched when a different chat is on
     // screen so the right ChatScreen instance still consumes it later.
-    LaunchedEffect(sessionId) {
-        val pending = com.rikkaminis.app.deeplink.DeepLinkCoordinator
-            .pendingHtmlPreview.value ?: return@LaunchedEffect
-        if (pending.sessionId != sessionId) return@LaunchedEffect
+    //
+    // [deep-audit-1027 ISSUE-01] Two fixes over the route-arg-only form:
+    //
+    //  1. The pending state is observed (`collectAsState`), and both the
+    //     route arg AND the live `viewModel.currentSessionId` are keys. A
+    //     draft chat keeps the `__new__<uuid>` route arg for the whole screen
+    //     lifetime even after the first send promotes it, while the pinned
+    //     shortcut stores the id that was live at pin time
+    //     (`viewModel.currentSessionId`). Matching against the route arg alone
+    //     left the pending state unconsumed forever — the shortcut silently
+    //     did nothing.
+    //  2. Resolution goes through `resolvePathForSession(activeSessionId, …)`
+    //     instead of the global `resolveHostPath`. Two reasons: (a) cold start
+    //     — the global resolver scans `minis-sessions/<id>/…` through
+    //     `bootContext`, which is still null this early, so a pinned shortcut
+    //     could never open before boot; the session-scoped resolver takes the
+    //     `Context` we already hold. (b) isolation — the global resolver picks
+    //     the FIRST existing match across every session tree, so two sessions
+    //     with a same-named `browser/index.html` could serve each other's
+    //     file. The session-scoped path is pinned to the owning session, and
+    //     paths outside the session subdirs (`shared/`, `mounts/`) still fall
+    //     through to the global resolver internally — see
+    //     `resolveSessionGuestHostPath`.
+    val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingHtmlPreview.collectAsState()
+    LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {
+        val pending = pendingHtmlPreviewState ?: return@LaunchedEffect
+        val activeSessionId = ChatViewModelStore.resolveSessionId(viewModel.currentSessionId)
+        if (pending.sessionId != sessionId && pending.sessionId != activeSessionId) {
+            return@LaunchedEffect
+        }
         com.rikkaminis.app.deeplink.DeepLinkCoordinator.consumePendingHtmlPreview()
-        // Resolve through PRootKernel so dot-segments / separators can never
-        // escape the `/var/minis` sandbox into an arbitrary host path — the
-        // preview WebView serves from the host file, so we must hand it the
-        // normalized host File rather than naively concatenating the raw
-        // resource path onto `/var/minis`.
-        val file = com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(
-            "/var/minis${pending.resourcePath}"
+        // Dot-segments / separators can never escape the `/var/minis` sandbox
+        // into an arbitrary host path: the resolver normalizes the guest path
+        // and containment-checks it against the session tree (or a bind mount
+        // for the shared dirs) before handing back the host File the preview
+        // WebView serves from.
+        val file = com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(
+            activeSessionId,
+            "/var/minis${pending.resourcePath}",
+            appCtx,
         )
         if (file == null || !file.exists()) {
             com.rikkaminis.app.logging.AppLogger.warning(
@@ -1708,7 +1631,12 @@ fun ChatScreen(
             )
             return@LaunchedEffect
         }
-        val url = "file://${file.absolutePath}"
+        // [fix/fileurl-contract] Same construction contract as openHtmlPreview:
+        // the pinned-shortcut deep link resolves to a host File whose URL then
+        // crosses to the WebView / asset loader, so it is built through the
+        // shared encoder (the pin path decodes it again in
+        // `WebPreviewShortcut.pin`).
+        val url = com.rikkaminis.app.ui.sandbox.fileUrlFor(file)
         htmlPreviewHolder?.destroy()
         htmlPreviewHolder = com.rikkaminis.app.ui.preview.WebViewHolder(appCtx, url)
         htmlPreviewFallbackTitle = pending.title
@@ -1872,7 +1800,11 @@ fun ChatScreen(
     // only contains still images. Resolution of `minis://` → host File is
     // deferred to the gallery's Coil model — Coil's MinisImageFetcher walks
     // the same session-aware resolver we use for inline rendering.
-    val markdownImageTapHandler = remember<(String, String) -> Unit>(messages, sessionId) {
+    // [da1023-F] Keyed on the ACTIVE session id (viewModel.currentSessionId),
+    // not the route arg: the route stays on the draft key after first-send
+    // promotion while the session dirs live under the real id — an unkeyed
+    // handler would resolve media against the orphan __new__ directory.
+    val markdownImageTapHandler = remember<(String, String) -> Unit>(messages, viewModel.currentSessionId) {
         handler@{ tappedMessageId, tappedUrl ->
             val imageRegex = Regex("!\\[([^\\]]*)\\]\\(([^)\\s]+)\\)")
             data class Ref(val messageId: String, val source: String, val title: String)
@@ -1885,13 +1817,14 @@ fun ChatScreen(
                     val alt = m.groupValues.getOrNull(1).orEmpty()
                     val src = m.groupValues.getOrNull(2).orEmpty()
                     if (src.isEmpty()) continue
-                    val pathPart = src.substringBefore('?').substringBefore('#')
-                    val ext = pathPart.substringAfterLast('.', "").lowercase()
+                    val pathPart = mediaPathOfUrl(src)
                     // Skip non-image media so the gallery stays still-image only,
                     // matching iOS minisVideoExtensions / minisAudioExtensions.
-                    if (ext in setOf("mp4", "mov", "avi", "mkv", "webm",
-                                     "mp3", "wav", "aac", "flac", "ogg", "m4a")) continue
-                    val title = alt.ifEmpty { pathPart.substringAfterLast('/').ifEmpty { src } }
+                    // [dv22/B-06] Classified through the single media source: the
+                    // old hand-written set missed `m4v`, ordered `?` before `#`
+                    // (so `x.mp4?t=1` leaked in) and never percent-decoded.
+                    if (mediaKindOfUrl(src) != MediaKind.IMAGE) continue
+                    val title = alt.ifEmpty { mediaFileNameOfUrl(src).ifEmpty { src } }
                     refs.add(Ref(msg.id, src, title))
                 }
             }
@@ -1912,7 +1845,9 @@ fun ChatScreen(
                 // doesn't have to re-walk PRootKernel for every page swipe.
                 // Falls back to the raw URL string when resolution misses —
                 // AsyncImage will route it through MinisImageFetcher anyway.
-                val resolved = resolveMdMediaFile(context, ref.source, sessionId)
+                // [da1023-F] Live read: draft key never resolves media after
+                // promotion — use the VM's current id.
+                val resolved = resolveMdMediaFile(context, ref.source, viewModel.currentSessionId)
                 com.rikkaminis.app.ui.components.ImageGalleryItem(
                     model = resolved ?: ref.source,
                     caption = ref.title,
@@ -1937,10 +1872,12 @@ fun ChatScreen(
             linkRenderCache.resolve(url, viewModel.currentSessionId)
         },
         LocalMarkdownImageTapHandler provides markdownImageTapHandler,
-        // Route markdown media resolution through this chat's session so
-        // minis://attachments/* lookups don't rely on the global bindMounts
+        // Route markdown media resolution through this chat's ACTIVE session
+        // (real id once the draft is promoted, __new__ route arg before —
+        // matches [ChatViewModel.currentSessionId]) so minis://attachments/*
+        // lookups don't rely on the global bindMounts
         // map (which is last-writer-wins across sessions).
-        LocalMarkdownSessionId provides sessionId,
+        LocalMarkdownSessionId provides viewModel.currentSessionId,
     ) {
     // RikkaHub-style left-swipe drawer: the chat is wrapped in a
     // ModalNavigationDrawer whose sheet is the conversation history. A left
@@ -2013,7 +1950,7 @@ fun ChatScreen(
                 .collectAsState()
             ChatHistoryDrawer(
                 chatRepository = chatRepository,
-                currentSessionId = sessionId,
+                currentSessionId = viewModel.currentSessionId,
                 draft = draftSnapshot
                     ?.takeIf { it.text.isNotBlank() && it.id != sessionId },
                 onOpenDraft = {
@@ -2055,10 +1992,15 @@ fun ChatScreen(
                     // anchoring on a same-session tap (the drawer just closes)
                     // would leave a dangling anchor that pollutes that
                     // session's later steps with a meaningless sinceClickMs.
-                    if (id != sessionId) {
+                    // [da1023-F] Compare against the ACTIVE session id (the
+                    // drawer itself is already fed viewModel.currentSessionId
+                    // at :2018) — the route arg stays on the draft key after
+                    // first-send promotion, so "current session" must be the
+                    // promoted id or the tap navigates a same-session row.
+                    if (id != viewModel.currentSessionId) {
                         com.rikkaminis.app.diagnostics.PerfLongCtx.click(id)
                     }
-                    if (id == sessionId) {
+                    if (id == viewModel.currentSessionId) {
                         // Current session: just close the drawer, no navigation.
                         historyDrawerScope.launch { historyDrawerState.close() }
                     } else {
@@ -3349,7 +3291,13 @@ fun ChatScreen(
                                             val tPrewarmNs = System.nanoTime()
                                             prewarmMarkdown(prewarmSources)
                                             val prewarmMs = (System.nanoTime() - tPrewarmNs) / 1_000_000
-                                            lastColdPrewarmMs = prewarmMs
+                                            // [deep-audit-1049 B-02] `lastColdPrewarmMs` is
+                                            // Compose state. The warming stays on Default; only
+                                            // the publish hops to Main — a state write from a
+                                            // background dispatcher races recomposition.
+                                            withContext(Dispatchers.Main.immediate) {
+                                                lastColdPrewarmMs = prewarmMs
+                                            }
                                             com.rikkaminis.app.diagnostics.PerfLongCtx.step(
                                                 sessionId,
                                                 "coldPrewarm.done",
@@ -3478,6 +3426,27 @@ fun ChatScreen(
                         )
                         pendingFocusId = null
                         return@LaunchedEffect
+                    }
+                    // [FIX-R4-Q F-12] A focus jump scrolls AWAY from the bottom
+                    // — mark the user as engaged or the OPEN-CATCHUP collector
+                    // (armed while the session has been open <2.5s, e.g. a
+                    // search-result tap into the same session) rolls the
+                    // viewport straight back to the bottom and cancels the
+                    // jump the user just asked for. Same marking the
+                    // InputHistorySheet jump already does.
+                    openCatchUpUserEngaged = true
+                    // [R5-C4] The jump must move the FOLLOW state too, not just
+                    // the catch-up gate: scrollToItem fires no
+                    // DragInteraction.Stop, so the drag-stop handler that owns
+                    // the FOLLOWING → DETACHED flip never runs. Dispatch BEFORE
+                    // the scroll so the streaming follow collector already reads
+                    // DETACHED on the emission the jump itself causes.
+                    followEventForProgrammaticJump(
+                        targetIsNewestRow = idx >= flatItems.lastIndex,
+                    )?.let { jumpEvent ->
+                        followState = dispatchFollow(
+                            sessionId, followState, jumpEvent, listState, isUserDragging, isStreaming,
+                        )
                     }
                     tracedScrollToItem("FOCUS-MESSAGE", idx, 0)
                     highlightedMessageId = originalMessageId(target)
@@ -3657,7 +3626,11 @@ fun ChatScreen(
                                     pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial,
                                 )
                                 if (slashMenuOpen) {
-                                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
+                                    // [fix/dv23-b3] The slash Popup is focusable=false /
+                                    // dismissOnClickOutside=false, so this tap-spy (not the
+                                    // Popup's own onDismissRequest) is what closes the menu;
+                                    // it must resolve against the composer's live text.
+                                    viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
                                 }
                                 if (mentionMenuOpenForSpy) {
                                     viewModel.dismissMentionMenu()
@@ -3918,9 +3891,13 @@ fun ChatScreen(
                                 onEdit = if (isStreaming || item.message.isQueued) null else ({
                                     val prefill = viewModel.editMessage(item.message.id)
                                     if (prefill != null) {
-                                        // [fix/setinputtext-caret-intent] Editing a full message:
-                                        // place the caret at the end so the user sees the tail.
-                                        viewModel.setInputText(prefill, caretOverride = prefill.length)
+                                        // [dv24/B-05] Caret at the end (user sees the tail),
+                                        // routed as an intent so the write reaches the FIELD.
+                                        // The old single write was silently swallowed whenever
+                                        // the draft already equalled the prefilled text (equal
+                                        // StateFlow write), and the live 150 ms IME burst then
+                                        // committed its older snapshot straight over the edit.
+                                        viewModel.requestComposerCommand(ComposerCommand.ReplaceText(prefill, caretOverride = prefill.length))
                                         coroutineScope.launch {
                                             tracedScrollToItem("EDIT-MSG", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
                                         }
@@ -4430,6 +4407,27 @@ fun ChatScreen(
                     androidx.compose.material3.FilledIconButton(
                         onClick = {
                             coroutineScope.launch {
+                                // [FIX-R4-Q F-12] The FAB-UP tap is a user
+                                // scroll-away from the bottom: mark it or the
+                                // OPEN-CATCHUP collector (still armed within
+                                // 2.5s of opening the session) rolls the
+                                // viewport back down and the "scroll to top"
+                                // tap appears to do nothing.
+                                openCatchUpUserEngaged = true
+                                // [R5-C4] Same follow-state gap as the
+                                // FOCUS-MESSAGE jump: a programmatic jump fires
+                                // no DragInteraction.Stop, so without this the
+                                // streaming collector drags the viewport back
+                                // down and the return-to-bottom FAB stays hidden.
+                                // Target is row 0; only a one-row list is
+                                // "already the newest row".
+                                followEventForProgrammaticJump(
+                                    targetIsNewestRow = flatItems.lastIndex <= 0,
+                                )?.let { jumpEvent ->
+                                    followState = dispatchFollow(
+                                        sessionId, followState, jumpEvent, listState, isUserDragging, isStreaming,
+                                    )
+                                }
                                 // [forward-stable] Forward list: oldest message
                                 // is index 0 (was totalItemsCount-1 under
                                 // reverseLayout).
@@ -4511,13 +4509,32 @@ fun ChatScreen(
             // edits from the in-chat pill are visually + behaviourally
             // identical to the home-screen long-press flow.
             editingSession?.let { session ->
+                // [da1032-A] `editingSession` is a one-shot snapshot
+                // (loadSessionEntity() at open time), but the sheet's
+                // Regenerate-Title button writes straight to the DB row — so
+                // the sheet has to follow the row, not the snapshot.
+                // Observing *inside* the `let` scopes the subscription to the
+                // sheet's lifetime: the block leaves the composition on
+                // dismiss, so ChatScreen gains no standing sessions
+                // subscription. `remember` keeps the cold Room flow's identity
+                // stable across the many recompositions of this screen
+                // (collectAsState would otherwise re-subscribe on every pass).
+                val sessionsFlow = remember { chatRepository.observeSessions() }
+                val liveSessions by sessionsFlow.collectAsState(initial = emptyList())
+                val liveSession = liveSessions.firstOrNull { it.id == session.id } ?: session
                 com.rikkaminis.app.ui.sessions.SessionEditSheet(
                     session = session,
+                    liveSession = liveSession,
                     onDismiss = { editingSession = null },
                     onSave = { newTitle, newCategory ->
                         viewModel.updateTitleAndCategory(newTitle, newCategory)
                         editingSession = null
                     },
+                    // [da1032-A] Same source as the drawer's regenerate entry
+                    // (:2200) — the ViewModel acts on the CURRENT session, which
+                    // is what this sheet always edits. Without this the
+                    // OutlinedButton ran its default no-op.
+                    onRegenerate = { viewModel.regenerateSessionTitle() },
                 )
             }
 
@@ -4528,7 +4545,10 @@ fun ChatScreen(
             // message-list body (the long-session input jank root cause).
             ChatInputArea(
                 viewModel = viewModel,
-                sessionId = sessionId,
+                // [da1023-F] Active id, not the route arg: the composer's
+                // downstream consumers (MoveToSessionSheet's self-filter,
+                // attachment add) must follow the promoted session.
+                sessionId = viewModel.currentSessionId,
                 chatRepository = chatRepository,
                 chatActions = chatActions,
                 isStreaming = isStreaming,
@@ -4630,7 +4650,12 @@ fun ChatScreen(
                     isDestructive = true,
                     onConfirm = {
                         viewModel.clearChat()
-                        viewModel.setInputText("")
+                        // [fix/dv23-b3] Let the composer wipe itself through its
+                        // three-write funnel. A bare `setInputText("")` here is an
+                        // equal write whenever the VM string is already empty, so
+                        // MutableStateFlow drops it and the field keeps whatever
+                        // the user pasted/dictated inside the 150 ms burst window.
+                        viewModel.requestComposerCommand(ComposerCommand.Clear)
                         showClearChatDialog = false
                     },
                 )
@@ -4700,7 +4725,10 @@ fun ChatScreen(
             }
             slashMenuOpen || mentionMenuOpenForSpy -> {
                 if (slashMenuOpen) {
-                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
+                    // [fix/dv23-b3] Dismiss through the composer so it resolves
+                    // against its live field text instead of the debounced VM
+                    // snapshot (see ChatInputArea's composerCommand collector).
+                    viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
                 }
                 if (mentionMenuOpenForSpy) {
                     viewModel.dismissMentionMenu()
@@ -4791,7 +4819,7 @@ fun ChatScreen(
     if (showSkillsSheet && skillRepository != null) {
         SessionSkillsSheet(
             skillRepository = skillRepository,
-            sessionId = sessionId,
+            sessionId = viewModel.currentSessionId,
             onDismiss = { showSkillsSheet = false },
         )
     }
@@ -4800,7 +4828,7 @@ fun ChatScreen(
     if (showMcpsSheet && mcpRepository != null) {
         SessionMcpsSheet(
             mcpRepository = mcpRepository,
-            sessionId = sessionId,
+            sessionId = viewModel.currentSessionId,
             onDismiss = { showMcpsSheet = false },
         )
     }
@@ -4838,16 +4866,34 @@ fun ChatScreen(
         val resolveAudioLabel = stringResource(R.string.model_picker_modality_audio)
         val resolveVideoLabel = stringResource(R.string.model_picker_modality_video)
         fun nonTextLabelFor(model: LLMModel): String? {
-            val mods = model.outputModalities?.map { it.lowercase() } ?: emptyList()
+            // [dv22/B-03] normalizeModalities strips the `_input`/`_output`
+            // suffixes and lowercases; the old bare `.lowercase()` never matched
+            // `image_output`, so a vision model could be bound to an Agent loop
+            // with no "non-text model" warning at all.
+            val mods = model.outputModalities.normalizeModalities() ?: emptyList()
+            // [dv24/B-02] A System ASR sentinel declares an AUDIO INPUT and no
+            // output modality at all (SystemVoiceEntries.asrOnline/asrOffline),
+            // so the three output checks below all missed it and a Voice Input
+            // group was bound straight away — no "non-text model" confirmation.
+            // An audio-in / no-declared-output model cannot drive an Agent loop
+            // for the same reason a TTS one cannot, so it earns the same label.
+            val ins = model.inputModalities.normalizeModalities() ?: emptyList()
             return when {
                 "image" in mods -> resolveImageLabel
                 "audio" in mods -> resolveAudioLabel
                 "video" in mods -> resolveVideoLabel
+                mods.isEmpty() && "audio" in ins -> resolveAudioLabel
                 else -> null
             }
         }
         fun entryById(entryId: String): ModelEntry? =
-            config.modelEntries.firstOrNull { it.id == entryId }
+            // [dv24/B-02] persisted entry first, synthesized System voice entry
+            // second — the same single source the group screens use. A default
+            // Voice Input/Output group holds ONLY System sentinels, so the old
+            // `config.modelEntries`-only lookup returned null here: `firstEntry`
+            // and `label` both nulled out and `selectGroup` ran with NO
+            // non-text-model confirmation for a group that cannot drive a loop.
+            SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
 
         ModelPickerSheet(
             groups = availableGroups,
@@ -4858,8 +4904,13 @@ fun ChatScreen(
             providerRepository = providerRepository,
             onSelectGroup = { groupId ->
                 val group = availableGroups.firstOrNull { it.id == groupId }
-                val firstEntry = group?.memberEntryIds?.firstNotNullOfOrNull(::entryById)
-                val label = firstEntry?.model?.let(::nonTextLabelFor)
+                // [dv24/B-02] same single source (see entryById) — a System
+                // voice member must resolve here too, or the confirmation is
+                // skipped for exactly the groups made of them
+                val firstEntry = group?.memberEntryIds?.firstNotNullOfOrNull { entryId ->
+                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+                }
+                val label = firstEntry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.Group(
                         groupId = groupId,
@@ -4873,7 +4924,7 @@ fun ChatScreen(
             },
             onSelectGroupEntry = { groupId, entryId ->
                 val entry = entryById(entryId)
-                val label = entry?.model?.let(::nonTextLabelFor)
+                val label = entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (entry != null && label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.GroupEntry(
                         groupId = groupId,
@@ -4888,7 +4939,7 @@ fun ChatScreen(
             },
             onSelectEntry = { entryId ->
                 val entry = entryById(entryId)
-                val label = entry?.model?.let(::nonTextLabelFor)
+                val label = entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (entry != null && label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.Entry(
                         entryId = entryId,
@@ -4982,7 +5033,7 @@ fun ChatScreen(
             com.rikkaminis.app.ui.preview.WebPreviewBottomSheet(
                 holder = holder,
                 fallbackTitle = htmlPreviewFallbackTitle,
-                pinSessionId = sessionId,
+                pinSessionId = viewModel.currentSessionId,
                 onExpandFullscreen = {
                     holder.detach()
                     htmlPreviewFullscreen = true
@@ -5031,7 +5082,10 @@ fun ChatScreen(
             source = com.rikkaminis.app.webapp.WebAppSource.ChatAttachment(
                 uri = target.uri,
                 fileName = target.fileName,
-                sessionId = sessionId,
+                // [da1023-F] The sheet copies bytes into
+                // minis-sessions/<sid>/attachments/<shortcutId>/ — the draft key
+                // would strand the shortcut in the orphan __new__ dir.
+                sessionId = viewModel.currentSessionId,
                 sessionTitle = null,
             ),
             onDismiss = { webAppSheetTarget = null },
@@ -5184,6 +5238,71 @@ private fun followEventLabel(event: FollowEvent): String = when (event) {
     is FollowEvent.FabDown -> "FabDown"
     is FollowEvent.ImeViewportChanged -> "ImeViewportChanged"
 }
+
+/**
+ * [B-03 deep-audit-1037] The ONE bottom verdict, shared by the derived
+ * `isNearBottom` state and the `DragInteraction.Stop` handler. "At bottom" =
+ * the last visible row's bottom edge sits within [thresholdPx] of the
+ * viewport end. Callers add the sentinel arm on top (sentinel row visible ⇒
+ * at bottom regardless of measurement) — the sentinel is a 5dp spacer one
+ * past the last message row and is only measurable when the user really is
+ * at the bottom, so it cannot be fooled by a tall last item (the T173
+ * failure mode of the old gap test).
+ *
+ * Before this function the two callers each carried their own copy, and the
+ * DragStop copy compared the viewport-TOP index (`firstVisibleItemIndex`)
+ * against `total - 2` — a reversed formula left over from the reverseLayout
+ * era that read FALSE at the true bottom (streaming stopped following) and
+ * TRUE when a tall last item's top reached the viewport top (a reader got
+ * yanked back). [LazyListItemInfo.size] is the FULL item height, so
+ * "bottom edge within threshold of the viewport end" is scroll-depth aware.
+ *
+ * Pure: no Compose / Android dependencies, JVM-testable.
+ */
+internal fun isListAtBottom(
+    lastVisibleOffsetPx: Int,
+    lastVisibleSizePx: Int,
+    viewportEndOffsetPx: Int,
+    thresholdPx: Int,
+): Boolean {
+    val bottomEdge = lastVisibleOffsetPx + lastVisibleSizePx
+    val distance = viewportEndOffsetPx - bottomEdge
+    return distance >= 0 && distance <= thresholdPx
+}
+
+/**
+ * [R5-C4] Which follow verdict a PROGRAMMATIC jump must publish (null = leave
+ * the state machine untouched).
+ *
+ * `tracedScrollToItem` goes through `LazyListState.scrollToItem`, which — unlike
+ * a finger — emits NO `DragInteraction.Stop`. The drag-stop handler (the
+ * interactionSource collector) is the ONLY place that flips FOLLOWING →
+ * DETACHED via `FollowEvent.UserDragEnd(atBottom = false)`, so the two jump
+ * entry points (the session/search focus jump and the "scroll to first message"
+ * FAB) left `followState` at FOLLOWING after moving the viewport away from the
+ * tail. Two user-visible consequences:
+ *
+ *  1. streaming: the SIMPLE_FOLLOW collector's `!followState.isFollowing` gate
+ *     still read "following", so the very `visibleItemsInfo` emission the jump
+ *     produces re-requested the bottom and yanked the reader back within a frame;
+ *  2. idle: the return-to-bottom FAB renders only when `!isFollowing`, so the
+ *     escape hatch stayed hidden after a jump into history.
+ *
+ * [targetIsNewestRow] keeps the verdict honest at the tail: jumping to the newest
+ * row is already where follow wants to be, so the state machine is left alone
+ * (null) — in particular a DETACHED reader who jumps to the newest row is NOT
+ * silently re-engaged; only the FOLLOWING-after-a-jump-away case is repaired.
+ * Returning the event (rather than dispatching from here) keeps the rule pure
+ * and JVM-testable against the real reducer.
+ *
+ * ponytail: 用「目标是否为最新一行」代替「跳转后哨兵是否可见」的真值——后者要等
+ * 一次布局才读得到，而 scrollToItem 返回时 layoutInfo 可能尚未 apply | 天花板:
+ * 跳到最新一行、但该行高于一屏时视口停在行首仍留在 FOLLOWING（流式期会被拉回
+ * 底部——与修复前完全一致，不构成回归）| 升级触发: 真机出现「跳最新行后被拉走」
+ * 或「跳最新行后回底按钮不出现」的反馈。
+ */
+internal fun followEventForProgrammaticJump(targetIsNewestRow: Boolean): FollowEvent? =
+    if (targetIsNewestRow) null else FollowEvent.UserDragEnd(atBottom = false)
 
 /**
  * [diag/render-attribution] T3-Q2: the single funnel every `followReducer`

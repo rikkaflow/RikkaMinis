@@ -7,18 +7,18 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.print.PrintAttributes
 import android.print.PrintManager
 import android.util.LruCache
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
+import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -46,6 +46,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -68,6 +69,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -80,21 +82,33 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.components.ImageGalleryItem
 import com.rikkaminis.app.ui.components.rememberIosBounceOverscrollEffect
-import com.rikkaminis.app.ui.markdown.MarkdownText
 import com.rikkaminis.app.ui.media.InlineAudioPlayer
 import com.rikkaminis.app.ui.media.InlineVideoPlayer
+import com.rikkaminis.app.ui.preview.ReleaseStep
+import com.rikkaminis.app.ui.preview.WebViewReleaseLatch
+import com.rikkaminis.app.ui.preview.releasePlan
+import com.rikkaminis.app.util.ExternalIntent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
-import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import com.rikkaminis.app.ui.components.MinisTextButton
 
 private const val MAX_TEXT_PREVIEW_BYTES = 512_000 // 500 KB
+
+// [da1026-F] Row cap for the CSV/TSV table preview — unchanged from the
+// original loop (`if (read >= 200)`). A row cap alone is NOT a memory bound;
+// see [readCsvPreviewSlice].
+private const val MAX_CSV_PREVIEW_ROWS = 200
+
+// [rv1014-E1] Fixed read buffer for [readCapped]: one 64 KB chunk per read()
+// syscall, no size surprises for small or huge files alike.
+private const val READ_BUFFER_BYTES = 64 * 1024
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -104,6 +118,14 @@ fun FilePreviewScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    // [deep-audit-1049 B-05] The print slot is module-level state, so nothing
+    // tore it down when the preview was left: a printed file kept its renderer
+    // alive for the rest of the process. Releasing here bounds it to the
+    // screen; a job that is still spooling is skipped (see the releaser).
+    DisposableEffect(Unit) {
+        onDispose { releasePrintWebViewIfNotSpooling() }
+    }
 
     // T-android-preview-title-toggle-path: tap the title to swap between
     // file name and absolute path. Mirrors the iOS preview's tap-to-toggle
@@ -124,9 +146,14 @@ fun FilePreviewScreen(
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch(Dispatchers.IO) {
             val ok = try {
+                // [deep-audit-1047 B-01] `openOutputStream` returns null (never
+                // throws) when the document provider refuses or died; `?.use`
+                // then skipped the copy and the old code returned `true` anyway
+                // — a "saved" toast over an empty document. Null now lands in
+                // the same failure branch as an I/O exception.
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     item.file.inputStream().use { it.copyTo(out) }
-                }
+                } ?: throw java.io.IOException("openOutputStream returned null")
                 true
             } catch (e: Exception) {
                 AppLogger.warning("FilePreview", "Save-As failed: ${e.message}")
@@ -150,12 +177,36 @@ fun FilePreviewScreen(
         // [fix/audit-b17 / T10-L9] collectImageGallery lists the parent
         // directory and stats every sibling — that used to run inside
         // remember{} on the main thread during composition.
-        val galleryState = produceState(
-            initialValue = emptyList<com.rikkaminis.app.ui.components.ImageGalleryItem>() to 0,
+        // [deep-audit-1036 B-01] The initial value used to be an EMPTY list,
+        // which is indistinguishable from "collected, nothing to show": the
+        // first frame rendered ImageGalleryViewer with zero items, and its
+        // defensive empty-items branch (LaunchedEffect { onDismiss() }) closed
+        // the preview before the off-main scan ever landed. `null` = "still
+        // collecting", a distinct state from any loaded result. And a loaded
+        // result is never empty: collectImageGallery falls back to a 1-item
+        // list (just the tapped file) when the parent dir can't be listed, so
+        // the viewer's empty branch stays reachable only for its other
+        // callers, never from this route.
+        val galleryState = produceState<Pair<List<ImageGalleryItem>, Int>?>(
+            initialValue = null,
             item.file.absolutePath,
         ) {
             value = withContext(Dispatchers.IO) { collectImageGallery(item.file) }
         }.value
+        if (galleryState == null) {
+            // Loading placeholder — same full-bleed dark surface as the viewer
+            // itself, so the hand-off does not flash the file browser behind
+            // it. Never handed to the gallery as an empty list.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Color.White)
+            }
+            return
+        }
         com.rikkaminis.app.ui.components.ImageGalleryViewer(
             items = galleryState.first,
             startIndex = galleryState.second,
@@ -264,20 +315,43 @@ private fun TextPreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    var content by remember { mutableStateOf<String?>(null) }
-    var truncated by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [da1026-F] These three had no `remember` key, so Compose reused the slot
+    // across file switches: `error` in particular stayed non-null until the new
+    // read finished (and if the new read succeeded it was never cleared at
+    // all, because the success path only assigns `content`), leaving the error
+    // banner permanently masking the newly opened file. Keyed on item.file the
+    // state is discarded on switch — same form CsvPreview/JsonPreview already
+    // used.
+    var content by remember(item.file) { mutableStateOf<String?>(null) }
+    var truncated by remember(item.file) { mutableStateOf(false) }
+    var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
-                val bytes = item.file.readBytes()
-                content = decodeUtf8Capped(bytes)
-                truncated = bytes.size > MAX_TEXT_PREVIEW_BYTES
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+        // [deep-audit-1048 B-01] IO computes, Main publishes: the capped read +
+        // decode stay on Dispatchers.IO; only the RESULT crosses back, and the
+        // Compose state is assigned after `withContext` returns (on the
+        // composition's dispatcher) instead of from inside the IO block.
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                // [rv1014-E1] was item.file.readBytes() — the full file was
+                // read into memory before any cap applied, so a 2 GB log file
+                // OOMed the preview. readCapped reads at most MAX+1 bytes and
+                // still yields the truncated verdict in one pass. (And it was
+                // briefly readNBytes(MAX+1) — API 33+, an uncatchable
+                // NoSuchMethodError on Android 8–12.)
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
+                decodeUtf8Capped(capped) to (capped.size > MAX_TEXT_PREVIEW_BYTES)
             }
         }
+        loaded.fold(
+            onSuccess = { (text, clipped) ->
+                content = text
+                truncated = clipped
+            },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+            },
+        )
     }
 
     when {
@@ -345,19 +419,28 @@ private fun MarkdownPreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    var content by remember { mutableStateOf<String?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [da1026-F] Same unkeyed-remember defect as TextPreview above: a stale
+    // `error` from the previous file masked the next one (the success path
+    // never clears it).
+    var content by remember(item.file) { mutableStateOf<String?>(null) }
+    var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
-                val bytes = item.file.readBytes()
-                content = decodeUtf8Capped(bytes)
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
-                AppLogger.warning("FilePreview", "markdown read failed for ${item.name}: ${e.message}")
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                // [rv1014-E1] capped read via readCapped — see TextPreview above.
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
+                decodeUtf8Capped(capped)
             }
         }
+        loaded.fold(
+            onSuccess = { text -> content = text },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+                AppLogger.warning("FilePreview", "markdown read failed for ${item.name}: ${e.message}")
+            },
+        )
     }
 
     when {
@@ -393,7 +476,14 @@ private fun HtmlPreview(item: FileItem) {
     // preview would be permanently blank after a renderer kill (the app itself
     // survives, which is the point of SafeWebViewClient).
     var rendererEpoch by remember(item.file) { mutableStateOf(0) }
-    key(rendererEpoch) {
+    // [dv17-3 B-03] `item.file` must stay in the key: `remember(item.file)`
+    // resets `rendererEpoch` to 0 when the file changes, so a bare
+    // `key(rendererEpoch)` never changes (0→0) and the factory does not
+    // re-run — the screen kept showing the *previous* file's HTML.
+    key(item.file, rendererEpoch) {
+    // [deep-audit-1046 S-07] One latch per WebView instance; `key(...)` recreates
+    // this block (and this `remember`) whenever the renderer is replaced.
+    val releaseLatch = remember { WebViewReleaseLatch() }
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
@@ -421,18 +511,44 @@ private fun HtmlPreview(item: FileItem) {
                         rendererEpoch += 1
                     }
                 }
-                val targetUrl = "file://${item.file.absolutePath}"
-                post { loadUrl(targetUrl) }
+                val targetUrl = fileUrlFor(item.file)
+                // [deep-audit-1046 S-07] `post` parks the load in this view's run
+                // queue until the first layout — and on a view that never gets
+                // attached it stays parked. If the preview is closed first, the
+                // load must not be replayed onto the destroyed WebView; named so
+                // `onRelease` can remove it by identity (`removeCallbacks(null)`
+                // is a no-op: AOSP guards it on `action != null`).
+                val initialLoad = Runnable {
+                    if (!releaseLatch.canRunDeferred()) return@Runnable
+                    loadUrl(targetUrl)
+                }
+                releaseLatch.track(initialLoad)
+                post(initialLoad)
             }
         },
         // [fix/render-ui F-274] This WebView had no release path: every preview
         // of an HTML file left a live renderer process handle behind, and the
         // queued `post { loadUrl }` could still fire after the composable left.
-        // Same three-call teardown as KaTeXView.kt's T10-M1 fix.
+        // [deep-audit-1046 S-07] That queued load was never actually cancelled:
+        // `removeCallbacks(null)` removes nothing (AOSP: `if (action != null) {
+        // … } return false;`), so a preview closed before its first layout still
+        // loaded the file into a destroyed WebView. The load is now registered
+        // with the latch and removed by identity, and the latch is flipped first
+        // so a re-post during teardown stands down too.
+        // Order (releasePlan, shared with KaTeXView.kt): latch → detach → drop
+        // tracked work → stopLoading → destroy.
         onRelease = { wv ->
-            wv.removeCallbacks(null)
-            wv.stopLoading()
-            wv.destroy()
+            val outstanding = releaseLatch.release()
+            for (step in releasePlan(attached = wv.parent != null)) {
+                when (step) {
+                    ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                    ReleaseStep.DROP_DEFERRED -> {
+                        for (task in outstanding) wv.removeCallbacks(task)
+                    }
+                    ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                    ReleaseStep.DESTROY -> wv.destroy()
+                }
+            }
         },
     )
     }
@@ -508,18 +624,25 @@ private fun PdfPreview(item: FileItem) {
     }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: `renderer.open`
+        // (page indexing + first decode) stays on Dispatchers.IO; the page
+        // count and the failure banner are published after it returns.
+        val opened = withContext(Dispatchers.IO) {
+            runCatching {
                 // Render at (about) the on-screen width instead of a fixed
                 // 1600px: same readability on a phone, a third of the
                 // memory per page.
                 val width = context.resources.displayMetrics.widthPixels.coerceIn(720, 1600)
-                pageCount = renderer.open(item.file, width)
-            } catch (e: Exception) {
-                AppLogger.warning("FilePreview", "PdfRenderer failed for ${item.name}: ${e.message}")
-                error = e.message ?: context.getString(R.string.filepreview_pdf_render_failed_fallback)
+                renderer.open(item.file, width)
             }
         }
+        opened.fold(
+            onSuccess = { count -> pageCount = count },
+            onFailure = { e ->
+                AppLogger.warning("FilePreview", "PdfRenderer failed for ${item.name}: ${e.message}")
+                error = e.message ?: context.getString(R.string.filepreview_pdf_render_failed_fallback)
+            },
+        )
     }
 
     // -1 = not loaded yet; 0 = empty document. Keeping the count non-null
@@ -537,7 +660,23 @@ private fun PdfPreview(item: FileItem) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(count) { idx ->
-                    val page by produceState<Bitmap?>(initialValue = renderer.cached(idx), key1 = idx) {
+                    // [deep-audit-1047 B-03] `idx` alone is not a data-source
+                    // key: the preview composable is reused for the next file,
+                    // so the page slot keeps the SAME `idx` and the old bitmap
+                    // survives the switch (and the `if (value == null)` guard
+                    // then skips the render, leaving the previous document's
+                    // page on screen). `item.file` is the source the page comes
+                    // from; the top-level `error`/`pageCount`/`renderer` are all
+                    // keyed on it for exactly this reason.
+                    //
+                    // `initialValue = renderer.cached(idx)` must stay FIRST: a
+                    // re-key still reuses the new renderer's LRU before paying
+                    // for a re-render when the page is already warm.
+                    val page by produceState<Bitmap?>(
+                        initialValue = renderer.cached(idx),
+                        key1 = idx,
+                        key2 = item.file,
+                    ) {
                         if (value == null) {
                             value = withContext(Dispatchers.IO) { renderer.render(idx) }
                         }
@@ -700,28 +839,32 @@ private fun CsvPreview(item: FileItem) {
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
     var rows by remember(item.file) { mutableStateOf<List<List<String>>?>(null) }
-    var truncated by remember(item.file) { mutableStateOf(false) }
+    var byteTruncated by remember(item.file) { mutableStateOf(false) }
+    var rowTruncated by remember(item.file) { mutableStateOf(false) }
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 val sep = if (item.file.extension.equals("tsv", true)) '\t' else ','
-                val parsed = mutableListOf<List<String>>()
-                item.file.bufferedReader(Charsets.UTF_8).use { br ->
-                    var read = 0
-                    var line: String?
-                    while (br.readLine().also { line = it } != null) {
-                        if (read >= 200) { truncated = true; break }
-                        parsed.add(parseCsvLine(line!!, sep))
-                        read++
-                    }
-                }
-                rows = parsed
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_csv_parse_error)
+                // [da1026-F] was a bare `item.file.bufferedReader(...)` +
+                // readLine() loop with only a ROW cap — see
+                // [readCsvPreviewSlice] for why the row cap did not bound
+                // memory.
+                readCsvPreviewSlice(item.file, sep, MAX_CSV_PREVIEW_ROWS)
             }
         }
+        loaded.fold(
+            onSuccess = { slice ->
+                rows = slice.rows
+                byteTruncated = slice.byteTruncated
+                rowTruncated = slice.rowTruncated
+            },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_csv_parse_error)
+            },
+        )
     }
 
     when {
@@ -734,9 +877,25 @@ private fun CsvPreview(item: FileItem) {
         else -> {
             val table = rows!!
             Column(Modifier.fillMaxSize()) {
-                if (truncated) {
+                if (byteTruncated || rowTruncated) {
                     Text(
-                        text = stringResource(R.string.filepreview_truncated_rows, 200, item.formattedSize),
+                        // Byte cap and row cap are independent: a huge single
+                        // line trips the byte cap without ever reaching 200
+                        // rows, and a 200-row file trips only the row cap.
+                        // Report the one that actually clipped the table.
+                        text = if (byteTruncated) {
+                            stringResource(
+                                R.string.filepreview_truncated_kb,
+                                MAX_TEXT_PREVIEW_BYTES / 1000,
+                                item.formattedSize,
+                            )
+                        } else {
+                            stringResource(
+                                R.string.filepreview_truncated_rows,
+                                MAX_CSV_PREVIEW_ROWS,
+                                item.formattedSize,
+                            )
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
@@ -767,6 +926,77 @@ private fun CsvPreview(item: FileItem) {
         }
     }
 }
+
+// --- begin csv-bounded-preview (JVM harness / unit test slices this region) ---
+
+/** [da1026-F] Result of [readCsvPreviewSlice]: parsed rows + why it stopped early. */
+internal data class CsvPreviewSlice(
+    val rows: List<List<String>>,
+    val byteTruncated: Boolean,
+    val rowTruncated: Boolean,
+)
+
+/**
+ * [da1026-F] Row-bounded **and** byte-bounded CSV/TSV preview slice.
+ *
+ * The previous implementation streamed `bufferedReader().readLine()` with a
+ * 200-row cap and nothing else. A row cap is not a memory bound: `readLine()`
+ * materialises the whole line before the cap can look at it, so a CSV whose
+ * single line is hundreds of MB (a minified data dump, a one-line export)
+ * grew one String to the size of the file → `OutOfMemoryError`. That is an
+ * `Error`, not an `Exception`, so the surrounding `catch (e: Exception)` in
+ * the caller never saw it and the process was killed. Same class of bug
+ * [rv1014-E1] fixed for TextPreview/MarkdownPreview/JsonPreview and
+ * [da1020-08] fixed for buildPrintHtml — this was the one site left, because
+ * the gate only looked for `.readBytes()`.
+ *
+ * Now the file goes through the same [readCapped] the other four surfaces use
+ * (at most [MAX_TEXT_PREVIEW_BYTES] + 1 bytes), so both the decode and the
+ * split operate on a bounded String no matter how the file is shaped.
+ *
+ * **Residual-fragment policy (deliberate).** A byte-capped slice normally ends
+ * mid-line. That fragment is DISCARDED rather than parsed: rendering it would
+ * put a half row on screen looking exactly like a complete one, and the row it
+ * belongs to is not otherwise recoverable. This mirrors [decodeUtf8Capped],
+ * which drops a split multi-byte stump for the same "don't show a lie" reason.
+ * Consequence: when the cut lands exactly on a newline the last *complete* row
+ * is dropped too — a bounded over-drop, never an under-drop, and the banner
+ * tells the user the preview is clipped anyway.
+ *
+ * Line splitting mirrors `BufferedReader.readLine()` rather than a naive
+ * `split('\n')`: a terminating newline does not produce a trailing empty row,
+ * an empty file produces no rows, and interior blank lines are preserved.
+ *
+ * @param maxRows row cap for the rendered table (rows beyond it set
+ *   [CsvPreviewSlice.rowTruncated]).
+ */
+internal fun readCsvPreviewSlice(file: File, sep: Char, maxRows: Int): CsvPreviewSlice {
+    val capped = readCapped(file, MAX_TEXT_PREVIEW_BYTES)
+    val byteTruncated = capped.size > MAX_TEXT_PREVIEW_BYTES
+    val lines = splitPreviewLines(decodeUtf8Capped(capped))
+    val completeLines = if (byteTruncated) lines.dropLast(1) else lines
+    val rowTruncated = completeLines.size > maxRows
+    val kept = if (rowTruncated) completeLines.subList(0, maxRows) else completeLines
+    return CsvPreviewSlice(
+        rows = kept.map { parseCsvLine(it, sep) },
+        byteTruncated = byteTruncated,
+        rowTruncated = rowTruncated,
+    )
+}
+
+/** `readLine()`-equivalent line split; see [readCsvPreviewSlice]. */
+internal fun splitPreviewLines(text: String): List<String> {
+    if (text.isEmpty()) return emptyList()
+    // Kotlin's lines() splits on CRLF / LF / CR — the same three terminators
+    // BufferedReader.readLine() does, so CRLF files keep their original
+    // behaviour (the \r never reaches a cell). `lines()` yields one trailing
+    // empty element when the text ends in a terminator; readLine() would not
+    // have produced that row, so drop it.
+    val parts = text.lines()
+    return if (parts.last().isEmpty()) parts.dropLast(1) else parts
+}
+
+// --- end csv-bounded-preview ---
 
 private fun parseCsvLine(line: String, sep: Char): List<String> {
     val out = mutableListOf<String>()
@@ -801,22 +1031,32 @@ private fun JsonPreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
-                val bytes = item.file.readBytes()
-                truncated = bytes.size > MAX_TEXT_PREVIEW_BYTES
-                val raw = decodeUtf8Capped(bytes)
-                pretty = try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                // [rv1014-E1] capped read via readCapped — see TextPreview above.
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
+                val clipped = capped.size > MAX_TEXT_PREVIEW_BYTES
+                val raw = decodeUtf8Capped(capped)
+                val formatted = try {
                     when (raw.trimStart().firstOrNull()) {
                         '{' -> org.json.JSONObject(raw).toString(2)
                         '[' -> org.json.JSONArray(raw).toString(2)
                         else -> raw
                     }
                 } catch (_: Exception) { raw }
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+                formatted to clipped
             }
         }
+        loaded.fold(
+            onSuccess = { (formatted, clipped) ->
+                pretty = formatted
+                truncated = clipped
+            },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+            },
+        )
     }
 
     when {
@@ -862,32 +1102,42 @@ private fun JsonPreview(item: FileItem) {
 
 // ==================== Archive (ZIP/JAR/APK) ====================
 
+/** One zip entry row. File-private (not a local class) so the type also
+ *  crosses the `withContext(Dispatchers.IO)` boundary in the loader. */
+private data class ArchiveEntry(val name: String, val size: Long, val isDir: Boolean)
+
 @Composable
 private fun ArchivePreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    data class Entry(val name: String, val size: Long, val isDir: Boolean)
-    var entries by remember(item.file) { mutableStateOf<List<Entry>?>(null) }
+    var entries by remember(item.file) { mutableStateOf<List<ArchiveEntry>?>(null) }
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
-                val out = mutableListOf<Entry>()
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview):
+        // the zip walk returns the sorted entry list; the state is assigned
+        // after `withContext` returns.
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                val out = mutableListOf<ArchiveEntry>()
                 java.util.zip.ZipFile(item.file).use { zf ->
                     val it = zf.entries()
                     while (it.hasMoreElements()) {
                         val e = it.nextElement()
-                        out.add(Entry(e.name, e.size, e.isDirectory))
+                        out.add(ArchiveEntry(e.name, e.size, e.isDirectory))
                         if (out.size >= 2000) break
                     }
                 }
-                entries = out.sortedBy { it.name }
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_archive_read_error)
+                out.sortedBy { it.name }
             }
         }
+        loaded.fold(
+            onSuccess = { list -> entries = list },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_archive_read_error)
+            },
+        )
     }
 
     when {
@@ -922,7 +1172,10 @@ private fun ArchivePreview(item: FileItem) {
                                 )
                             },
                             supportingContent = if (e.isDir) null else {
-                                { Text(android.text.format.Formatter.formatFileSize(null, e.size)) }
+                                // [sweep1014-B29] was Formatter.formatFileSize(null, …) —
+                                // AOSP Formatter returns "" for a null context; use the
+                                // pure-Kotlin formatter from FileBrowserViewModel.kt.
+                                { Text(formatFileSize(e.size)) }
                             },
                         )
                         HorizontalDivider()
@@ -1004,9 +1257,22 @@ private fun openExternally(context: Context, item: FileItem, mime: String) {
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "Open with…"))
+        // [deep-audit-1049 B-03] The chooser is what gets started, and it does
+        // not inherit the inner intent's flags — the hand-rolled version left
+        // NEW_TASK on the inner intent only. The chooser label moves from a
+        // hard-coded English literal to the existing localized string.
+        ExternalIntent.share(
+            context,
+            intent,
+            context.getString(R.string.filepreview_open_externally),
+        ) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.filepreview_no_app),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         AppLogger.warning("FilePreview", "openExternally failed: ${e.message}")
         Toast.makeText(context, context.getString(R.string.filepreview_no_app), Toast.LENGTH_SHORT).show()
@@ -1116,7 +1382,19 @@ private fun shareFile(context: Context, item: FileItem) {
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, context.getString(R.string.file_share_chooser_title)))
+        // [deep-audit-1049 B-03] Shared launcher: NEW_TASK lands on the
+        // chooser (the intent that is actually started) instead of nowhere.
+        ExternalIntent.share(
+            context,
+            intent,
+            context.getString(R.string.file_share_chooser_title),
+        ) { t ->
+            Toast.makeText(
+                context,
+                context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         AppLogger.warning("FilePreview", "share failed for ${item.name}: ${e.message}")
         Toast.makeText(context, context.getString(R.string.file_share_failed_toast, e.message ?: ""), Toast.LENGTH_SHORT).show()
@@ -1149,19 +1427,26 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
     //
     // A *field* does create a GC root, so `printWebView` below is the real
     // version of that intent. It is deliberately NOT destroyed in
-    // `onPageFinished` and NOT destroyed by the next print either:
-    // `createPrintDocumentAdapter` hands the framework an adapter that reads
-    // this WebView lazily for as long as the job is spooling, and nothing tells
-    // us when that ends. Destroying on the success path (or on the next call)
-    // would silently produce blank printouts whenever a job outlives its call.
-    // The single slot bounds the retention to one view — see the ponytail note
-    // on the field.
+    // `onPageFinished`: `createPrintDocumentAdapter` hands the framework an
+    // adapter that reads this WebView lazily for as long as the job is
+    // spooling, and nothing tells us when that ends. Destroying on the success
+    // path would silently produce blank printouts whenever a job outlives its
+    // call.
+    //
+    // [deep-audit-1049 B-05] The slot IS released before the next print claims
+    // it, and on preview exit — but only when the current view has not started
+    // spooling yet (`releasePrintWebViewIfNotSpooling`). A spooling view keeps
+    // the old "bounded to whatever is still printing" behaviour; what no longer
+    // happens is the double dialog, because `onPageFinished` now refuses to
+    // start a job for a view that is no longer the slot owner.
     try {
+        releasePrintWebViewIfNotSpooling()
         val webView = WebView(context).apply {
             settings.javaScriptEnabled = false
             settings.allowFileAccess = true
         }
         printWebView = webView
+        printWebViewSpooling = false
         webView.webViewClient = object : SafeWebViewClient() {
             /**
              * [GH#341] Renderer died mid-print. The print job cannot proceed —
@@ -1178,6 +1463,22 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                // [deep-audit-1049 B-05] A superseded view must not pull a
+                // print job. Its page keeps loading after the slot was claimed
+                // by a newer print, and the old code started a second dialog
+                // from here whose adapter `releasePrintWebView(view)` could no
+                // longer reach (the identity check made it a no-op), leaving
+                // both the dialog and the renderer behind. Never spooling means
+                // this view can be torn down immediately.
+                if (printWebView !== view) {
+                    AppLogger.warning(
+                        "FilePreview",
+                        "print page finished for a superseded view: ${item.name}",
+                    )
+                    destroyPrintWebView(view)
+                    return
+                }
+                printWebViewSpooling = true
                 val printManager =
                     context.getSystemService(Context.PRINT_SERVICE) as PrintManager
                 val jobName = "${context.getString(R.string.app_name)} - ${item.name}"
@@ -1205,7 +1506,7 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
             }
         }
         if (preRenderedHtml == null) {
-            webView.loadUrl("file://${item.file.absolutePath}")
+            webView.loadUrl(fileUrlFor(item.file))
         } else {
             webView.loadDataWithBaseURL(null, preRenderedHtml, "text/html", "utf-8", null)
         }
@@ -1220,25 +1521,40 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
  * field (not a local) is what makes it an actual GC root; see the note in
  * [printFile] for why it outlives `onPageFinished`.
  *
- * ponytail: 单槽，成功路径不销毁 | 天花板: 打印期间保留 1 个 WebView；连续打印
- * 时旧实例会被新实例覆盖（不累积，但旧的渲染器要到 GC 才回收）| 升级触发:
+ * ponytail: 单槽，打印中不销毁 | 天花板: 一次打印作业 spool 期间再点打印，前一个
+ * WebView 无法安全销毁（销毁 = 空白纸），会留到 GC；非 spool 的旧实例在下次打印
+ * 前与退出预览时都会被释放（[releasePrintWebViewIfNotSpooling]）| 升级触发:
  * PrintManager 提供作业完成回调，或出现「打印相关 WebView 驻留」的内存报告。
  */
 private var printWebView: WebView? = null
 
 /**
+ * [deep-audit-1049 B-05] Whether [printWebView] has already handed its adapter
+ * to PrintManager. A spooling view is still being read by the framework, so it
+ * is the one instance that must NOT be destroyed.
+ */
+private var printWebViewSpooling = false
+
+/**
+ * [deep-audit-1049 B-05] Decision behind [releasePrintWebViewIfNotSpooling],
+ * pulled out so a JVM test can pin the branch (the WebView itself is
+ * Android-only). Pure: the caller supplies the two facts.
+ */
+internal fun shouldReleasePrintSlot(hasSlot: Boolean, slotSpooling: Boolean): Boolean =
+    hasSlot && !slotSpooling
+
+/**
  * [fix/render-ui F-274] Drop the reference and tear the renderer down. Called
- * on a load failure, and at the start of the next print. `destroy()` on an
+ * on a load failure, by [releasePrintWebViewIfNotSpooling] before a new print
+ * claims the slot, and when the preview screen goes away. `destroy()` on an
  * already-destroyed WebView is a no-op, and the identity check makes a stale
  * callback from a superseded view safe.
  */
 private fun releasePrintWebView() {
     val view = printWebView ?: return
     printWebView = null
-    runCatching {
-        view.stopLoading()
-        view.destroy()
-    }
+    printWebViewSpooling = false
+    destroyPrintWebView(view)
 }
 
 /**
@@ -1247,17 +1563,52 @@ private fun releasePrintWebView() {
  * newer print is using.
  */
 private fun releasePrintWebView(view: WebView) {
-    if (printWebView === view) releasePrintWebView()
+    if (isCurrentPrintView(printWebView, view)) releasePrintWebView()
+}
+
+/**
+ * [deep-audit-1049 B-05] Identity, not equality: two WebViews that would
+ * compare "equal" are still different renderers, and releasing the wrong one
+ * blanks the job the other is spooling. Pure so the identity semantics the
+ * whole slot guard rests on are pinned on the JVM.
+ */
+internal fun isCurrentPrintView(owner: Any?, candidate: Any?): Boolean =
+    owner != null && owner === candidate
+
+/**
+ * [deep-audit-1049 B-05] Release the slot before it is re-claimed (a new print)
+ * or abandoned (the preview screen exits) — the contract [releasePrintWebView]
+ * always documented but nothing called. A view whose job is already spooling is
+ * skipped: `createPrintDocumentAdapter` reads it lazily, so destroying it here
+ * would print blank pages.
+ */
+private fun releasePrintWebViewIfNotSpooling() {
+    if (shouldReleasePrintSlot(printWebView != null, printWebViewSpooling)) {
+        releasePrintWebView()
+    }
+}
+
+/** Tear down one WebView that no print job depends on any more. */
+private fun destroyPrintWebView(view: WebView) {
+    runCatching {
+        view.stopLoading()
+        view.destroy()
+    }
 }
 
 /**
  * Read a text-ish preview file (capped at [MAX_TEXT_PREVIEW_BYTES]) and wrap
- * it in a printable HTML document. Call from Dispatchers.IO: the read itself
- * is unbounded (the cap applies to the bytes handed to the WebView, not to
- * how much is read from disk).
+ * it in a printable HTML document. Call from Dispatchers.IO.
+ *
+ * [da1020-08] The read is bounded as well, through the same [readCapped] the
+ * preview surfaces below use: this used to call `File.readBytes()`, so printing
+ * a multi-GB .log pulled the whole file into the heap before [decodeUtf8Capped]
+ * applied its cap. Printed output is unchanged — at most MAX+1 bytes are read
+ * (the one-extra-byte verdict documented on [readCapped]) and [decodeUtf8Capped]
+ * still hands the WebView exactly [MAX_TEXT_PREVIEW_BYTES] bytes.
  */
 private fun buildPrintHtml(item: FileItem): String {
-    val raw = decodeUtf8Capped(item.file.readBytes())
+    val raw = decodeUtf8Capped(readCapped(item.file, MAX_TEXT_PREVIEW_BYTES))
     return buildString {
         append("<html><head><meta charset=\"utf-8\">")
         append("<style>body{font-family:monospace;font-size:12px;white-space:pre-wrap;word-wrap:break-word;}</style>")
@@ -1278,6 +1629,33 @@ private fun decodeUtf8Capped(bytes: ByteArray, cap: Int = MAX_TEXT_PREVIEW_BYTES
     val slice = if (truncated) bytes.copyOf(cap) else bytes
     val text = String(slice, Charsets.UTF_8)
     return if (truncated && text.endsWith('\uFFFD')) text.dropLast(1) else text
+}
+
+/**
+ * [rv1014-E1] Bounded replacement for java.io.InputStream.readNBytes, which
+ * is API 33+ — minSdk is 26 and desugaring is off, so on Android 8–12
+ * previewing any text file threw an uncatchable NoSuchMethodError (`Error`,
+ * not `Exception`).
+ *
+ * Reads at most [maxBytes] + 1 bytes into a ByteArrayOutputStream with a fixed
+ * [READ_BUFFER_BYTES] buffer, stopping as soon as the bound is reached — same
+ * semantics the call sites relied on from `readNBytes(maxBytes + 1)`: the one
+ * extra byte lets the caller derive the truncated verdict (`size > maxBytes`)
+ * in a single pass.
+ */
+private fun readCapped(file: File, maxBytes: Int): ByteArray {
+    val out = java.io.ByteArrayOutputStream(minOf(maxBytes + 1, READ_BUFFER_BYTES))
+    val buf = ByteArray(READ_BUFFER_BYTES)
+    file.inputStream().use { input ->
+        var remaining = maxBytes + 1
+        while (remaining > 0) {
+            val n = input.read(buf, 0, minOf(buf.size, remaining))
+            if (n < 0) break
+            out.write(buf, 0, n)
+            remaining -= n
+        }
+    }
+    return out.toByteArray()
 }
 
 private fun escapeHtml(s: String): String =
@@ -1319,4 +1697,68 @@ private fun collectImageGallery(
     }
     return items to startIdx
 }
+
+// ── file:// URL encoding (da1022-H / backlog §1021-V) ─────────────────────────
+
+// --- begin file-url-path-encode (JVM harness slices this region verbatim) ---
+
+private const val FILE_URL_HEX = "0123456789ABCDEF"
+
+/**
+ * Percent-encode an absolute filesystem path for use in a `file://` URL.
+ *
+ * Why this exists (backlog §1021-V, device-verified): a name containing `#`
+ * pasted raw into a `file://` URL makes WebView treat everything after the
+ * `#` as a fragment, so `a#b.html` loads as `a.html` → `net::ERR_FILE_NOT_FOUND`.
+ * Space, `?`, `%` and non-ASCII names break the same way.
+ *
+ * [com.rikkaminis.app.ui.preview.toAssetLoaderUrl] does NOT apply here: it
+ * maps to the asset loader's `https://appassets.androidplatform.net/` origin,
+ * which only resolves when a WebViewAssetLoader intercepts the load —
+ * FilePreviewScreen loads plain `file://` URLs, so it needs the path itself
+ * encoded. This is also why `android.net.Uri.encode(path, "/")` is not used:
+ * this function is JVM-pure (no Android imports) so it is unit-testable
+ * without Robolectric.
+ *
+ * Semantics: the RFC 3986 unreserved set (`ALPHA` / `DIGIT` / `-._~`) plus
+ * `/` survives byte-for-byte (encoding `/` would destroy the path structure);
+ * every other UTF-8 byte becomes `%XX`. `%` itself is escaped (`50%off` →
+ * `50%25off`), which is what keeps a file literally named `a#b.html` or
+ * `50%23.html` round-tripping to itself after WebView's percent-decode —
+ * deliberately NOT idempotent on already-encoded input for the same reason.
+ */
+internal fun encodeFileUrlPath(path: String): String {
+    val sb = StringBuilder(path.length)
+    for (b in path.toByteArray(Charsets.UTF_8)) {
+        val value = b.toInt() and 0xFF
+        val c = value.toChar()
+        val safe = c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' ||
+            c == '-' || c == '.' || c == '_' || c == '~' || c == '/'
+        if (safe) {
+            sb.append(c)
+        } else {
+            sb.append('%').append(FILE_URL_HEX[value shr 4]).append(FILE_URL_HEX[value and 0x0F])
+        }
+    }
+    return sb.toString()
+}
+
+// --- end file-url-path-encode ---
+
+/**
+ * Build the `file://` URL for [file] with the path percent-encoded — never
+ * concatenate `"file://" + file.absolutePath` raw: a name containing `#` or
+ * `?` is parsed as fragment/query by WebView and the load fails with
+ * `net::ERR_FILE_NOT_FOUND` (backlog §1021-V, device-verified 2026-10-17).
+ *
+ * [fix/fileurl-contract] This is the single construction point for a `file://`
+ * URL that crosses to a system component (WebView / asset loader / FileProvider),
+ * so it is `internal` rather than `private`: the chat HTML preview
+ * (`ChatScreen.openHtmlPreview` + the pinned-shortcut deep link) and the webapp
+ * shortcut (`WebAppActivity`) used to concatenate the raw path themselves, which
+ * left the two contracts spliced together — a file literally named `50%23.html`
+ * reached the decoding consumers as `50#.html`. Contract: **encoded at
+ * construction, decoded at every path-semantics consumer** (`decodeUriPath`).
+ */
+internal fun fileUrlFor(file: File): String = "file://" + encodeFileUrlPath(file.absolutePath)
 

@@ -60,17 +60,29 @@ fun ThinkingRuleEditorDialog(
     onSave: (ThinkingRule) -> Unit,
 ) {
     val seed = request.seed
-    var label by remember { mutableStateOf(seed.label) }
-    var allModels by remember { mutableStateOf(seed.scope is ThinkingRule.Scope.AllModels) }
-    var pattern by remember {
+    // [da1033-I07] Every editable field below is seeded from `seed`, so every one of
+    // them keys on it: without a key, an external write (minis-config / Debug RPC /
+    // backup restore) left the dialog showing the copy it opened with, and Save wrote
+    // that copy back over the newer rule — or resurrected one that had been deleted.
+    // One key for the whole form on purpose: a half-refreshed state (the new seed's
+    // label next to the previous seed's format choice) is not a state this dialog can
+    // represent. `formatMenuOpen` below is a transient popup flag and stays keyless.
+    var label by remember(seed) { mutableStateOf(seed.label) }
+    var allModels by remember(seed) { mutableStateOf(seed.scope is ThinkingRule.Scope.AllModels) }
+    var pattern by remember(seed) {
         mutableStateOf((seed.scope as? ThinkingRule.Scope.ModelPattern)?.pattern ?: "")
     }
-    var choice by remember { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
+    var choice by remember(seed) { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
+    // [da1024-F] "the user actively changed the format" — the dropdown selection OR any
+    // per-format parameter field below. Until this is set, the dialog must not rewrite a
+    // wire format it cannot represent (FormatChoice.from's `else` would map DeepSeekRelay /
+    // QwenRootOnly / null onto REASONING_EFFORT). See ThinkingRuleEditPreserve.kt.
+    var formatChanged by remember(seed) { mutableStateOf(false) }
     // Shared editable params across formats.
-    var sendOffValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
-    var offValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
-    var path by remember { mutableStateOf(formatPath(seed.wireFormat) ?: "") }
-    var customValues by remember { mutableStateOf(customEditableValues(seed.wireFormat)) }
+    var sendOffValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
+    var offValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
+    var path by remember(seed) { mutableStateOf(formatPath(seed.wireFormat) ?: "") }
+    var customValues by remember(seed) { mutableStateOf(customEditableValues(seed.wireFormat)) }
     var formatMenuOpen by remember { mutableStateOf(false) }
 
     fun buildWireFormat(): ThinkingWireFormat = when (choice) {
@@ -90,11 +102,19 @@ fun ThinkingRuleEditorDialog(
         )
     }
 
-    fun buildRule() = ThinkingRule(
-        kind = ThinkingRule.Kind.CUSTOM,
-        scope = if (allModels) ThinkingRule.Scope.AllModels else ThinkingRule.Scope.ModelPattern(pattern.trim()),
-        wireFormat = buildWireFormat(),
-        label = label.trim(),
+    /** True while the dialog has neither changed nor been able to represent the seed's format. */
+    val preservesSeedFormat = !formatChanged && !isDropdownRepresentableWireFormat(seed.wireFormat)
+
+    fun buildRule() = buildEditedThinkingRule(
+        seed = seed,
+        allModels = allModels,
+        pattern = pattern,
+        wireFormat = chooseEditedWireFormat(
+            seedWire = seed.wireFormat,
+            formatChanged = formatChanged,
+            edited = buildWireFormat(),
+        ),
+        label = label,
     )
 
     val isValid = label.isNotBlank() &&
@@ -158,22 +178,39 @@ fun ThinkingRuleEditorDialog(
                 )
                 Column {
                     MinisTextButton(onClick = { formatMenuOpen = true }) {
-                        Text(stringResource(choice.titleRes))
+                        // ponytail: the preserved case labels the button with the list's
+                        // English wireFormatSummary instead of adding localized titles for
+                        // two rarely-copied formats. | 天花板: a non-English user sees one
+                        // English label in this dialog. | 升级触发: DeepSeekRelay /
+                        // QwenRootOnly get real FormatChoice entries (needs 8-language
+                        // strings.xml) — then the label collapses back to choice.titleRes.
+                        Text(
+                            if (preservesSeedFormat) {
+                                // The dropdown has no entry for this rule's format, so it
+                                // must not claim one: show the same summary the rules list
+                                // shows, which is also what Save will persist.
+                                wireFormatSummary(seed.wireFormat)
+                            } else {
+                                stringResource(choice.titleRes)
+                            },
+                        )
                     }
                     DropdownMenu(expanded = formatMenuOpen, onDismissRequest = { formatMenuOpen = false }) {
                         FormatChoice.entries.forEach { c ->
                             DropdownMenuItem(
                                 text = { Text(stringResource(c.titleRes)) },
-                                onClick = { choice = c; formatMenuOpen = false },
+                                onClick = { choice = c; formatChanged = true; formatMenuOpen = false },
                             )
                         }
                     }
                 }
-                Text(
-                    stringResource(choice.explanationRes),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (!preservesSeedFormat) {
+                    Text(
+                        stringResource(choice.explanationRes),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
 
                 // Per-format fields
                 when (choice) {
@@ -186,13 +223,13 @@ fun ThinkingRuleEditorDialog(
                             Text(stringResource(R.string.thinking_rules_send_off_value))
                             Switch(
                                 checked = sendOffValue,
-                                onCheckedChange = { sendOffValue = it },
+                                onCheckedChange = { sendOffValue = it; formatChanged = true },
                             )
                         }
                         if (sendOffValue) {
                             OutlinedTextField(
                                 value = offValue,
-                                onValueChange = { offValue = sanitizeSingleLineInput(it) },
+                                onValueChange = { offValue = sanitizeSingleLineInput(it); formatChanged = true },
                                 label = { Text(stringResource(R.string.thinking_rules_off_value)) },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
@@ -202,7 +239,7 @@ fun ThinkingRuleEditorDialog(
                     FormatChoice.BOOLEAN_TOGGLE, FormatChoice.EXTRA_BODY_TOGGLE -> {
                         OutlinedTextField(
                             value = path,
-                            onValueChange = { path = sanitizeSingleLineInput(it) },
+                            onValueChange = { path = sanitizeSingleLineInput(it); formatChanged = true },
                             label = { Text(stringResource(R.string.thinking_rules_field_path)) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -211,7 +248,7 @@ fun ThinkingRuleEditorDialog(
                     FormatChoice.CUSTOM_PATH -> {
                         OutlinedTextField(
                             value = path,
-                            onValueChange = { path = sanitizeSingleLineInput(it) },
+                            onValueChange = { path = sanitizeSingleLineInput(it); formatChanged = true },
                             label = { Text(stringResource(R.string.thinking_rules_dotted_path)) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -221,6 +258,7 @@ fun ThinkingRuleEditorDialog(
                                 value = customValues[tier] ?: "",
                                 onValueChange = {
                                     customValues = customValues + (tier to sanitizeSingleLineInput(it))
+                                    formatChanged = true
                                 },
                                 label = {
                                     Text(
@@ -276,6 +314,15 @@ enum class FormatChoice(val titleRes: Int, val explanationRes: Int) {
     CUSTOM_PATH(R.string.thinking_fmt_custom_title, R.string.thinking_fmt_custom_desc);
 
     companion object {
+        /**
+         * The dropdown entry that stands for [fmt] — DISPLAY ONLY.
+         *
+         * The `else` fallback is safe here because it can no longer reach the wire: the
+         * save path goes through `chooseEditedWireFormat`, which keeps the seed's own
+         * format unless the user actively changed it ([da1024-F], see
+         * ThinkingRuleEditPreserve.kt). Before that, `from` was the ONLY source of the
+         * saved format, so this `else` silently rewrote DeepSeekRelay / QwenRootOnly.
+         */
         fun from(fmt: ThinkingWireFormat?): FormatChoice = when (fmt) {
             is ThinkingWireFormat.OmitEverything -> OMIT
             is ThinkingWireFormat.ReasoningEffort -> REASONING_EFFORT
@@ -344,13 +391,21 @@ private fun firstCustomTier(fmt: ThinkingWireFormat?): ThinkingLevel =
  * Live preview: resolve the rule against a sample body and show the JSON it would
  * produce. Only one tier can be rendered at a time, so [firstCustomTier] picks the
  * tier the rule actually configures.
+ *
+ * [meta-audit-1028 D4 F-01] The draft is evaluated through
+ * [ThinkingRuleResolver.applyDraftRules] — a READ path. This function used to publish
+ * the draft into the process-wide rule cache under a throwaway instance id and then
+ * remove it again, which was two cache mutations (and two `customRulesRevision` bumps)
+ * per call. This call sits in the dialog's composition body, so every frame the dialog
+ * was open bumped the parent list's Room reload key: the provider screen re-queried all
+ * of the instance's custom rules per frame, and a throw between publish and cleanup left
+ * a rule in the cache that no screen could ever remove.
  */
 private fun previewJson(rule: ThinkingRule): String {
     return try {
         val body = JSONObject()
-        // Isolate: inject just this one rule as the sole custom rule under a throwaway id.
+        // Isolate: the draft is the SOLE custom rule for this evaluation.
         val previewInstance = "__preview__"
-        ThinkingRuleResolver.setCustomRules(previewInstance, listOf(rule))
         val ctx = ThinkingResolveContext(
             modelId = (rule.scope as? ThinkingRule.Scope.ModelPattern)?.pattern?.replace("*", "x") ?: "sample-model",
             instanceId = previewInstance,
@@ -367,8 +422,7 @@ private fun previewJson(rule: ThinkingRule): String {
             isOfficialDeepSeek = false,
             offEffort = null,
         )
-        ThinkingRuleResolver.apply(body, ctx)
-        ThinkingRuleResolver.setCustomRules(previewInstance, emptyList())
+        ThinkingRuleResolver.applyDraftRules(body, ctx, listOf(rule))
         if (body.length() == 0) "{ }  (no thinking key sent)" else body.toString(2)
     } catch (e: Exception) {
         "(preview unavailable)"

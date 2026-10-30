@@ -187,10 +187,29 @@ object NativeOffloadServer {
         // [D-2] size the offload worker cap from the shared ConcurrencyPrefs
         // knob (runs after ConcurrencyPrefs.prime in MinisApp.onCreate), kept
         // aligned with the shell coordinator + session slot cap.
-        workerConcurrency = java.util.concurrent.Semaphore(
-            com.rikkaminis.app.data.ConcurrencyPrefs.maxConcurrentSessions(),
-            true,
-        )
+        val workers = com.rikkaminis.app.data.ConcurrencyPrefs.maxConcurrentSessions()
+        workerConcurrency = java.util.concurrent.Semaphore(workers, true)
+
+        // [meta1028-B04 F-11] Close the two ledger gaps that survive a knob
+        // change and a process death:
+        //
+        //  * SIZE — the ledger's DEFAULT_CAPACITY (4) assumed the worker pool
+        //    was the old fixed 2. It is now 1..16 (`ConcurrencyPrefs`), and at
+        //    16 the ring would evict a file after TWO newer requests while
+        //    fourteen replies are still in flight and un-cat'd: the exact
+        //    "deleted a file the guest had not read yet" failure the ledger
+        //    exists to prevent.
+        //  * ORPHANS — the ring lives in memory, so a process death (silent
+        //    kill, OOM, debug crash) leaves every `.native-offload-*` file in
+        //    the rootfs /tmp (a tmpfs = RAM) with nothing left to reclaim it.
+        //    Sweeping them at start is the only closure across a process
+        //    boundary; nothing can still be reading them, because the proot
+        //    that would `cat` them died with the old process.
+        rootfsTmpDir?.let { dir ->
+            val swept = sweepStaleTmpFiles(dir)
+            if (swept > 0) Log.i(TAG, "reclaimed $swept orphaned offload tmpfile(s) from a previous process")
+        }
+        tmpLedger.resize(OffloadTmpFileLedger.capacityFor(workers))
 
         // T287-followup: bind with bounded retry. Linux abstract sockets are
         // freed by the kernel only after the owning process is fully reaped —
@@ -208,8 +227,27 @@ object NativeOffloadServer {
                 "previous process holding the namespace?",
             )
         serverSocket = s
+        // [ISSUE-12b] Thread creation for this generation is owned by the pool:
+        // it spawns a worker only while a permit is free (non-blocking
+        // tryAcquire) and the worker returns the permit when it drains empty —
+        // so an idle server holds zero worker threads, while a burst can never
+        // exceed the permit cap the rest of the memory budgeting was sized for.
+        val pool = BoundedWorkerPool<LocalSocket>(
+            permits = workerConcurrency,
+            threadName = "native-offload-worker",
+            spawnThread = { name, body -> thread(name = name, isDaemon = true) { body() } },
+            handler = { client, queueMs ->
+                try {
+                    handleClient(client, queueMs)
+                } catch (e: Exception) {
+                    Log.w(TAG, "worker error: ${e.message}", e)
+                } finally {
+                    try { client.close() } catch (_: Exception) {}
+                }
+            },
+        )
         acceptThread = thread(name = "native-offload-accept", isDaemon = true) {
-            runAcceptLoop(s)
+            runAcceptLoop(s, pool)
         }
         Log.i(TAG, "listening on abstract socket '$SOCKET_NAME' " +
             "handlers=${handlers.keys.sorted()} tmpDir=${rootfsTmpDir?.absolutePath}")
@@ -240,7 +278,7 @@ object NativeOffloadServer {
         tmpLedger.clearAll()
     }
 
-    private fun runAcceptLoop(s: LocalServerSocket) {
+    private fun runAcceptLoop(s: LocalServerSocket, pool: BoundedWorkerPool<LocalSocket>) {
         while (true) {
             val client = try {
                 s.accept()
@@ -249,35 +287,15 @@ object NativeOffloadServer {
                 return
             }
             Log.d(TAG, "accepted client from proot extension")
-            thread(name = "native-offload-worker", isDaemon = true) {
-                // [native-rss-tool-guard] Bounded concurrency: acquire the
-                // worker slot BEFORE reading the frame so a burst of
-                // concurrent offload requests queues here instead of each
-                // spawning an unbounded handler thread that bloats native
-                // heap. The slot is released on every exit path (success,
-                // decode error, handler throw) so one bad client can't leak
-                // the worker permit.
-                val queueStartNs = System.nanoTime()
-                val acquired = try {
-                    workerConcurrency.acquire()
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    runCatching { client.close() }
-                    return@thread
-                }
-                // [audit-cs0913] Time spent waiting for a slot — reported by
-                // handleClient (see OffloadQueuePolicy). Pool size is
-                // ConcurrencyPrefs.maxConcurrentSessions() (default 2).
-                val queueMs = (System.nanoTime() - queueStartNs) / 1_000_000
-                try {
-                    handleClient(client, queueMs)
-                } catch (e: Exception) {
-                    Log.w(TAG, "worker error: ${e.message}", e)
-                } finally {
-                    workerConcurrency.release()
-                    try { client.close() } catch (_: Exception) {}
-                }
-            }
+            // [ISSUE-12b] The accept loop no longer spawns one OS thread per
+            // connection (and no longer blocks, so `serverSocket.close()` keeps
+            // interrupting `accept()` exactly as before). It hands the socket to
+            // the bounded pool, which spawns a worker ONLY while a permit is
+            // free and queues excess clients as cheap FIFO entries — a parked
+            // thread costs a ~1 MB native stack, a queued socket entry
+            // effectively nothing. Arrival order, the concurrency cap and the
+            // back-pressure measurement are unchanged.
+            pool.submit(client)
         }
     }
 
@@ -374,20 +392,24 @@ object NativeOffloadServer {
             MemorySpikeRecorder.onEvent("offload-latency", detail)
         }
 
-        val tmpDir = rootfsTmpDir ?: throw IllegalStateException("server not started")
-        tmpDir.mkdirs()
-
-        // [audit-RC7] Register the new tmpfile in the bounded ledger. The
-        // ledger evicts (deletes) the oldest tracked file once it exceeds
-        // capacity — an evicted file has survived several full reply→cat
-        // cycles, so the guest has long consumed it. Deletion happens for
-        // exactly one thread per file (ledger-internal lock): no orphan, no
-        // double-delete, no deleting a file the guest hasn't cat'd yet.
-        val seq = counter.incrementAndGet()
-        val tmpHost = File(tmpDir, ".native-offload-$pid-$seq")
-        tmpHost.writeText(result.output)
-        tmpLedger.rotate(tmpHost)
-        val tmpGuest = "/tmp/${tmpHost.name}"
+        // [meta1028-B04 F-11] Deliver the response. A tmpfile that cannot be
+        // WRITTEN is a delivery failure, and the protocol's only channel is a
+        // PATH — inventing a reply here would have the guest `cat` a sentence.
+        // So the exception still propagates (the worker closes the socket, the
+        // guest sees the same hard failure it always did); what changes is that
+        // the half-written file is now reclaimed instead of leaking, and the
+        // failure is logged with its cause instead of vanishing as EOF.
+        val delivered = deliverResponseFile(
+            result.output,
+            rootfsTmpDir ?: throw IllegalStateException("server not started"),
+            pid,
+            counter.incrementAndGet(),
+            tmpLedger,
+        ).getOrElse { cause ->
+            Log.e(TAG, "could not write the response tmpfile for pid=$pid: ${cause.message}")
+            throw IllegalStateException("response delivery failed: ${cause.message}", cause)
+        }
+        val tmpGuest = delivered.guestPath
 
         Log.d(TAG, "reply name='$name' exit=${result.exitCode} outBytes=${result.output.length} " +
             "tmpGuest=$tmpGuest elapsed=${elapsedMs}ms")
@@ -410,4 +432,170 @@ object NativeOffloadServer {
         writeLEInt(bytes.size)
         if (bytes.isNotEmpty()) write(bytes)
     }
+}
+
+/**
+ * Name prefix of every response tmpfile. Shared by the writer and the boot
+ * sweep so a rename cannot make the sweep stop seeing orphans
+ * ([meta1028-B04 F-11]).
+ */
+internal const val OFFLOAD_TMP_PREFIX = ".native-offload-"
+
+/**
+ * Where one delivered response can be found, host side and guest side.
+ */
+internal data class DeliveredResponse(val hostPath: String, val guestPath: String)
+
+/**
+ * Write one handler response into [tmpDir] and register it in [ledger].
+ *
+ * [meta1028-B04 F-11] Two things this ordering buys, both invisible in the
+ * old `writeText(...)` + `rotate(...)` pair:
+ *
+ *  1. a failed write deletes what it created ([writeResponseFile] reclaims the
+ *     file it registered), instead of leaking a partial tmpfile the ledger
+ *     never heard about;
+ *  2. the caller gets a [Result] it must branch on, so "could not deliver" can
+ *     no longer fall through to a success reply carrying a path that does not
+ *     exist — the guest `cat`'d nothing and read an empty answer at exit 0.
+ *
+ * [writeFn] is injectable so both arms run in a JVM test.
+ */
+internal fun deliverResponseFile(
+    output: String,
+    tmpDir: File,
+    pid: Int,
+    seq: Long,
+    ledger: OffloadTmpFileLedger,
+    // Named, not an inline lambda: see `writeFileText` — a write inside a
+    // parameter-list default is outside every parsed function body and trips
+    // the read-only-mount gate's fail-closed rule.
+    writeFn: (File, String) -> Unit = ::writeFileText,
+): Result<DeliveredResponse> {
+    tmpDir.mkdirs()
+    val host = File(tmpDir, "$OFFLOAD_TMP_PREFIX$pid-$seq")
+    return writeResponseFile(host, output, ledger, writeFn)
+        .map { DeliveredResponse(host.absolutePath, "/tmp/${host.name}") }
+}
+
+/**
+ * Delete every response tmpfile left in [dir] by a PREVIOUS process.
+ *
+ * [meta1028-B04 F-11] The in-memory ledger cannot outlive the process that
+ * owns it, and the files are the only part of a response that does: each one
+ * occupies real RAM (the rootfs /tmp is a tmpfs). Called from `start()`, when
+ * nothing can still be reading them — the proot that would `cat` a file is a
+ * child of the process that died. Returns how many were reclaimed.
+ *
+ * Only regular files whose name starts with [OFFLOAD_TMP_PREFIX] are touched,
+ * so a guest's own `/tmp` content is never collateral. [deleteFn] and [names]
+ * are parameters so the sweep is testable without a real rootfs.
+ */
+internal fun sweepStaleTmpFiles(
+    dir: File,
+    deleteFn: (File) -> Boolean = { it.delete() },
+    names: (File) -> Array<String>? = { it.list() },
+): Int {
+    val entries = names(dir) ?: return 0
+    var swept = 0
+    for (name in entries) {
+        if (!name.startsWith(OFFLOAD_TMP_PREFIX)) continue
+        val f = File(dir, name)
+        // A directory can carry the same name only if something inside the
+        // guest created it; `File.delete()` refuses non-empty directories, so
+        // this cannot recurse into content the sweep never inspected.
+        if (runCatching { deleteFn(f) }.getOrDefault(false)) swept++
+    }
+    return swept
+}
+
+/**
+ * [ISSUE-12b] Bounded transient worker pool backing [NativeOffloadServer].
+ *
+ * The old accept loop spawned one `thread {}` per accepted connection and let
+ * that thread block on the concurrency semaphore — so a burst of N
+ * offloads created N OS threads (each parking on a ~1 MB native stack) while
+ * only 2 made progress. The [native-rss-tool-guard] comment promised "queues
+ * here instead of spawning an unbounded handler thread", but the queue was
+ * implemented as parked threads.
+ *
+ * This pool makes that promise real, with the semaphore still the single
+ * bound mechanism (sized in `start()` from ConcurrencyPrefs, unchanged):
+ *  - at most `permits.availablePermits()+in-flight` — i.e. exactly the permit
+ *    count — worker threads exist at any moment: a submit spawns a worker only
+ *    via non-blocking `tryAcquire()`, and the worker holds that permit until
+ *    it drains the queue empty and releases it on exit;
+ *  - excess clients wait as FIFO queue entries (arrival order preserved, the
+ *    same order the old fair semaphore gave);
+ *  - workers are transient: a drained pool holds zero threads, so an idle
+ *    server costs no native stack (the D-2 memory rationale, kept);
+ *  - no accepted client is ever lost: the submit side (enqueue + tryAcquire)
+ *    and the worker-exit side (poll-empty + release) run under the same lock,
+ *    so a submit either sees a free permit and spawns, or sees a live worker
+ *    that is guaranteed to poll the just-enqueued entry;
+ *  - the accept thread never blocks on permits, so `stop()`'s
+ *    `serverSocket.close()` keeps interrupting `accept()` exactly as before;
+ *  - a throwing handler neither strands the queue nor leaks the permit (the
+ *    old per-connection worker released in a `finally`): the worker keeps
+ *    draining, then rethrows the first failure after it exits.
+ *
+ * `queueMs` handed to [handler] keeps [OffloadQueuePolicy]'s meaning — time
+ * spent waiting for a worker slot ([audit-cs0913] back-pressure report),
+ * measured accept→pickup instead of thread-start→acquire: the same wait,
+ * end to end.
+ */
+internal class BoundedWorkerPool<T>(
+    private val permits: java.util.concurrent.Semaphore,
+    private val threadName: String,
+    private val spawnThread: (name: String, body: () -> Unit) -> Unit,
+    private val handler: (item: T, queueMs: Long) -> Unit,
+) {
+    private class Entry<T>(val item: T, val enqueuedNs: Long)
+
+    private val lock = Any()
+    private val pending = java.util.ArrayDeque<Entry<T>>()
+
+    /** FIFO enqueue; spawns a worker only when a permit is free. */
+    fun submit(item: T) {
+        val spawn = synchronized(lock) {
+            pending.addLast(Entry(item, System.nanoTime()))
+            permits.tryAcquire()
+        }
+        if (spawn) {
+            spawnThread(threadName) { drain() }
+        }
+    }
+
+    private fun drain() {
+        var firstFailure: Throwable? = null
+        while (true) {
+            val entry = synchronized(lock) {
+                pending.pollFirst() ?: run {
+                    // No work left: hand the permit back so a future submit
+                    // can spawn again. Poll-empty + release are atomic w.r.t.
+                    // submit's enqueue + tryAcquire — that is what makes
+                    // "enqueue sees a permit-less world with no live worker"
+                    // impossible.
+                    permits.release()
+                    null
+                }
+            } ?: break
+            try {
+                handler(entry.item, (System.nanoTime() - entry.enqueuedNs) / 1_000_000)
+            } catch (t: Throwable) {
+                // A throwing handler must neither strand the queue nor leak the
+                // permit — the old per-connection worker released in a finally
+                // for exactly this reason. Keep draining (the production
+                // wiring already logs each handler error), remember the first
+                // failure and rethrow it once this worker exits, so an
+                // unhandled Error still reaches the thread's default handler
+                // instead of being swallowed.
+                if (firstFailure == null) firstFailure = t
+            }
+        }
+        firstFailure?.let { throw it }
+    }
+
+    /** Diagnostics / tests only: entries still waiting for a worker. */
+    val pendingCount: Int get() = synchronized(lock) { pending.size }
 }

@@ -1,5 +1,7 @@
 package com.rikkaminis.app.ui.settings
 
+import android.content.Context
+import android.content.SharedPreferences
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -43,6 +45,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -57,6 +60,9 @@ import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.model.DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+import com.rikkaminis.app.data.model.normalizeModalities
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.R
@@ -98,6 +104,38 @@ fun ModelGroupsScreen(
     // edit-then-live semantics.
     var compactModelEntryId by remember {
         mutableStateOf(AgentRuntimeLimitsPrefs.compactModelEntryId())
+    }
+    // [da1024-C] ...and re-read it when someone ELSE writes the pin. The
+    // `remember` above is a one-shot snapshot: this page persists on every
+    // pick, so an external writer — `minis-config set runtime.compactModelEntryId`,
+    // a backup restore, or the removeEntry / removeInstance / replaceEntries
+    // cascade resetting a dangling pin — used to leave the row showing an id
+    // the repository no longer resolves. Same DisposableEffect + named
+    // listener shape as RuntimeLimitsScreen (prefs_listener_holder_guard:
+    // SharedPreferencesImpl holds listeners weakly, so an inline lambda is
+    // collected and the callback silently stops firing).
+    DisposableEffect(context) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == null || key == AgentRuntimeLimitsPrefs.KEY_COMPACT_MODEL_ENTRY_ID) {
+                // [dv17-b07-prefs-prime] Prime FIRST, then read —
+                // `compactModelEntryId()` returns the @Volatile cache, and
+                // SharedPreferencesImpl dispatches the registered listeners in
+                // unspecified (WeakHashMap bucket) order, so this screen's
+                // listener can run BEFORE AgentRuntimeLimitsPrefs' own
+                // self-sync listener and would otherwise publish the value from
+                // just before the write that triggered it. Same belt as
+                // RuntimeLimitsScreen's [fix/da1026-prefs-priming] primes;
+                // covered by prefs_listener_holder_guard (criterion C3).
+                AgentRuntimeLimitsPrefs.prime(context.applicationContext)
+                compactModelEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId()
+            }
+        }
+        val pinPrefs = context.applicationContext.getSharedPreferences(
+            AgentRuntimeLimitsPrefs.PREFS,
+            Context.MODE_PRIVATE,
+        )
+        pinPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { pinPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
     // Choices = every model entry in the provider config (provider label for
     // grouping, display name for the row); recomputed whenever the config
@@ -361,6 +399,13 @@ fun ModelGroupsScreen(
                                 // signals like the default group does. Users can
                                 // raise or clear it in the group detail screen.
                                 contextLimitTokens = DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS,
+                                // [da1031-D ISSUE-06] Cross-layer asymmetry fix:
+                                // the four-way sync for a new field means the UI
+                                // create path must also seed the "last selected"
+                                // memory (the toggle ON→OFF→ON restore reads it),
+                                // same value as contextLimitTokens. The Debug RPC
+                                // groupsCreate gets the same field in this batch.
+                                lastContextLimitTokens = DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS,
                             )
                             providerRepository.addGroup(newGroup)
                             // Auto-set as primary default if it's the first group.
@@ -476,10 +521,19 @@ private fun groupTopModalities(
     val inputs = mutableSetOf<String>()
     val outputs = mutableSetOf<String>()
     for (entryId in group.memberEntryIds) {
-        val model = config.modelEntries.find { it.id == entryId }?.model ?: continue
-        model.inputModalities.orEmpty().forEach { inputs.add(it.lowercase()) }
-        val out = model.outputModalities.orEmpty()
-        if (out.isEmpty()) outputs.add("text") else out.forEach { outputs.add(it.lowercase()) }
+        // [deep-audit-1043 B-06] Two halves of the same 母题:
+        //  - resolve through the System single source, or the default Voice
+        //    groups contribute no marker at all;
+        //  - read capability off `ModelsDevApi.effectiveModel`, or every built-in
+        //    registry model reports no modalities (its `baseModel` fields are
+        //    null by construction and only the registry fills them). Raw
+        //    `.lowercase()` also kept the provider-side `_input` / `_output`
+        //    suffixes, so "image_input" never matched the "image" marker.
+        val entry = SystemVoiceEntries.resolveIn(config.modelEntries, entryId) ?: continue
+        val model = ModelsDevApi.effectiveModel(entry)
+        model.inputModalities.normalizeModalities().orEmpty().forEach { inputs.add(it) }
+        val out = model.outputModalities.normalizeModalities().orEmpty()
+        if (out.isEmpty()) outputs.add("text") else out.forEach { outputs.add(it) }
     }
     return GROUP_MODALITY_PRIORITY.filter { marker ->
         if (marker.isOutput) marker.kind in outputs else marker.kind in inputs
@@ -528,8 +582,11 @@ private fun GroupRow(
      *  inert handle — fine for previews/non-reorderable hosts. */
     dragHandleModifier: Modifier = Modifier,
 ) {
+    // [deep-audit-1043 B-06] System voice members are virtual — resolving only
+    // through `config.modelEntries` left the default Voice groups with an empty
+    // member preview even though their detail screen lists two entries.
     val memberNames = group.memberEntryIds.mapNotNull { entryId ->
-        config.modelEntries.find { it.id == entryId }?.model?.displayName
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)?.model?.displayName
     }
     val preview = if (memberNames.size <= 3) {
         memberNames.joinToString(", ")
@@ -549,8 +606,12 @@ private fun GroupRow(
     // appears empty in chat.
     val enabledInstanceIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
     val totalMembers = group.memberEntryIds.size
+    // [deep-audit-1043 B-06] Same single predicate the runtime member list uses
+    // (`ProviderRepository.enabledMemberEntries`): System entries are usable
+    // without a Provider instance, so judging them by `enabledInstanceIds` marked
+    // every default Voice group 「No usable models」 in red.
     val enabledMembers = group.memberEntryIds.count { entryId ->
-        config.modelEntries.find { it.id == entryId }?.providerInstanceId in enabledInstanceIds
+        SystemVoiceEntries.isEnabledGroupMember(config.modelEntries, enabledInstanceIds, entryId)
     }
     val allDisabled = totalMembers > 0 && enabledMembers == 0
 

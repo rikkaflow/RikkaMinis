@@ -328,6 +328,9 @@
     <string name="skill_import_error_no_url">URL を入力してください</string>
     <string name="skill_import_error_invalid">SKILL.md が無効、または skill が既に存在します</string>
     <string name="skill_import_error_format">SKILL.md が無効です。\'name:\' フィールドを含む YAML frontmatter を確認してください。</string>
+    <string name="skill_file_error_read">選択したファイルを読み込めませんでした</string>
+    <string name="skill_file_error_archive">skill アーカイブが無効です: SKILL.md が見つかりません</string>
+    <string name="skill_file_error_detail">インポートに失敗しました: %1$s</string>
     <string name="skill_import_in_progress">インポート中…</string>
     <string name="skill_import_submit">インポート</string>
     <string name="skill_detail_label_name">名前</string>
@@ -540,6 +543,9 @@
     <string name="browser_history_clear">消去</string>
     <string name="browser_history_done">完了</string>
     <string name="browser_history_search">履歴を検索</string>
+    <string name="browser_history_today">今日</string>
+    <string name="browser_history_yesterday">昨日</string>
+    <string name="browser_history_results">検索結果</string>
     <string name="browser_history_empty_title">閲覧履歴はありません</string>
     <string name="browser_history_empty_subtitle">履歴は 7 日間保持されます</string>
     <string name="browser_history_clear_dialog_title">閲覧履歴を消去しますか？</string>
@@ -1087,9 +1093,10 @@
     <string name="browser_viewport_width">幅</string>
     <string name="browser_viewport_height">高さ</string>
     <string name="common_loading">読み込み中…</string>
+    <string name="settings_secret_unreadable">保存済みの値を読み取れませんでした。何も保存していません。このフォームを閉じて開き直してください。</string>
     <string name="rootfs_reset_button">リセット</string>
     <string name="session_title_label">タイトル</string>
-    <string name="backup_import_too_large">バックアップファイルが大きすぎます（%1$d MB、上限 %2$d MB）。何もインポートされませんでした。</string>
+    <string name="backup_import_too_large">バックアップファイルが大きすぎます（%1$d MB、上限 %2$d MB）。何もインポートされませんでした。「チャット履歴の期間」を短くするかオフにして再エクスポートし、新しいファイルをインポートしてください。</string>
     <string name="backup_export_incomplete">警告: %1$d 個のフィールドの読み取りに失敗しました — このバックアップは不完全な可能性があります。</string>
     <string name="code_expand">%1$d 行を展開</string>
     <string name="code_collapse">折りたたむ</string>
@@ -1112,6 +1119,7 @@
     <string name="sysmsg_compact_failed">圧縮に失敗しました：%1$s</string>
     <string name="sysmsg_context_full_hint">コンテキストが間もなく満杯になります（%1$d / %2$d tokens）。/compact を実行して古い会話を要約に畳み込めます。</string>
     <string name="sysmsg_wait_compact">送信前に現在の圧縮が完了するまでお待ちください。</string>
+    <string name="sysmsg_edit_wait_stream">メッセージを編集中です。先に現在の応答を停止してください — 編集は元のメッセージを置き換えるため、キューには入れられません。</string>
     <string name="sysmsg_context_trimmed">コンテキストが %1$d の制限に達したため、最も古い %2$d 件のメッセージを切り捨ててタスクを続行しました。</string>
     <string name="sysmsg_compact_no_provider">プロバイダーが設定されていません。圧縮できません。</string>
     <string name="sysmsg_compact_empty_session">圧縮するものはありません — セッションは空です。</string>
@@ -1645,9 +1653,43 @@
     <string name="scheduled_delete_title">定時タスクを削除しますか？</string>
     <string name="scheduled_delete_body">「%1$s」は完全に削除されます。</string>
     <string name="scheduled_fuse_notification_title">定時タスクを停止しました</string>
+    <string name="scheduled_edit_missing_body">このタスクは存在しません。この画面を開いている間に削除された可能性があります。</string>
     <string name="scheduled_fuse_notification_body">「%1$s」が %2$d 回連続で失敗したため停止しました。設定から再開できます。</string>
 
     <string name="backup_passphrase_title">暗号化されたバックアップ</string>
     <string name="backup_passphrase_body">この OpenMinis パッケージは暗号化されています（minisbak-enc/1）。エクスポート時に設定したパスフレーズを入力してください。</string>
     <string name="backup_passphrase_label">パスフレーズ</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">%1$sへのリンク</string>
+    <string name="tts_spoken_bare_link">リンク</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">自動承認</string>
+    <string name="perm_auto_approve_title">自動承認モード</string>
+    <string name="perm_auto_approve_desc">通常の設定変更を確認なしで適用します。機密性・破壊的な変更は確認を求めることができます。</string>
+    <string name="perm_auto_approve_sensitive">機密設定を含める</string>
+    <string name="perm_auto_approve_sensitive_desc">プロバイダーの認証情報（API キー、ベース URL）も確認なしで適用します。エージェントが黙って変更する可能性があります。</string>
+    <string name="perm_auto_approve_privileged">特権ツールを許可</string>
+    <string name="perm_auto_approve_privileged_desc">エージェントにユーザー補助と Shizuku コマンドラインの使用を許可します（他のアプリの操作や画面の読み取りが可能になります）。</string>
+    <string name="perm_auto_approve_footer">デフォルトはオフです。オンにすると、通常の書き込みで確認ダイアログが表示されなくなり、ツールの権限確認も停止します。すべての変更は ログ → 設定変更 に記録されます。</string>
+    <string name="perm_auto_approve_confirm_title">自動承認をオンにしますか？</string>
+    <string name="perm_auto_approve_confirm_text">通常の設定変更は確認なしで適用され、ツールの権限確認も表示されなくなります。機密設定（プロバイダーの API キー）と破壊的な変更は引き続き確認します。いつでもオフにできます。</string>
+    <string name="perm_auto_approve_confirm_on">オンにする</string>
+    <string name="perm_section_runtime_batch">システム権限</string>
+    <string name="perm_runtime_batch_desc">Android は機能を使用するたびにこれらの権限を個別に尋ねます。今まとめて許可しておくと、後で中断されません。</string>
+    <string name="perm_runtime_batch_title">すべてのシステム権限を許可</string>
+    <string name="perm_runtime_batch_sub">カレンダー、連絡先、位置情報、写真、マイク、カメラ、通知</string>
+    <string name="perm_runtime_batch_all_granted">すべてのシステム権限は既に許可されています。</string>
+    <string name="perm_runtime_batch_partial">まだ %1$d 件の権限が許可されていません — Android が拒否したか、スキップしました。</string>
+    <string name="mirror_section_title">外部コピー</string>
+    <string name="mirror_section_footer">アプリの保存領域の外に置かれる、継続的に更新されるコピーです。アプリのデータを消去しても残り、任意のファイルマネージャーで開けます。</string>
+    <string name="mirror_enable">外部ミラー</string>
+    <string name="mirror_enable_sub">Download/RikkaMinis/backup — 自動更新</string>
+    <string name="mirror_last_sync">最終同期：%1$s</string>
+    <string name="mirror_never">まだ同期していません</string>
+    <string name="mirror_pending_count">同期待ち %1$d 件</string>
+    <string name="mirror_diag_stale">同期が遅れています：未書き込み %1$d 件（最終書き込みから %2$d 分）</string>
+    <string name="mirror_diag_failed">前回の同期に失敗しました</string>
+    <string name="mirror_diag_unavailable">利用可能なストレージがありません</string>
+    <string name="mirror_retry">再試行</string>
 </resources>

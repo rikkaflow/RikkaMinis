@@ -44,21 +44,36 @@ class ShareReceiverActivity : ComponentActivity() {
         private const val MAX_TOTAL_BYTES = 500L * 1024 * 1024  // 500 MB total
         private const val IO_TIMEOUT_MS = 30_000L               // 30 s per file
 
+        /** [FIX-R3-E F-14] Saved-state slot for the staged items (see [extractedItems]). */
+        private const val STATE_ITEMS = "share_receiver_items"
+
         /**
-         * Process-lifetime cumulative counter of bytes staged for the pending
-         * share, tracked as a companion [java.util.concurrent.atomic.AtomicLong]
-         * (not an instance field) so it survives Activity re-creation
-         * (rotation / low-memory death while the staged files themselves remain
-         * on disk). Resets only when the whole process is reaped, matching the
-         * lifecycle of [SharedShareStore]'s dirty staging files. Guards against
-         * a single user flooding many share intents past [MAX_TOTAL_BYTES]
-         * across Activity instances.
+         * Process-lifetime cumulative budget of bytes staged for the pending
+         * share, owned by the pure [StagedBytesLedger] (companion-scoped, not
+         * an instance field) so it survives Activity re-creation (rotation /
+         * low-memory death while the staged files themselves remain on disk).
+         * Resets only when the whole process is reaped, matching the lifecycle
+         * of [SharedShareStore]'s dirty staging files. Guards against a single
+         * user flooding many share intents past [MAX_TOTAL_BYTES] across
+         * Activity instances.
          */
-        private val totalStagedBytes = java.util.concurrent.atomic.AtomicLong(0)
+        private val stagedBytes = StagedBytesLedger()
 
         /** Reset the cumulative staged-byte counter after the staged set is deleted. */
         fun resetStagedBytes() {
-            totalStagedBytes.set(0L)
+            stagedBytes.reset()
+        }
+
+        /**
+         * [FIX-R3-E F-14] Absolute ledger reconcile: set the counter to the
+         * summed size of the files actually left on disk after a selective
+         * cleanup. [SharedShareStore.cleanSharedFiles] now KEEPS the files the
+         * newest pending share still references, so a blind reset would
+         * under-count the surviving bytes and the 500 MB budget would silently
+         * loosen.
+         */
+        fun setStagedBytes(bytes: Long) {
+            stagedBytes.set(bytes)
         }
 
         /**
@@ -66,9 +81,13 @@ class ShareReceiverActivity : ComponentActivity() {
          * [SharedShareStore.cleanSharedFiles] (e.g. the provider-import path).
          * Clamped at 0 — over-counting would falsely trip [MAX_TOTAL_BYTES]
          * and reject legitimate shares while nothing is on disk.
+         * [§1042-A-07] The clamp used to be applied to a DISCARDED copy
+         * (`addAndGet(-bytes).coerceAtLeast(0L)` as a statement), so a double
+         * debit drove the real counter negative and the cumulative check
+         * under-counted. The ledger writes the clamped balance back.
          */
         fun debitStagedBytes(bytes: Long) {
-            totalStagedBytes.addAndGet(-bytes).coerceAtLeast(0L)
+            stagedBytes.debit(bytes)
         }
     }
 
@@ -77,12 +96,53 @@ class ShareReceiverActivity : ComponentActivity() {
         super.attachBaseContext(com.rikkaminis.app.i18n.LocaleWrap.wrap(newBase))
     }
 
+    /**
+     * [FIX-R3-E F-14] Items staged by THIS instance (or restored from a
+     * previous one). Saved in [onSaveInstanceState] so a configuration-change
+     * rebuild reuses the already-staged files instead of re-running the
+     * extraction against the same intent — which used to write a SECOND copy
+     * of every attachment (`shared-<newid>`), credit its bytes a second time,
+     * and leave the first copy orphaned: no item ever referenced it, so no
+     * cleanup path could reach it, and its bytes stayed in the process-lifetime
+     * ledger until the 500 MB budget falsely tripped.
+     *
+     * [R5-A3 C-09①] Appended IN PLACE, one item per staged file, instead of
+     * being assigned once after `extractItems()` returned. The old shape had a
+     * hole exactly as wide as the extraction itself: a rotation (or a
+     * low-memory Activity death) landing while attachment 3 of 10 was copying
+     * saved an EMPTY list, so the rebuilt instance re-extracted the same intent
+     * — re-staging every file (`shared-<newid>`, a second copy AND a second
+     * ledger credit) while the files already copied lost their only reference.
+     * Now whatever has landed on disk is already in this list when
+     * `onSaveInstanceState` runs, so the rebuild hands those files off instead
+     * of redoing them.
+     *
+     * A synchronized wrapper because the writers are on Dispatchers.IO (the
+     * extraction) while the reader is the main thread (`onSaveInstanceState`):
+     * `toList()` under the list's own monitor yields a consistent snapshot.
+     */
+    private val extractedItems: MutableList<PendingShare.Item> =
+        java.util.Collections.synchronizedList(mutableListOf())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // [FIX-R3-E F-14] A rebuild arrives with a non-null savedInstanceState
+        // and the SAME intent — re-extracting it would re-stage (and re-credit)
+        // everything. Restore the item list instead; the staged files behind
+        // the ATTACHMENT values are untouched by a rebuild, so the values stay
+        // valid. Process death mid-dialog loses the dialog, not the staged
+        // files: the restored flow re-offers them.
+        val restoredItems = savedInstanceState?.getString(STATE_ITEMS)?.let { raw ->
+            runCatching { PendingShare.fromJson(org.json.JSONObject(raw))?.items }.getOrNull()
+        }.orEmpty()
+        if (restoredItems.isNotEmpty()) restoreStagedItems(restoredItems)
         // Extract share items on the IO dispatcher so the main thread is
         // never blocked by potentially slow ContentResolver reads.
         lifecycleScope.launch(Dispatchers.IO) {
-            val items = extractItems()
+            // [R5-A3 C-09①] extractItems() appends into [extractedItems] as each
+            // file lands; a rebuild that already restored the list skips it.
+            if (restoredItems.isEmpty()) extractItems()
+            val items = stagedItemsSnapshot()
             // Provider-JSON detection also reads the staged file — keep on IO.
             val providerJson = items.singleOrNull()?.let { providerExportJsonOrNull(it) }
             withContext(Dispatchers.Main) {
@@ -95,9 +155,62 @@ class ShareReceiverActivity : ComponentActivity() {
         }
     }
 
-    /** Extract items from the incoming intent. Runs on IO. */
-    private suspend fun extractItems(): List<PendingShare.Item> {
-        val items = mutableListOf<PendingShare.Item>()
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // [R5-A3 C-09①] Snapshot, never the live list: the extraction is still
+        // appending on Dispatchers.IO while this runs on the main thread.
+        val staged = stagedItemsSnapshot()
+        if (staged.isNotEmpty()) {
+            outState.putString(
+                STATE_ITEMS,
+                PendingShare(staged, System.currentTimeMillis()).toJson().toString(),
+            )
+        }
+    }
+
+    /** Consistent copy of the items staged so far (see [extractedItems]). */
+    private fun stagedItemsSnapshot(): List<PendingShare.Item> =
+        synchronized(extractedItems) { extractedItems.toList() }
+
+    /**
+     * Seed [extractedItems] from a saved-state restore. The files are already
+     * on disk and already accounted in the process-lifetime ledger, so they are
+     * re-registered as in-flight: until this instance hands them off they have
+     * no pending-share entry, and a concurrent
+     * [SharedShareStore.cleanSharedFiles] would otherwise treat them as orphans
+     * of an earlier share.
+     */
+    private fun restoreStagedItems(items: List<PendingShare.Item>) {
+        synchronized(extractedItems) {
+            extractedItems.clear()
+            extractedItems.addAll(items)
+        }
+        for (item in items) {
+            if (item.kind == PendingShare.Item.Kind.ATTACHMENT) {
+                StagedInFlightFiles.begin(item.value)
+            }
+        }
+    }
+
+    /** Staged filenames behind [items] — the in-flight bookkeeping names. */
+    private fun attachmentNames(items: List<PendingShare.Item>): List<String> =
+        items.filter { it.kind == PendingShare.Item.Kind.ATTACHMENT }.map { it.value }
+
+    /**
+     * Extract items from the incoming intent, appending each one to
+     * [extractedItems] the moment its file has landed. Runs on IO.
+     *
+     * [R5-A3 C-09①] The handlers write straight into the Activity field (not
+     * into a local list returned at the end): that is what makes a
+     * mid-extraction rebuild save a partial — but real — staged set instead of
+     * an empty one, so the rebuilt instance hands the files off rather than
+     * re-staging them.
+     */
+    private suspend fun extractItems() {
+        // [R5-A3 C-09①] `items` is the LIVE accumulator, not a second list: the
+        // handlers append into it as each file lands, which is what makes a
+        // mid-extraction rebuild save a partial — but real — staged set.
+        val items = extractedItems
         try {
             when (intent?.action) {
                 Intent.ACTION_SEND -> handleSingleSend(intent, items)
@@ -108,7 +221,6 @@ class ShareReceiverActivity : ComponentActivity() {
         } catch (e: Throwable) {
             AppLogger.error(TAG, "extraction failed: ${e.message}")
         }
-        return items
     }
 
     /**
@@ -131,6 +243,11 @@ class ShareReceiverActivity : ComponentActivity() {
         } catch (e: Throwable) {
             AppLogger.error(TAG, "savePendingShare failed: ${e.message}")
         }
+        // [R5-A3 F-07] The staged names leave the in-flight set only now: when
+        // the save landed, the pending share is their reference; when it did
+        // not, they are genuine orphans and the next clean must be free to
+        // remove them (a name left registered would be protected forever).
+        StagedInFlightFiles.endAll(attachmentNames(items))
         // shared_content=true only when the pending share actually persisted —
         // otherwise MainActivity runs the ShareCoordinator lookup for nothing.
         launchMainActivity(withSharedContent = saved)
@@ -182,17 +299,41 @@ class ShareReceiverActivity : ComponentActivity() {
             .setTitle(getString(com.rikkaminis.app.R.string.share_provider_json_title))
             .setMessage(getString(com.rikkaminis.app.R.string.share_provider_json_message))
             .setPositiveButton(getString(com.rikkaminis.app.R.string.share_provider_json_import)) { _, _ ->
-                if (importProviderJson(json)) {
-                    // Imported: the staged JSON has served its purpose. Drop it
-                    // (and debit the cumulative byte counter) so the file doesn't
-                    // linger in share_extension/ forever — cleanSharedFiles only
-                    // runs on the pending-share consumption path.
-                    discardStagedAttachments(items)
-                    finish()
-                } else {
-                    // Import failed — fall through to the attachment flow so the
-                    // user doesn't lose the file (same promise as dismiss/back).
-                    finishWithAttachmentFlow(items)
+                // [deep-audit-1026 ISSUE-07] Both steps below are disk-bound:
+                // importInstanceJSON runs ensureConfigLoaded (runBlocking) + an
+                // EncryptedSharedPreferences commit + the Room write, and
+                // discardStagedAttachments does length() + delete() per staged
+                // file. Executing them straight in the positive-button callback
+                // froze the main thread for the whole import — and this Activity
+                // is the cold-start share entry point, so a multi-MB provider
+                // JSON plus many staged attachments could stall the first frame
+                // long enough for Input dispatching timeout (ANR).
+                //
+                // Mirrors the [T6-M4] shape in ProviderListScreen: do the I/O on
+                // the IO dispatcher, then return to Main for the UI hand-off.
+                // Toasts raised inside importProviderJson hop back via
+                // runOnUiThread (Toast needs a Looper on its calling thread).
+                lifecycleScope.launch {
+                    val imported = withContext(Dispatchers.IO) {
+                        val ok = importProviderJson(json)
+                        if (ok) {
+                            // Imported: the staged JSON has served its purpose.
+                            // Drop it (and debit the cumulative byte counter) so
+                            // the file doesn't linger in share_extension/
+                            // forever — cleanSharedFiles only runs on the
+                            // pending-share consumption path.
+                            discardStagedAttachments(items)
+                        }
+                        ok
+                    }
+                    if (imported) {
+                        finish()
+                    } else {
+                        // Import failed — fall through to the attachment flow so
+                        // the user doesn't lose the file (same promise as
+                        // dismiss/back).
+                        finishWithAttachmentFlow(items)
+                    }
                 }
             }
             .setNegativeButton(getString(com.rikkaminis.app.R.string.share_provider_json_attach)) { _, _ ->
@@ -239,34 +380,95 @@ class ShareReceiverActivity : ComponentActivity() {
             if (runCatching { f.delete() }.getOrDefault(false) && len > 0) {
                 debitStagedBytes(len)
             }
+            // [R5-A3 F-07] Released either way: a delete that failed leaves an
+            // orphan the next cleanSharedFiles must be allowed to retry.
+            StagedInFlightFiles.end(item.value)
         }
     }
 
+    /**
+     * Show [msg] on the main thread. [deep-audit-1026 ISSUE-07]: the provider
+     * import now runs on the IO dispatcher, and `Toast` needs a Looper on the
+     * thread that shows it — calling it from a `Dispatchers.IO` worker throws
+     * "Can't toast on a thread that has not called Looper.prepare()".
+     * `runOnUiThread` posts when we are not already on Main and runs inline
+     * when we are, so both the import path and any future Main-thread caller
+     * behave identically.
+     */
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        runOnUiThread {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun handleSingleSend(intent: Intent, out: MutableList<PendingShare.Item>) {
         val type = intent.type ?: ""
-        when {
-            type == "text/plain" -> {
-                val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
-                    ?: return
-                if (text.length <= INLINE_TEXT_LIMIT) {
-                    out += PendingShare.Item(PendingShare.Item.Kind.INLINE_TEXT, text)
-                } else {
-                    val name = "shared-text-${shortId()}.txt"
-                    File(SharedShareStore.sharedFileDirectory(this), name)
-                        .writeText(text, Charsets.UTF_8)
-                    out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
+        // [B28] Resolve the send route with the pure decision function:
+        // file managers share .txt/.log files as text/plain via EXTRA_STREAM
+        // (a content:// Uri) with EXTRA_TEXT absent — fall back to the stream
+        // staging path instead of silently dropping.
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        val streamUri = getParcelableExtra<Uri>(intent, Intent.EXTRA_STREAM)
+        when (val d = decideSingleSend(type, text, streamUri != null, INLINE_TEXT_LIMIT)) {
+            is SingleSendDecision.InlineText ->
+                out += PendingShare.Item(PendingShare.Item.Kind.INLINE_TEXT, d.text)
+            is SingleSendDecision.AttachText -> {
+                // [§1042-A-07] Text attachments used to skip the staging
+                // budget entirely: no MAX_FILE_BYTES / MAX_TOTAL_BYTES guard
+                // and no credit, so a flood of huge EXTRA_TEXT shares grew the
+                // staging dir past the 500 MB cap the binary path enforces.
+                // Same two guards as copyUriToStaging, decided by the pure
+                // [admitAttachText] core (JVM-pinned) and counted in UTF-8
+                // bytes — the budget is bytes, not characters.
+                val textBytes = attachTextByteCount(d.text)
+                val admission = admitAttachText(
+                    textBytes,
+                    stagedBytes.current(),
+                    MAX_FILE_BYTES,
+                    MAX_TOTAL_BYTES,
+                )
+                when (admission) {
+                    AttachTextAdmission.RejectedPerFile ->
+                        AppLogger.warning(TAG, "AttachText not staged: $textBytes bytes exceeds per-file cap $MAX_FILE_BYTES")
+                    AttachTextAdmission.RejectedCumulative ->
+                        AppLogger.warning(TAG, "AttachText not staged: $textBytes bytes would exceed cumulative cap $MAX_TOTAL_BYTES")
+                    AttachTextAdmission.Admitted -> {
+                        val name = "shared-text-${shortId()}.txt"
+                        // [R5-A3 F-07] Claim the name BEFORE the file exists so a
+                        // concurrent cleanSharedFiles — the previous share being
+                        // consumed in ChatScreen — can never mistake this write for
+                        // an orphan. The pending-share entry that will reference it
+                        // is only written at hand-off (finishWithAttachmentFlow).
+                        StagedInFlightFiles.begin(name)
+                        val dest = File(SharedShareStore.sharedFileDirectory(this), name)
+                        // [FIX-R3-E F-14] A write that throws mid-text used to
+                        // leave the partial file on disk with NOTHING in the
+                        // ledger and no item referencing it — an unaccounted
+                        // orphan only a full clean would reach. Delete on
+                        // failure, credit only what landed.
+                        val staged = try {
+                            dest.writeText(d.text, Charsets.UTF_8)
+                            true
+                        } catch (e: Throwable) {
+                            runCatching { dest.delete() }
+                            StagedInFlightFiles.end(name)
+                            AppLogger.warning(TAG, "AttachText staging failed: ${e.message}")
+                            false
+                        }
+                        if (staged) {
+                            stagedBytes.credit(textBytes)
+                            out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
+                        }
+                    }
                 }
             }
-            else -> {
-                val uri = getParcelableExtra<Uri>(intent, Intent.EXTRA_STREAM) ?: return
-                copyUriToStaging(uri, type)?.let {
-                    out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, it)
+            is SingleSendDecision.Stream ->
+                streamUri?.let { uri ->
+                    copyUriToStaging(uri, type)?.let {
+                        out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, it)
+                    }
                 }
-            }
+            SingleSendDecision.Drop -> Unit
         }
     }
 
@@ -304,7 +506,17 @@ class ShareReceiverActivity : ComponentActivity() {
      *  IO dispatcher (the caller is [extractItems]). Returns the staged
      *  filename (relative to sharedFileDirectory) or null on failure.
      *  Enforces per-file and cumulative size limits and cleans up partial
-     *  files on any failure. */
+     *  files on any failure.
+     *
+     *  [§1044-A08] The byte-copying itself lives in the JVM-pinned
+     *  [copySharedStream] core, which null-guards the resolver stream BEFORE
+     *  the destination file is created. `ContentResolver.openInputStream`
+     *  returns null (without throwing) when a remote provider refuses or its
+     *  process died; the old inline shape `openInputStream(uri)?.use { … }`
+     *  then skipped its whole block and still returned `name`, so the caller
+     *  built a `PendingShare.Item` for a file that never existed — a ghost
+     *  attachment that reached the composer with no "could not read" error.
+     *  Nothing is staged unless the core reports [SharedStreamCopy.Staged]. */
     private fun copyUriToStaging(uri: Uri, mimeType: String): String? {
         val ext = guessExtension(mimeType, uri)
         val prefix = when {
@@ -313,45 +525,43 @@ class ShareReceiverActivity : ComponentActivity() {
             else -> "shared"
         }
         val name = "$prefix-${shortId()}${if (ext.isNotEmpty()) ".$ext" else ""}"
+        // [R5-A3 F-07] Same claim-before-create rule as the AttachText arm: the
+        // copy can take seconds (100 MB cap) and the name has no pending-share
+        // entry until hand-off.
+        StagedInFlightFiles.begin(name)
         val dest = File(SharedShareStore.sharedFileDirectory(this), name)
-        return try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output ->
-                    val buf = ByteArray(8192)
-                    var total = 0L
-                    val deadline = System.currentTimeMillis() + IO_TIMEOUT_MS
-                    while (true) {
-                        if (System.currentTimeMillis() > deadline) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) timed out after ${IO_TIMEOUT_MS}ms")
-                            // Remove the partial file left behind by the timeout.
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        total += n
-                        if (total > MAX_FILE_BYTES) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) exceeded ${MAX_FILE_BYTES} bytes")
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        if (totalStagedBytes.get() + total > MAX_TOTAL_BYTES) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) would exceed cumulative ${MAX_TOTAL_BYTES} bytes")
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        output.write(buf, 0, n)
-                    }
-                    totalStagedBytes.addAndGet(total)
-                }
+        return when (
+            val outcome = copySharedStream(
+                openStream = { contentResolver.openInputStream(uri) },
+                openDest = { dest.outputStream() },
+                deleteDest = { dest.delete() },
+                stagedBytesNow = { stagedBytes.current() },
+                credit = { stagedBytes.credit(it) },
+                maxFileBytes = MAX_FILE_BYTES,
+                maxTotalBytes = MAX_TOTAL_BYTES,
+                ioTimeoutMs = IO_TIMEOUT_MS,
+                now = { System.currentTimeMillis() },
+            )
+        ) {
+            is SharedStreamCopy.Staged -> name
+            is SharedStreamCopy.Failed -> {
+                // [R5-A3 F-07] The core already deleted the partial file; drop
+                // the claim so the orphan decision goes back to the disk.
+                StagedInFlightFiles.end(name)
+                AppLogger.warning(TAG, "copyUriToStaging($uri): ${outcome.describe()}")
+                null
             }
-            name
-        } catch (e: Exception) {
-            AppLogger.warning(TAG, "copyUriToStaging($uri): ${e.message}")
-            // Clean up partial file, if any
-            try { dest.delete() } catch (_: Exception) {}
-            null
         }
+    }
+
+    /** Human-readable reason for a failed staging copy. Keeps the log lines the
+     *  pre-§1044-A08 inline copy emitted (same wording, same numbers). */
+    private fun SharedStreamCopy.Failed.describe(): String = when (reason) {
+        SharedStreamFailure.OpenStreamNull -> "openInputStream returned null — nothing to stage"
+        SharedStreamFailure.TimedOut -> "timed out after ${IO_TIMEOUT_MS}ms"
+        SharedStreamFailure.ExceededPerFile -> "exceeded $MAX_FILE_BYTES bytes"
+        SharedStreamFailure.ExceededCumulative -> "would exceed cumulative $MAX_TOTAL_BYTES bytes"
+        SharedStreamFailure.ReadFailed -> detail ?: "read failed"
     }
 
     private fun guessExtension(mimeType: String, uri: Uri): String {
@@ -384,4 +594,37 @@ class ShareReceiverActivity : ComponentActivity() {
     ): ArrayList<T>? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU)
         intent.getParcelableArrayListExtra(key, T::class.java)
     else intent.getParcelableArrayListExtra(key)
+}
+
+/** [B28] Where a single ACTION_SEND goes. */
+internal sealed class SingleSendDecision {
+    /** Short inline text — prefill the composer directly. */
+    data class InlineText(val text: String) : SingleSendDecision()
+    /** Long text — stage it as a .txt attachment. */
+    data class AttachText(val text: String) : SingleSendDecision()
+    /** No usable text — stage the content:// stream (EXTRA_STREAM) instead. */
+    object Stream : SingleSendDecision()
+    /** Neither text nor stream — nothing shareable arrived. */
+    object Drop : SingleSendDecision()
+}
+
+/**
+ * [B28] Pure dispatch core of [ShareReceiverActivity] single-send handling,
+ * extracted for JVM testing. A text/plain share that carries no usable
+ * EXTRA_TEXT (file managers share .txt/.log bytes via EXTRA_STREAM with a
+ * null EXTRA_TEXT) falls back to the stream path instead of being silently
+ * dropped; the inline-vs-attach split by [inlineTextLimit] and the
+ * no-EXTRA_STREAM drop are unchanged.
+ */
+internal fun decideSingleSend(
+    type: String,
+    text: String?,
+    hasStream: Boolean,
+    inlineTextLimit: Int,
+): SingleSendDecision = when {
+    type == "text/plain" && text != null && text.isNotBlank() ->
+        if (text.length <= inlineTextLimit) SingleSendDecision.InlineText(text)
+        else SingleSendDecision.AttachText(text)
+    hasStream -> SingleSendDecision.Stream
+    else -> SingleSendDecision.Drop
 }

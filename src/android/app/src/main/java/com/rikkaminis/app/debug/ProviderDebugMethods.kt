@@ -3,8 +3,8 @@ package com.rikkaminis.app.debug
 import android.content.Context
 import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
 import org.json.JSONArray
 import org.json.JSONObject
@@ -47,12 +47,12 @@ internal object ProviderDebugMethods {
         val builtInIds = JSONArray()
         for (m in type.builtInModels) builtInIds.put(m.id)
 
-        // T192: Anthropic now supports custom base URL too (Anthropic-
-        // compatible endpoints like DeepSeek-anthropic, Bailian-anthropic).
-        // iOS LLMProviderFactory.makeAnthropicProvider has always allowed
-        // this — Android was the only platform reporting the field as
-        // unsupported via RPC `provider.types`.
-        val customBaseSupported = type == ProviderType.openAI || type == ProviderType.anthropic
+        // T192: Anthropic now supports custom base URL too. Since FIX-I the
+        // predicate is single-sourced (ProviderType.supportsCustomBaseURL,
+        // [da1023-C] semantics: every type except openRouter), so gemini/xAI/
+        // kimiCode now report supported as well — matching what the write path
+        // (instancesCreate guard / ProvidersCollection) actually accepts.
+        val customBaseSupported = type.supportsCustomBaseURL
         return JSONObject().apply {
             put("id", type.name)
             put("displayName", type.displayName)
@@ -96,6 +96,11 @@ internal object ProviderDebugMethods {
                 put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
                 put("appendV1Suffix", inst.appendV1Suffix)
                 put("useResponsesAPI", inst.useResponsesAPI)
+                // [da1030-C ISSUE-04] Azure auth shape was invisible on this
+                // face: the debug listing (and the mutation response built by
+                // instanceJsonCore) reported 14 keys without it, so a harness
+                // could not tell a Bearer instance from an api-key one.
+                put("azureMode", inst.azureMode)
                 // [GH#68] Surface the image-endpoint picker state so harnesses
                 // can verify persistence across restarts.
                 put("imageEndpointMode", inst.imageEndpointMode.name)
@@ -124,7 +129,11 @@ internal object ProviderDebugMethods {
         val visible = if (includeHidden) all else all.filter { !it.isHidden }
         val arr = JSONArray()
         for (entry in visible) {
-            val effective: LLMModel = entry.model
+            // [dv22-A4] Enriched effective model (models.dev first, the
+            // user's overrides second) — the same resolver the model-use
+            // faces use, so this view can no longer disagree with them.
+            val effective: LLMModel =
+                com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
             arr.put(JSONObject().apply {
                 put("id", entry.id)
                 put("modelId", effective.id)
@@ -230,6 +239,13 @@ internal object ProviderDebugMethods {
                 put("fallbackStrategy", group.fallbackStrategy.name)
                 put("isDefault", isDefault)
                 put("inAgentLoop", group.id in cfg.agentLoopGroupIds)
+                // [da1031-D ISSUE-06] Session-default fields the harness could
+                // read on no face: the group's thinking level and its context
+                // limit (null = unlimited). Same two keys the mutation face's
+                // groupToJson emits and minis-config's `groups` collection
+                // exposes (snake_case there), so all three read faces agree.
+                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+                put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
                 val ids = JSONArray()
                 for (id in group.memberEntryIds) ids.put(id)
                 put("memberEntryIds", ids)
@@ -237,13 +253,21 @@ internal object ProviderDebugMethods {
             if (includeMembers) {
                 val members = JSONArray()
                 for (memberId in group.memberEntryIds) {
-                    val entry = cfg.modelEntries.find { it.id == memberId } ?: continue
+                    // [dv20-a1 A-02] System voice members are virtual — resolve
+                    // them through the shared sentinel so the harness sees the
+                    // member (with the synthetic "System" provider label)
+                    // instead of a silently missing row. `system` marks the row
+                    // so a caller can tell it from a persisted entry.
+                    val persisted = cfg.modelEntries.find { it.id == memberId }
+                    val entry = persisted ?: SystemVoiceEntries.resolve(memberId) ?: continue
                     val instLabel = cfg.instances.find { it.id == entry.providerInstanceId }?.label
+                        ?: SystemVoiceEntries.syntheticInstance().label
                     members.put(JSONObject().apply {
                         put("entryId", entry.id)
                         put("modelId", entry.baseModel.id)
                         put("displayName", entry.model.displayName)
-                        put("providerLabel", instLabel ?: "")
+                        put("providerLabel", instLabel)
+                        put("system", persisted == null)
                     })
                 }
                 obj.put("members", members)

@@ -20,13 +20,10 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -101,9 +98,11 @@ import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
+import com.rikkaminis.app.ui.markdown.MarkdownMathHeuristic
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.data.ChatTuningPrefs
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.ui.media.resolvedMediaSourceKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -373,13 +372,21 @@ private fun MdText(
     val linkRenderResolver = LocalMarkdownLinkRenderResolver.current
     val missingLinkRanges = remember(text, linkRenderResolver) {
         if (linkRenderResolver == null) emptyList<IntRange>()
-        else text.getStringAnnotations("url", 0, text.length)
-            .distinctBy { it.item }
-            .mapNotNull { ann ->
-                if (linkRenderResolver(ann.item) is ChatLinkAction.MissingFile) {
-                    ann.start until ann.end
-                } else null
-            }
+        else {
+            // [sweep1014-B6] Cache the resolve verdict per URL so repeated
+            // occurrences of the same dead link in one paragraph all get the
+            // grey style — the previous distinctBy{ it.item } kept only the
+            // first occurrence's range, leaving later duplicates clickable.
+            // Resolve cost stays at one lookup per distinct URL.
+            val verdicts = HashMap<String, Boolean>()
+            text.getStringAnnotations("url", 0, text.length)
+                .mapNotNull { ann ->
+                    val missing = verdicts.getOrPut(ann.item) {
+                        linkRenderResolver(ann.item) is ChatLinkAction.MissingFile
+                    }
+                    if (missing) ann.start until ann.end else null
+                }
+        }
     }
     val missingLinkStyle = SpanStyle(
         color = currentMdColors().link.copy(alpha = 0.4f),
@@ -657,13 +664,31 @@ private fun StreamingMarkdownTextBody(
     // the frozen branch below deposits every parse it computes — so scroll-back
     // and close/reopen are HITs too. The peek never computes (lock-only), so a
     // MISS keeps today's off-main behaviour byte-for-byte.
-    val warmSeed = remember(displayContent) {
-        if (isStreaming) null else MarkdownParseCaches.cachedBlocks(displayContent)
+    // [fix/dv21-b4-B05] The seed's key set carries `isStreaming` next to the
+    // content. Keyed on `displayContent` alone, `remember` handed back the
+    // `null` it had cached while the stream was live, so the frame that
+    // CONVERGED (stream ended, content unchanged) never consulted the cache it
+    // was about to populate.
+    val warmSeed = remember(displayContent, isStreaming) {
+        StreamingBlockLedger.warmSeed(displayContent, isStreaming) {
+            MarkdownParseCaches.cachedBlocks(it)
+        }
     }
-    var blocks by remember { mutableStateOf<List<MdBlock>>(warmSeed.orEmpty()) }
-    LaunchedEffect(displayContent) {
+    // [fix/dv21-b4-B05] The block state is a (blocks, source) LEDGER, not a
+    // bare list — see [StreamingBlockLedger] for the two defects the unkeyed
+    // `List<MdBlock>` produced, and why keying it on `displayContent` is NOT
+    // the fix (while streaming the seed is always null, so a keyed reset would
+    // blank the whole message on every throttle tick).
+    var published by remember {
+        mutableStateOf(StreamingBlockLedger.seed(warmSeed, displayContent))
+    }
+    val blocks = StreamingBlockLedger.rendered(published, warmSeed)
+    LaunchedEffect(displayContent, isStreaming) {
         // Seeded from the cache above — this body's first frame is already final.
-        if (warmSeed != null && blocks === warmSeed) {
+        if (warmSeed != null) {
+            if (published.blocks !== warmSeed) {
+                published = StreamingBlockLedger.seed(warmSeed, displayContent)
+            }
             // [T-android-liveness-census] The census lives HERE, not in
             // MarkdownBlockBody: this body is the renderer the aggregate
             // pipeline actually runs (MarkdownBlockBody serves only the
@@ -682,6 +707,33 @@ private fun StreamingMarkdownTextBody(
             }
             return@LaunchedEffect
         }
+        // [fix/dv21-b4-B05] Convergence frame. `isStreaming` is a key of this
+        // effect, so the frame where the stream ends re-enters here with a
+        // FRESH `isStreaming` — the coroutine that was already running keeps
+        // the `true` it captured, which made the deposit below read
+        // `!isStreaming == false` and skip; with the content unchanged the old
+        // single-key effect never ran again either, so every long streamed
+        // answer stayed out of `blocksLru` and re-parsed from scratch on
+        // scroll-back / session re-entry.
+        //
+        // When the live parse already published exactly this content there is
+        // nothing to compute: deposit the list in hand instead of paying an
+        // identical off-main parse. [StreamingBlockLedger.isConvergedWith] is
+        // what makes that safe — a list left over from an EARLIER chunk (its
+        // parse was cancelled when the content last changed) must fall through
+        // to the parse below, because caching a prefix under the final
+        // content's key would render a truncated message from then on.
+        if (StreamingBlockLedger.isConvergedWith(published, displayContent, isStreaming)) {
+            if (displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
+                MarkdownParseCaches.putBlocks(displayContent, published.blocks)
+                com.rikkaminis.app.logging.AppLogger.debug(
+                    "Perf",
+                    "[Perf][OpenRowWarm] chars=${displayContent.length} " +
+                        "blocks=${published.blocks.size} warm=1",
+                )
+            }
+            return@LaunchedEffect
+        }
         com.rikkaminis.app.diagnostics.Liveness.record(
             if (isStreaming) com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.LIVE_PARSE
             else com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.FROZEN_MISS,
@@ -690,9 +742,8 @@ private fun StreamingMarkdownTextBody(
             parseMarkdownBlocks(displayContent).also {
                 MarkdownParseCaches.prewarm(it, mdColors)
                 // [fix/open-row-first-frame-final] Deposit frozen parses so the
-                // heat survives close/reopen (the live branch already deposits
-                // at its freeze edge; the frozen branch never did, so every
-                // re-entry re-parsed from scratch).
+                // heat survives close/reopen (the frozen branch never did, so
+                // every re-entry re-parsed from scratch).
                 if (!isStreaming && displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
                     MarkdownParseCaches.putBlocks(displayContent, it)
                 }
@@ -701,7 +752,7 @@ private fun StreamingMarkdownTextBody(
         // If the LE was cancelled while parseMarkdownBlocks was still running
         // (a newer chunk arrived), don't publish stale blocks.
         coroutineContext.ensureActive()
-        blocks = computed
+        published = StreamingBlockLedger.publish(computed, displayContent)
         if (!isStreaming && displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
             com.rikkaminis.app.logging.AppLogger.debug(
                 "Perf",
@@ -1716,11 +1767,22 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
     // contain '#' (hashtags). `minis://` URLs don't carry fragments anyway,
     // and truncating here would hide the '.mp4' extension and the file's real
     // name from the resolver.
+    // [da1023-H] every branch below now honours that contract: the `file://`
+    // branch used to hand the string to `Uri.parse(...).path`, which re-cut it
+    // at the first `#` and cancelled this line — that branch now uses
+    // decodeUriPath like the `minis://` one, so `#` survives end to end.
     val stripped = url.substringBefore('?')
     val primary: File? = when {
         stripped.startsWith("minis://") -> {
-            val decoded = java.net.URLDecoder.decode(stripped.removePrefix("minis://"), "UTF-8")
-            val linuxPath = "/var/minis/$decoded"
+            // [rv1014-B1] decodeUriPath = URI path semantics (decodes %XX only,
+            // leaves `+` intact, never throws on bare `%`). The previous
+            // URLDecoder.decode threw IllegalArgumentException on `100%.png`
+            // during render and turned `a+b.png` into `a b.png`.
+            val decoded = decodeUriPath(stripped.removePrefix("minis://"))
+            // [dv22/B-06] `minis:///var/minis/...` yields an absolute guest path;
+            // prefixing it unconditionally used to produce
+            // `/var/minis//var/minis/...`. Same guard as ChatLinkResolver.
+            val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
             // Prefer the session-scoped resolver when the caller supplied a
             // sessionId: the global `bindMounts` map is overwritten every time
             // another session boots its shell, so without sessionId we'd route
@@ -1729,7 +1791,13 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
             if (sessionId != null) PRootKernel.resolveSessionHostPath(sessionId, linuxPath, context)
             else PRootKernel.resolveHostPath(linuxPath)
         }
-        stripped.startsWith("file://") -> File(Uri.parse(stripped).path ?: return null)
+        // [da1023-H] decodeUriPath, not `Uri.parse(...).path`: the latter
+        // treated a literal '#' in the name as a fragment start and truncated
+        // the path, which cancelled the '#' contract stated above. Blank after
+        // prefix removal = fail-closed null (File("") would resolve to the
+        // process working directory).
+        stripped.startsWith("file://") ->
+            decodeUriPath(stripped.removePrefix("file://")).takeIf { it.isNotBlank() }?.let { File(it) }
         stripped.startsWith("/") -> File(stripped)
         else -> null
     }
@@ -1747,7 +1815,7 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
         android.util.Log.d("MdStream", "resolveMdMediaFile primary miss url=$url (non-minis scheme, no fallback)")
         return null
     }
-    val decoded = java.net.URLDecoder.decode(stripped.removePrefix("minis://"), "UTF-8")
+    val decoded = decodeUriPath(stripped.removePrefix("minis://"))
     val basename = decoded.substringAfterLast('/')
     val subdir = decoded.substringBefore('/', missingDelimiterValue = "").takeIf { it.isNotEmpty() } ?: "attachments"
     val root = File(context.filesDir, "minis-sessions")
@@ -1774,7 +1842,9 @@ private fun filenameFromMdUrl(url: String): String {
     // Keep '#' — it's a legitimate character in attachment filenames.
     val stripped = url.substringBefore('?')
     val last = stripped.substringAfterLast('/')
-    return try { java.net.URLDecoder.decode(last, "UTF-8") } catch (_: Throwable) { last }
+    // [rv1014-B1] decodeUriPath never throws and leaves `+` intact, so the
+    // try/catch around the old URLDecoder.decode is no longer needed.
+    return decodeUriPath(last)
 }
 
 private fun openMdMediaExternally(context: Context, file: File, mime: String) {
@@ -1813,9 +1883,14 @@ private fun formatMdMediaMs(ms: Int): String {
  * consumers render against the URL until the File lands and rebuild (their
  * remembered players/requests key on the absolute path, so the null→File
  * transition re-runs them exactly once).
+ *
+ * [dv19-B06] `internal` so the `ui/markdown` renderer (MarkdownText.kt)
+ * shares THIS mechanism instead of re-growing a synchronous copy: its
+ * MinisVideoBlock / MinisAudioBlock still resolved a media URL inside
+ * `remember { }` on the composition thread.
  */
 @Composable
-private fun rememberMdMediaFile(url: String, sessionId: String?): File? {
+internal fun rememberMdMediaFile(url: String, sessionId: String?): File? {
     val context = LocalContext.current
     val resolved by androidx.compose.runtime.produceState<File?>(initialValue = null, url, sessionId) {
         value = withContext(Dispatchers.IO) { resolveMdMediaFile(context, url, sessionId) }
@@ -1921,16 +1996,28 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
     val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromMdUrl(block.url) }
 
-    val player = remember(file?.absolutePath) {
-        if (file == null) null else runCatching {
-            MediaPlayer().apply { setDataSource(file.absolutePath) }
-        }.getOrNull()
+    // [dv19-B06] Same shape as MarkdownText.MinisAudioBlock [T10-M5] — and it
+    // has to be: setDataSource() opens the file descriptor and parses the
+    // container header, real disk/codec work that used to run right here in
+    // composition, on the main thread, for the FIRST frame of every audio
+    // block in the main chat. The player instance is created first so the
+    // DisposableEffect below always owns something to release; the old
+    // `runCatching { MediaPlayer().apply { setDataSource(...) } }` returned
+    // null on a corrupt file and the freshly built native player leaked
+    // until GC.
+    val player = remember(resolvedMediaSourceKey(file)) {
+        if (file == null) null else MediaPlayer()
     }
-    var prepared by remember(file?.absolutePath) { mutableStateOf(false) }
-    LaunchedEffect(player) {
-        if (player == null) return@LaunchedEffect
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
+        val p = player ?: return@LaunchedEffect
+        val f = file ?: return@LaunchedEffect
         prepared = withContext(Dispatchers.IO) {
-            runCatching { player.prepare(); true }.getOrElse {
+            runCatching {
+                p.setDataSource(f.absolutePath)
+                p.prepare()
+                true
+            }.getOrElse {
                 android.util.Log.w("MdStream", "audio prepare failed: ${it.message}")
                 false
             }
@@ -1939,8 +2026,11 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
     DisposableEffect(player) {
         onDispose { try { player?.release() } catch (_: Throwable) {} }
     }
-    var isPlaying by remember { mutableStateOf(false) }
-    var positionMs by remember { mutableStateOf(0) }
+    // [dv19-B06] Keyed on the file like `player`/`prepared` above: a reused
+    // composition slot otherwise started the next audio in the previous
+    // file's play state / position.
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
     val durationMs = if (prepared && player != null) {
         runCatching { player.duration }.getOrDefault(0)
     } else 0
@@ -2111,6 +2201,23 @@ private fun RenderTable(block: MdBlock.Table) {
     val shardIdForTable = LocalShardId.current
     val messageId = shardIdForTable?.messageId
 
+    // [fix/dv16-b] Table-level registration key: each table gets a stable
+    // per-slot index within its fragment (the same allocator MdText uses),
+    // so same-message tables publish under distinct (messageId, tableIndex)
+    // keys. The old bare-messageId key let the LAST table overwrite the
+    // first, and a table leaving composition dropped its sibling's entry.
+    val tableSlotAllocator = LocalShardSubIndexAllocator.current
+    val tableIndex = remember { tableSlotAllocator?.next() ?: 0 }
+    // [fix/dv16-b] Scope the cell shards under THIS table: cells read the
+    // ambient [LocalShardId], so overriding its shard id with the table scope
+    // makes every cell register under "tbl:<index>#<sub>" — how
+    // selectionTableActions() resolves which table a selection belongs to.
+    // A null ambient id means the table participates in no selection anyway;
+    // providing null there is observationally identical to not providing.
+    val tableScopedShardId = shardIdForTable?.copy(
+        shardId = "$TABLE_SHARD_SCOPE_PREFIX$tableIndex",
+    )
+
     // [T-android-table-hscroll-preserve] Stable identity-keyed ScrollState so
     // streaming re-parses / the live→frozen branch move don't reset the user's
     // horizontal offset (see TableHScrollStates). Falls back to an anonymous
@@ -2124,7 +2231,10 @@ private fun RenderTable(block: MdBlock.Table) {
     }
     if (selectionController != null && messageId != null) {
         // Re-register whenever the inputs that the actions close over change.
-        androidx.compose.runtime.DisposableEffect(selectionController, messageId, block.raw) {
+        // [fix/dv16-b] tableIndex is part of the identity: a slot migration
+        // (live→frozen handoff) re-registers under the new key and forgets
+        // only its own old one.
+        androidx.compose.runtime.DisposableEffect(selectionController, messageId, block.raw, tableIndex) {
             val actions = SelectionController.TableActions(
                 copyTableMarkdown = {
                     val md = block.raw
@@ -2148,8 +2258,18 @@ private fun RenderTable(block: MdBlock.Table) {
                                 // TTL), so run it before adding another one.
                                 com.rikkaminis.app.ui.components.pruneShareDir(shareDir)
                                 val outFile = java.io.File(shareDir, "table_${System.currentTimeMillis()}.png")
-                                outFile.outputStream().use {
+                                // [deep-audit-1047 B-01] dropped `compress` result
+                                // => 0-byte png + "copied" toast.
+                                val encoded = outFile.outputStream().use {
                                     androidBitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                                }
+                                if (!com.rikkaminis.app.util.saveOutcome(
+                                        streamOpened = true,
+                                        compressed = encoded,
+                                    )
+                                ) {
+                                    outFile.delete()
+                                    throw java.io.IOException("png encode failed")
                                 }
                                 val uri = androidx.core.content.FileProvider.getUriForFile(
                                     context,
@@ -2176,11 +2296,19 @@ private fun RenderTable(block: MdBlock.Table) {
                     Unit
                 },
             )
-            selectionController.rememberTableActions(messageId, actions)
-            onDispose { selectionController.forgetTableActions(messageId) }
+            selectionController.rememberTableActions(messageId, tableIndex, actions)
+            onDispose { selectionController.forgetTableActions(messageId, tableIndex) }
         }
     }
 
+    // [fix/dv16-b] Provide the table-scoped shard id for the whole subtree so
+    // every cell registers under "tbl:<index>#<sub>" (that scope is what lets
+    // selectionTableActions() resolve the table under a selection). When no
+    // ambient id was supplied (non-chat contexts) this is observationally
+    // identical to the previous unscoped render — null either way.
+    androidx.compose.runtime.CompositionLocalProvider(
+        LocalShardId provides (tableScopedShardId ?: shardIdForTable),
+    ) {
     // BoxWithConstraints (OUTSIDE horizontalScroll) reads the real viewport width —
     // inside a horizontalScroll container, maxWidth would be Constraints.Infinity.
     androidx.compose.foundation.layout.BoxWithConstraints(
@@ -2349,6 +2477,7 @@ private fun RenderTable(block: MdBlock.Table) {
         }
         }
     }
+    }
 }
 
 // ─── [T-android-inline-parse-offmain] Parse caches ──────────────────────────
@@ -2401,6 +2530,80 @@ internal object StreamRenderProfiler {
         )
         ticks = 0; parseMsSum = 0.0; parseMsMax = 0.0; maxFragLen = 0
     }
+}
+
+/**
+ * [fix/dv21-b4-B05] The block state of [StreamingMarkdownTextBody] as a
+ * (blocks, source) pair, with the four decisions that body makes.
+ *
+ * Before this existed the body kept a bare `List<MdBlock>` in an UNKEYED
+ * `remember`, and two things followed from the missing `source`:
+ *
+ *  1. A body REUSED for another message (lazy-list slot reuse, edit/regenerate
+ *     replacing a frozen row's content) drew the PREVIOUS message's blocks for
+ *     one frame, and — because the seed check was the identity comparison
+ *     `blocks === warmSeed` — a cache that plainly HAD the answer was recorded
+ *     as `FROZEN_MISS` and re-parsed off-main. [rendered] adopts the seed in
+ *     the very composition it is discovered, and the body's effect adopts the
+ *     same list into the state so the identity check stops lying.
+ *  2. The frame where a stream CONVERGES could not deposit: the deposit is
+ *     gated on `!isStreaming`, and a coroutine already running keeps the
+ *     `isStreaming` value it captured at launch (Compose effect lambdas close
+ *     over the composition, not over state) — while the effect's key,
+ *     `displayContent`, had already reached its final value a throttle tick
+ *     earlier, so the effect never ran again. Net: long streamed answers never
+ *     entered `blocksLru`, and every scroll-back / re-entry re-parsed them
+ *     ([MarkdownParseCaches.cachedBlocks] cold) — the opposite of what the
+ *     "freeze-edge handoff" KDoc on `putBlocks` promises.
+ *
+ * `source` is the display text the stored list was parsed FROM. Without it the
+ * convergence deposit cannot tell "this list IS the content on screen" from
+ * "this list is the previous chunk, whose parse was cancelled" — and caching a
+ * prefix under the final content's key is a durable wrong render, far worse
+ * than a cold cache. That is why the state is a pair rather than a list.
+ *
+ * Note what is deliberately NOT here: keying the block state on
+ * `displayContent`. While streaming the seed is always `null`, so a keyed
+ * reset would blank the entire message on every throttle tick (~200-2000 ms) —
+ * the report's own `不得引入` line.
+ *
+ * Pure Kotlin (no Compose, no Android) so the decisions run as JVM unit tests.
+ */
+internal object StreamingBlockLedger {
+
+    /** The block list a body renders, plus the exact text it came from.
+     *  `source == null` = nothing published yet (empty list, no deposit claim). */
+    data class Published(val blocks: List<MdBlock>, val source: String?)
+
+    /** Warm-cache seed for a frame: a live stream is never seeded — its text
+     *  is still growing, so the cache key would only ever be a prefix. */
+    fun warmSeed(raw: String, isStreaming: Boolean, peek: (String) -> List<MdBlock>?): List<MdBlock>? =
+        if (isStreaming) null else peek(raw)
+
+    /** State for a frame that starts from a warm seed. Only a real seed claims
+     *  a source: an empty initial list must not be mistaken for a parse. */
+    fun seed(blocks: List<MdBlock>?, raw: String): Published =
+        Published(blocks.orEmpty(), if (blocks != null) raw else null)
+
+    /** State once an off-main parse is published for [raw]. */
+    fun publish(computed: List<MdBlock>, raw: String): Published = Published(computed, raw)
+
+    /**
+     * The list this composition draws. A seed for the current content wins over
+     * the previous publication (defect 1); with no seed (mid-stream, or a
+     * content that is not cached) the previous list is kept until the parse
+     * publishes, which is what stops a live message from flickering.
+     */
+    fun rendered(published: Published, seed: List<MdBlock>?): List<MdBlock> =
+        if (seed != null && published.blocks !== seed) seed else published.blocks
+
+    /**
+     * Convergence verdict: the stream has ended AND the list in hand is already
+     * a parse of the content on screen, so the frame owes a deposit and nothing
+     * else — no re-parse, no census branch (no new render path happened).
+     */
+    fun isConvergedWith(published: Published, raw: String, isStreaming: Boolean): Boolean =
+        !isStreaming && published.source != null && published.source == raw
 }
 
 
@@ -2784,10 +2987,10 @@ private fun parseInline(text: String, colors: MdColors): AnnotatedString {
                 // code before this reorder). `\[ … \]` display math stays block-
                 // level; here we only handle the inline `\( … \)` form.
                 text.startsWith("\\(", i) -> {
-                    val end = text.indexOf("\\)", i + 2)
-                    if (end != -1) {
-                        appendInlineContent(katexInlineTagFor(text.substring(i + 2, end)), text.substring(i + 2, end))
-                        i = end + 2
+                    val span = inlineParenMathSpan(text, i)
+                    if (span != null) {
+                        appendInlineContent(katexInlineTagFor(span.latex), span.latex)
+                        i = span.next
                     } else { append(text[i]); i++ }
                 }
                 // Escape: \* \_ \` etc.
@@ -2934,10 +3137,10 @@ private fun AnnotatedString.Builder.appendRecursive(text: String, colors: MdColo
             // before the `\` escape branch so `\(` is treated as math, not an
             // escaped `(`.
             text.startsWith("\\(", i) -> {
-                val end = text.indexOf("\\)", i + 2)
-                if (end != -1) {
-                    appendInlineContent(katexInlineTagFor(text.substring(i + 2, end)), text.substring(i + 2, end))
-                    i = end + 2
+                val span = inlineParenMathSpan(text, i)
+                if (span != null) {
+                    appendInlineContent(katexInlineTagFor(span.latex), span.latex)
+                    i = span.next
                 } else { append(text[i]); i++ }
             }
             text[i] == '$' && i + 1 < text.length && text[i + 1] != '$' && text[i + 1] != ' ' -> {
@@ -3106,6 +3309,41 @@ internal fun estimateInlineMathSize(latex: String, fontSize: TextUnit): Pair<Tex
     return (fontSize * widthEm) to (fontSize * heightEm)
 }
 
+// ─── [crash-1016] `\(` … `\)` inline-math span extraction ─────────────────
+
+/** A resolved `\(` … `\)` inline-math span: its payload plus the index just
+ *  past the closing `\)`. */
+internal class ParenMathSpan(val latex: String, val next: Int)
+
+/**
+ * [crash-1016] Resolve the `\(` … `\)` inline-math span opening at [open]
+ * (which must point at the backslash), or `null` when the characters there must
+ * render as LITERAL text instead.
+ *
+ * `null` means either "no closing `\)`" or "the payload is EMPTY". The empty
+ * case is not math and must never reach the renderer: the payload doubles as the
+ * accessibility alternate text of `appendInlineContent(tag, alternateText)`, and
+ * androidx requires it non-empty (`InlineTextContent.kt`:
+ * `require(alternateText.isNotEmpty())`). An adjacent `\(`\)` therefore threw
+ * `IllegalArgumentException: alternateText can't be an empty string` from inside
+ * Compose's draw pass and killed the app (2026-10-16 crash: a python regex
+ * `…f\(\): String…` sat inside a fenced code block that the block splitter had
+ * leaked into a list item's text, i.e. straight into inline parsing). Empty
+ * payloads now fall through as literal text, mirroring the existing
+ * `looksLikeMath` guard on the `$…$` branch. All three scan sites
+ * (parseInline, the emphasis-scoped parser, collectInlineMathLatex) share this
+ * one decision so the pre-registered KaTeX slots and the rendered tags can
+ * never disagree.
+ */
+internal fun inlineParenMathSpan(text: String, open: Int): ParenMathSpan? {
+    if (!text.startsWith("\\(", open)) return null
+    val end = text.indexOf("\\)", open + 2)
+    if (end == -1) return null
+    val latex = text.substring(open + 2, end)
+    if (latex.isEmpty()) return null
+    return ParenMathSpan(latex, end + 2)
+}
+
 /**
  * T208-4 part 4: scan a markdown line for inline-math spans (same delimiter
  * logic as parseInline) so we can pre-register a sized placeholder for
@@ -3120,11 +3358,30 @@ internal fun collectInlineMathLatex(text: String): List<String> {
             i += 2; continue
         }
         if (c == '\\' && i + 1 < text.length && text[i + 1] == '(') {
-            val end = text.indexOf("\\)", i + 2)
-            if (end != -1) {
-                out.add(text.substring(i + 2, end))
-                i = end + 2; continue
+            val span = inlineParenMathSpan(text, i)
+            if (span != null) {
+                out.add(span.latex)
+                i = span.next; continue
             }
+        }
+        if (c == '`') {
+            // [F-07 meta-audit-1028] Consume an inline-code span whole, before
+            // the `$` scanner below can see the dollars inside it. `parseInline`
+            // has always had this branch (same `findInlineCodeClose` helper), so
+            // the two scanners disagreed on any line that mixes code holding a
+            // dollar sign with a real formula — a line like "`$USER_DIR` 是否满足
+            // $x + 1 > 0$" made parseInline emit the REAL formula's tag while this
+            // function paired the code's `$` with the formula's opening `$`,
+            // registered the phantom span "USER_DIR` 是否满足 " and jumped past the
+            // real opener. The real tag therefore had no inlineContent entry
+            // (Compose falls back to the alternate text = the formula rendered as
+            // literal text) and a KaTeX bitmap was burned on a formula that never
+            // appears on screen. Sharing the close-scanner keeps both boundaries
+            // identical; an unclosed backtick stays literal in parseInline (one
+            // char consumed, scanning continues), so it must fall through to
+            // `i++` here too.
+            val end = findInlineCodeClose(text, i + 1)
+            if (end != -1) { i = end + 1; continue }
         }
         if (c == '$' && i + 1 < text.length && text[i + 1] != '$' && text[i + 1] != ' ') {
             val end = findInlineMathClose(text, i + 1)
@@ -3171,31 +3428,18 @@ internal fun findInlineMathClose(text: String, from: Int): Int {
 }
 
 /**
- * Crude heuristic to skip plain currency like `$5`, `$1,000` and avoid
- * turning prose dollar signs into KaTeX renders. Real LaTeX math nearly
- * always carries a backslash command, a brace, a math operator, or a
- * superscript/subscript marker. iOS uses the same idea
- * (MinisMarkdownParser.looksLikeMath).
+ * [r5-ef / F-F-07, P1] "Is this `$ … $` content a formula or money?" — delegated
+ * to [MarkdownMathHeuristic], the single implementation shared with the settled
+ * parser ([com.rikkaminis.app.ui.markdown.MarkdownParser]).
+ *
+ * This function used to be its own crude copy (glyph scan before the currency
+ * nets), so the streaming renderer and the settled renderer answered differently
+ * for the shapes the static copy had already learned to refuse: `$5-`, `$5k-`,
+ * `$10/mo-`, `$5B+`, `$5k-US` rendered as KaTeX while streaming and snapped back
+ * to dollars on settle. Streaming must be the *same* classifier, never a cheaper
+ * one — a cheaper one shows the user two different documents of one sentence.
  */
-internal fun looksLikeMath(latex: String): Boolean {
-    if (latex.isBlank()) return false
-    if (latex.contains('\\')) return true
-    if (latex.contains('{') || latex.contains('}')) return true
-    if (latex.contains('^') || latex.contains('_')) return true
-    val mathChars = "=+-*/<>≤≥≠∑∫∏√∞αβγθπφλμωΔΩ"
-    if (latex.any { it in mathChars }) return true
-    // [T-latex-inline] Bare short spans like `$x$`, `$pi$`, `$abc$` carry no
-    // LaTeX glyph but ARE math. Mirror iOS MinisMarkdownParser.looksLikeMath,
-    // which accepts `count > 2`, and additionally accept a single alphanumeric
-    // token (`$x$`, `$n$`) — the strict "needs a math char" rule was the drift
-    // that made single-variable inline math leak as literal `$…$`. Currency
-    // (`$5`, `$1,000`) is filtered by the leading-digit guard, and `$$`/space
-    // openers never reach here (gated by the caller).
-    if (latex[0].isDigit()) return false            // currency: `$5`, `$10.99`
-    if (latex.first().isWhitespace() || latex.last().isWhitespace()) return false
-    if (latex.length <= 30 && latex.all { it.isLetterOrDigit() }) return true
-    return latex.length > 2
-}
+internal fun looksLikeMath(latex: String): Boolean = MarkdownMathHeuristic.looksLikeMath(latex)
 
 /**
  * [T-latex-inline] True when a candidate inline-math span is really a markdown

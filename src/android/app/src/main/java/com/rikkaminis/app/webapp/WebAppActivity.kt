@@ -70,6 +70,9 @@ import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.preview.ASSET_LOADER_HOST
+import com.rikkaminis.app.ui.preview.toAssetLoaderUrl
+import com.rikkaminis.app.ui.sandbox.fileUrlFor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -107,7 +110,18 @@ class WebAppActivity : ComponentActivity() {
      */
     private var rendererEpoch by androidx.compose.runtime.mutableIntStateOf(0)
     private var resolvedFile: File? = null
-    private var isFullscreen: Boolean = false
+    /**
+     * [da1032-A] The ONE fullscreen source. It lives on the Activity — not in
+     * the composition — because two writers need it (the system back callback
+     * below and the toolbar toggle in [WebAppHost]); [WebAppHost] therefore
+     * only *reads* it and never keeps a copy. The previous shape held a plain
+     * `Boolean` here plus a keyed `remember` copy inside the host, and that
+     * copy could survive a host re-run whose key did not change (false → false),
+     * leaving the toolbar icon and the system bars disagreeing after a back
+     * press. A snapshot state read by the composition makes that class of drift
+     * unrepresentable.
+     */
+    private val fullscreenState = mutableStateOf(false)
 
     // T-n01-andmenu-l10n: pre-Tiramisu locale override (see MainActivity).
     override fun attachBaseContext(newBase: android.content.Context) {
@@ -136,11 +150,16 @@ class WebAppActivity : ComponentActivity() {
         // T-pwa-3: back press — exit fullscreen if active, else finish.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (isFullscreen) {
-                    isFullscreen = false
+                if (fullscreenState.value) {
+                    // [da1032-A] Flip the single source only. The composition
+                    // reads it, so the toolbar icon follows by recomposition —
+                    // renderHost() is deliberately NOT called here: re-running
+                    // setContent bought nothing once the state moved to the
+                    // Activity (nothing here owns the fullscreen value any
+                    // more) and it is the exact call that made a WebView
+                    // rebuild possible ([audit-0909 T7-M2]).
+                    fullscreenState.value = false
                     applySystemBars(fullscreen = false)
-                    // Re-render Compose host so toolbar icon updates.
-                    renderHost()
                 } else {
                     finish()
                 }
@@ -180,7 +199,7 @@ class WebAppActivity : ComponentActivity() {
         super.onResume()
         // Re-apply current bar state — dialogs / external activities can
         // resurrect bars even when we asked for fullscreen.
-        applySystemBars(fullscreen = isFullscreen)
+        applySystemBars(fullscreen = fullscreenState.value)
     }
 
     private fun applySystemBars(fullscreen: Boolean) {
@@ -200,9 +219,9 @@ class WebAppActivity : ComponentActivity() {
             MaterialTheme {
                 WebAppHost(
                     file = file,
-                    initialFullscreen = isFullscreen,
+                    fullscreen = fullscreenState.value,
                     onFullscreenChange = { fs ->
-                        isFullscreen = fs
+                        fullscreenState.value = fs
                         applySystemBars(fullscreen = fs)
                     },
                     onClose = { finish() },
@@ -265,7 +284,20 @@ class WebAppActivity : ComponentActivity() {
     private fun openInMinis(sourceSessionId: String?) {
         val intent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            sourceSessionId?.let { putExtra(EXTRA_TARGET_SESSION_ID, it) }
+            // [fix/audit-1015 BUG-08①] This used to put a `target_session_id`
+            // string extra — a dead letter: MainActivity has no reader for it
+            // (the only occurrence of the key in the repo was the constant
+            // itself), so "Open in Minis" always landed on whatever MainActivity
+            // happened to be showing. The app already has a first-class
+            // session deep link — minis://session/<sid> →
+            // DeepLinkAction.OpenSession → Routes.chat — handled both warm
+            // (MainActivity.onNewIntent:752 → handleDeepLink) and cold
+            // (onCreate:475 parses the launch intent's data). Route through it
+            // instead of inventing a parallel extra. Uri.encode keeps the
+            // segment safe; DeepLinkHandler reads uri.path which decodes it
+            // back. No session (source missing) → plain launch, unchanged.
+            sourceSessionId
+                ?.let { data = Uri.parse("minis://session/" + Uri.encode(it)) }
         }
         startActivity(intent)
         finish()
@@ -274,13 +306,20 @@ class WebAppActivity : ComponentActivity() {
     @Composable
     private fun WebAppHost(
         file: File,
-        initialFullscreen: Boolean,
+        fullscreen: Boolean,
         onFullscreenChange: (Boolean) -> Unit,
         onClose: () -> Unit,
         onWebViewReady: (WebView) -> Unit,
     ) {
         val context = LocalContext.current
-        var fullscreen by remember { mutableStateOf(initialFullscreen) }
+        // [da1032-A] `fullscreen` is a plain read here on purpose: the Activity
+        // owns the single snapshot (fullscreenState) and this composable only
+        // observes it. Do NOT reintroduce a `remember { mutableStateOf(...) }`
+        // copy — a second source is exactly what let the toolbar icon and the
+        // system bars drift apart when the host was re-run with an unchanged
+        // key. (Superseded note from [fix/audit-1015 BUG-08②]: that key existed
+        // to paper over the re-run, and the re-run is gone — the back callback
+        // now only flips state.)
         var toolbarVisible by remember { mutableStateOf(true) }
         // Bumped on each user interaction; LaunchedEffect uses it as a key
         // so the auto-hide timer restarts on every tap.
@@ -332,15 +371,19 @@ class WebAppActivity : ComponentActivity() {
                     webViewState = wv
                     wv
                 },
-                // [audit-0909 T7-M2] renderHost() re-runs setContent on every
-                // fullscreen toggle (back press), and each pass dropped the
-                // previous AndroidView without destroying its WebView — a live
-                // renderer per toggle (BrowserUseManager's own note puts those
-                // at 50-100 MB each, and setContent replays the composition so
-                // the factory runs again). onRelease covers both the
+                // [audit-0909 T7-M2] The composition can still replace this
+                // AndroidView (a renderer death bumps `rendererEpoch` above,
+                // which re-keys the block), and a pass used to drop the
+                // previous instance without destroying its WebView — a live
+                // renderer per replacement (BrowserUseManager's own note puts
+                // those at 50-100 MB each). onRelease covers both the
                 // replacement and the activity-teardown path; destroy() is
                 // idempotent and clearing the refs keeps onDestroy() from
                 // touching an already-destroyed instance.
+                // [da1032-A] The fullscreen toggle no longer re-runs
+                // setContent (the state is Activity-owned and this host only
+                // reads it), so the epoch is the only remaining rebuild path
+                // this hook guards.
                 onRelease = { wv ->
                     if (webViewRef === wv) webViewRef = null
                     if (webViewState === wv) webViewState = null
@@ -366,8 +409,7 @@ class WebAppActivity : ComponentActivity() {
                     fullscreen = fullscreen,
                     onClose = onClose,
                     onToggleFullscreen = {
-                        fullscreen = !fullscreen
-                        onFullscreenChange(fullscreen)
+                        onFullscreenChange(!fullscreen)
                         toolbarVisible = true
                         interactionTick += 1
                     },
@@ -491,14 +533,19 @@ class WebAppActivity : ComponentActivity() {
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val chooser = Intent.createChooser(
+            // [deep-audit-1049 B-03] Shared launcher: NEW_TASK stays on the
+            // chooser (the intent actually started) and a device with no share
+            // target now says so instead of only writing a log line.
+            com.rikkaminis.app.util.ExternalIntent.share(
+                context,
                 send,
                 context.getString(R.string.webapp_share_chooser_title),
-            ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-            try {
-                context.startActivity(chooser)
-            } catch (e: ActivityNotFoundException) {
-                AppLogger.warning(logTag, "Share chooser failed: ${e.message}")
+            ) { t ->
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
         }
     }
@@ -506,7 +553,8 @@ class WebAppActivity : ComponentActivity() {
     /**
      * Copy [file] into `cacheDir/share/` and return a FileProvider Uri for
      * it. Returns null on IO failure. The staged file overwrites any prior
-     * copy with the same name — share/ accumulates one entry per WebApp.
+     * copy with the same name — [pruneShareDir] clears entries older than a
+     * day before each new staging, so share/ no longer grows unbounded.
      *
      * [fix/audit0917-b8] Suspends and copies on [Dispatchers.IO]: the caller is
      * a toolbar click handler on the main thread, and a large page (bundled
@@ -514,10 +562,23 @@ class WebAppActivity : ComponentActivity() {
      */
     private suspend fun stagedShareUri(context: android.content.Context, file: File): Uri? {
         return try {
-            val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             val stem = file.nameWithoutExtension.ifBlank { "webapp" }
-            val staged = File(shareDir, "$stem.html")
-            withContext(Dispatchers.IO) { file.copyTo(staged, overwrite = true) }
+            val staged = withContext(Dispatchers.IO) {
+                // [da1022-H] mkdirs + prune on IO, not the main thread: the
+                // caller is a toolbar click handler and `dir.listFiles()` in
+                // pruneShareDir is a disk walk that stalls on large cache dirs.
+                val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
+                // [da1022-H] Nothing deleted share/ entries before the pruner
+                // landed (fix/render-ui F-273) — share/ accumulated one blob
+                // per WebApp for the life of the install. Prune before
+                // staging: the 24h TTL cutoff always postdates the fresh copy
+                // written below, so prune-then-copy can never delete the file
+                // this call is about to stage.
+                com.rikkaminis.app.ui.components.pruneShareDir(shareDir)
+                val s = File(shareDir, "$stem.html")
+                file.copyTo(s, overwrite = true)
+                s
+            }
             FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
@@ -598,7 +659,28 @@ class WebAppActivity : ComponentActivity() {
             }
         }
 
-        val url = "https://$ASSET_LOADER_HOST/${file.name}"
+        // [da1021-F] Route through the shared single-source mapping
+        // (WebViewHolder.toAssetLoaderUrl) instead of pasting `file.name` raw:
+        // the loader resolves its path as a URL path, so a space/CJK name used
+        // to produce an unresolvable URL. The mapping's root is the initial
+        // file's *parent* directory — the same root this handler serves
+        // (`InternalStoragePathHandler(this, parent)`), so only the last path
+        // segment is meaningful here and the reuse is exact. The null branch
+        // is unreachable for an existing File (the input is always a well-
+        // formed file:// URL) but fails closed into the source-missing state
+        // rather than a doomed 404.
+        //
+        // [fix/fileurl-contract] The file URL is built by the shared encoder
+        // (`ui.sandbox.fileUrlFor`), not `"file://" + file.absolutePath`:
+        // `toAssetLoaderUrl` consumes the URL contract (encoded path), and a raw
+        // concatenation made a file literally named `50%23.html` decode to
+        // `50#.html` inside the mapping — the shortcut then pointed at a
+        // non-existent sibling.
+        val url = toAssetLoaderUrl(fileUrlFor(file))
+            ?: run {
+                renderSourceMissing(sourceSessionId = null)
+                return
+            }
         webView.loadUrl(url)
     }
 
@@ -615,8 +697,14 @@ class WebAppActivity : ComponentActivity() {
     companion object {
         const val EXTRA_SHORTCUT_ID = "webapp_shortcut_id"
         const val ACTION_OPEN_WEBAPP = "com.rikkaminis.app.action.OPEN_WEBAPP"
-        const val EXTRA_TARGET_SESSION_ID = "target_session_id"
-        private const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
+        // [fix/audit-1015 BUG-08①] EXTRA_TARGET_SESSION_ID removed: it had no
+        // reader anywhere in the repo (grep across all sources: the constant's
+        // only consumer was the write it was created for). openInMinis now uses
+        // the existing minis://session/<sid> deep link.
+        // [da1021-F] ASSET_LOADER_HOST removed: the single source now lives in
+        // ui/preview/WebViewHolder.kt (`internal const val`) — this activity
+        // imports it (with toAssetLoaderUrl) instead of carrying a second copy
+        // of the origin string that could drift apart from the loader mapping.
         private const val AUTO_HIDE_MS = 4000L
     }
 }

@@ -15,7 +15,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,21 +22,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import com.rikkaminis.app.R
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.core.graphics.drawable.toBitmap
+import coil.Coil
 import coil.ImageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.OutputStream
+import java.io.IOException
 
 // [fix/render-ui F-272] The `FullscreenImageViewer` composable was deleted here.
 //
@@ -99,6 +99,15 @@ internal fun ImageActionButton(
 // [audit-0917] One loader for the process: a per-call ImageLoader(context)
 // spun up its own executor and was never shut down - it leaked threads on
 // every Copy/Share/Save. Coil's ImageLoader is meant to be a singleton.
+//
+// [fix/dv21-b4-B06] …and it has to be THE APP'S singleton, not a freshly
+// built one: `ImageLoader(context.applicationContext)` registers none of the
+// components `MinisApp.newImageLoader()` installs, so `minis://` models had no
+// fetcher (Copy / Share / Save failed with a decode error for every attachment
+// that reaches the viewer as a URI) and an in-place rewritten file had no
+// mtime keyer (the stale bitmap came back out of the cache). `Coil.imageLoader`
+// resolves the very singleton Coil's own AsyncImage path uses, so both paths
+// also share one memory cache instead of two.
 @Volatile
 private var sharedImageLoader: ImageLoader? = null
 
@@ -106,8 +115,18 @@ internal suspend fun loadBitmap(context: Context, model: Any): Bitmap? =
     withContext(Dispatchers.IO) {
         try {
             val loader = sharedImageLoader
-                ?: ImageLoader(context.applicationContext).also { sharedImageLoader = it }
-            val req = ImageRequest.Builder(context).data(model).allowHardware(false).build()
+                ?: Coil.imageLoader(context.applicationContext).also { sharedImageLoader = it }
+            // [fix/dv21-b4-B06] `allowHardware(false)` bounds nothing: with no
+            // target size Coil decodes at the image's INTRINSIC size, and this
+            // is the path Copy / Share / Save take — a 3000x17920 screenshot
+            // allocated ~215 MB of ARGB_8888 right here (`DisplayBitmapLimits`
+            // documents the crash that follows). Same ceiling the markdown
+            // renderers apply.
+            val req = ImageRequest.Builder(context)
+                .data(model)
+                .allowHardware(false)
+                .limitDisplaySize()
+                .build()
             val result = loader.execute(req)
             (result as? SuccessResult)?.drawable?.toBitmap()
         } catch (e: Exception) {
@@ -151,7 +170,14 @@ internal fun copyBitmapToClipboard(
             val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             pruneShareDir(shareDir)
             val file = File(shareDir, "clipboard_img_${System.currentTimeMillis()}.png")
-            file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            // [deep-audit-1047 B-01] `compress` returns false when the encoder
+            // wrote nothing — the old statement-position call dropped that and
+            // pasted a content:// URI pointing at a 0-byte file.
+            val encoded = file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                file.delete()
+                error("png encode failed")
+            }
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
@@ -195,7 +221,13 @@ internal suspend fun shareImage(context: Context, model: Any) {
             val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             pruneShareDir(shareDir)
             val file = File(shareDir, "share_img_${System.currentTimeMillis()}.png")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            // [deep-audit-1047 B-01] a dropped `compress` result shared a 0-byte
+            // file: the chooser opened on an unreadable image.
+            val encoded = file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                file.delete()
+                error("png encode failed")
+            }
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
@@ -225,7 +257,6 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
     withContext(Dispatchers.IO) {
         try {
             val filename = "minis_${System.currentTimeMillis()}.png"
-            val stream: OutputStream?
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, filename)
@@ -236,14 +267,28 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                     ?: return@withContext false
                 try {
-                    stream = context.contentResolver.openOutputStream(uri)
-                    stream?.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    // [deep-audit-1047 B-01] Two failure channels never reached
+                    // this catch, so a failed write was PUBLISHED: the row was
+                    // flipped to IS_PENDING=0 and `saveToGallery` returned true,
+                    // and the caller toasts "saved to album" over a 0-byte
+                    // entry. 1) `openOutputStream` returns null (dead/refusing
+                    // provider) — `stream?.use` skipped the write; 2) `compress`
+                    // returns false — its result was dropped. Both now throw
+                    // into this catch, which deletes the pending row
+                    // ([audit-0917]) and therefore never publishes it.
+                    val out = context.contentResolver.openOutputStream(uri)
+                        ?: throw IOException("openOutputStream returned null")
+                    val encoded = out.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                        throw IOException("png encode failed")
+                    }
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
                     context.contentResolver.update(uri, values, null, null)
                 } catch (e: Exception) {
                     // [audit-0917] Delete the orphaned IS_PENDING=1 row: the old
                     // catch returned false and left a pending entry in the gallery.
+                    // (A failed encode is deleted here too — never published.)
                     context.contentResolver.delete(uri, null, null)
                     throw e
                 }
@@ -252,8 +297,15 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
                 val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
                 val minisDir = File(dir, "Minis").also { it.mkdirs() }
                 val file = File(minisDir, filename)
-                stream = file.outputStream()
-                stream.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                // [deep-audit-1047 B-01] pre-Q has no row to delete, so the
+                // symmetry is a file delete: a dropped `compress` result used to
+                // leave a 0-byte png in Pictures/Minis that the gallery shows as
+                // a broken thumbnail.
+                val encoded = file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                    file.delete()
+                    throw IOException("png encode failed")
+                }
             }
             true
         } catch (e: Exception) {

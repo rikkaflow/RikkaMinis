@@ -27,13 +27,15 @@ object FileEditTool {
     )
 
     fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
             val oldString = args.optString("old_string", "")
             val newString = args.optString("new_string", "")
             val replaceAll = args.optBoolean("replace_all", false)
-            val toolTitle = args.optString("tool_title", NAME)
 
             if (path.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
@@ -114,16 +116,34 @@ object FileEditTool {
                 content.replaceFirst(oldString, newString)
             }
 
+            // [deep-audit-1047 A-08] Mirror file_write's encoding guard.
+            // Without it an unpaired surrogate reached AtomicFileWrite, whose
+            // encoder silently substitutes '?': the file lands corrupted AND
+            // the expected-size check in AtomicFileWrite warns about a byte
+            // count nobody can reconcile. The byte-contract is checked before
+            // the write, so nothing reaches disk when it fails.
+            if (isUnpairedSurrogateFailure(newContent)) {
+                return ToolExecutionResult(
+                    UNENCODABLE_CONTENT_MESSAGE,
+                    false,
+                    toolTitle = toolTitle,
+                )
+            }
+
             // §30: atomic replace — writeText truncates in place, so a SIGKILL
             // mid-write left a torn file behind (SIGKILL runs no `finally`).
             AtomicFileWrite.write(file, newContent)
             val replacements = if (replaceAll) count else 1
+            // [DESIGN-06] Report UTF-8 bytes, not `String.length` (UTF-16 code
+            // units) — the latter under-reports CJK text by up to 3x and was
+            // the only "size" number the tool ever printed.
+            val bytes = file.length()
             ToolExecutionResult(
-                "Edited $path ($replacements replacement(s), ${newContent.length} bytes)",
+                "Edited $path ($replacements replacement(s), $bytes bytes)",
                 true, toolTitle = toolTitle
             )
         } catch (e: Exception) {
-            ToolExecutionResult("Error editing file: ${e.message}", false, toolTitle = NAME)
+            ToolExecutionResult("Error editing file: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 }

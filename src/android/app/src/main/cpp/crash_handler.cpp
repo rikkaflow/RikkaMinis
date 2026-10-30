@@ -3,7 +3,7 @@
 // Registered at app startup from MinisApp.onCreate via JNI. Catches
 // fatal signals raised inside JNI / proot / pty_bridge / any other
 // native code, writes a one-shot text report to the configured logs
-// dir, then restores the default handler and re-raises so the system
+// dir, then restores the previous handler and re-raises so the system
 // tombstone is also generated and the app exits like normal.
 //
 // Strict async-signal-safety: only signal-safe libc calls inside the
@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdio>
+#include <stdarg.h>
 #include <ctime>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -27,8 +28,27 @@
 static char g_log_dir[512] = {0};
 
 // Reentrancy guard. If the handler crashes itself, we want the second
-// signal to skip straight to SIG_DFL rather than recursing.
+// signal to skip straight to the previous handler rather than recursing.
 static volatile sig_atomic_t g_in_handler = 0;
+
+// [fix/sweep1014-crash-cpp] Previous handlers, saved at install time.
+// On Android the pre-installed handler is debuggerd's — it is what
+// produces the tombstone and the `logcat -b crash` entry. Installing
+// SIG_DFL directly (the old behavior) silently defeated it, so we save
+// each signal's previous handler and restore it before re-raising.
+#define MINIS_MAX_SIGNAL 32
+static struct sigaction g_old_sa[MINIS_MAX_SIGNAL];
+static volatile sig_atomic_t g_old_saved[MINIS_MAX_SIGNAL];
+
+// [fix/audit-1015 BUG-05] Alternate signal stack. The handler is installed
+// with SA_ONSTACK so that a stack-overflow SIGSEGV — where the crashing
+// thread's own stack is unusable — can still run it. Without a registered
+// alternate stack the flag is inert and such a crash produces no report at
+// all. Static BSS: nothing is allocated at install time or, more importantly,
+// in the handler. 64 KiB is the usual Android/debuggerd order of magnitude
+// (the handler's own frames are small: a 2 KiB report buffer plus /proc
+// scratch buffers, all static).
+static char g_alt_stack[64 * 1024];
 
 // ---- async-signal-safe helpers for richer crash context ----
 //
@@ -110,40 +130,151 @@ static const char* signal_name(int sig) {
     }
 }
 
+// [fix/sweep1014-crash-cpp] Signal-safe UTC time formatting. gmtime_r and
+// localtime_r both take the tz locks (and localtime_r may additionally read
+// files/env), so neither may run in a signal handler — a crash while another
+// thread held the tz/malloc lock would deadlock the handler itself, and the
+// very crashes this handler exists to capture would be lost. Compute the
+// civil date from time_t with pure arithmetic instead (proleptic Gregorian,
+// Howard Hinnant's civil_from_days algorithm; no locks, no env, no I/O).
+static long long epoch_seconds_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);  // async-signal-safe per POSIX
+    return (long long)ts.tv_sec;
+}
+
+// days since 1970-01-01 -> y/m/d, pure integer arithmetic.
+static void civil_from_days(long z, int* y, int* m, int* d) {
+    z += 719468;
+    long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned long)(z - era * 146097);               // [0, 146096]
+    unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; // [0, 399]
+    long yy = (long)yoe + era * 400;
+    unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);               // [0, 365]
+    unsigned mp = (5*doy + 2)/153;                                  // [0, 11]
+    unsigned dd = doy - (153*mp+2)/5 + 1;                           // [1, 31]
+    unsigned mm = mp < 10 ? mp+3 : mp-9;                            // [1, 12]
+    *y = (int)(yy + (mm <= 2 ? 1 : 0));
+    *m = (int)mm;
+    *d = (int)dd;
+}
+
+// [fix/sweep1014-crash-cpp] Restore the saved previous handler (typically
+// debuggerd's) so the tombstone chain stays intact. Falls back to SIG_DFL if
+// the previous handler was never saved. Used for every re-raise path (early
+// returns included — a tombstone helps there too).
+//
+// [fix/audit-1015 BUG-05] The old body finished with an unconditional
+// raise(sig). raise() *delivers a brand-new siginfo_t*: si_code becomes
+// SI_USER/SI_TKILL and si_addr becomes nullptr, so debuggerd's tombstone —
+// the artifact this handler exists to preserve — lost the hardware fault
+// address (si_addr) and the fault classification (si_code). Instead:
+//   • previous handler SIG_DFL (or none saved): just RETURN. The crashing
+//     instruction re-executes, the kernel redelivers the signal with its
+//     original siginfo_t, and the default action terminates the process —
+//     no raise() needed, and the death keeps the true fault context.
+//   • previous handler declares SA_SIGINFO (debuggerd on Android): RETURN as
+//     well. The redelivered fault reaches debuggerd with si_addr/si_code
+//     intact, which is exactly what its tombstone wants.
+//   • previous handler is a legacy non-SA_SIGINFO sa_handler: it cannot read
+//     siginfo at all, so nothing is lost by raise(); keep the explicit
+//     synchronous re-delivery for that case.
+// Known residual (documented, not fixable here): if the signal was raised
+// *synchronously by software* rather than by a faulting instruction (e.g.
+// another thread's pthread_kill with SIGSEGV), the return path has no
+// instruction to re-execute and the thread continues. abort() is unaffected
+// (it re-raises itself when its handler returns, per POSIX); the app's crash
+// signals are otherwise hardware faults.
+static void restore_and_reraise(int sig) {
+    struct sigaction sa{};
+    bool have_saved = (sig >= 0 && sig < MINIS_MAX_SIGNAL && g_old_saved[sig] != 0);
+    if (have_saved) {
+        sa = g_old_sa[sig];
+    } else {
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+    }
+    sigaction(sig, &sa, nullptr);
+    const bool old_is_dfl = !have_saved || sa.sa_handler == SIG_DFL;
+    const bool old_is_siginfo = (sa.sa_flags & SA_SIGINFO) != 0;
+    if (!old_is_dfl && !old_is_siginfo) {
+        raise(sig);
+    }
+}
+
+// [fix/sweep1014-crash-cpp] Install `sa` for `sig`, capturing the previous
+// handler exactly once (first install wins, so a repeated nativeInstall
+// never loses the debuggerd handler it captured the first time).
+static void install_and_save(int sig, const struct sigaction& sa) {
+    struct sigaction captured{};
+    if (!g_old_saved[sig] && sigaction(sig, &sa, &captured) == 0) {
+        g_old_sa[sig] = captured;
+        g_old_saved[sig] = 1;
+    } else {
+        sigaction(sig, &sa, nullptr);
+    }
+}
+
+// [fix/audit-1015 BUG-05] snprintf returns the number of bytes the formatted
+// output WOULD occupy, not the number actually stored. The previous
+// `off += snprintf(buf + off, sizeof(buf) - (size_t)off, ...)` pattern
+// therefore advanced `off` past the end of the buffer whenever the report
+// exceeded its capacity, and the NEXT call then (a) computed
+// `sizeof(buf) - (size_t)off` with `off > sizeof(buf)` — an unsigned
+// underflow to a huge size_t — and (b) wrote at `buf + off`, i.e. far out of
+// bounds, from inside the crash handler. All 12 appends below go through
+// `buf_append`, which clamps: `off` stays within [0, cap), a truncated write
+// is still NUL-terminated, and the size argument passed to vsnprintf is
+// always exact. The append is silent about truncation (a crash report that
+// stops early is still worth writing); the invariant it guarantees is
+// memory safety, not completeness. vsnprintf keeps the async-signal-safe
+// profile this file's snprintf use already relied on.
+static size_t buf_append(char* buf, size_t cap, size_t off, const char* fmt, ...) {
+    if (off + 1 >= cap) return off;  // no room for even one byte + NUL
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return off;          // error (or empty) -> leave off alone
+    size_t usable = (cap - off) - 1; // bytes available beside the NUL
+    return off + ((size_t)n <= usable ? (size_t)n : usable);
+}
+
 static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
     // Reentrancy: if we're already in the handler, just restore default
     // and re-raise. Avoids infinite loop when the handler itself faults.
     if (g_in_handler) {
-        signal(sig, SIG_DFL);
-        raise(sig);
+        restore_and_reraise(sig);
         return;
     }
     g_in_handler = 1;
 
     if (g_log_dir[0] == 0) {
-        signal(sig, SIG_DFL);
-        raise(sig);
+        restore_and_reraise(sig);
         return;
     }
 
     // Build the per-crash filename. We timestamp in UTC and mark it "Z"
     // so the filename always matches wall-clock / file mtime regardless
-    // of device timezone; the report body prints both UTC and local time.
-    time_t now = time(nullptr);
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
+    // of device timezone. [fix/sweep1014-crash-cpp] the body prints UTC
+    // only: gmtime_r/localtime_r take the tz locks and are not
+    // signal-safe, so the civil date is computed by pure arithmetic.
+    long long now = epoch_seconds_now();
+    long secs_of_day = (long)(now % 86400);
+    int y, mo, d;
+    civil_from_days((long)(now / 86400), &y, &mo, &d);
+    int hh = (int)(secs_of_day / 3600);
+    int mi = (int)((secs_of_day % 3600) / 60);
+    int ss = (int)(secs_of_day % 60);
 
     char path[640];
     snprintf(path, sizeof(path),
         "%s/native-crash-%04d-%02d-%02dT%02d-%02d-%02dZ.log",
-        g_log_dir,
-        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
-        tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+        g_log_dir, y, mo, d, hh, mi, ss);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        signal(sig, SIG_DFL);
-        raise(sig);
+        restore_and_reraise(sig);
         return;
     }
 
@@ -202,7 +333,7 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
 
     char buf[2048];
     int off = 0;
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+    off = (int)buf_append(buf, sizeof(buf), (size_t)off,
         "=== Minis Native Crash ===\n"
         "Signal: %d (%s)\n"
         "si_code: %d\n"
@@ -213,31 +344,26 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
         info ? info->si_code : -1,
         info ? info->si_addr : nullptr,
         getpid(), (int)syscall(SYS_gettid),
-        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
-        tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+        y, mo, d, hh, mi, ss);
 
-    // Local time (for humans reading the report on the device).
-    struct tm tm_local;
-    localtime_r(&now, &tm_local);
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-        "Local: %04d-%02d-%02d %02d:%02d:%02d\n",
-        tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
-        tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+    // [fix/sweep1014-crash-cpp] Local-time line removed: localtime_r is not
+    // async-signal-safe (tz locks + may read files/env). UTC above is the
+    // canonical timestamp; local timezone display is intentionally dropped.
 
     if (cmdline[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Process: %s\n", cmdline);
     }
     if (vm_rss[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmRSS: %s kB\n", vm_rss);
     }
     if (vm_peak[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmPeak: %s kB\n", vm_peak);
     }
     if (threads[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Threads: %s\n", threads);
     }
     // Private-anon split + address-space pressure. RssAnon is the metric the
@@ -245,30 +371,30 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
     // probe curve that led to this death lives in
     // files/logs/memspike-<date>.log (columns anon/resid/native/java/peak).
     if (rss_anon[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssAnon: %s kB\n", rss_anon);
     }
     if (rss_file[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssFile: %s kB\n", rss_file);
     }
     if (rss_shmem[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssShmem: %s kB\n", rss_shmem);
     }
     if (vm_size[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmSize: %s kB\n", vm_size);
     }
     if (mem_available[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "MemAvailable: %s kB\n", mem_available);
     }
     if (map_lines >= 0) {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Maps: %ld entries\n", map_lines);
     }
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+    off = (int)buf_append(buf, sizeof(buf), (size_t)off,
         "\n"
         "(Full backtrace + abort message: run `logcat -b crash -d` and "
         "find this PID/TID.)\n");
@@ -283,13 +409,12 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
     }
     close(fd);
 
-    // Re-raise with default handler so Android still produces a tombstone
-    // and ActivityManager handles process-death the normal way.
-    struct sigaction sa{};
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    sigaction(sig, &sa, nullptr);
-    raise(sig);
+    // Re-raise after restoring the saved previous handler (typically
+    // debuggerd's) so Android still produces a tombstone and
+    // ActivityManager handles process-death the normal way.
+    // [fix/sweep1014-crash-cpp] previously SIG_DFL was installed directly,
+    // which silently defeated debuggerd: no tombstone, no `logcat -b crash`.
+    restore_and_reraise(sig);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -305,9 +430,25 @@ Java_com_rikkaminis_app_crash_NativeCrashHandler_nativeInstall(
     // mkdir is fine here — we're on the JVM thread, not in a signal.
     mkdir(g_log_dir, 0755);
 
+    // [fix/audit-1015 BUG-05] Register the alternate signal stack BEFORE
+    // installing the handlers. Per-thread: it covers the installing (JVM
+    // main) thread; threads created later have no alternate stack and, per
+    // POSIX, a SA_ONSTACK handler without a registered stack simply runs on
+    // the current stack — i.e. their behavior is unchanged from before this
+    // fix (documented residual; a full per-thread registry would need a
+    // pthread_create hook, out of scope here).
+    stack_t ss{};
+    ss.ss_sp = g_alt_stack;
+    ss.ss_size = sizeof(g_alt_stack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+
     struct sigaction sa{};
     sa.sa_sigaction = crash_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
+    // [fix/audit-1015 BUG-05] SA_ONSTACK: without it a stack-overflow
+    // SIGSEGV cannot run any handler (the thread's own stack is the thing
+    // that died), so the one-shot report is never written.
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
 
     // Register for the signals that map to JNI/native bugs we actually
@@ -315,12 +456,18 @@ Java_com_rikkaminis_app_crash_NativeCrashHandler_nativeInstall(
     // from libc; SIGSEGV/BUS/ILL cover most JNI memory bugs; SIGFPE
     // covers integer div-by-zero. SIGSYS catches seccomp violations
     // (proot occasionally trips these on new kernels).
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGBUS,  &sa, nullptr);
-    sigaction(SIGFPE,  &sa, nullptr);
-    sigaction(SIGILL,  &sa, nullptr);
-    sigaction(SIGSYS,  &sa, nullptr);
+    // [fix/sweep1014-crash-cpp] the third argument now saves the previous
+    // handler per signal (debuggerd's on Android) so the handler can
+    // restore it before re-raising — without this, the "Android still
+    // produces a tombstone" intent is defeated by our own SIG_DFL
+    // overwrite. First save wins: a second install never clobbers the
+    // original handler we captured.
+    install_and_save(SIGSEGV, sa);
+    install_and_save(SIGABRT, sa);
+    install_and_save(SIGBUS,  sa);
+    install_and_save(SIGFPE,  sa);
+    install_and_save(SIGILL,  sa);
+    install_and_save(SIGSYS,  sa);
 
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
         "installed: dir=%s", g_log_dir);

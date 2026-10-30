@@ -55,7 +55,9 @@ import kotlin.math.roundToInt
  *   (B) History drawer footer — all ten actions have a pin Switch; the order
  *       defines the footer FlowRow rendering. SETTINGS, when pinned, is
  *       always anchored last (its row is non-draggable + shows a "fixed
- *       right" hint); the row is always listed so it can always be re-pinned.
+ *       right" hint; it is also a *wall* for the other rows' drags, so no
+ *       gesture can swap it out of that slot — F-12); the row is always
+ *       listed so it can always be re-pinned.
  *
  * Each row has a drag handle (≡) to grab and reorder (long-press + drag,
  * live swap as you cross the half-row boundary). Order and visibility / pin
@@ -115,12 +117,45 @@ fun ChatMenuSettingsScreen(
     // recomposition trigger for the in-screen switches; without a listener it
     // never moved for external writes, so the switches kept rendering the
     // values read at first composition.
+    //
+    // [da1021-D] Two gaps closed here:
+    //  1. The guard used to match ONLY `key.startsWith("chatMenu.")`, but the
+    //     two top-bar/composer keys are `topBar.inputHistory.visible` and
+    //     `composer.modelPickerButton.visible` — they never fired the tick, so
+    //     the two switches this KDoc names kept rendering stale values on
+    //     external writes. The predicate now matches the self-contained set:
+    //     the chatMenu.* prefix OR the two fixed keys (referenced via
+    //     ChatMenuPrefs constants — single source, no second string copy).
+    //  2. The three order States (menuOrder / footerOrder / attachOrder) were
+    //     never re-read either: an external restore of `chatMenu.order` /
+    //     `chatMenu.pinOrder` / `chatMenu.attachOrder` left the lists stale,
+    //     and a subsequent in-screen drag would write the stale order back.
+    //     The re-read expressions are VERBATIM copies of the first-composition
+    //     reads (resolveOrder + defaultMenuVisible filter / settingsPinOrder /
+    //     resolveAttachOrder) so an external restore renders exactly the list
+    //     a fresh open would. Guarded by `draggingEntry == null` so an async
+    //     listener notification can't interrupt an in-flight drag gesture or
+    //     overwrite the commit* write-back path (which is idempotent: the
+    //     re-read reproduces the same list the commit wrote).
     DisposableEffect(context) {
         val prefs = context.applicationContext
             .getSharedPreferences(ChatMenuPrefs.PREFS, android.content.Context.MODE_PRIVATE)
         val listener =
             android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                if (key != null && key.startsWith("chatMenu.")) prefsTick++
+                if (key != null && (
+                        key.startsWith("chatMenu.") ||
+                            key == ChatMenuPrefs.TOP_BAR_INPUT_HISTORY_PREF ||
+                            key == ChatMenuPrefs.COMPOSER_MODEL_PICKER_BUTTON_PREF
+                    )
+                ) {
+                    prefsTick++
+                    if (draggingEntry == null) {
+                        menuOrder = ChatMenuPrefs.resolveOrder(prefs)
+                            .filter { ChatActionCatalog.spec(it)?.defaultMenuVisible != false }
+                        footerOrder = ChatMenuPrefs.settingsPinOrder(prefs)
+                        attachOrder = ChatMenuPrefs.resolveAttachOrder(prefs)
+                    }
+                }
             }
         prefs.registerOnSharedPreferenceChangeListener(listener)
         onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
@@ -291,6 +326,13 @@ fun ChatMenuSettingsScreen(
                                 index = index,
                                 isLast = index == footerOrder.lastIndex,
                                 draggable = !isSettings,
+                                // [F-12] SETTINGS is non-draggable AND a wall:
+                                // without this the entry directly above it
+                                // could swap with it, which (a) left the list
+                                // showing SETTINGS mid-order while the drawer
+                                // re-anchored it last and (b) persisted an
+                                // order that disagreed with both.
+                                lockedKeys = setOf(ChatMenuPrefs.SETTINGS),
                                 rowHeightPx = rowHeightPx,
                                 order = footerOrder,
                                 draggingEntry = draggingEntry,
@@ -358,6 +400,15 @@ private fun DraggableActionRow(
     index: Int,
     isLast: Boolean,
     draggable: Boolean,
+    /**
+     * Keys that must not move even though a draggable row is being dragged
+     * across them ("walls", see [chatMenuDragTargetIndex]). [draggable]
+     * decides whether THIS row can be grabbed; this set decides whether a
+     * grab elsewhere may land on top of another row. The footer passes
+     * `SETTINGS`, whose row is composed non-draggable but was still swappable
+     * by its neighbour's gesture before F-12.
+     */
+    lockedKeys: Set<String> = emptySet(),
     rowHeightPx: Float,
     order: List<String>,
     draggingEntry: String?,
@@ -375,6 +426,11 @@ private fun DraggableActionRow(
     // seeing the initial null / 0f and the reorder logic never fires.
     val currentDraggingEntry by rememberUpdatedState(draggingEntry)
     val currentDragOffset by rememberUpdatedState(dragOffset)
+    // Same freeze rule as the two above: `lockedKeys` is captured by the
+    // pointerInput coroutine at launch, and the footer builds it inline
+    // (`setOf(ChatMenuPrefs.SETTINGS)`), so a fresh instance per recomposition
+    // must not be able to leave the handler holding a stale set.
+    val currentLockedKeys by rememberUpdatedState(lockedKeys)
     val isDragging = draggingEntry == entryKey
 
     // Read prefsTick to establish re-composition dependency when prefs change
@@ -399,15 +455,21 @@ private fun DraggableActionRow(
                                 if (currentIndex < 0) return@detectDragGesturesAfterLongPress
                                 val delta = (newOffset / rowHeightPx).roundToInt()
                                 if (delta != 0) {
-                                    val targetIndex =
-                                        (currentIndex + delta).coerceIn(0, currentOrder.lastIndex)
+                                    // [F-12] The landing slot is clamped to the
+                                    // draggable run: a locked row (footer
+                                    // SETTINGS) is a wall, so the swap can no
+                                    // longer push it out of its slot and the
+                                    // committed order stays equal to the order
+                                    // the list renders.
+                                    val targetIndex = chatMenuDragTargetIndex(
+                                        order = currentOrder,
+                                        currentIndex = currentIndex,
+                                        delta = delta,
+                                        lockedKeys = currentLockedKeys,
+                                    )
                                     if (targetIndex != currentIndex) {
-                                        val next = currentOrder.toMutableList()
-                                        val tmp = next[currentIndex]
-                                        next[currentIndex] = next[targetIndex]
-                                        next[targetIndex] = tmp
                                         onDragOffsetChange(newOffset - (targetIndex - currentIndex) * rowHeightPx)
-                                        onCommitOrder(next)
+                                        onCommitOrder(chatMenuDragSwap(currentOrder, currentIndex, targetIndex))
                                     }
                                 }
                             },

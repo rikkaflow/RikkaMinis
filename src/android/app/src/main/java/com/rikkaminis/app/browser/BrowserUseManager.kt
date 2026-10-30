@@ -18,12 +18,14 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -105,6 +107,19 @@ class BrowserUseManager(
          *  LLM context). */
         private const val DIAGNOSTICS_TEXT_CAP = 16_000
 
+        /**
+         * [audit2-A2] Ceiling on the `data:` URL string a page may push through
+         * the `__minis__.saveBlobDownload` bridge / the download listener.
+         *
+         * Sized off the DECODED payload — 24 MiB of URL text is ≈16 MiB of
+         * bytes for base64 (4 chars per 3 bytes) — which is comfortably above
+         * any real export a page offers (worksheets, PDFs, images, small
+         * archives) and far below "allocate the app to death": the decode step
+         * holds the string and its byte copy at once, and the pool then writes
+         * that same payload into the session workspace.
+         */
+        private const val MAX_BLOB_DATA_URL_CHARS = 24 * 1024 * 1024
+
         @SuppressLint("SetJavaScriptEnabled")
         fun configureWebView(webView: WebView, profile: UserAgentProfile, customUA: String? = null) {
             // [T-android-browser-blank] The browser lives inside a Material3
@@ -124,6 +139,19 @@ class BrowserUseManager(
                 useWideViewPort = true
                 builtInZoomControls = false
                 setSupportMultipleWindows(true)
+                // [deep-audit-1016 9b] Explicitly deny the file:// and
+                // content:// surfaces. WebView's defaults for these only became
+                // false in API 30, so on the minSdk 26 floor this pool would
+                // still inherit the old permissive defaults unless they are
+                // named. Nothing here needs them — the pool loads http/https
+                // plus minis://, which is served through shouldInterceptRequest
+                // rather than as a file URL — and WebAppActivity sets the same
+                // four for its own WebView. The KaTeX pool is a different
+                // WebView with a deliberate file:// load, so it is unaffected.
+                allowFileAccess = false
+                allowContentAccess = false
+                allowFileAccessFromFileURLs = false
+                allowUniversalAccessFromFileURLs = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 val ua = customUA ?: profile.userAgentString
                 if (ua != null) userAgentString = ua
@@ -147,6 +175,47 @@ class BrowserUseManager(
 
     private val _currentURL = MutableStateFlow("")
     val currentURL: StateFlow<String> = _currentURL.asStateFlow()
+
+    /**
+     * Chat session that owns this tab's WebView. Populated by
+     * [BrowserTabPool.setSession] (which receives it from the same internal
+     * call sites that stamp [BrowserActionInput.sessionId] — the CLI offload
+     * handler / ChatViewModel tool executor; NEVER parsed from model JSON).
+     * Null in the manual browser sheet (no session context) →
+     * [interceptMinisURL] falls back to the pre-existing global resolver
+     * (the manual sheet had no session pinning before this fix either).
+     */
+    @Volatile
+    var minisSessionId: String? = null
+
+    /**
+     * Last committed main-document URL for the minis:// subresource gate.
+     *
+     * Maintained ONLY on the WebView's UI thread, and only from signals that
+     * mean this tab actually adopted the document: onPageStarted /
+     * onPageFinished, the main-frame minis:// interception in
+     * shouldInterceptRequest, and shouldOverrideUrlLoading — that last one only
+     * once it has decided not to route the navigation away (deep-audit-1016
+     * 9a: recording a URL this hook then cancels let a page seed the gate with
+     * an origin the tab never committed to). Reset to null on destroy().
+     *
+     * Keep the [MinisMainDocGate] gate fail-closed for null — fresh tabs commit
+     * only when the blank bootstrap page lands.
+     */
+    @Volatile
+    private var lastMainDocUrl: String? = null
+
+    /**
+     * [r3-B09 F-14] Status code of the last main-frame HTTP error on this tab
+     * (403 / 429 / …), cleared when a new document starts loading. Read by
+     * `BrowserTabPool` and handed to
+     * [BrowserRiskControl.detectChallenge] as `statusCode` — the field existed
+     * for a long time with no producer at all, so the two status-based kinds
+     * (`rate_limited`, `access_denied`) were unreachable.
+     */
+    @Volatile
+    var lastMainFrameHttpError: Int? = null
+        private set
 
     private val _pageTitle = MutableStateFlow("")
     val pageTitle: StateFlow<String> = _pageTitle.asStateFlow()
@@ -183,6 +252,18 @@ class BrowserUseManager(
     var onBlobDownloadData: ((data: ByteArray, filename: String, mimeType: String?) -> Unit)? = null
 
     /**
+     * [r3-B09 F-10] A blob:/data: download failed before any bytes reached the
+     * pool (no bridge token match, FileReader error, unsafe name, malformed or
+     * oversized data URL, decode failure, or the tab died mid-flight).
+     *
+     * The pool cannot infer any of these: they happen entirely inside the page
+     * JS / bridge handshake, so without this callback the only trace was a
+     * Log.w here and the user saw nothing at all after tapping "download".
+     * `filename` is null when the failure is before a name exists.
+     */
+    var onBlobDownloadFailed: ((filename: String?, reason: String) -> Unit)? = null
+
+    /**
      * Deferred for awaiting navigation completion.
      *
      * [audit-0916b] Carries a [NavigationResult], not a bare `Unit`. Every
@@ -190,7 +271,20 @@ class BrowserUseManager(
      * timeout runnable / handing the URL to another app) stamps which of those
      * actually happened, because the old `Unit` made them indistinguishable and
      * navigate() answered `success = true` for all of them (§20b).
+     *
+     * [deep-audit-1019 ISSUE-08] `@Volatile`, for the same reason
+     * [pendingFileChooser] carries one ("every write happens on the main
+     * thread, but readers run on the offload coroutine") and the same reason
+     * [AsyncJsSlot] replaced two bare fields: here the shapes are inverted but
+     * the hazard is identical — `navigate()` / `reloadAndWait()` install the
+     * deferred from the calling coroutine thread, while the readers are WebView
+     * callbacks and [destroy], all on Main. A teardown read that saw a stale
+     * `null` would skip the wake-up this fix exists to perform, making it
+     * silently dependent on scheduling. `complete()` is itself thread-safe;
+     * this does not make the reference swap atomic, so every existing
+     * identity guard (`navigationDeferred === deferred`) stays as it was.
      */
+    @Volatile
     private var navigationDeferred: CompletableDeferred<NavigationResult>? = null
 
     /** Screenshots directory. */
@@ -228,8 +322,41 @@ class BrowserUseManager(
      * (which previously caused cross-request result串台 — request A's data
      * delivered to request B).
      */
-    private var asyncJsDeferred: CompletableDeferred<String>? = null
-    private var asyncJsActiveToken: String? = null
+    /**
+     * Single-slot registry for in-flight async JS bridge requests.
+     * [fix/audit-s6h2] each request is tagged with a unique token that the JS
+     * callbacks echo back; a late resolve/reject from a TIMED-OUT prior
+     * request is discarded instead of completing the next request's deferred
+     * (which previously caused cross-request result串台 — request A's data
+     * delivered to request B).
+     *
+     * [deep-audit-1016c ISSUE-03B] Was two bare fields (`asyncJsDeferred` /
+     * `asyncJsActiveToken`) with no `@Volatile` and an unconditional,
+     * token-less `finish` — see [AsyncJsSlot] for the three defects it fixes
+     * (visibility on the JavaBridge thread, finish only clearing its own slot,
+     * begin completing the evicted deferred with a structured error).
+     */
+    private val asyncJsSlot = AsyncJsSlot<CompletableDeferred<String>>()
+
+    /**
+     * [audit2-A2] One-shot credential for the `__minis__.saveBlobDownload`
+     * bridge call — same shape as the async-JS token above (a fresh UUID per
+     * request, compared with `==`). [fetchBlobDownload] arms it right before
+     * injecting the FileReader that echoes it back.
+     *
+     * Why it exists: `addJavascriptInterface` exposes the bridge to EVERY page
+     * this tab loads, so without a credential any third-party page (or an
+     * iframe inside one) could call `__minis__.saveBlobDownload(…)` itself and
+     * write attacker-chosen bytes into the session workspace — no user action
+     * needed. The token is only knowable to script we injected ourselves.
+     *
+     * Consumed (cleared) on first use, so a replayed call after the real
+     * download landed is rejected as well.
+     */
+    // @Volatile: armed on the main thread (download listener →
+    // fetchBlobDownload), read on the WebView's JavaBridge thread.
+    @Volatile
+    private var blobDownloadActiveToken: String? = null
 
     // ── [feat/browser-console-network-upload] diagnostics buffers ────────────
 
@@ -297,69 +424,129 @@ class BrowserUseManager(
     private fun beginAsyncJsRequest(): Pair<CompletableDeferred<String>, String> {
         val token = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
-        asyncJsDeferred = deferred
-        asyncJsActiveToken = token
+        // [deep-audit-1016c ISSUE-03B] A request starting while another is
+        // still in flight evicts it — complete the evicted deferred with a
+        // structured error (same shape as the bridge's own reject, so both
+        // executeJS and fetch surface it as a real error) instead of
+        // orphaning it until the full 30s/60s timeout.
+        asyncJsSlot.begin(token, deferred)?.complete(
+            "{\"error\":\"superseded by a newer async JS request\"}"
+        )
         return deferred to token
     }
 
-    private fun finishAsyncJsRequest() {
-        asyncJsDeferred = null
-        asyncJsActiveToken = null
+    /**
+     * Release the slot iff [token] still owns it. [deep-audit-1016c ISSUE-03B]
+     * a timed-out / cancelled / failed request must never clear the slot of a
+     * newer request that already began.
+     */
+    private fun finishAsyncJsRequest(token: String) {
+        asyncJsSlot.finish(token)
     }
 
     /** JavaScript interface for async script result callbacks. */
     private val jsBridge = object {
         @JavascriptInterface
         fun resolve(token: String, result: String) {
-            if (token == asyncJsActiveToken) asyncJsDeferred?.complete(result)
+            asyncJsSlot.ifOwner(token)?.complete(result)
         }
 
         @JavascriptInterface
         fun reject(token: String, error: String) {
-            if (token == asyncJsActiveToken) asyncJsDeferred?.complete("{\"error\":${JSONObject.quote(error)}}")
+            asyncJsSlot.ifOwner(token)?.complete("{\"error\":${JSONObject.quote(error)}}")
         }
 
         /**
          * Receives a blob: download read as a data URL by [fetchBlobDownload]'s
          * injected FileReader. Runs on the WebView's JavaBridge thread — file
          * I/O downstream is fine, but don't touch the WebView from here.
+         *
+         * [audit2-A2] Credential check. This method is reachable from ANY page
+         * the tab loads (that is what `addJavascriptInterface` means), so the
+         * call is only honoured when it carries the token [fetchBlobDownload]
+         * just armed. An unauthenticated call is dropped silently — never
+         * thrown back into the page, which would leak internals — and leaves a
+         * warn line for forensics.
          */
         @JavascriptInterface
-        fun saveBlobDownload(dataUrl: String, filename: String) {
-            // [audit-RC11] Defense-in-depth: page-provided names are untrusted.
-            // The pool also sanitizes, but refuse as early as possible so the
-            // bytes are never even handed off for an unsafe name.
-            val safeName = BrowserTabPool.sanitizeDownloadName(filename) ?: run {
-                Log.w(TAG, "blob download rejected: unsafe filename '${filename.take(80)}'")
+        fun saveBlobDownload(token: String, dataUrl: String, filename: String) {
+            if (token != blobDownloadActiveToken) {
+                // [r3-B09 F-10] A newer blob: fetch overwrote the single-slot
+                // token before this reader answered; say so instead of dropping
+                // the download on the floor.
+                reportBlobFailure(filename, "the page replaced this download request before it finished")
                 return
             }
-            val comma = dataUrl.indexOf(',')
-            if (comma < 0 || !dataUrl.startsWith("data:")) {
-                Log.w(TAG, "blob download: malformed data URL (len=${dataUrl.length})")
-                return
-            }
-            val header = dataUrl.substring(5, comma)
-            val mime = header.substringBefore(';').ifEmpty { null }
-            val bytes = try {
-                if (header.endsWith(";base64")) {
-                    android.util.Base64.decode(dataUrl.substring(comma + 1), android.util.Base64.DEFAULT)
-                } else {
-                    // Non-base64 data: URL — payload is percent-encoded text.
-                    java.net.URLDecoder.decode(dataUrl.substring(comma + 1), "UTF-8")
-                        .toByteArray(Charsets.UTF_8)
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "blob download: payload decode failed: ${t.message}")
-                return
-            }
-            Log.i(TAG, "blob download decoded: $safeName (${bytes.size} bytes, mime=$mime)")
-            onBlobDownloadData?.invoke(bytes, safeName, mime)
+            // One-shot: the credential dies with the call it authorised.
+            blobDownloadActiveToken = null
+            deliverBlobDownload(dataUrl, filename)
         }
 
         @JavascriptInterface
         fun blobDownloadError(error: String) {
-            Log.w(TAG, "blob download failed in page JS: $error")
+            // [r3-B09 F-10] No token on this member (the page-side error hook is
+            // not credentialed), so no name is known here either.
+            reportBlobFailure(null, error.ifBlank { "the page failed to read the download" })
         }
+    }
+
+    /**
+     * Decode a `data:` URL produced by the page-side blob reader and hand the
+     * bytes to [onBlobDownloadData]. Deliberately NOT a `@JavascriptInterface`
+     * member: the two legitimate callers are the bridge method above (after its
+     * credential check) and the `data:` branch of the download listener (an
+     * in-process call from native code, which needs no token).
+     */
+    private fun deliverBlobDownload(dataUrl: String, filename: String) {
+        // [audit2-A2] Bound the payload before touching it. The page chooses
+        // this string, and the decode below allocates a SECOND copy of it
+        // (base64 is 4 chars per 3 bytes, so ≈0.75×; percent-encoded text can
+        // double), then the pool persists it to the workspace — an unbounded
+        // input is an unbounded allocation plus an unbounded file. The check
+        // must be on the STRING length, before decoding: decoding first would
+        // mean the allocation we are trying to prevent has already happened.
+        // (The page-side string itself is built inside the WebView before we
+        // ever see it, so this bounds our amplification, not the page's.)
+        if (dataUrl.length > MAX_BLOB_DATA_URL_CHARS) {
+            reportBlobFailure(filename, "payload too large (${dataUrl.length} > $MAX_BLOB_DATA_URL_CHARS chars)")
+            return
+        }
+        // [audit-RC11] Defense-in-depth: page-provided names are untrusted.
+        // The pool also sanitizes, but refuse as early as possible so the
+        // bytes are never even handed off for an unsafe name.
+        val safeName = BrowserTabPool.sanitizeDownloadName(filename) ?: run {
+            reportBlobFailure(filename, "the page supplied an unusable filename")
+            return
+        }
+        val comma = dataUrl.indexOf(',')
+        if (comma < 0 || !dataUrl.startsWith("data:")) {
+            reportBlobFailure(filename, "malformed data URL (len=${dataUrl.length})")
+            return
+        }
+        val header = dataUrl.substring(5, comma)
+        val mime = header.substringBefore(';').ifEmpty { null }
+        val bytes = try {
+            // [deep-audit-1019 ISSUE-08] The decode decision lives in the
+            // top-level [decodeDataUrlPayload] so the `+`-vs-form semantics are
+            // unit-testable without a WebView — the same JVM lift [MinisMainDocGate]
+            // was created for.
+            decodeDataUrlPayload(header, dataUrl.substring(comma + 1))
+        } catch (t: Throwable) {
+            reportBlobFailure(filename, "payload decode failed: ${t.message}")
+            return
+        }
+        Log.i(TAG, "blob download decoded: $safeName (${bytes.size} bytes, mime=$mime)")
+        onBlobDownloadData?.invoke(bytes, safeName, mime)
+    }
+
+    /**
+     * [r3-B09 F-10] One funnel for "this download died before the pool saw a
+     * byte": log for forensics AND tell the owner, so the failure reaches the
+     * downloads panel + chat instead of dying in logcat.
+     */
+    private fun reportBlobFailure(filename: String?, reason: String) {
+        Log.w(TAG, "blob download failed${filename?.let { " ($it)" } ?: ""}: $reason")
+        onBlobDownloadFailed?.invoke(filename, reason)
     }
 
     init {
@@ -377,9 +564,11 @@ class BrowserUseManager(
                 url.startsWith("blob:") -> fetchBlobDownload(url, contentDisposition, mimetype)
                 // data: URLs carry the payload inline — decode directly
                 // (java.net.URL can't fetch them in the pool's downloader).
+                // [audit2-A2] In-process call: no bridge token involved, the
+                // value never travelled through page JS.
                 url.startsWith("data:") -> {
                     val name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
-                    jsBridge.saveBlobDownload(url, name)
+                    deliverBlobDownload(url, name)
                 }
                 else -> onDownloadStart?.invoke(url, userAgent, contentDisposition, mimetype, contentLength)
             }
@@ -408,9 +597,31 @@ class BrowserUseManager(
      * through the `__minis__.saveBlobDownload` bridge. blob: object URLs are
      * scoped to the page — they cannot be fetched from native code, so this
      * injected fetch + FileReader round-trip is the only way to get the data.
+     *
+     * [audit2-A2] Arms [blobDownloadActiveToken] first and interpolates that
+     * token into the injected script, so the bridge only accepts the callback
+     * from THIS reader.
      */
     private fun fetchBlobDownload(blobUrl: String, contentDisposition: String?, mimeType: String?) {
+        // [deep-audit-1045 B-02] Check the latch BEFORE arming the credential:
+        // a dispatch that [runJsOnMain] will refuse must not leave a one-shot
+        // bridge token armed for a request that can never come back.
+        if (destroyed) {
+            reportBlobFailure(
+                android.webkit.URLUtil.guessFileName(blobUrl, contentDisposition, mimeType),
+                "the tab was closed before the download could start",
+            )
+            return
+        }
         val guessedName = android.webkit.URLUtil.guessFileName(blobUrl, contentDisposition, mimeType)
+        // [audit2-A2] Arm the one-shot bridge credential for THIS fetch: the
+        // token interpolated below is the only value the bridge will accept
+        // until the page's FileReader hands its data back. Kept separate from
+        // the async-JS slot's token (rather than reusing it) so the download
+        // path stays independent of any in-flight executeJS request — the two
+        // have different lifetimes and would otherwise clear each other's token.
+        val token = UUID.randomUUID().toString()
+        blobDownloadActiveToken = token
         val js = """
             (function() {
                 fetch(${JSONObject.quote(blobUrl)})
@@ -418,7 +629,7 @@ class BrowserUseManager(
                     .then(function(blob) {
                         var reader = new FileReader();
                         reader.onloadend = function() {
-                            __minis__.saveBlobDownload(reader.result, ${JSONObject.quote(guessedName)});
+                            __minis__.saveBlobDownload(${JSONObject.quote(token)}, reader.result, ${JSONObject.quote(guessedName)});
                         };
                         reader.onerror = function() { __minis__.blobDownloadError('FileReader error'); };
                         reader.readAsDataURL(blob);
@@ -426,7 +637,50 @@ class BrowserUseManager(
                     .catch(function(e) { __minis__.blobDownloadError(String(e)); });
             })();
         """.trimIndent()
-        webView.post { webView.evaluateJavascript(js, null) }
+        // [deep-audit-1045 B-02] NOT `webView.post { … }`: that is a View-queue
+        // write. On a DETACHED WebView — which every headless pool tab is until
+        // something attaches it to a window — the runnable parks in View's
+        // HandlerActionQueue and is only flushed on a later attach. For a tab
+        // that never attaches, the injected FileReader therefore never runs:
+        // the download silently never lands and the one-shot bridge token armed
+        // above is never consumed. `evaluateJavascript` needs the main THREAD,
+        // not a window (the pool drives detached tabs this way everywhere
+        // else), so the injection goes through the same main-thread chokepoint
+        // [setUserAgent] uses — one that always drains.
+        runJsOnMain("blob-download") { webView.evaluateJavascript(js, null) }
+    }
+
+    /**
+     * [deep-audit-1045 B-02] Main-thread chokepoint for one-shot JS injections
+     * requested from a non-suspending caller (download listener, WebView
+     * client callbacks).
+     *
+     * Two things it owns that a bare `View.post` does not:
+     *  1. **the queue** — a main-`Looper` hop always drains; a detached View's
+     *     `post` queue waits for an attach that a headless pool tab never gets
+     *     ([jsDispatchFor] carries the whole decision).
+     *  2. **the latch** — the hop can land *after* [destroy], so the destroyed
+     *     flag is re-checked at execution time, and a WebView throwing
+     *     "… on a destroyed WebView" is logged instead of crashing the app.
+     */
+    private fun runJsOnMain(what: String, block: () -> Unit) {
+        when (jsDispatchFor(destroyed, Looper.myLooper() == Looper.getMainLooper())) {
+            JsDispatch.REJECT_DESTROYED ->
+                Log.w(TAG, "JS dispatch dropped ($what): the WebView was already destroyed")
+            JsDispatch.INLINE -> runJsNow(what, block)
+            JsDispatch.HOP_TO_MAIN -> Handler(Looper.getMainLooper()).post { runJsNow(what, block) }
+        }
+    }
+
+    /** Run [block] if the tab is still alive; a destroy race stays a log line. */
+    private fun runJsNow(what: String, block: () -> Unit) {
+        if (destroyed) {
+            Log.w(TAG, "JS dispatch dropped ($what): the WebView was destroyed before it ran")
+            return
+        }
+        runCatching(block).onFailure {
+            Log.w(TAG, "JS dispatch failed ($what): ${it.message}")
+        }
     }
 
     /**
@@ -473,6 +727,21 @@ class BrowserUseManager(
         webView.setInitialScale(scalePct)
     }
 
+    // originOf() and isAppAssetsOrigin() moved into MinisMainDocGate below so
+    // the whole minis:// trust decision is one JVM-testable pure unit.
+
+    /**
+     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads.
+     * Thin delegation to [MinisMainDocGate], which owns the decision (and the
+     * only reason it is JVM-testable): see its KDoc for the full rationale —
+     * a committed main document is the sole authority, a page-supplied Origin
+     * header can never rescue a disallowed document, and both arms fail closed.
+     */
+    internal fun minisMainDocAllowsSubresource(
+        mainDocUrl: String?,
+        originHeader: String?,
+    ): Boolean = MinisMainDocGate.allowsSubresource(mainDocUrl, originHeader)
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebViewClient() {
         webView.webViewClient = object : SafeWebViewClient() {
@@ -487,6 +756,11 @@ class BrowserUseManager(
              */
             override fun onRendererGone(view: WebView?) {
                 _isLoading.value = false
+                // [r3-B09 F-02] Arm the inertness latch FIRST: every later entry
+                // into this instance (this navigation's metadata read, the next
+                // navigate(), the auto-snapshot) has to be able to see that no
+                // callback will ever arrive again.
+                rendererDead = true
                 Log.e(TAG, "renderer gone — failing pending navigation")
                 navigationDeferred?.complete(
                     NavigationResult(
@@ -495,6 +769,19 @@ class BrowserUseManager(
                     )
                 )
                 navigationDeferred = null
+                // [deep-audit-1019 ISSUE-08] The navigation wait has been woken
+                // here for a long time; the async-JS wait sitting next to it was
+                // not. `__minis__.resolve` / `.reject` live inside this renderer,
+                // so an in-flight executeJS()/fetch() would have burned its full
+                // 30s/60s timeout and then reported a JS timeout for a tab whose
+                // renderer is already gone. Completed with the bridge's own
+                // reject shape (`{"error":…}`, same literal form as the eviction
+                // message in beginAsyncJsRequest) — a bare text payload would
+                // fall through executeJS's "not JSON" branch and surface as a
+                // SUCCESSFUL result for a request that never ran.
+                asyncJsSlot.takeCurrent()?.complete(
+                    "{\"error\":\"WebView renderer process was killed before the async JS request completed\"}"
+                )
                 // Deliberately NOT destroying the instance here (unlike the
                 // rebuild-by-key hosts): this tab is still in BrowserTabPool's
                 // list and the pool keeps handing the same WebView to the next
@@ -516,6 +803,33 @@ class BrowserUseManager(
                 request: WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
+                // [deep-audit-1016 9a] A page must not be able to hand this tab
+                // a minis:// document: that discloses a sandbox file into the
+                // tab, and if the landed file carries script it becomes a
+                // trusted main document that may then pull *other* minis://
+                // files. Refuse a top-level minis:// navigation unless the
+                // document that initiated it is already trusted. Tested against
+                // the committed document, i.e. before this navigation could
+                // change it; a tab with no document yet passes, so the app's
+                // own first load (loadUrl does not reach this hook) and a
+                // trusted page's navigations are unaffected.
+                //
+                // Deliberately no completeNavigationExternally here, unlike the
+                // two branches below: those end a load the app is waiting on,
+                // whereas this hook only sees renderer-initiated navigations —
+                // never the navigation a navigate() wait is attached to. There
+                // is also no NavigationOutcome for "blocked", so completing the
+                // wait would mislabel it as ROUTED_EXTERNALLY.
+                if (request.isForMainFrame &&
+                    !MinisMainDocGate.allowsTopLevelNavigation(lastMainDocUrl, urlStr)
+                ) {
+                    Log.w(
+                        TAG,
+                        "Blocked top-level minis:// navigation from mainDoc=" +
+                            "${lastMainDocUrl?.take(80)} target=${urlStr?.take(80)}",
+                    )
+                    return true
+                }
                 // T234: Google permanently disallows WebView for sign-in /
                 // OAuth. Hand any auth-domain navigation to Chrome Custom
                 // Tab so the user can complete login in their real Chrome
@@ -540,6 +854,18 @@ class BrowserUseManager(
                 // navigation timeout and then report the wrong thing (before
                 // this fix: a plain success).
                 if (handled && request.isForMainFrame) completeNavigationExternally(urlStr)
+                // [audit-RC13 / deep-audit-1016 9a] Commit the minis:// gate's
+                // main-document for a MAIN-frame navigation this hook actually
+                // lets the WebView carry out. This write used to sit at the top
+                // of the method, ahead of the two cancel branches above, so a
+                // URL this hook then refuses was recorded as the tab's document
+                // while the page that named it kept running — the gate trusted
+                // an origin the tab never committed to. Kept here rather than
+                // dropped so the RC13 intent still holds: an adopted navigation
+                // is committed before the new document's own subresources fire.
+                if (!handled && request.isForMainFrame && !urlStr.isNullOrEmpty()) {
+                    lastMainDocUrl = urlStr
+                }
                 return handled
             }
 
@@ -549,6 +875,10 @@ class BrowserUseManager(
                 _pageTitle.value = view.title ?: ""
                 _canGoBack.value = view.canGoBack()
                 _canGoForward.value = view.canGoForward()
+                // [audit-RC13] Final commit of the tab's main document for the
+                // minis:// subresource gate (covers redirects that never passed
+                // through a shouldOverrideUrlLoading main-frame branch).
+                if (!url.isNullOrEmpty()) lastMainDocUrl = url
                 // [audit-0916b] LOADED — this is the only path that means "the
                 // page finished loading". A main-frame onReceivedError has
                 // already completed (and cleared) the same deferred, so the
@@ -568,11 +898,40 @@ class BrowserUseManager(
                 // viewport instead of the pre-scale layout viewport. Without
                 // this, fixed-positioned UI on some sites drifts off the
                 // visible region after the synthetic measure+layout pass.
-                view.postDelayed({
-                    view.evaluateJavascript(
-                        "window.dispatchEvent(new Event('resize'));", null,
-                    )
+                // [r3-B09 F-06] NOT `view.postDelayed`: a pool tab is detached
+                // until the sheet opens, and `View.post*` on a detached view
+                // parks the runnable in its HandlerActionQueue — which the
+                // destroy-path's `removeCallbacks(null)` cannot reach, because
+                // that API is a documented no-op for a null token. The 80ms
+                // resize therefore survived the tab: it either fired on a dead
+                // renderer after destroy() or was flushed into the next page
+                // attach. A main-Looper hop always drains, and [runJsNow]
+                // re-checks the destroyed latch when it runs (which is what
+                // `browser_destroy_wakeup_check`'s chokepoint criterion pins).
+                Handler(Looper.getMainLooper()).postDelayed({
+                    runJsNow("post-scale-resize") {
+                        webView.evaluateJavascript(
+                            "window.dispatchEvent(new Event('resize'));", null,
+                        )
+                    }
                 }, 80)
+            }
+
+            /**
+             * [r3-B09 F-14] HTTP-level failures (403 / 429 / 503) are NOT
+             * [onReceivedError] — that one only reports transport errors, so a
+             * rate-limited page used to reach no callback at all and
+             * `BrowserRiskControl.detectChallenge(statusCode = …)` had no
+             * caller that ever passed a status. Recorded for the main frame
+             * only; subresource 404s are page furniture, not a challenge.
+             */
+            override fun onReceivedHttpError(
+                view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse
+            ) {
+                if (request.isForMainFrame) {
+                    lastMainFrameHttpError = errorResponse.statusCode
+                    Log.w(TAG, "main-frame HTTP ${errorResponse.statusCode} for ${request.url}")
+                }
             }
 
             override fun onReceivedError(
@@ -600,6 +959,15 @@ class BrowserUseManager(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                // [r3-B09 F-14] One HTTP-error reading per document: the risk
+                // detector reads this after every action, and a stale 429 from
+                // the previous page would keep throttling a page that loaded
+                // fine.
+                lastMainFrameHttpError = null
+                // [audit-RC13] Commit the main document for the minis://
+                // subresource gate BEFORE its subresources fire (onPageStarted
+                // is invoked before subresource resolution begins).
+                if (!url.isNullOrEmpty()) lastMainDocUrl = url
                 // [feat/browser-console-network-upload] A pending file chooser
                 // belongs to the page that opened it. Navigating away cancels
                 // it (answered with null) so a stale chooser can never
@@ -631,17 +999,40 @@ class BrowserUseManager(
                 if (url.scheme != "minis") return null
                 // [audit-RC13] Only serve minis:// from page-initiated loads that
                 // are either the main frame (agent navigation / top-level href)
-                // or a same-origin subresource (Origin starts with minis:// or the
-                // bundled app assets origin). A cross-origin frame with an explicit
-                // Origin header is a potential SSRF/scanning vector and must not be
-                // able to pull local workspace files through it.
+                // or a subresource of a same-app-origin main document (minis://
+                // page pulling minis:// assets, appassets preview, about:blank
+                // bootstrap). A subresource of any WEBSITE main document —
+                // with or without an Origin header (<img src> / <iframe src> /
+                // <script src> send none) — must not be able to pull local
+                // workspace files through it (SSRF / cross-session file
+                // disclosure vector). Origin is looked up case-insensitively:
+                // Chromium may hand us "Origin" or "origin".
                 if (!request.isForMainFrame) {
-                    val origin = request.requestHeaders?.get("Origin")
-                    if (!origin.isNullOrEmpty() &&
-                        !origin.startsWith("minis://") &&
-                        !origin.startsWith("https://appassets")) {
-                        return null
+                    val headers = request.requestHeaders
+                    val originHeader = headers?.entries?.firstOrNull {
+                        it.key.equals("Origin", ignoreCase = true)
+                    }?.value
+                    // null mainDoc (no committed main document yet) evaluates
+                    // fail-closed: only an explicit allowed-app Origin header
+                    // can still let it through, everything else is blocked.
+                    val mainDoc = lastMainDocUrl?.takeIf { it.isNotBlank() }
+                    if (!minisMainDocAllowsSubresource(mainDoc, originHeader)) {
+                        Log.w(TAG, "Blocked cross-origin minis:// subresource from " +
+                            "mainDoc=${mainDoc?.take(80)} origin=${originHeader?.take(60)}")
+                        val blockMsg = "Blocked: minis:// subresource requires a " +
+                            "minis://, appassets, or about:blank main document"
+                        return android.webkit.WebResourceResponse(
+                            "text/plain", "UTF-8", 403, "Forbidden",
+                            emptyMap(),
+                            blockMsg.toByteArray(Charsets.UTF_8).inputStream(),
+                        )
                     }
+                } else {
+                    // Main-frame minis:// load (agent navigation): commit it as
+                    // the tab's main document BEFORE its own subresources fire
+                    // (belt-and-braces with the onPageStarted commit — the two
+                    // write the same value in WebView's ordering).
+                    lastMainDocUrl = url.toString()
                 }
                 return interceptMinisURL(url)
             }
@@ -652,12 +1043,26 @@ class BrowserUseManager(
     private fun interceptMinisURL(uri: android.net.Uri): android.webkit.WebResourceResponse? {
         try {
             // minis://workspace/foo.html → /var/minis/workspace/foo.html, then
-            // resolve to the host file via PRoot bind mounts (per-session
-            // workspace lives under filesDir/minis-sessions/<sid>/workspace/).
+            // resolve to the host file. Per-session subdirs (workspace /
+            // attachments / offloads / browser) resolve through
+            // [PRootKernel.resolvePathForSession] — pinned to THIS chat
+            // session's minis-sessions/<sid>/ tree (T178 pattern, same as
+            // file_upload) instead of the global fallback that returns the
+            // first same-named file across ALL sessions (cross-session
+            // disclosure). Non-session paths (minis://attachments-shared/…,
+            // minis://minis-global/…) fall through to the global resolver
+            // inside resolveSessionHostPath itself. [audit3 F-08] A path the
+            // session resolver *rejects* stays rejected — resolvePathForSession
+            // never re-resolves it globally.
             val host = uri.host ?: return null
             val path = uri.path ?: ""
             val linuxPath = "/var/minis/$host$path"
-            val localFile = com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
+            // runCatching keeps the pre-existing exception safety, but its null
+            // is now the single answer acted on below: a session-scoped
+            // rejection must not fall back to the global resolver.
+            val localFile = runCatching {
+                PRootKernel.resolvePathForSession(minisSessionId, linuxPath, webView.context)
+            }.getOrNull()
             if (localFile == null || !localFile.exists() || !localFile.isFile) {
                 return android.webkit.WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     emptyMap(), "File not found: $host$path".byteInputStream())
@@ -882,7 +1287,10 @@ class BrowserUseManager(
             val bitmap = captureWebViewBitmap() ?: return result
             val file = saveBitmapToFile(bitmap, "snapshot", SNAPSHOT_QUALITY)
             bitmap.recycle()
-            result.copy(imageFilePath = file.absolutePath)
+            // [deep-audit-1048 A-02] A failed encode leaves no file to point at;
+            // the result keeps its text and simply carries no image (rather than
+            // a path to a 0-byte file).
+            if (file == null) result else result.copy(imageFilePath = file.absolutePath)
         } catch (e: Exception) {
             Log.w(TAG, "Auto-snapshot failed: ${e.message}")
             result
@@ -893,6 +1301,14 @@ class BrowserUseManager(
 
     private suspend fun navigate(urlString: String?): BrowserActionResult {
         if (urlString.isNullOrEmpty()) return BrowserActionResult.error("Missing 'url' parameter")
+
+        // [r3-B09 F-02] A dead tab never reports back. Before this short-circuit
+        // an explicit-tab navigate onto a renderer-killed / destroyed tab loaded
+        // into nothing, waited out the whole navigation timeout, then asked the
+        // live page for its title/viewport/scroll — and `evaluateJavascript` has
+        // no timeout at all, so the call hung past the timeout until the tool
+        // deadline (~120s) and reported a network problem for a tab that is gone.
+        if (webViewInert()) return webViewGoneResult()
 
         // [audit-0916] Scheme-aware normalization — see normalizeBrowserUrl.
         // The previous `contains("://")` test turned `about:blank` into
@@ -964,7 +1380,11 @@ class BrowserUseManager(
         val report = navigationReport(
             outcome = navResult.outcome,
             url = reportedUrl,
-            details = navigationDetails(),
+            // [r3-B09 F-02] The wake-up can be "the renderer died" / "the tab was
+            // destroyed" instead of "the page finished": reading the live page
+            // then hangs on a JS callback that cannot arrive, so say plainly that
+            // there is no page to describe.
+            details = if (webViewInert()) "  (no live WebView — the tab's renderer is gone)" else navigationDetails(),
             errorDescription = navResult.errorDescription,
             routedTarget = navResult.routedTarget,
             timeoutSec = navTimeoutSec,
@@ -1097,16 +1517,31 @@ class BrowserUseManager(
         } ?: return BrowserActionResult.error("Failed to capture screenshot")
 
         val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, AgentRuntimeLimitsPrefs.browserScreenshotQuality(), out)
+        // [deep-audit-1048 A-02] `compress` answers false when the JPEG encoder
+        // wrote nothing — no throw. Both channels below read that as success: the
+        // base64 handed to the model and the file whose path was published. The
+        // encode verdict is the only place that can differ, so it is answered
+        // once, before either channel is built.
+        val encoded = bitmap.compress(
+            Bitmap.CompressFormat.JPEG,
+            AgentRuntimeLimitsPrefs.browserScreenshotQuality(),
+            out,
+        )
         val jpegBytes = out.toByteArray()
+        if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+            bitmap.recycle()
+            return BrowserActionResult.error("Failed to encode screenshot (JPEG encoder wrote no bytes)")
+        }
 
+        // null = the encoder refused the file write too; the caller must not be
+        // handed a path to a 0-byte file (see saveBitmapToFile).
         val file = saveBitmapToFile(bitmap, "screenshot")
         val base64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
 
         val w = bitmap.width; val h = bitmap.height
         bitmap.recycle()
 
-        Log.i(TAG, "Screenshot saved: ${file.absolutePath}, ${w}x$h, ${jpegBytes.size} bytes (full_page=$fullPage)")
+        Log.i(TAG, "Screenshot captured: ${file?.absolutePath ?: "<not saved>"}, ${w}x$h, ${jpegBytes.size} bytes (full_page=$fullPage)")
 
         val meta = viewportMetadata(
             imageW = w,
@@ -1118,7 +1553,7 @@ class BrowserUseManager(
         )
 
         return BrowserActionResult(
-            text = meta, base64Image = base64, imageFilePath = file.absolutePath
+            text = meta, base64Image = base64, imageFilePath = file?.absolutePath
         )
     }
 
@@ -1181,6 +1616,15 @@ class BrowserUseManager(
     suspend fun captureLiveSnapshot(): Bitmap? = captureWebViewBitmap()
 
     private suspend fun captureWebViewBitmap(): Bitmap? = withContext(Dispatchers.Main) {
+        // [r3-B09 F-02] `navigate()` captures a snapshot even when it fails, so a
+        // dead tab reached the capture path by design; touching a destroyed
+        // WebView throws, and a renderer-killed one is a blank surface. Either
+        // way there is nothing to show: report "no image" instead of burning the
+        // call on a crash log.
+        if (webViewInert()) {
+            Log.w(TAG, "snapshot skipped: the WebView is gone")
+            return@withContext null
+        }
         try {
             // WebView may be detached (pool-owned, never added to a window), so
             // width/height can be 0. Ensure it has a layout box matching the
@@ -1212,11 +1656,27 @@ class BrowserUseManager(
         }
     }
 
-    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = AgentRuntimeLimitsPrefs.browserScreenshotQuality()): File {
+    /**
+     * Encode [bitmap] to the screenshot cache. Returns **null** when the encoder
+     * wrote nothing — [Bitmap.compress] reports that by returning false, not by
+     * throwing, and a dropped verdict publishes a path to a 0-byte file that the
+     * agent (and the vision model) then treat as a real screenshot.
+     *
+     * [deep-audit-1048 A-02]
+     */
+    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = AgentRuntimeLimitsPrefs.browserScreenshotQuality()): File? {
         val filename = "${prefix}_${System.currentTimeMillis()}.jpg"
         val file = File(screenshotsDir, filename)
-        file.outputStream().use { out ->
+        val encoded = file.outputStream().use { out ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+        }
+        if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+            // Do not leave the 0-byte artefact behind: the cache prune is
+            // age-based, so a failed encode would otherwise linger for days and
+            // any path that guessed the name would find it.
+            file.delete()
+            Log.w(TAG, "saveBitmapToFile: encoder wrote no bytes for $filename")
+            return null
         }
         // [T-android-screenshot-cache-cap] Bound the local cache after a
         // successful save (see pruneScreenshotCache for the rationale).
@@ -1364,11 +1824,21 @@ class BrowserUseManager(
 
     private suspend fun executeJS(script: String?): BrowserActionResult {
         if (script.isNullOrEmpty()) return BrowserActionResult.error("execute_js requires 'script'")
+        // [r5-F F-F-01] Decided BEFORE beginAsyncJsRequest(): a slot armed on an
+        // inert tab has no completer (onRendererGone fired at most once; the
+        // bridge lives in the dead renderer), so the request would sit out the
+        // whole 30s timeout and report a phantom "JavaScript execution timed
+        // out" for a tab that is gone. Same one-liner as navigate()'s.
+        if (webViewInert()) return webViewGoneResult()
         // Wrap in an async IIFE so `await` works in user scripts.
         // Android WebView doesn't resolve Promises from evaluateJavascript,
         // so we use a JS bridge callback (__minis__.resolve / __minis__.reject).
+        // [deep-audit-1016c ISSUE-03B] begin() hoisted out of the try: the
+        // catch blocks below must release the slot THEY own (the old
+        // declaration was invisible from the catch clauses). It has no
+        // throwing surface (UUID + a CompletableDeferred constructor).
+        val (deferred, token) = beginAsyncJsRequest()
         return try {
-            val (deferred, token) = beginAsyncJsRequest()
             val wrapped = """
                 (async function(){
                     try {
@@ -1391,10 +1861,10 @@ class BrowserUseManager(
             }
             val raw = withTimeoutOrNull(30_000L) { deferred.await() }
                 ?: run {
-                    finishAsyncJsRequest()
+                    finishAsyncJsRequest(token)
                     return BrowserActionResult.error("JavaScript execution timed out (30s)")
                 }
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             val json = try { JSONObject(raw) } catch (_: Exception) { null }
             if (json != null) {
                 if (json.has("error")) {
@@ -1410,10 +1880,10 @@ class BrowserUseManager(
             // swallowed CancellationException and turned a cancelled run into a
             // "JavaScript error" result — the caller then treated an aborted
             // tool call as a completed one. Still release the registry slot.
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             throw e
         } catch (e: Exception) {
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             BrowserActionResult.error("JavaScript error: ${e.message}")
         }
     }
@@ -1472,6 +1942,14 @@ class BrowserUseManager(
             val status = json.optInt("status", 0)
             val finalURL = json.optString("url", urlString)
 
+            // [r3-B09 F-11] 404's body is an error PAGE, not the fetch result:
+            // the pre-fix code only read `status` to print it and handed the
+            // body over as a successful download. The policy is pure
+            // ([fetchHttpFailure]) so the two directions can be pinned with
+            // literals: non-2xx (when the JS reported one) is a failure, and a
+            // 0-byte 2xx is a legal empty resource, not an error.
+            fetchHttpFailure(status, finalURL)?.let { return BrowserActionResult.error(it) }
+
             // `base64` is optional — only present when the JS captured bytes.
             // If missing, fall back to `text` (JSON / plain text) so callers
             // can fetch human-readable payloads without forcing a byte roundtrip.
@@ -1480,6 +1958,23 @@ class BrowserUseManager(
             } ?: json.optString("text").takeIf { it.isNotEmpty() }?.toByteArray(Charsets.UTF_8)
 
             if (data == null) {
+                // [r3-B09 F-11] The 200/204-no-body direction: the old code
+                // answered "no body" as an ERROR for exactly the responses the
+                // fetch succeeded on. An empty 2xx body is a real (empty)
+                // result — report it, don't fail it.
+                if (status in 200..299) {
+                    val text = buildString {
+                        appendLine("Fetched $finalURL")
+                        appendLine("  Status: $status")
+                        appendLine("  Content-Type: $contentType")
+                        appendLine("  Size: 0 bytes (empty body)")
+                    }
+                    return BrowserActionResult(
+                        text = text,
+                        fetchedFileData = ByteArray(0),
+                        fetchedFileName = "fetch_${System.currentTimeMillis()}.${extensionForMimeType(contentType)}",
+                    )
+                }
                 return BrowserActionResult.error("Fetch returned no body (status=$status)")
             }
             val size = json.optInt("size", data.size)
@@ -1510,6 +2005,13 @@ class BrowserUseManager(
      * pattern used by [executeJS].
      */
     private suspend fun awaitPromiseJs(js: String): String? {
+        // [r5-F F-F-01] Same decision as executeJS, one level lower: fetch's
+        // only entry here. `onRendererGone` fires at most once and cannot wake
+        // a slot armed after it, so registering on an inert tab means the full
+        // 60s timeout and a "fetch timed out" for a tab that is gone. The
+        // reject shape carries webViewGoneResult()'s wording (deadTabGoneMessage),
+        // which `fetch` already parses into "Fetch failed: …".
+        deadTabAsyncJsAnswer(destroyed, rendererDead)?.let { return it }
         val (deferred, token) = beginAsyncJsRequest()
         val wrapped = """
             (async function(){
@@ -1536,7 +2038,7 @@ class BrowserUseManager(
         val raw = try {
             withTimeoutOrNull(60_000L) { deferred.await() }
         } finally {
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
         }
         return raw
     }
@@ -1545,6 +2047,16 @@ class BrowserUseManager(
 
     /** Set user agent from UI settings (public, non-result). */
     fun setUserAgent(profile: UserAgentProfile, customUA: String? = null) {
+        // [deep-audit-1045 B-02] The latch must be the FIRST statement: the
+        // thread hop below re-enters this same function, so one check here
+        // covers both the direct call and a hop that lands after destroy().
+        // Without it the body wrote `settings.userAgentString` and called
+        // reload() on a destroyed WebView — "Attempt to perform WebView method
+        // on a destroyed WebView" for any UI path that outlived its tab.
+        if (destroyed) {
+            Log.w(TAG, "setUserAgent dropped: the WebView was already destroyed")
+            return
+        }
         // [audit-0917] WebView.settings / reload() are main-thread-only, and
         // this is a public entry point. Every current caller happens to be on
         // the main thread, but the failure mode (CalledFromWrongThreadException)
@@ -1616,27 +2128,50 @@ class BrowserUseManager(
     }
 
     private suspend fun setUserAgent(profile: UserAgentProfile?): BrowserActionResult {
+        // [deep-audit-1045 B-02] Same latch as the public overload, but this is
+        // the AGENT-facing entry (BrowserAction.SET_USER_AGENT → the answer
+        // slot). Silently returning would report "Switched to …" for a tab that
+        // no longer exists, so the refusal goes into the result.
+        if (destroyed) return destroyedTabResult()
         val newProfile = profile ?: UserAgentProfile.MOBILE_CHROME
-        currentProfile = newProfile
         val ua = newProfile.userAgentString
         // Every WebView method must be called on the main thread, but the
         // offload handler's `runBlocking { ... execute(...) }` dispatches on
         // a worker. `applyViewport(...)` measures/layouts the detached
         // WebView; settings / reload likewise. Hop to main so we don't
         // crash with "A WebView method was called on thread 'worker-N'".
-        withContext(Dispatchers.Main) {
-            if (ua != null) {
-                webView.settings.userAgentString = ua
-            }
-            applyViewport()
-            val oldUrl = _currentURL.value
-            if (oldUrl.isNotEmpty()) {
-                webView.reload()
+        val applied = withContext(Dispatchers.Main) {
+            // Re-checked after the hop: the tab can be evicted while we are
+            // waiting for the main thread.
+            if (destroyed) {
+                false
+            } else {
+                currentProfile = newProfile
+                if (ua != null) {
+                    webView.settings.userAgentString = ua
+                }
+                applyViewport()
+                val oldUrl = _currentURL.value
+                if (oldUrl.isNotEmpty()) {
+                    webView.reload()
+                }
+                true
             }
         }
+        if (!applied) return destroyedTabResult()
         val vp = newProfile.viewportSize
         return BrowserActionResult(text = "Switched to ${newProfile.value} (${vp.first}x${vp.second})")
     }
+
+    /**
+     * [deep-audit-1045 B-02] The answer-slot form of "this tab is gone".
+     * Every entry that can outlive its tab returns this instead of a fabricated
+     * success or a silent no-op.
+     */
+    private fun destroyedTabResult(): BrowserActionResult = BrowserActionResult.error(
+        "This tab's WebView was already destroyed (the tab was closed or evicted) — " +
+            "the user agent was not applied; open a new tab and retry",
+    )
 
     // -- User Navigation --
 
@@ -1659,6 +2194,17 @@ class BrowserUseManager(
      * viewport-change callers still get a deterministic page refresh.
      */
     suspend fun reloadAndWait() {
+        // [r5-F F-F-01] Best-effort refresh (set_viewport / UA switch). On an
+        // inert tab `onPageFinished` can never fire, so installing
+        // navigationDeferred here would burn the whole navigation timeout and
+        // hand the caller a fake TIMED_OUT. Early-exit instead — and NOT by
+        // completing the deferred: "the reload happened" is exactly the claim
+        // this path cannot make (the next read, e.g. get_page_info, answers the
+        // dead-tab error through the evaluateJavascript guard).
+        if (webViewInert()) {
+            Log.w(TAG, "reloadAndWait skipped: the WebView is gone")
+            return
+        }
         // [audit-0916b] Typed like navigate()'s. These two are internal
         // best-effort refreshes (viewport change / fresh-tab init) and
         // deliberately ignore the outcome — a failed reload must not break
@@ -1707,6 +2253,14 @@ class BrowserUseManager(
      * `document.body` populated. Must be called on the main thread.
      */
     suspend fun loadBlankPage() {
+        // [r5-F F-F-01] Same early-exit as reloadAndWait(): this is the
+        // fresh-tab init refresh, also best-effort. A renderer-killed tab never
+        // reports onPageFinished, so arming navigationDeferred would stall the
+        // caller (createTab / tab switch) for the whole navigation timeout.
+        if (webViewInert()) {
+            Log.w(TAG, "loadBlankPage skipped: the WebView is gone")
+            return
+        }
         // [audit-0916b] Typed like navigate()'s. These two are internal
         // best-effort refreshes (viewport change / fresh-tab init) and
         // deliberately ignore the outcome — a failed reload must not break
@@ -1745,6 +2299,16 @@ class BrowserUseManager(
     // -- JS Evaluation Helpers --
 
     private suspend fun evaluateJavascript(js: String): String = withContext(Dispatchers.Main) {
+        // [r3-B09 F-02] The callback handed to `WebView.evaluateJavascript` runs
+        // in the renderer. With the renderer gone (or the view destroyed) it
+        // never runs, and this `deferred.await()` has no timeout — the caller
+        // would sit until the tool deadline. Answer with the bridge's own reject
+        // shape so `evaluateAndReturn` / `evaluateJSAndParse` surface an error
+        // instead of a hang.
+        if (webViewInert()) {
+            Log.w(TAG, "JS evaluation dropped: the WebView is gone")
+            return@withContext "{\"error\": \"This tab's WebView is gone (renderer killed or tab destroyed) — open a new tab\"}"
+        }
         val deferred = CompletableDeferred<String>()
         webView.evaluateJavascript(js) { result ->
             // Android WebView returns JSON-encoded strings, so unquote
@@ -2167,7 +2731,14 @@ class BrowserUseManager(
 
         val collected = LinkedHashSet<String>()
         for (i in 0 until iterations) {
-            val escaped = selector.replace("\\", "\\\\").replace("'", "\\'")
+            // [audit2-A2] Was a hand-rolled `replace("\\","\\\\").replace("'","\\'")`,
+            // which left raw line terminators in the literal below — a selector
+            // containing a newline (a legal CSS attribute value, e.g.
+            // div[title="a\nb"]) produced an unterminated JS string, so the
+            // whole snippet died as a SyntaxError and scroll_and_collect
+            // silently returned nothing. Use the one escaper the rest of the
+            // browser JS is built with (`\n` / `\r` / `\t` / quotes).
+            val escaped = BrowserUseJS.jsQuote(selector)
             val raw = evaluateJavascript(
                 """(function(){
                     try {
@@ -2223,6 +2794,39 @@ class BrowserUseManager(
      */
     @Volatile
     private var destroyed = false
+
+    /**
+     * [r3-B09 F-02] The renderer behind this WebView was killed by the system
+     * (`onRendererGone`), so the instance is inert: it can never fire
+     * `onPageFinished`, and `evaluateJavascript` callbacks never arrive.
+     *
+     * Deliberately NOT [destroyed] — the pool still holds this tab, the WebView
+     * object is alive (it is only the renderer that died) and it must be
+     * destroyed for real when the tab goes, so a `destroyed = true` here would
+     * make `destroy()` return early and leak the view. This is the "don't wait
+     * for a callback that cannot come" half of the GH#341 latch.
+     */
+    @Volatile
+    private var rendererDead = false
+
+    /** [r3-B09 F-02] No live renderer: destroyed, or renderer killed. */
+    private fun webViewInert(): Boolean = destroyed || rendererDead
+
+    /**
+     * [r3-B09 F-02] The result for an action aimed at a tab that has no live
+     * WebView.
+     *
+     * Two causes, two different fixes on the caller's side, so they get two
+     * different messages: a torn-down tab means "pick another tab", a killed
+     * renderer means "this tab is done, open a new one". Both used to surface as
+     * a network-flavoured timeout.
+     *
+     * [r5-F F-F-01] The wording now lives in [deadTabGoneMessage] so the
+     * async-JS reject shape (`deadTabAsyncJsAnswer`, what `executeJS`/`fetch`
+     * answer with) cannot drift from this one — one dead tab, one story.
+     */
+    private fun webViewGoneResult(): BrowserActionResult =
+        BrowserActionResult.error(deadTabGoneMessage(destroyed))
 
     // ── [feat/browser-console-network-upload] diagnostics + file upload ──────
 
@@ -2361,16 +2965,16 @@ class BrowserUseManager(
         // pattern, same as file_read/file_edit/read_image): the global
         // resolveHostPath fallback searches EVERY minis-sessions/<id>/ tree
         // and returns the first same-named hit — i.e. possibly another chat
-        // session's file. resolveSessionHostPath pins per-session subdirs to
-        // THIS session; non-session paths (/tmp/...) fall through to the
-        // global resolver inside it.
+        // session's file. [audit3 F-08] resolvePathForSession is the single
+        // entry point: with a session in scope the global resolver is never
+        // consulted (not even when the session resolver rejects the path);
+        // non-session paths (/tmp/...) still fall through to the global
+        // resolver inside resolveSessionHostPath itself.
         val context = webView.context
         val hostFiles = mutableListOf<File>()
         for (linuxPath in paths) {
             val host = runCatching {
-                input.sessionId
-                    ?.let { PRootKernel.resolveSessionHostPath(it, linuxPath, context) }
-                    ?: PRootKernel.resolveHostPath(linuxPath)
+                PRootKernel.resolvePathForSession(input.sessionId, linuxPath, context)
             }.getOrNull()
             if (host == null || !host.exists() || !host.isFile) {
                 return BrowserActionResult.error(
@@ -2446,14 +3050,53 @@ class BrowserUseManager(
             runCatching { pendingFileChooser?.onReceiveValue(null) }
             pendingFileChooser = null
             pendingFileAccept = null
+            // [deep-audit-1019 ISSUE-08] Wake the other two in-flight waiters
+            // BEFORE the client is swapped for a no-op and the WebView is
+            // destroyed: after that neither onPageFinished nor a
+            // `__minis__.resolve`/`.reject` callback can ever arrive, so
+            // navigate()/reloadAndWait() and executeJS()/fetch() would each
+            // burn their full 30s/60s timeout and then blame the network / the
+            // page for what was really a tab that no longer exists. Same
+            // complete-then-clear pairing every other completion site in this
+            // file uses. The async-JS error keeps the bridge's own reject shape
+            // (`{"error":…}`) because executeJS treats any non-JSON payload as
+            // a successful result.
+            navigationDeferred?.complete(
+                NavigationResult(
+                    NavigationOutcome.FAILED,
+                    errorDescription = "WebView was destroyed before the navigation completed",
+                )
+            )
+            navigationDeferred = null
+            asyncJsSlot.takeCurrent()?.complete(
+                "{\"error\":\"WebView was destroyed before the async JS request completed\"}"
+            )
             // Remove from any parent before destroying — WebView.destroy() on
             // an attached view is undefined behavior on some OEMs and can
             // crash the app (ConnectionTerminated / missing renderer).
             (webView.parent as? android.view.ViewGroup)?.removeView(webView)
             webView.stopLoading()
+            // [deep-audit-1045 B-02] Drop everything queued on this view before
+            // it dies: `onPageFinished` posts a synthetic `resize` via
+            // `view.postDelayed(…, 80)` and a late attach would flush that
+            // runnable straight into a destroyed renderer (KaTeXView.kt and
+            // FilePreviewScreen.kt carry the same three-call teardown: stop →
+            // drop callbacks → destroy).
+            //
+            // Order matters twice over: this MUST sit after the removeView()
+            // above, because `View.removeCallbacks(null)` on an ATTACHED view
+            // also drains the shared window handler's null-token messages,
+            // while on a detached one it only drops this view's run queue.
+            webView.removeCallbacks(null)
             webView.loadUrl("about:blank")
             webView.removeAllViews()
             webView.settings.javaScriptEnabled = false
+            // [audit-RC13] Drop the committed main document so a recycled or
+            // destroyed WebView can never carry stale main-doc state into a
+            // new page's subresource gate. Fail-closed: null blocks until the
+            // next onPageStarted commits again.
+            lastMainDocUrl = null
+            lastMainFrameHttpError = null // [r3-B09 F-14] no status outlives the tab
             // Assign a no-op implementation instead of null — the Kotlin
             // Android SDK bindings expose webViewClient/webChromeClient as
             // non-null types (API 26+), so "= null" won't compile.
@@ -2467,3 +3110,254 @@ class BrowserUseManager(
     }
 
 }
+
+/**
+ * [deep-audit-1016 9a] Pure trust decisions for the `minis://` gate: which
+ * main documents may reference minis:// resources, and which may navigate the
+ * tab to a minis:// document.
+ *
+ * Lifted out of [BrowserUseManager] (two private helpers plus the gate body,
+ * moved verbatim) so the whole policy is one JVM-testable unit — it had no
+ * direct test before, because an Android-owned instance method cannot be
+ * exercised without a WebView.
+ */
+internal object MinisMainDocGate {
+
+    /** Strip an arbitrary `Origin` header value down to `scheme://host[:port]`.
+     *  Scheme + authority are lowercased (RFC 3986 case-insensitivity) so
+     *  `MINIS://…` / `HTTPS://APPASSETS…` spellings normalize before any
+     *  prefix comparison; the `null` opaque-origin sentinel maps to "". */
+    fun originOf(headerValue: String): String {
+        // `null` (sentinel for sandboxed/opaque origins) and anything that
+        // doesn't look like scheme://… carries no trustable site identity.
+        val v = headerValue.trim()
+        val schemeEnd = v.indexOf("://")
+        if (v.equals("null", ignoreCase = true) || schemeEnd <= 0) return ""
+        val rest = v.substring(schemeEnd + 3)
+        val authority = rest.substringBefore('/').substringBefore('?').substringBefore('#')
+        return "${v.substring(0, schemeEnd).lowercase()}://${authority.lowercase()}"
+    }
+
+    /** Exact-host app-assets origin check (tightened from the old loose
+     *  `startsWith("https://appassets")` prefix, which also matched
+     *  `https://appassets.evil.com`). Allows the bare origin plus path /
+     *  port suffixes only. */
+    fun isAppAssetsOrigin(origin: String): Boolean {
+        val base = "https://appassets.androidplatform.net"
+        return origin == base || origin.startsWith("$base/") || origin.startsWith("$base:")
+    }
+
+    /**
+     * Whether a page whose COMMITTED main document is [mainDocUrl] is trusted
+     * to reach sandbox-local `minis://` content at all. Null / blank means "no
+     * document committed yet" and is NOT trusted here — callers that need the
+     * pre-first-commit race arm use [allowsSubresource] instead.
+     */
+    fun isTrustedMainDoc(mainDocUrl: String?): Boolean {
+        // Lowercase: scheme is case-insensitive per RFC 3986 and this gate's
+        // prefix comparisons are exact — normalize before matching. (Chromium
+        // emits normalized lowercase URLs anyway; this defends the gate
+        // against unnormalized input shapes.)
+        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+        // The blank-tab bootstrap page (loadDataWithBaseURL(null, …)) lands on
+        // about:blank; blocking it would break fresh-tab subresource loads.
+        // (Known second-order nuance: an about:blank window.open'ed by a
+        // website inherits the opener's origin — logged as a follow-up
+        // hardening candidate, out of scope here.)
+        return doc == "about:blank" ||
+            doc.startsWith("minis://") ||
+            isAppAssetsOrigin(originOf(doc))
+    }
+
+    /**
+     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads.
+     * Callers pass the current tab's main-document URL and the optional Origin
+     * request header (value looked up case-insensitively by the caller —
+     * Chromium may send "Origin" or "origin").
+     *
+     * When a main document IS committed, it is the sole authority: a
+     * page-supplied Origin header can never rescue a disallowed document
+     * (the header is attacker-controllable — `Origin: minis://…` sent by an
+     * https:// page must not re-open the door the main-document gate just
+     * closed). Only minis:// / appassets / about:blank main documents may
+     * reference minis:// subresources — that is the built-in preview path
+     * (minis:// page pulling minis:// attachment images). Any website main
+     * document is rejected with or without an Origin header: no-Origin
+     * subresources (<img src>, <iframe src>, <script src>) were previously
+     * waved through, which let any web page read sandbox-local minis://
+     * files (local disclosure / SSRF vector). Fail-closed.
+     *
+     * When NO main document is committed yet (subresource racing the very
+     * first navigation), fall back to an explicit Origin header naming an
+     * allowed app origin; the opaque-origin `null` sentinel and website
+     * origins reject here too.
+     */
+    fun allowsSubresource(mainDocUrl: String?, originHeader: String?): Boolean {
+        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (doc != null) return isTrustedMainDoc(doc)
+        // No committed main document yet — header-based fallback only.
+        // (The header is forgeable; this only covers the pre-first-commit
+        // race window, so it keeps the original semantics: any minis://
+        // origin passes — harmless, since resolution is subdir-pinned —
+        // while the appassets origin is checked against its exact host.)
+        val headerOrigin = originOf(originHeader ?: "")
+        return headerOrigin.startsWith("minis://") || isAppAssetsOrigin(headerOrigin)
+    }
+
+    /**
+     * [deep-audit-1016 9a] Whether a TOP-LEVEL navigation to [targetUrl] may
+     * proceed out of a page whose committed main document is [mainDocUrl].
+     *
+     * Non-minis:// targets are always allowed — this gate exists only for the
+     * arm `shouldInterceptRequest` cannot cover: a page navigating the tab to a
+     * `minis://` document (`location.href = "minis://workspace/…"`), which
+     * displays a sandbox file in the tab and — if that file carries script —
+     * hands the page a trusted main document to pull other minis:// files
+     * with. [mainDocUrl] null/blank means the tab has no document yet, so the
+     * navigation is allowed: `loadUrl` never reaches the caller's hook, which
+     * is how the app's own (trusted) navigations arrive.
+     */
+    fun allowsTopLevelNavigation(mainDocUrl: String?, targetUrl: String?): Boolean {
+        val target = targetUrl?.trim()?.lowercase() ?: return true
+        if (!target.startsWith("minis://")) return true
+        if (mainDocUrl.isNullOrBlank()) return true
+        return isTrustedMainDoc(mainDocUrl)
+    }
+}
+
+/**
+ * [deep-audit-1019 ISSUE-08] Decode the payload half of a `data:` URL.
+ *
+ * RFC 2397 payloads are percent-encoded (RFC 3986), where a literal `+` is
+ * just a `+` — never a space. [java.net.URLDecoder] implements FORM decoding
+ * (`application/x-www-form-urlencoded`, '+' → ' '), which silently corrupted
+ * every non-base64 download that contained one: `data:text/plain,1+1%3D2`
+ * landed on disk as `1 1=2` (likewise `1e+5` in CSV, `+` in code/text). The
+ * pre-escape of a literal '+' as "%2B" is the same fix WebDavClient's
+ * `decodeHrefSegment` and OAuthCallbackServer's query decoder already carry;
+ * `%20` still decodes to a space, and an already-encoded `%2B` still decodes
+ * to a literal '+'.
+ *
+ * Lifted out of `deliverBlobDownload` (decision moved verbatim, call site
+ * semantics unchanged) for the same reason [MinisMainDocGate] exists: an
+ * Android-owned instance method cannot be exercised without a WebView, and
+ * silent data corruption is exactly what a pinned unit test should hold
+ * still. `base64Decoder` is a parameter so the *routing* decision is testable
+ * on the JVM too; [decodeDataUrlBase64] stays the production default.
+ */
+internal fun decodeDataUrlPayload(
+    header: String,
+    payload: String,
+    base64Decoder: (String) -> ByteArray = ::decodeDataUrlBase64,
+): ByteArray =
+    if (header.endsWith(";base64")) {
+        base64Decoder(payload)
+    } else {
+        java.net.URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8")
+            .toByteArray(Charsets.UTF_8)
+    }
+
+/** [deep-audit-1019 ISSUE-08] Production Base64 half of [decodeDataUrlPayload]. */
+private fun decodeDataUrlBase64(payload: String): ByteArray =
+    Base64.decode(payload, Base64.DEFAULT)
+
+/**
+ * [r3-B09 F-11] Pure policy for the agent-facing `fetch`: which statuses are a
+ * failure even though the server sent a body.
+ *
+ * Lifted to the top level so both directions can be pinned with literals —
+ * `fetch` itself is a manager method and cannot be exercised without a
+ * WebView. `status = 0` means the JS never reported one (bridge error / older
+ * shape): an unknown status is not a failure, it is reported as-is in the
+ * result text.
+ */
+internal fun fetchHttpFailure(status: Int, url: String): String? = when {
+    status in 200..299 -> null
+    status == 0 -> null
+    else -> "Fetch failed: HTTP $status for $url — the response body is the " +
+        "server's error page, not the resource you asked for"
+}
+
+/**
+ * [deep-audit-1045 B-02] Where a one-shot JS injection must land.
+ *
+ * Lifted to the top level next to [MinisMainDocGate] / [decodeDataUrlPayload]
+ * for the same reason they were: an Android-owned instance member cannot be
+ * exercised without a WebView, and "the download goes into a queue nothing
+ * ever drains" is exactly the kind of silent loss a pinned unit test should
+ * hold still.
+ *
+ * The axis is deliberately **not** "is the view attached". A headless pool tab
+ * is never attached and must still run JS — `evaluateJavascript` needs the main
+ * *thread*, not a window (every other entry in this file drives detached tabs
+ * that way). The axis is *which queue receives the block*:
+ *
+ *  * `View.post` on a detached view parks the runnable into
+ *    `HandlerActionQueue` and replays it only when attachInfo arrives — never,
+ *    for a tab that never attaches. The pre-fix blob: download path used it,
+ *    so the injected FileReader never ran: no file, no error, and the armed
+ *    one-shot bridge token left dangling.
+ *  * a `Looper.getMainLooper()` hop always drains, and is what the sibling
+ *    entries ([setUserAgent]'s thread hop, `navigate()`'s timeout runnable) use.
+ */
+internal enum class JsDispatch {
+    /** Already on the main thread: run the block directly. */
+    INLINE,
+
+    /** Posted to the main Looper — always runs (unlike a detached View queue). */
+    HOP_TO_MAIN,
+
+    /** The WebView is destroyed: nothing may touch it, on any thread. */
+    REJECT_DESTROYED,
+}
+
+/**
+ * [deep-audit-1045 B-02] Three-state decision. `destroyed` outranks the thread:
+ * a destroyed WebView must not be touched even from the main thread (every
+ * method throws "Attempt to perform WebView method on a destroyed WebView").
+ */
+internal fun jsDispatchFor(destroyed: Boolean, onMainThread: Boolean): JsDispatch = when {
+    destroyed -> JsDispatch.REJECT_DESTROYED
+    onMainThread -> JsDispatch.INLINE
+    else -> JsDispatch.HOP_TO_MAIN
+}
+
+/**
+ * [r5-F F-F-01] The message a tab with no live WebView answers with, in one
+ * place. `destroyed` and `rendererDead` need different advice (pick another
+ * tab / this tab is done, open a new one), and the two consumers —
+ * [BrowserUseManager]'s `webViewGoneResult()` and [deadTabAsyncJsAnswer]'s
+ * async-JS reject shape — must not drift apart: the same dead tab used to
+ * report "timed out" to `fetch` and "renderer was killed" to `navigate`.
+ *
+ * Pure (and top level, like [fetchHttpFailure]) so the JVM can pin both
+ * branches with literals.
+ */
+internal fun deadTabGoneMessage(destroyed: Boolean): String =
+    if (destroyed) {
+        "This tab's WebView was already destroyed (the tab was closed or evicted) — " +
+            "pick another tab or open a new one."
+    } else {
+        "This tab's WebView renderer was killed by the system; this tab can no longer " +
+            "load pages — open a new tab."
+    }
+
+/**
+ * [r5-F F-F-01] The async-JS answer for an inert tab: null when the tab is
+ * live (proceed), else the bridge's own reject shape — `{"error":…}`, the form
+ * `fetch` parses into "Fetch failed: …" and the teardown paths
+ * (`onRendererGone` / `destroy`) complete an in-flight waiter with.
+ *
+ * Why this must be decided BEFORE `beginAsyncJsRequest()`: `onRendererGone`
+ * fires at most once. A request registered after it has no completer at all —
+ * the bridge lives in the dead renderer and no second death will come — so it
+ * sits on the slot until `withTimeoutOrNull` gives up (30s for `executeJS`,
+ * 60s for `awaitPromiseJs`). The two booleans are the same disjunction as
+ * `webViewInert()`, spelled out so the decision is testable off-device.
+ */
+internal fun deadTabAsyncJsAnswer(destroyed: Boolean, rendererDead: Boolean): String? =
+    if (destroyed || rendererDead) {
+        "{\"error\":${JSONObject.quote(deadTabGoneMessage(destroyed))}}"
+    } else {
+        null
+    }

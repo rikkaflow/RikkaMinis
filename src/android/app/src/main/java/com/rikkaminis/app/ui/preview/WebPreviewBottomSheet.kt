@@ -10,11 +10,9 @@ import android.app.Activity
 import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.WindowInsets
@@ -23,14 +21,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddToHomeScreen
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DesktopWindows
-import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInBrowser
@@ -48,6 +44,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -65,6 +62,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.chat.decodeUriPath
+import com.rikkaminis.app.ui.theme.ChatColors
 
 /**
  * Immersive 90%-tall bottom sheet that hosts a [WebViewHolder] for a
@@ -102,7 +101,13 @@ fun WebPreviewBottomSheet(
     val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val view = LocalView.current
-    val darkTheme = isSystemInDarkTheme()
+    // [da1034-B2 / B-03] ChatColors.isDark follows the in-app theme override
+    // (Settings -> theme_mode); isSystemInDarkTheme() only tracks the system
+    // setting. The sheet's container is colorScheme.surface, so with a forced
+    // dark app on a light system the surface stayed dark while the status-bar
+    // icons were drawn for a light background (icons invisible on their own
+    // bar). Same single source as KaTeXView.kt / ChatToolDetailUI.kt.
+    val darkTheme = ChatColors.isDark
 
     LaunchedEffect(holder) {
         holder.startIfNeeded()
@@ -228,6 +233,20 @@ fun WebPreviewBottomSheet(
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
             }
             Box(modifier = Modifier.fillMaxSize()) {
+                // [dv17-3 B-03] `AndroidView` runs `factory` only when this
+                // node's `key` changes. The holder is swappable while the node
+                // keeps its slot (`rememberWebViewHolder(url)` rebuilds it on a
+                // URL change), so without a key the sheet kept displaying the
+                // *previous* holder's WebView — already `destroy()`ed by the
+                // caller — and the new holder's WebView was never attached.
+                // `key(holder, holder.webView)` re-runs the factory on holder
+                // identity change — and, since [r3-c / B09 F-08], on a
+                // renderer-death rebuild that swaps `holder.webView` for a fresh
+                // instance. (`update = { }` was the alternative: rejected because
+                // the factory returns the WebView itself, so re-parenting from
+                // `update` would require switching the node to a container
+                // view and moving the touch-listener setup with it.)
+                key(holder, holder.webView) {
                 AndroidView(
                     factory = {
                         // Issue #24: ModalBottomSheet's nested-scroll grabbed
@@ -255,6 +274,60 @@ fun WebPreviewBottomSheet(
                         holder.webView
                     },
                     modifier = Modifier.fillMaxSize(),
+                )
+                }
+                // [r3-c / B09 F-08, P1] The renderer-death flag had NO reader in
+                // the whole repo: the sheet kept showing the dead WebView (a
+                // blank rectangle), and Reload went into that corpse. Read it and
+                // surface the one recovery that exists.
+                if (holder.rendererGone) {
+                    WebPreviewRendererGone(onRetry = { holder.rebuildAfterRendererGone() })
+                }
+            }
+        }
+    }
+}
+
+/**
+ * [r3-c / B09 F-08, P1] Overlay for a preview whose WebView renderer process
+ * exited (OOM / native crash). Shared by both hosts so the bottom sheet and the
+ * fullscreen screen cannot drift apart — the failure is the same one, and only
+ * the holder can recover from it.
+ */
+@Composable
+internal fun WebPreviewRendererGone(
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surface),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(24.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.webpreview_renderer_gone),
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
+            androidx.compose.material3.TextButton(
+                onClick = onRetry,
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = stringResource(R.string.webpreview_reload),
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(start = 6.dp),
                 )
             }
         }
@@ -451,13 +524,20 @@ internal fun openExternalFromSheet(context: android.content.Context, url: String
     AppLogger.info("WebPreviewSheet", "open external: $url")
     val intent = if (url.startsWith("file://")) {
         runCatching {
-            // [audit-0917] Use the path as-is: Uri.parse(...).path is ALREADY
-            // percent-decoded, so the extra URLDecoder.decode() was a second
-            // decode — a filename containing '%' or '+' (e.g. "report%20v2.pdf"
-            // arriving as "%2520", or any literal "+") was corrupted, the
-            // resulting File did not exist, and the sheet silently fell through
-            // to the generic branch instead of previewing the file.
-            val raw = Uri.parse(url).path ?: return@runCatching null
+            // [da1023-H] Resolve through decodeUriPath (the single URI-path
+            // exit, ui/chat/UriPathDecode.kt) instead of `Uri.parse(url).path`.
+            // `Uri.parse` reparses the string as a generic URI, so a literal
+            // `#` or `?` inside a local file name started a fragment / query
+            // there and was dropped from `.path` — `report#1.html` became
+            // `…/report`, exists() was false, and "open in browser" silently
+            // did nothing (a warning line in the log was the only trace).
+            // Percent-decoding stays exactly where [audit-0917] put it: ONE
+            // decode, path semantics (`+` is a literal, a bare `%` survives).
+            // The `startsWith("file://")` gate above makes the prefix removal
+            // unconditional-safe; a degenerate "file://" (empty path) refuses
+            // here instead of reaching FileProvider with "".
+            val raw = decodeUriPath(url.removePrefix("file://"))
+            if (raw.isBlank()) return@runCatching null
             val file = java.io.File(raw)
             if (!file.exists()) return@runCatching null
             val authority = context.packageName + ".fileprovider"

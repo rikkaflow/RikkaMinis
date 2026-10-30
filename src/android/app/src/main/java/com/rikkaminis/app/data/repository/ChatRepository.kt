@@ -28,6 +28,18 @@ import java.util.UUID
 class ChatRepository(
     internal val dao: ChatDao,
     private val sessionFiles: SessionFileStore? = null,
+    // [fix/da1021-A] Cross-db session cleanup hook. Invoked after the session
+    // row (and messages) are gone from EVERY delete entry point — user delete,
+    // row-only delete and (since dv21-a2) the startup empty-session sweep — so
+    // session-scoped tables in OTHER repositories (skill / mcp
+    // session_skill_overrides / mcp_session_overrides) are reaped with the
+    // session. Those clearSessionOverrides functions existed with zero
+    // production callers — a deleted session's "Allow in this session" skill
+    // toggles leaked into every later session that reused the id. runCatching:
+    // a cleanup failure must never bubble into the delete itself (the rows are
+    // already gone; failing the delete now would double-delete or surface a
+    // spurious error for work that is already done).
+    val onSessionDeleted: ((String) -> Unit)? = null,
 ) {
 
     fun observeSessions(): Flow<List<ChatSessionEntity>> = dao.observeSessions()
@@ -99,9 +111,32 @@ class ChatRepository(
      * then the SAME interrupted-tail predicate as ChatViewModel.loadSession's
      * detection (kept in sync intentionally). Mirrors iOS
      * ChatStore.interruptedSessionIds.
+     *
+     * Returns `null` when the tail query itself failed — the caller must then
+     * leave the persisted PAUSED badges alone rather than treat the failure as
+     * "nothing is interrupted" (see [badgeReconcileInput]).
      */
-    suspend fun interruptedSessionIds(): Set<String> {
-        val tails = runCatching { dao.lastMessageTailPerSession() }.getOrElse { emptyList() }
+    suspend fun interruptedSessionIds(): Set<String>? {
+        // [fix/meta1028-d1 F-03] A FAILED read is not an empty answer. The
+        // consumer (SessionBadgeStore.reconcileInterruptedSessions) is a
+        // set-difference: everything it is not told about gets its PAUSED badge
+        // dropped AND the pruned map persisted, so collapsing this failure into
+        // an empty set silently cleared every badge in the app (cold start +
+        // every foreground transition, forever, until each session is reopened).
+        // The query materialises one `parts_json` per session for the whole
+        // history in a single cursor, so a single oversized / corrupt row can
+        // abort it — see [badgeReconcileInput] and the two MinisApp call sites,
+        // which now SKIP the reconcile on null instead of reconciling to empty.
+        val tails = try {
+            dao.lastMessageTailPerSession()
+        } catch (e: Exception) {
+            android.util.Log.w(
+                "ChatRepository",
+                "interruptedSessionIds: tail query failed — reporting UNKNOWN " +
+                    "(PAUSED badges left untouched): ${e.message}",
+            )
+            return null
+        }
         val result = HashSet<String>()
         for (row in tails) {
             if (isInterruptedTail(row.role, row.partsJson)) result.add(row.sessionId)
@@ -204,6 +239,17 @@ class ChatRepository(
     suspend fun deleteSession(id: String): SessionFileStore.DeleteResult? {
         dao.deleteMessages(id)
         dao.deleteSession(id)
+        // [fix/da1021-A] Cross-db cleanup — must run AFTER the session row is
+        // gone (the rows are the source of truth for "session exists"; a
+        // cleanup that raced ahead could be seen as legit by a concurrent
+        // session). Failures are contained: the DB rows are already deleted,
+        // so propagating an exception would only mislead the caller.
+        runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+            AppLogger.warning(
+                "ChatRepository",
+                "onSessionDeleted($id) cleanup failed: ${it.message}",
+            )
+        }
         // [A: session file reclamation] Dropping the DB rows previously leaked
         // the bind-mounted session dir (minis-sessions/<id>: workspace /
         // attachments / offloads / browser) and any media, which kept burning
@@ -251,6 +297,16 @@ class ChatRepository(
     suspend fun deleteSessionRowOnly(id: String) {
         dao.deleteMessages(id)
         dao.deleteSession(id)
+        // [fix/da1021-A] Same cross-db cleanup as deleteSession: an
+        // empty-session sweep (cleanupIfEmptyOnExit) removes rows that only
+        // ever held a thinking / memory toggle — that toggle may have written
+        // a session_skill_overrides row, so it must be reaped with the session.
+        runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+            AppLogger.warning(
+                "ChatRepository",
+                "onSessionDeleted($id) cleanup failed (rowOnly): ${it.message}",
+            )
+        }
     }
 
     /**
@@ -284,7 +340,34 @@ class ChatRepository(
     ): Int {
         val guarded = guardActiveIds(activeIds)
         val staleBefore = System.currentTimeMillis() - graceMillis
-        return dao.deleteEmptySessions(guarded, staleBefore)
+        // [dv21-a2] Third delete entry point, same contract. This sweep drops
+        // `sessions` rows, so each removed id owes the cross-db cleanup that
+        // deleteSession / deleteSessionRowOnly already run — it used to be the
+        // one entry point that skipped `onSessionDeleted`, which left the
+        // skills.db / mcp.db session overrides, the session-list badge and the
+        // session-scoped offload grants behind for whatever session later
+        // reused the id (and the hook KDoc in MinisApp already claimed the
+        // sweep was covered).
+        //
+        // Order: snapshot the candidate ids (same guards) → DELETE (its guards
+        // still apply inside the statement, so no row that acquired a message
+        // is removed) → notify only the candidates that are really gone. A
+        // candidate that survived means a first message landed in the window:
+        // notifying it would reap a live session's overrides.
+        val candidates = dao.selectEmptySessionIds(guarded, staleBefore)
+        val deleted = dao.deleteEmptySessions(guarded, staleBefore)
+        if (candidates.isEmpty()) return deleted
+        val survivors = dao.existingSessionIds(candidates).toSet()
+        for (id in candidates) {
+            if (id in survivors) continue
+            runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+                AppLogger.warning(
+                    "ChatRepository",
+                    "onSessionDeleted($id) cleanup failed (empty sweep): ${it.message}",
+                )
+            }
+        }
+        return deleted
     }
 
     suspend fun searchSessions(query: String): List<ChatSessionEntity> =
@@ -343,22 +426,7 @@ class ChatRepository(
         var offset = 0
         while (offset < total) {
             val limit = LOAD_PAGE_SIZE
-            val page = try {
-                dao.loadMessagesPage(sessionId, offset, limit)
-            } catch (e: SQLiteBlobTooBigException) {
-                // Fall back to single-row pages so we can isolate the
-                // offending blob(s) and serve the rest of the slice.
-                loadPageRowByRow(sessionId, offset, limit)
-            } catch (e: IllegalStateException) {
-                // Some Room/SQLite combinations wrap the CursorWindow
-                // overflow in IllegalStateException("Couldn't read row N,
-                // col N from CursorWindow"); treat the same way.
-                if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
-                    loadPageRowByRow(sessionId, offset, limit)
-                } else {
-                    throw e
-                }
-            }
+            val page = loadPageTolerant(sessionId, offset, limit)
             if (page.isEmpty()) break
             out.addAll(page)
             offset += limit
@@ -366,15 +434,78 @@ class ChatRepository(
         return out
     }
 
+    /**
+     * Paged read that survives the per-CursorWindow 2 MB ceiling.
+     *
+     * Both the legacy `dao.loadMessages` batch and a plain
+     * `dao.loadMessagesPage` materialise their rows into a single
+     * CursorWindow, so one row holding a large tool_result blob (>2 MB)
+     * aborts the whole read with [SQLiteBlobTooBigException] (Issue #17).
+     * Every production paged read funnels through here so the degradation
+     * policy lives in exactly one place: try the normal page, then fall
+     * back to single-row pages, substituting an [oversizedProxyRow] for any
+     * row that genuinely cannot be materialised — the slice stays
+     * continuous instead of failing the caller.
+     */
+    private suspend fun loadPageTolerant(
+        sessionId: String,
+        offset: Int,
+        limit: Int,
+        // [fix/da1019-partsjson-funnel] Optional created_at bounds, forwarded
+        // verbatim from loadMessagePage. The date-filtered query reads the same
+        // columns of the same table, so it is exposed to the very same
+        // CursorWindow ceiling — it funnels through here too instead of taking
+        // its own raw DAO path (1018 FIX-D R1 registered that raw read; this
+        // closes it). null/null keeps the pre-existing unbounded query.
+        startMs: Long? = null,
+        endMs: Long? = null,
+    ): List<MessageEntity> = try {
+        loadPageSlice(sessionId, offset, limit, startMs, endMs)
+    } catch (e: SQLiteBlobTooBigException) {
+        // Fall back to single-row pages so we can isolate the
+        // offending blob(s) and serve the rest of the slice.
+        loadPageRowByRow(sessionId, offset, limit, startMs, endMs)
+    } catch (e: IllegalStateException) {
+        // Some Room/SQLite combinations wrap the CursorWindow
+        // overflow in IllegalStateException("Couldn't read row N,
+        // col N from CursorWindow"); treat the same way.
+        if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
+            loadPageRowByRow(sessionId, offset, limit, startMs, endMs)
+        } else {
+            throw e
+        }
+    }
+
+    /**
+     * The single place that picks which paged DAO shape a slice read uses
+     * (unbounded vs created_at-bounded). Kept separate from
+     * [loadPageTolerant] so the degradation policy and the query selection stay
+     * independently readable — and so `dao.loadMessagesPage*` has exactly one
+     * call site, which `scripts/scan/parts_json_funnel_check.py` pins.
+     */
+    private suspend fun loadPageSlice(
+        sessionId: String,
+        offset: Int,
+        limit: Int,
+        startMs: Long? = null,
+        endMs: Long? = null,
+    ): List<MessageEntity> = if (startMs == null && endMs == null) {
+        dao.loadMessagesPage(sessionId, offset, limit)
+    } else {
+        dao.loadMessagesPageInRange(sessionId, offset, limit, startMs, endMs)
+    }
+
     private suspend fun loadPageRowByRow(
         sessionId: String,
         baseOffset: Int,
         limit: Int,
+        startMs: Long? = null,
+        endMs: Long? = null,
     ): List<MessageEntity> {
         val result = ArrayList<MessageEntity>(limit)
         for (i in 0 until limit) {
             val row = try {
-                dao.loadMessagesPage(sessionId, baseOffset + i, 1).firstOrNull()
+                loadPageSlice(sessionId, baseOffset + i, 1, startMs, endMs).firstOrNull()
             } catch (e: SQLiteBlobTooBigException) {
                 // [fix/audit-s5h2] a genuinely un-materialisable oversized row
                 // is now represented by a proxy MessageEntity instead of being
@@ -408,6 +539,92 @@ class ChatRepository(
         )
     }
 
+    /**
+     * [fix/meta1028-d1 F-04] Result of [loadMessagesTailTolerant]: the rows that
+     * COULD be materialised, plus how many could not.
+     *
+     * The count is the whole point. The backup packer receives an empty list for
+     * a session it cannot read, which is indistinguishable from "this session has
+     * no messages" — the exported document then carries the session header with
+     * zero messages and NO truncation note, i.e. a backup that reports success
+     * while dropping a conversation. Returning the miss count lets the export
+     * account for it (readFailures / chatTruncated) instead.
+     */
+    data class MessageTailLoad(
+        val messages: List<MessageEntity>,
+        /** Rows that exist in the DB but could not be read (never silently 0-by-0). */
+        val unreadableRows: Int,
+    )
+
+    /**
+     * [fix/meta1028-d1 F-04] Tail read for the backup path, with the same
+     * CursorWindow degradation policy as [loadPageTolerant] (which only serves
+     * the per-session transcript reads).
+     *
+     * `dao.messagesLast` materialises up to 200 full rows — `parts_json` +
+     * `reasoning_content` per row, each capped at 500 KB but never SUM-capped —
+     * into one cursor. A single row past the window ceiling aborts the whole
+     * read with [SQLiteBlobTooBigException]; ConfigBackup used to
+     * `getOrDefault(emptyList())` that, so the session silently lost its entire
+     * history in the backup. Here the failure degrades to one-row reads: the
+     * healthy rows still ship, and the ones that genuinely cannot be read are
+     * counted back to the caller instead of vanishing.
+     *
+     * Order matches `messagesLast` (newest first) on both paths — the packer
+     * packs newest-first so the most recent context survives the budget.
+     */
+    suspend fun loadMessagesTailTolerant(sessionId: String, limit: Int): MessageTailLoad {
+        try {
+            return MessageTailLoad(dao.messagesLast(sessionId, limit).asReversed(), unreadableRows = 0)
+        } catch (e: Exception) {
+            if (!isCursorWindowFailure(e)) throw e
+            android.util.Log.w(
+                "ChatRepository",
+                "loadMessagesTailTolerant: batch read hit the CursorWindow ceiling " +
+                    "(session=$sessionId, limit=$limit) — degrading to one-row reads: ${e.message}",
+            )
+        }
+        val total = dao.messageCountForSession(sessionId)
+        if (total == 0) return MessageTailLoad(emptyList(), unreadableRows = 0)
+        val start = maxOf(0, total - limit)
+        val out = ArrayList<MessageEntity>(minOf(limit, total))
+        var unreadable = 0
+        // Newest first, matching messagesLast's contract on the fast path.
+        //
+        // The single-row reads go through [loadPageSlice] rather than calling
+        // `dao.loadMessagesPage` directly: parts_json_funnel_check [R1] pins that
+        // shape to ONE call site (loadPageSlice), and a second raw call would be
+        // a third way to reach the DAO with no byte cap on the way in.
+        for (offset in (total - 1) downTo start) {
+            try {
+                out.addAll(loadPageSlice(sessionId, offset, 1))
+            } catch (e: Exception) {
+                if (!isCursorWindowFailure(e)) throw e
+                unreadable += 1
+            }
+        }
+        if (unreadable > 0) {
+            android.util.Log.w(
+                "ChatRepository",
+                "loadMessagesTailTolerant: $unreadable message row(s) unreadable in " +
+                    "session=$sessionId — they will be reported as dropped, not silently skipped",
+            )
+        }
+        return MessageTailLoad(out, unreadable)
+    }
+
+    /**
+     * [fix/meta1028-d1 F-04] The two exception shapes Android uses for "this row
+     * does not fit in a CursorWindow" (see [loadPageTolerant], which inlines the
+     * same test). Kept separate so the read paths added here do not copy it a
+     * third time.
+     */
+    private fun isCursorWindowFailure(e: Throwable): Boolean = when (e) {
+        is SQLiteBlobTooBigException -> true
+        is IllegalStateException -> e.message?.contains("CursorWindow", ignoreCase = true) == true
+        else -> false
+    }
+
     // [F-234] `fromSortOrder` = delete boundary (inclusive), NOT a row count.
     suspend fun deleteMessagesAfter(sessionId: String, fromSortOrder: Int) =
         dao.deleteMessagesAfter(sessionId, fromSortOrder)
@@ -419,7 +636,12 @@ class ChatRepository(
      * target tool_use. Mirrors iOS ChatStore.updateMessageParts.
      */
     suspend fun updateMessageParts(id: String, partsJson: String) =
-        dao.updateMessageParts(id, partsJson)
+        // [fix/da1019-partsjson-funnel] Second writer of the same column, so it
+        // takes the same ceiling: `ChatViewModel.rerunFromToolBlock` rewrites a
+        // row in place with the parts of an existing (possibly oversized) row,
+        // and an uncapped write here reinstates exactly the payload the append
+        // path truncated — the 2 MB CursorWindow crash walks straight back in.
+        dao.updateMessageParts(id, capPartsJsonForRow(partsJson))
 
     /** [T-error-persist-android] Set/clear the error sticker on a row by id. */
     suspend fun updateMessageErrorInfo(messageId: String, errorInfo: String?) =
@@ -473,13 +695,7 @@ class ChatRepository(
         // for CJK, 2.0 MB for 4-byte emoji against a 500 KB nominal cap) —
         // exactly the SQLiteBlobTooBigException this guard exists to prevent.
         val capped = capPartsJsonForRow(partsJson)
-        val cappedReasoning = reasoningContent?.let { rc ->
-            if (rc.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_PARTS_JSON_BYTES) {
-                buildTruncatedText(rc)
-            } else {
-                rc
-            }
-        }
+        val cappedReasoning = capReasoningContentForRow(reasoningContent)
         val message = MessageEntity(
             id = UUID.randomUUID().toString(),
             sessionId = sessionId,
@@ -502,13 +718,55 @@ class ChatRepository(
             // [RC15] Unique (session_id, sort_order) constraint violated —
             // another concurrent append raced to the same sort_order. Retry
             // with a fresh sort_order from the DB.
+            //
+            // [dv29-A2] …but ONLY that one. This catch used to assume every
+            // SQLiteConstraintException was the sort_order race. A FOREIGN KEY
+            // failure (`messages.session_id → chat_sessions.id`, code 787) is
+            // not: re-reading `nextSortOrder` for a session with no row returns
+            // 0, the replay repeats the identical insert against the identical
+            // missing parent, and the second throw escaped the catch — as an
+            // uncaught coroutine exception it killed the process (ACRA,
+            // 2026-10-24 12:57 ×2 via `minis-sessions-cli send --session
+            // <missing id>`). Decide from the message, retry only the race, and
+            // re-throw everything else as a CLASSIFIED failure so callers can
+            // report it instead of dying.
+            val conflict = classifyMessageInsertConstraint(e.message)
+            if (conflict != MessageInsertConflict.SORT_ORDER &&
+                conflict != MessageInsertConflict.UNKNOWN
+            ) {
+                AppLogger.warning(
+                    "ChatRepository",
+                    "appendMessage: insert rejected ($conflict) — not retried " +
+                        "(session=$sessionId id=${message.id})",
+                )
+                throw MessageInsertRejectedException(conflict, sessionId, e)
+            }
             val retrySortOrder = dao.nextSortOrder(sessionId)
             AppLogger.info("ChatRepository", "appendMessage: constraint-retry re-order=$retrySortOrder (original=$sortOrder)")
             // NB: keep `.also { }` as this block's last expression — it's the
             // MessageEntity the `persisted` val is initialized from. Logging
             // AFTER it would make the block's inferred type `Any` (AppLogger.info → Unit).
             message.copy(sortOrder = retrySortOrder).also {
-                dao.insertMessage(it)
+                try {
+                    dao.insertMessage(it)
+                } catch (retry: SQLiteConstraintException) {
+                    // [dv29-A2] The replay is allowed exactly once, and a
+                    // SECOND failure never leaves this function as a raw
+                    // constraint exception: whatever it was, it is now a
+                    // classified `MessageInsertRejectedException` (the ACRA
+                    // process kill started here, on the un-caught second throw).
+                    val retryConflict = classifyMessageInsertConstraint(retry.message)
+                    AppLogger.warning(
+                        "ChatRepository",
+                        "appendMessage: retry also rejected ($retryConflict) — " +
+                            "giving up (session=$sessionId id=${message.id})",
+                    )
+                    throw MessageInsertRejectedException(
+                        if (retryConflict == MessageInsertConflict.UNKNOWN) conflict else retryConflict,
+                        sessionId,
+                        retry,
+                    )
+                }
                 AppLogger.info("ChatRepository", "appendMessage: insertMessage(retry) done (${System.currentTimeMillis() - t0}ms)")
             }
         }
@@ -742,9 +1000,20 @@ class ChatRepository(
             }
         }
         val where = if (conditions.isEmpty()) "" else "WHERE " + conditions.joinToString(" AND ")
+        // [fix/meta1028-d1 F-04] The preview column is BOUNDED. `preview` is
+        // `.take(60)` of the first user message's TEXT, but the subquery used to
+        // hand the whole `parts_json` (legally up to MAX_MESSAGE_PARTS_JSON_BYTES
+        // = 500 KB per row) to the cursor for every session in `limit` — the
+        // aggregate is unbounded, and an oversized row aborts the query
+        // (CursorWindow), which the CLI surfaces as an INTERNAL error instead of
+        // a listing. 8 KB of the array covers a text-first message several times
+        // over; when the text part sits behind a large binary part the preview
+        // degrades to absent (it is an optional field) instead of failing the
+        // whole call. SUBSTR counts CHARACTERS in SQLite, so a CJK-heavy row
+        // still reads at most ~24 KB.
         val sql = """
             SELECT s.id, s.title,
-                   (SELECT m2.parts_json FROM messages m2
+                   (SELECT SUBSTR(m2.parts_json, 1, $PREVIEW_JSON_CHARS) FROM messages m2
                     WHERE m2.session_id = s.id AND m2.role = 'user'
                     ORDER BY m2.sort_order ASC LIMIT 1) AS first_user_msg,
                    s.source, s.created_at, s.updated_at,
@@ -821,9 +1090,53 @@ class ChatRepository(
         """.trimIndent()
         args += (limit * 3)
 
-        val rows = dao.runMessageSearchQuery(
-            androidx.sqlite.db.SimpleSQLiteQuery(sql, args.toTypedArray()),
-        )
+        // [fix/meta1028-d1 F-04] `limit * 3` full rows in one cursor: the same
+        // CursorWindow exposure as the listing above, except here the payload is
+        // load-bearing (the snippet is extracted from it), so it cannot simply be
+        // truncated. On a window failure fall back to a two-phase read: the same
+        // WHERE/ORDER/LIMIT with an empty `parts_json` projection, then one row at
+        // a time by id. A row that still cannot be materialised costs that single
+        // match, not the whole command (and every other row is still searchable).
+        val rows = try {
+            dao.runMessageSearchQuery(
+                androidx.sqlite.db.SimpleSQLiteQuery(sql, args.toTypedArray()),
+            )
+        } catch (e: Exception) {
+            if (!isCursorWindowFailure(e)) throw e
+            android.util.Log.w(
+                "ChatRepository",
+                "searchMessages: batch read hit the CursorWindow ceiling — reading matches " +
+                    "one row at a time: ${e.message}",
+            )
+            val refsSql = """
+                SELECT m.session_id, m.id, m.role, m.created_at, '' AS parts_json
+                FROM messages m
+                WHERE $where
+                ORDER BY m.created_at DESC
+                LIMIT ?
+            """.trimIndent()
+            val refs = dao.runMessageSearchQuery(
+                androidx.sqlite.db.SimpleSQLiteQuery(refsSql, args.toTypedArray()),
+            )
+            refs.mapNotNull { ref ->
+                val parts = try {
+                    dao.getMessage(ref.id)?.partsJson
+                } catch (rowError: Exception) {
+                    if (!isCursorWindowFailure(rowError)) throw rowError
+                    null
+                }
+                if (parts == null) {
+                    android.util.Log.w(
+                        "ChatRepository",
+                        "searchMessages: message ${ref.id} could not be materialised — " +
+                            "that single match is dropped, the rest of the search still runs",
+                    )
+                    null
+                } else {
+                    ref.copy(partsJson = parts)
+                }
+            }
+        }
         val out = mutableListOf<MessageSearchMatch>()
         for (r in rows) {
             val text = extractTextForOffload(r.partsJson, r.role)
@@ -857,11 +1170,12 @@ class ChatRepository(
         startMs: Long? = null,
         endMs: Long? = null,
     ): List<MessagePageItem> {
-        val rows = if (startMs == null && endMs == null) {
-            dao.loadMessagesPage(sessionId, offset, limit)
-        } else {
-            dao.loadMessagesPageInRange(sessionId, offset, limit, startMs, endMs)
-        }
+        // [fix/da1019-partsjson-funnel] Both branches funnel through the same
+        // tolerant pager. The unbounded branch used to call
+        // `dao.loadMessagesPage` directly, so a single >2 MB row inside the
+        // page aborted the whole call (SessionsOffloadHandler / `minis-sessions-cli
+        // messages` got SQLiteBlobTooBigException instead of a degraded slice).
+        val rows = loadPageTolerant(sessionId, offset, limit, startMs, endMs)
         return rows.mapNotNull { e ->
             val text = extractTextForOffload(e.partsJson, e.role)
             if (text.isBlank()) return@mapNotNull null
@@ -896,13 +1210,18 @@ class ChatRepository(
      * to stream-export long sessions without loading every message into
      * memory. Unlike [loadMessagePage] this does not strip / project the
      * row; the exporter needs the full `parts_json` payload to serialize.
+     *
+     * Routed through [loadPageTolerant] so a session containing a
+     * un-materialisable (>2 MB) blob degrades one row at a time instead of
+     * aborting the whole export (the exporter's own catch turns a throw
+     * into a failed export, not a degraded one).
      */
     suspend fun loadMessagePageRaw(
         sessionId: String,
         offset: Int,
         limit: Int,
     ): List<MessageEntity> =
-        dao.loadMessagesPage(sessionId, offset, limit)
+        loadPageTolerant(sessionId, offset, limit)
 
     /**
      * Walk parts_json and concatenate every `{type:"text", value:...}`
@@ -1039,6 +1358,14 @@ class ChatRepository(
         // still amortising query overhead for long sessions.
         private const val LOAD_PAGE_SIZE = 200
 
+        /**
+         * [fix/meta1028-d1 F-04] How much of `parts_json` `querySessionsMeta`
+         * may pull per session for its 60-char preview — see the SQL comment.
+         * SQLite's SUBSTR counts characters, so the worst case (3-byte CJK) is
+         * ~24 KB per row.
+         */
+        private const val PREVIEW_JSON_CHARS = 8192
+
         // Issue #17 — hard cap on a single message's parts_json. 500_000
         // BYTES (not chars — [F-226]): a payload truncated to this many
         // UTF-8 bytes plus the JSON wrapper stays comfortably inside a
@@ -1102,6 +1429,26 @@ class ChatRepository(
                 buildTruncatedPartsJson(partsJson)
             } else {
                 partsJson
+            }
+
+        /**
+         * [fix/da1019-partsjson-funnel] Companion funnel for the
+         * `reasoning_content` byte ceiling — the sibling of
+         * [capPartsJsonForRow] over the same budget.
+         *
+         * Extracted from [appendMessage] so the *other* writer of that column
+         * (backup restore, `ConfigBackup.importChatSections`) shares one
+         * definition instead of re-deriving the byte comparison. A restored row
+         * with a multi-MB reasoning blob is the same CursorWindow crash as an
+         * oversized `parts_json`, and nothing on the import path capped either.
+         */
+        internal fun capReasoningContentForRow(reasoningContent: String?): String? =
+            reasoningContent?.let { rc ->
+                if (rc.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_PARTS_JSON_BYTES) {
+                    buildTruncatedText(rc)
+                } else {
+                    rc
+                }
             }
 
         /** [F-226] Byte-budgeted truncation of a plain string field (reasoning). */
@@ -1174,4 +1521,71 @@ data class MessagePageItem(
     // [T-android-sessions-cli-full] True when the stored text exceeded the
     // requested cap and [text] is a prefix. Surfaced as "truncated": true.
     val truncated: Boolean = false,
+)
+
+/**
+ * [dv29-A2] Which constraint did a `messages` INSERT trip?
+ *
+ * Classified from the SQLite message because that is the only thing Room hands
+ * back (`SQLiteConstraintException.message`), and it is the only discriminator
+ * available before deciding whether the insert may be replayed.
+ */
+internal enum class MessageInsertConflict {
+    /** `unique(session_id, sort_order)` — two appends raced; replay with a fresh order. */
+    SORT_ORDER,
+
+    /** `messages.session_id → chat_sessions.id` (code 787) — the session row is gone. */
+    SESSION_ROW_MISSING,
+
+    /** Anything else the message names (another unique index, NOT NULL, …) — never replayable. */
+    OTHER,
+
+    /**
+     * No usable message (null/blank). Cannot happen with a real SQLite, but a
+     * constraint failure whose identity is unknowable is the one case where a
+     * single bounded replay is still worth trying — and its second failure is
+     * classified rather than thrown raw, so the unknowable case cannot crash.
+     */
+    UNKNOWN,
+}
+
+/**
+ * [dv29-A2] Pure classifier for [ChatRepository.appendMessage]'s retry gate.
+ *
+ * `sort_order` is part of the SORT_ORDER test on purpose: `messages` also has a
+ * unique PRIMARY KEY, and "UNIQUE constraint failed: messages.id" must NOT be
+ * treated as a sort-order race (the retry would re-send the same colliding id).
+ */
+internal fun classifyMessageInsertConstraint(message: String?): MessageInsertConflict {
+    val text = message?.trim().orEmpty()
+    if (text.isEmpty()) return MessageInsertConflict.UNKNOWN
+    if (text.contains("FOREIGN KEY constraint failed", ignoreCase = true)) {
+        return MessageInsertConflict.SESSION_ROW_MISSING
+    }
+    if (text.contains("UNIQUE constraint failed", ignoreCase = true) &&
+        text.contains("sort_order", ignoreCase = true)
+    ) {
+        return MessageInsertConflict.SORT_ORDER
+    }
+    return MessageInsertConflict.OTHER
+}
+
+/**
+ * [dv29-A2] A `messages` INSERT that must not be replayed failed.
+ *
+ * Thrown instead of letting the raw `SQLiteConstraintException` escape: it
+ * carries the [conflict] classification, so a caller (RPC entry, recovery
+ * sweep, fork) can report `session_not_found` / `insert_rejected` rather than
+ * crash, and the probe of "did we retry?" is answerable from the type alone.
+ * `appendMessage`'s caller-visible contract is unchanged for the one case the
+ * retry exists for (the sort_order race is still retried and still returns a
+ * persisted row).
+ */
+internal class MessageInsertRejectedException(
+    val conflict: MessageInsertConflict,
+    val sessionId: String,
+    cause: Throwable,
+) : RuntimeException(
+    "messages insert rejected ($conflict) for session=$sessionId",
+    cause,
 )

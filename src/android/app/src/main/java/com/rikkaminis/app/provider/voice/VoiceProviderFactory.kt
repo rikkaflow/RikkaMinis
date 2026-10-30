@@ -24,7 +24,25 @@ object VoiceProviderFactory {
 
     private const val TAG = "VoiceFactory"
 
-    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
+    /**
+     * Build the voice provider for [instance] and give it the instance's
+     * User-Agent override.
+     *
+     * [da1029 I05] The injection is one wrapper around [build] rather than an
+     * assignment inside the branch body on purpose: `build` has 2 early
+     * `return`s plus a 11-arm `when`, and that is exactly the shape that lost
+     * the chat-side override in deep-audit-1019 ISSUE-04 (the factory forwarded
+     * it on some arms and silently dropped it on others). One post-construction
+     * assignment covers every current and future arm, and `it?` keeps the
+     * `kimiCode`/non-voice arms returning null.
+     *
+     * A null/blank value is harmless: [applyUserAgentOverride] falls back to
+     * `MinisUserAgent.DEFAULT`, the same rule the chat providers use.
+     */
+    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? =
+        build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }
+
+    private fun build(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
         // [T-provider-key-roulette] Rotate at the voice choke point too, so no
         // vendor ever receives the raw multi-key string. A single key comes
         // back cleaned and verbatim, and Xunfei's "appId;apiKey;apiSecret"
@@ -81,11 +99,18 @@ object VoiceProviderFactory {
                     normalizedBase.contains("tts.speech.microsoft.com") -> {
                         // Strip /cognitiveservices if the user included it — the
                         // provider appends it in the endpoint path.
-                        var azureBase = custom ?: "https://eastasia.tts.speech.microsoft.com"
-                        if (azureBase.endsWith("/cognitiveservices")) {
-                            azureBase = azureBase.removeSuffix("/cognitiveservices")
-                        }
-                        AzureTTSVoiceProvider(instance.id, azureBase, apiKey)
+                        // [deep-audit-1039 A-05] The strip used to run before any
+                        // trailing-slash trim, so a pasted base ending in "/" never
+                        // matched and the endpoint appended a SECOND segment
+                        // (…/cognitiveservices/cognitiveservices/v1 → 404). The
+                        // normalization (incl. the full-endpoint form) now lives in
+                        // VoiceBaseNormalizer.normalizeAzureBase, single source.
+                        AzureTTSVoiceProvider(
+                            instance.id,
+                            VoiceBaseNormalizer.normalizeAzureBase(custom)
+                                .ifEmpty { "https://eastasia.tts.speech.microsoft.com" },
+                            apiKey,
+                        )
                     }
                     normalizedBase.contains("deepgram") ->
                         DeepgramVoiceProvider(instance.id, custom ?: "https://api.deepgram.com", apiKey)

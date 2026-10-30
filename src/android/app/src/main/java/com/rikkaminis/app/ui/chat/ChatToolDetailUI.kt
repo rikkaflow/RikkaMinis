@@ -3,74 +3,22 @@ package com.rikkaminis.app.ui.chat
 // [T-android-split-chat] Tool-detail sheet + reveal/editor helpers extracted
 // verbatim from ChatScreen.kt: ToolDetailSheet, extractShellCommand,
 // extractPartialJsonString, chunkToolOutput, initialRevealChunks,
-// LazyRevealToolText, EditorCard. Full import block copied (unused=warnings).
+// LazyRevealToolText, EditorCard. Imports pruned to used symbols (2026-10-27).
 // Externally-called ones are internal; cluster-only ones stay private.
 
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
-import android.net.Uri
-import android.provider.OpenableColumns
 import java.io.File
-import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.gestures.verticalDrag
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.AudioFile
-import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.VideoFile
-import androidx.compose.material.icons.automirrored.filled.Article
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.conflate
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.sample
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -78,200 +26,68 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AppShortcut
-import androidx.compose.material.icons.filled.ArrowCircleUp
-import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.BugReport
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.CloseFullscreen
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.RadioButtonChecked
-import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import com.rikkaminis.app.BuildConfig
 import com.rikkaminis.app.R
-import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.ui.components.MinisAlertDialog
-import com.rikkaminis.app.ui.components.MinisMenu
-import com.rikkaminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.TextFieldDefaults
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.compositionLocalOf
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.onPlaced
-import androidx.compose.ui.layout.boundsInWindow
-import androidx.compose.ui.layout.positionInWindow
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBars
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
-import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.automirrored.filled.NoteAdd
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.EditNote
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.ArrowCircleDown
-import androidx.compose.material.icons.filled.AccountTree
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.style.TextDecoration
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import com.rikkaminis.app.offload.OffloadPermissionManager
-import com.mikepenz.markdown.compose.components.markdownComponents
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
-import org.intellij.markdown.ast.ASTNode
-import org.intellij.markdown.ast.getTextInNode
-import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.ModelEntry
-import com.rikkaminis.app.data.model.ModelGroup
-import com.rikkaminis.app.data.model.ProviderConfig
-import com.rikkaminis.app.data.model.ProviderType
-import com.rikkaminis.app.data.model.RoutingStrategy
-import com.rikkaminis.app.data.model.ThinkingLevel
-import com.rikkaminis.app.data.repository.ChatRepository
-import com.rikkaminis.app.data.repository.MemoryRepository
-import com.rikkaminis.app.data.repository.ProviderRepository
-import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.DisplayBitmapLimits
 import com.rikkaminis.app.ui.theme.ChatColors
-import com.rikkaminis.app.ui.components.MinisTextButton
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -339,7 +155,11 @@ internal fun ToolDetailSheet(
                 //    clipboard.
                 val clipboardManager = LocalClipboardManager.current
                 val actionContext = LocalContext.current
-                var copyDone by remember { mutableStateOf(false) }
+                // [F-11 meta-audit-1028] Keyed on the block: this flag lives in
+                // the sheet header, which is shared by every paged tool block, so
+                // an unkeyed `remember` carried the 2-second "copied ✓" state onto
+                // the NEXT tool when the user paged within that window.
+                var copyDone by remember(block.id) { mutableStateOf(false) }
                 val isShellTool = block.toolName == "shell_execute"
                 val isBrowserTool = block.toolName == "browser_use"
                 val toolArgsForAction = remember(block.toolArgs) {
@@ -348,28 +168,13 @@ internal fun ToolDetailSheet(
                 // Resolve the browser URL the same way the inline preview does
                 // (block.browserURL → args.url → most-recent prior browser_use
                 // block) so the top-right action lines up with the URL pill
-                // shown below.
+                // shown below. [F-10 meta-audit-1028] Both sites now go through
+                // [resolveBrowserUseUrl] — before this, the header carried the
+                // "skip non-browser_use predecessors" guard and the body's URL
+                // bar did not, so a preceding web_fetch / MCP call's `url` arg
+                // could surface in one and not the other.
                 val browserActionUrl = remember(block.id, block.browserURL, block.toolArgs, toolBlocks) {
-                    if (!isBrowserTool) ""
-                    else {
-                        val direct = block.browserURL?.takeIf { it.isNotEmpty() }
-                        val argsUrl = toolArgsForAction.optString("url", "").takeIf { it.isNotEmpty() }
-                        direct ?: argsUrl ?: run {
-                            val idx = toolBlocks.indexOfFirst { it.id == block.id }
-                            if (idx > 0) {
-                                (idx - 1 downTo 0).firstNotNullOfOrNull { i ->
-                                    val prev = toolBlocks[i]
-                                    if (prev.toolName != "browser_use") return@firstNotNullOfOrNull null
-                                    prev.browserURL?.takeIf { it.isNotEmpty() }
-                                        ?: try {
-                                            org.json.JSONObject(prev.toolArgs)
-                                                .optString("url", "")
-                                                .takeIf { it.isNotEmpty() }
-                                        } catch (_: Exception) { null }
-                                }
-                            } else null
-                        } ?: ""
-                    }
+                    if (!isBrowserTool) "" else resolveBrowserUseUrl(block, toolBlocks)
                 }
                 val hasBrowserUrl = isBrowserTool && browserActionUrl.isNotEmpty()
                 Box(
@@ -438,7 +243,17 @@ internal fun ToolDetailSheet(
             HorizontalDivider(thickness = 1.dp, color = ChatColors.sheetHeaderBorder)
 
             // ── Content Area (iOS: tool-specific rendering) ──
-            val outputScrollState = rememberScrollState()
+            // [F-11 meta-audit-1028] One ScrollState for the whole sheet, keyed on
+            // the block so paging with the `|<` / `>|` arrows starts the new tool
+            // at its top. Without the key the state survived the page flip: the
+            // arrows only change `currentIdx`, so a long output left the viewport
+            // thousands of pixels down and the next tool opened mid-document (with
+            // a long-but-shorter tool it silently clamped to that tool's bottom).
+            // `rememberScrollState()` has no key parameter, hence the explicit
+            // ScrollState — no other call site scrolls this state programmatically,
+            // which is also what makes `value != 0` a faithful "user scrolled"
+            // signal for the auto-reveal gate below.
+            val outputScrollState = remember(block.id) { androidx.compose.foundation.ScrollState(0) }
             val toolArgsObj = remember(block.toolArgs) {
                 try { org.json.JSONObject(block.toolArgs) } catch (_: Exception) { org.json.JSONObject() }
             }
@@ -524,22 +339,21 @@ internal fun ToolDetailSheet(
                                             // T38: linkify http/https URLs in shell output so the user can
                                             // tap them to open the in-app web preview (matches iOS
                                             // TerminalCanvasView.addURLLinks → MinisOpenURLBroker).
-                                            val urlClick = LocalMarkdownUrlClickHandler.current
-                                            val linkified = remember(block.content, urlClick) {
-                                                if (urlClick != null) {
-                                                    com.rikkaminis.app.ui.util.linkifyUrls(
-                                                        text = block.content,
-                                                        onClick = urlClick,
-                                                        linkColor = Color(0xFF7CC4FF), // light blue on dark terminal bg
-                                                    )
-                                                } else androidx.compose.ui.text.AnnotatedString(block.content)
-                                            }
-                                            Text(
-                                                text = linkified,
-                                                fontSize = 13.sp,
-                                                fontFamily = FontFamily.Monospace,
+                                            // [F-12 meta-audit-1028] Reveal the output incrementally
+                                            // instead of laying out the whole buffer in one Text: a
+                                            // multi-tens-of-KB build/compile log used to run the
+                                            // linkifier regex over the full body and hand Compose a
+                                            // single enormous AnnotatedString on the composition thread
+                                            // every time the sheet opened (jank, ANR for large enough
+                                            // output). Same shape as the generic branch below.
+                                            LazyRevealToolText(
+                                                bodyText = block.content,
                                                 color = ChatColors.success,  // iOS .green
-                                                lineHeight = 18.sp,
+                                                scrollState = outputScrollState,
+                                                linkify = true,
+                                                // Terminal card is black; keep the lighter link tint
+                                                // the previous single-Text version used.
+                                                linkColor = Color(0xFF7CC4FF),
                                             )
                                         }
                                     }
@@ -697,8 +511,15 @@ internal fun ToolDetailSheet(
                                             .verticalScroll(outputScrollState),
                                         verticalArrangement = Arrangement.spacedBy(0.dp),
                                     ) {
-                                        if (oldStr.isNotEmpty()) {
-                                            oldStr.lines().forEach { line ->
+                                        // [F-12 meta-audit-1028] Cap what gets composed: the
+                                        // unbounded `lines().forEach { Text(...) }` built one node
+                                        // per diff line, so a whole-file rewrite (thousands of
+                                        // lines) blocked the composition thread. Display-only cap —
+                                        // the footer states how many lines are held back.
+                                        val oldPreview = remember(oldStr) { buildDiffPreview(oldStr) }
+                                        val newPreview = remember(newStr) { buildDiffPreview(newStr) }
+                                        if (oldPreview.lines.isNotEmpty()) {
+                                            oldPreview.lines.forEach { line ->
                                                 Text(
                                                     text = "- $line",
                                                     fontSize = 13.sp,
@@ -711,9 +532,16 @@ internal fun ToolDetailSheet(
                                                         .padding(horizontal = 14.dp, vertical = 2.dp),
                                                 )
                                             }
+                                            if (oldPreview.hiddenLines > 0) {
+                                                DiffPreviewFooter(
+                                                    hiddenLines = oldPreview.hiddenLines,
+                                                    color = redText,
+                                                    background = redBg,
+                                                )
+                                            }
                                         }
-                                        if (newStr.isNotEmpty()) {
-                                            newStr.lines().forEach { line ->
+                                        if (newPreview.lines.isNotEmpty()) {
+                                            newPreview.lines.forEach { line ->
                                                 Text(
                                                     text = "+ $line",
                                                     fontSize = 13.sp,
@@ -724,6 +552,13 @@ internal fun ToolDetailSheet(
                                                         .fillMaxWidth()
                                                         .background(greenBg)
                                                         .padding(horizontal = 14.dp, vertical = 2.dp),
+                                                )
+                                            }
+                                            if (newPreview.hiddenLines > 0) {
+                                                DiffPreviewFooter(
+                                                    hiddenLines = newPreview.hiddenLines,
+                                                    color = greenText,
+                                                    background = greenBg,
                                                 )
                                             }
                                         }
@@ -806,23 +641,13 @@ internal fun ToolDetailSheet(
                     // ── Browser: action capsule + URL bar + screenshot + result text ──
                     "browser_use" -> {
                         val action = toolArgsObj.optString("action", "")
-                        val argsUrl = toolArgsObj.optString("url", "")
                         // Resolved URL: prefer block.browserURL (actual page URL), fallback to args URL,
-                        // then inherit from preceding browser block (mirrors iOS resolvedBrowserURL).
-                        val resolvedUrl = block.browserURL?.takeIf { it.isNotEmpty() }
-                            ?: argsUrl.takeIf { it.isNotEmpty() }
-                            ?: run {
-                                val blockIdx = toolBlocks.indexOfFirst { it.id == block.id }
-                                if (blockIdx > 0) {
-                                    (blockIdx - 1 downTo 0).firstNotNullOfOrNull { i ->
-                                        val prev = toolBlocks[i]
-                                        prev.browserURL?.takeIf { it.isNotEmpty() }
-                                            ?: try {
-                                                org.json.JSONObject(prev.toolArgs).optString("url", "").takeIf { it.isNotEmpty() }
-                                            } catch (_: Exception) { null }
-                                    }
-                                } else null
-                            } ?: ""
+                        // then inherit from preceding browser_use block (mirrors iOS resolvedBrowserURL).
+                        // [F-10 meta-audit-1028] Shares [resolveBrowserUseUrl] with the header's
+                        // globe button so the pill below and the action above can never disagree.
+                        val resolvedUrl = remember(block.id, block.browserURL, block.toolArgs, toolBlocks) {
+                            resolveBrowserUseUrl(block, toolBlocks)
+                        }
                         // Preview priority (matches iOS): live WebView snapshot while the
                         // tool is running → current block's saved imageFilePath → most
                         // recent preceding browser_use block's screenshot.
@@ -1351,20 +1176,149 @@ internal fun extractPartialJsonString(key: String, json: String): String? {
             val c = after[i]
             if (c == '\\') { i += 2; continue }
             if (c == '"') {
-                return after.substring(0, i)
-                    .replace("\\n", "\n").replace("\\t", "\t")
-                    .replace("\\\"", "\"").replace("\\/", "/")
-                    .replace("\\\\", "\\")
+                // [F-13 meta-audit-1028] was a multi-pass .replace chain that
+                // turned literal escape sequences into control characters.
+                return unescapeJsonStringBody(after.substring(0, i))
             }
             i++
         }
         // No closing quote yet (still streaming) — return what we have.
-        return after.replace("\\n", "\n").replace("\\t", "\t")
-            .replace("\\\"", "\"").replace("\\/", "/")
-            .replace("\\\\", "\\")
+        return unescapeJsonStringBody(after)
     }
     return null
 }
+
+/**
+ * [F-13 meta-audit-1028] Single-pass unescape of a JSON *string body*.
+ *
+ * The former implementation was a chain of `String.replace` passes
+ * (`\n`, `\t`, `\"`, `\/`, `\\` → their characters). Multi-pass replacement
+ * cannot tell an escape that the model emitted from one it produced itself, so
+ * *literal* backslashes were destroyed:
+ *  - a tool arg whose value really contains backslash+n (a sed/awk script, a
+ *    regex, a Kotlin/Java source snippet, a Windows path) rendered as a real
+ *    newline, re-flowing the whole diff / command preview;
+ *  - an escaped backslash immediately before `n` was eaten by the first pass
+ *    instead of the last one, so `\\` + `n` also became a newline.
+ *
+ * Consuming the escape pair as a unit fixes both: only the exact sequences the
+ * encoder emits are converted, and every other backslash survives verbatim.
+ * Unknown escapes (`\r`, `\uXXXX`, `\b`, …) and a trailing lone backslash (a
+ * half-streamed buffer) are passed through unchanged — same as the old chain.
+ *
+ * Sibling occurrence: `ChatViewModelUtils.unescapePartialJsonString` still has
+ * the multi-pass shape; it is out of this file's radius and is registered in
+ * the meta-audit-1028 backlog.
+ */
+internal fun unescapeJsonStringBody(raw: String): String {
+    if (raw.indexOf('\\') < 0) return raw   // fast path: nothing escapes
+    val out = StringBuilder(raw.length)
+    var i = 0
+    while (i < raw.length) {
+        val c = raw[i]
+        if (c != '\\' || i == raw.length - 1) {
+            out.append(c)
+            i++
+            continue
+        }
+        when (val escape = raw[i + 1]) {
+            'n' -> out.append('\n')
+            't' -> out.append('\t')
+            '"' -> out.append('"')
+            '/' -> out.append('/')
+            '\\' -> out.append('\\')
+            else -> out.append('\\').append(escape)
+        }
+        i += 2
+    }
+    return out.toString()
+}
+
+/**
+ * [F-10 meta-audit-1028] Single source of truth for "which URL does this
+ * browser_use block point at", shared by the sheet header's globe button and
+ * the browser branch's URL pill.
+ *
+ * Resolution order (mirrors iOS `resolvedBrowserURL`):
+ *  1. `block.browserURL` — the page URL recorded when the action ran.
+ *  2. the block's own `args.url`.
+ *  3. the nearest *preceding* `browser_use` block's URL (navigate / click /
+ *     screenshot actions usually carry no url of their own).
+ *
+ * Step 3 only ever considers `browser_use` blocks. web_fetch / MCP / http tools
+ * carry a `url` argument too, and the body's URL pill used to take the nearest
+ * predecessor with *any* url — so it could name a page the in-app browser never
+ * loaded, while the header (which filtered by tool name) picked a different
+ * URL or none at all. Two parts of the same sheet contradicting each other.
+ *
+ * Note on the filter: `firstNotNullOfOrNull` treats a null result as "not a
+ * match, keep scanning", so this cannot stop at the first non-browser_use
+ * block — and it shouldn't. A web_fetch between two browser_use actions does
+ * not navigate the browser, so the last browser_use page is still the page on
+ * screen.
+ */
+internal fun resolveBrowserUseUrl(block: AssistantBlock, toolBlocks: List<AssistantBlock>): String {
+    block.browserURL?.takeIf { it.isNotEmpty() }?.let { return it }
+    parseToolArgUrl(block.toolArgs)?.let { return it }
+    val idx = toolBlocks.indexOfFirst { it.id == block.id }
+    if (idx <= 0) return ""
+    return (idx - 1 downTo 0).firstNotNullOfOrNull { i ->
+        val prev = toolBlocks[i]
+        if (prev.toolName != "browser_use") return@firstNotNullOfOrNull null
+        prev.browserURL?.takeIf { it.isNotEmpty() } ?: parseToolArgUrl(prev.toolArgs)
+    } ?: ""
+}
+
+/** `url` field of a raw tool-args JSON buffer; null when absent or malformed. */
+internal fun parseToolArgUrl(args: String): String? = try {
+    org.json.JSONObject(args).optString("url", "").takeIf { it.isNotEmpty() }
+} catch (_: Exception) {
+    null
+}
+
+// ─── [F-12 meta-audit-1028] file_edit diff render cap ───────────────────────
+// The file_edit branch rendered one Text per diff line inside a
+// non-virtualizing `verticalScroll` Column. A whole-file rewrite (a few
+// thousand lines) composed thousands of text nodes on the composition thread —
+// visible jank on open, and a plausible ANR once the edit is large enough. Cap
+// the rendered window per side and state how many lines were held back; the
+// full old/new strings remain available to the model/copy path, this is a
+// display-only cap.
+internal const val DIFF_PREVIEW_MAX_LINES = 300
+internal const val DIFF_PREVIEW_MAX_CHARS_PER_LINE = 2_000
+
+internal data class DiffPreview(
+    /** Rendered lines, in order, already clipped per line. */
+    val lines: List<String>,
+    /** Diff lines not rendered because of [DIFF_PREVIEW_MAX_LINES]. */
+    val hiddenLines: Int,
+)
+
+/**
+ * Build the rendered window for one diff side. [text] is split lazily so a
+ * multi-megabyte body is never materialised as a `List<String>`; the total line
+ * count is derived with an allocation-free `indexOf` walk instead.
+ */
+internal fun buildDiffPreview(
+    text: String,
+    maxLines: Int = DIFF_PREVIEW_MAX_LINES,
+    maxCharsPerLine: Int = DIFF_PREVIEW_MAX_CHARS_PER_LINE,
+): DiffPreview {
+    if (text.isEmpty()) return DiffPreview(emptyList(), 0)
+    var total = 1
+    var nl = text.indexOf('\n')
+    while (nl >= 0) {
+        total++
+        nl = text.indexOf('\n', nl + 1)
+    }
+    val lines = ArrayList<String>(minOf(total, maxLines))
+    for (line in text.lineSequence()) {
+        if (lines.size >= maxLines) break
+        lines.add(if (line.length > maxCharsPerLine) line.take(maxCharsPerLine) + "…" else line)
+    }
+    return DiffPreview(lines, (total - lines.size).coerceAtLeast(0))
+}
+
 
 /**
  * Shared editor-card layout used by file_read / file_write / memory_* detail
@@ -1400,6 +1354,37 @@ private const val LAZY_TOOL_CHUNK_LINES = 40
 private const val LAZY_TOOL_INITIAL_CHUNKS = 5            // ~200 lines
 private const val LAZY_TOOL_BATCH_CHUNKS = 5              // +200 lines per reveal
 private const val LAZY_TOOL_INITIAL_BYTE_CAP = 10 * 1024 // clamp first window to ~10KB
+
+/** [F-11 meta-audit-1028] Distance from the bottom (in px) that still counts as
+ *  "the user reached the end of what is currently revealed". Extracted from the
+ *  inline literal so the auto-reveal predicate below is unit-testable. */
+private const val LAZY_TOOL_NEAR_BOTTOM_PX = 600
+
+/**
+ * [F-11 meta-audit-1028] Pure predicate behind the lazy-reveal gate: may the
+ * next batch be revealed without the user asking for it?
+ *
+ * [scrollValue] == 0 means the viewport has NOT moved since this text was
+ * installed — nothing in this sheet scrolls the state programmatically — so it
+ * can never mean "reached the bottom". The old inline form checked only
+ * `value >= maxValue - 600`, which the very first frame satisfies whenever the
+ * content overflows the viewport by 1..600 px: the gate opened itself and each
+ * pending batch was revealed as soon as it was laid out, so a short-to-medium
+ * output bypassed the laziness entirely (the "Load more" counter flashed and
+ * vanished). Requiring a real offset keeps the documented behaviour — "only
+ * grows the window once the user has actually scrolled near the end" — and
+ * leaves the manual "Load more / Load all" buttons as the way through when the
+ * content fits (maxValue == 0) or Compose hasn't measured it yet (Int.MAX_VALUE).
+ */
+internal fun shouldAutoRevealMore(
+    scrollValue: Int,
+    maxValue: Int,
+    nearBottomPx: Int = LAZY_TOOL_NEAR_BOTTOM_PX,
+): Boolean {
+    if (maxValue <= 0 || maxValue == Int.MAX_VALUE) return false
+    if (scrollValue <= 0) return false
+    return scrollValue >= maxValue - nearBottomPx
+}
 
 /** Split [text] into ordered 40-line chunks. Each chunk keeps its trailing
  *  newline so concatenation round-trips. */
@@ -1448,6 +1433,28 @@ private fun initialRevealChunks(chunks: List<String>): Int {
  * `scrollState.value` vs `maxValue` instead only grows the window once the user
  * has actually scrolled near the end of what's currently revealed.
  */
+/**
+ * [F-12 meta-audit-1028] Trailing marker on a capped diff side, so the reader
+ * knows the card isn't the whole edit (the strings are display-capped only).
+ * Literal rather than a string resource on purpose: this file is the only user,
+ * and adding a resource means touching all 8 translation files — same trade-off
+ * as the neighbouring "streaming…" / "Running..." literals in this sheet.
+ */
+@Composable
+private fun DiffPreviewFooter(hiddenLines: Int, color: Color, background: Color) {
+    Text(
+        text = "… $hiddenLines more lines not shown",
+        fontSize = 12.sp,
+        fontFamily = FontFamily.Monospace,
+        color = color.copy(alpha = 0.8f),
+        lineHeight = 17.sp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(background)
+            .padding(horizontal = 14.dp, vertical = 3.dp),
+    )
+}
+
 @Composable
 private fun LazyRevealToolText(
     bodyText: String,
@@ -1455,6 +1462,10 @@ private fun LazyRevealToolText(
     scrollState: androidx.compose.foundation.ScrollState,
     modifier: Modifier = Modifier,
     linkify: Boolean = false,
+    // [F-12 meta-audit-1028] the shell branch used a lighter tint on the black
+    // terminal card; keep it parameterised instead of hardcoding one colour for
+    // every caller.
+    linkColor: Color = Color(0xFF0A84FF),
 ) {
     val chunks = remember(bodyText) { chunkToolOutput(bodyText) }
     // Reset the reveal window whenever the underlying text changes (e.g. the
@@ -1465,19 +1476,25 @@ private fun LazyRevealToolText(
         chunks.take(revealed.coerceIn(1, total.coerceAtLeast(1))).joinToString("\n")
     }
     val urlClick = LocalMarkdownUrlClickHandler.current
-    val displayed = remember(shownText, urlClick, linkify) {
+    val displayed = remember(shownText, urlClick, linkify, linkColor) {
         if (linkify && urlClick != null) {
-            com.rikkaminis.app.ui.util.linkifyUrls(text = shownText, onClick = urlClick)
+            com.rikkaminis.app.ui.util.linkifyUrls(
+                text = shownText,
+                onClick = urlClick,
+                linkColor = linkColor,
+            )
         } else androidx.compose.ui.text.AnnotatedString(shownText)
     }
 
     // Auto-grow the window when the user scrolls within ~600px of the bottom of
     // the currently-revealed content. derivedStateOf keeps the predicate from
     // recomposing on every scroll pixel; it only flips at the threshold.
-    val nearBottom by remember {
+    // [F-11 meta-audit-1028] `remember` is keyed on [scrollState]: the sheet now
+    // swaps in a fresh ScrollState per tool block, and an unkeyed remember would
+    // keep reading the previous block's instance (stale value + stale max).
+    val nearBottom by remember(scrollState) {
         derivedStateOf {
-            val max = scrollState.maxValue
-            max > 0 && max != Int.MAX_VALUE && scrollState.value >= max - 600
+            shouldAutoRevealMore(scrollState.value, scrollState.maxValue)
         }
     }
     LaunchedEffect(nearBottom, revealed, total) {

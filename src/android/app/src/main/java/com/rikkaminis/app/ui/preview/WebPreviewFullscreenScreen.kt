@@ -1,8 +1,6 @@
 package com.rikkaminis.app.ui.preview
 
 import android.app.Activity
-import android.content.Intent
-import android.net.Uri
 import android.view.MotionEvent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -11,7 +9,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
@@ -19,7 +16,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.FullscreenExit
@@ -28,12 +24,12 @@ import androidx.compose.material.icons.outlined.OpenInBrowser
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -51,6 +47,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.theme.ChatColors
 import kotlinx.coroutines.delay
 
 /**
@@ -75,7 +72,13 @@ fun WebPreviewFullscreenScreen(
 ) {
     val context = LocalContext.current
     val view = LocalView.current
-    val darkTheme = isSystemInDarkTheme()
+    // [da1034-B2 / B-03] Same single source as WebPreviewBottomSheet.kt /
+    // KaTeXView.kt: ChatColors.isDark follows the in-app theme override while
+    // isSystemInDarkTheme() only tracks the system setting. The icon appearance
+    // applied below is constant (the WebView paints pure black behind the
+    // swipe-revealed bars), so this swap only realigns when the effect restarts
+    // — it removes a second, disagreeing authority on "dark" from this screen.
+    val darkTheme = ChatColors.isDark
 
     LaunchedEffect(holder) {
         holder.startIfNeeded()
@@ -181,6 +184,11 @@ fun WebPreviewFullscreenScreen(
                 .fillMaxSize()
                 .background(Color.Black),
         ) {
+            // [dv17-3 B-03] Same missing-key defect as WebPreviewBottomSheet:
+            // `AndroidView` only runs `factory` on first composition (or when
+            // the enclosing `key` changes), so a holder swap left this screen
+            // showing the destroyed WebView of the previous holder.
+            key(holder, holder.webView) {
             AndroidView(
                 factory = {
                     val wv = holder.webView
@@ -196,6 +204,15 @@ fun WebPreviewFullscreenScreen(
                 },
                 modifier = Modifier.fillMaxSize(),
             )
+            }
+
+            // [r3-c / B09 F-08, P1] Same dead-wire as the bottom sheet: nothing
+            // read `rendererGone`, so a killed renderer left a black rectangle
+            // and the toolbar's Reload talked to the corpse. The floating menu is
+            // drawn AFTER this overlay on purpose — closing must stay reachable.
+            if (holder.rendererGone) {
+                WebPreviewRendererGone(onRetry = { holder.rebuildAfterRendererGone() })
+            }
 
             val navInset = WindowInsets.navigationBars.asPaddingValues()
                 .calculateBottomPadding()

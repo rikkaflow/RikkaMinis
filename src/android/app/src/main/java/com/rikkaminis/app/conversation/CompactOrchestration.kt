@@ -4,31 +4,18 @@ import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.db.CompactMarkerEntity
-import com.rikkaminis.app.data.db.MessageEntity
-import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
-import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.LLMResponse
 import com.rikkaminis.app.data.model.ThinkingLevel
-import com.rikkaminis.app.data.model.RoutingStrategy
-import com.rikkaminis.app.diagnostics.SessionIdAliases
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.provider.ProviderFactory
-import com.rikkaminis.app.sandbox.ExecutionCoordinator
-import com.rikkaminis.app.service.SessionActivityTracker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.R
-import com.rikkaminis.app.agent.InterruptedTailDetector
-import com.rikkaminis.app.agent.InterruptedTailPartKind
-import com.rikkaminis.app.agent.InterruptedTailShape
-import com.rikkaminis.app.agent.InterruptedTailSnapshot
 import com.rikkaminis.app.agent.runtime.AgentRunEvent
 import com.rikkaminis.app.agent.runtime.AgentRunPhase
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -38,7 +25,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import com.rikkaminis.app.ui.chat.ChatAgentTraceObserver
 import com.rikkaminis.app.ui.chat.ChatViewModel
-import com.rikkaminis.app.ui.chat.TruncatedToolCallPolicy
 import com.rikkaminis.app.ui.chat.applyCompactGreyedRange
 import com.rikkaminis.app.ui.chat.buildConversationTextForSummary
 import com.rikkaminis.app.ui.chat.buildFallbackProviders
@@ -66,6 +52,25 @@ internal fun ChatViewModel.compactAll(
     // next provider call, so the guard's "don't tear the streaming UI" concern
     // does not apply. All other callers (manual /compact, sendMessage auto-
     // compact) keep the strict guard via the default false.
+    // ── silent 契约（[fix/compact-silent-abort-cards-1016]）──────────────
+    // silent=true 的调用方只有两个：发送前的 maybeTriggerAutoCompact 与
+    // 长跑回合边界的 maybeAutoCompactInLoop —— 都是 agent 侧的上下文管理，
+    // 不是用户主动动作，对话记录必须看起来没被动过。所以 compactAll 内部
+    // 的**每一条** appendSystemInfo 都必须是「manual-only」，即包在
+    // `if (!silent)` 里（分栏 divider 是唯一的例外：它本来就在 else 分支，
+    // 只在非 silent 路径出现）。判据不是「silent 模式下不许有任何输出」，
+    // 而是「能被重复触发、会在回合中反复出现的卡片 = 泄漏；一次性的、用户
+    // 需要知道的失败通知 = 保留」。逐点判定（2026-10-16，FIX-D）：
+    //  - 已 gate 的 9 处（busy/no-provider/empty-session/no-persisted/
+    //    already-done/nothing/budget-exhausted/anchor-failed/empty-summary）：
+    //    无事发生或可重复的失败，silent 不打印，日志保留诊断；
+    //  - anchor_id_missing：刻意不 gate —— LLMMessage.dbMessageId 是 val、
+    //    且上游两条路都保证非空，这条分支证明不可达；若真的触发，说明内存
+    //    不变量本身坏了，属于「用户需要看一次」的失败通知（见该处注释）；
+    //  - compact_failed 横幅：gate —— 3 天真机日志（10-14/15/16）11 次
+    //    "Compact failed"，同窗口 134 次 compactAll 全部 silent=true，且失败在回合间会复发
+    //    （provider 超时持续存在），正是会重复的卡片；下游仍有 trim 通知、
+    //    发送前 context-full 提示与 Log.w，信息不丢。
     if (_isStreaming.value && !allowInStream) {
         AppLogger.info(ChatViewModel.TAG, "[Compact] aborted: stream in progress")
         if (!silent) {
@@ -209,7 +214,10 @@ internal fun ChatViewModel.compactAll(
     // T7-C: compaction 预算耗尽 → 跳过 compact，不改变历史
     if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_COMPACTION_CALLS) { it.consumeCompaction() }) {
         _isCompacting.value = false
-        appendSystemInfo(context.getString(R.string.sysmsg_compact_budget_exhausted), "compact")
+        // [fix/sweep1014-b13] Was ungated — the other 7 abort branches all
+        // guard on !silent; an in-loop maybeAutoCompactInLoop(silent=true)
+        // re-emitted this card every turn once the budget was exhausted.
+        if (!silent) appendSystemInfo(context.getString(R.string.sysmsg_compact_budget_exhausted), "compact")
         return
     }
     // [fix/audit0917-b8] Stamp the auto-compact retry gate HERE — at the last
@@ -251,8 +259,13 @@ internal fun ChatViewModel.compactAll(
     // [fix/compact-cancel-on-stop-1002] Store the job so cancelStream can
     // kill the compact (see compactJob KDoc). CancellationException already
     // propagates cleanly through this launch: the catch rethrows, the
-    // finally resets _isCompacting + traces, and nothing is persisted
-    // before the commit block — a cancelled compact leaves zero trace.
+    // finally resets _isCompacting + traces, and nothing is persisted before
+    // the commit block — a cancelled compact leaves the transcript unfolded
+    // and writes no marker. [§47 N-2] The commit block BELOW is the boundary
+    // of that promise: a cancel landing on insertCompactMarker either keeps
+    // the row out (no trace) or leaves the row without its in-memory mirror
+    // (the next session load rebuilds the summary from it) — never a second
+    // write, and never "zero trace" once the insert has committed.
     compactJob = viewModelScope.launch(Dispatchers.IO) {
         // [T-android-compact-queued-drain] Only a SUCCESSFUL compact kicks
         // the queued-prompt drain below; failure/cancel/empty-summary paths
@@ -269,9 +282,34 @@ internal fun ChatViewModel.compactAll(
                 previousSummary = existing,
                 depth = 0,
             ).trim()
-            if (summary.isEmpty()) {
-                withContext(Dispatchers.Main) {
-                    appendSystemInfo(context.getString(R.string.sysmsg_compact_empty_summary), "compact")
+            // [fix/r5-c1-compact-F01] Judge the BODY, not the assembled string.
+            // The pinned block is appended INSIDE the call above
+            // (generateCompactSummaryWithSplitting → appendPinnedSection), so a
+            // plain `summary.isEmpty()` could never fire whenever the fold
+            // region held one user message: the block turned a filtered/empty
+            // provider answer into a non-empty summary, the marker was persisted
+            // with no body at all, and effectiveAgentHistory then replaced the
+            // whole folded range with verbatim quotes of the user's own words.
+            // Empty body = nothing was summarised = nothing may be folded.
+            val bodyEmpty = !summaryHasBody(summary)
+            if (bodyEmpty) {
+                // [fix/compact-silent-abort-cards-1016] Gated with !silent like
+                // every other abort branch above: a silent auto-compact must
+                // leave the transcript untouched, and this branch can be
+                // re-entered on each eligible attempt (an empty summary is a
+                // provider behaviour, not a one-off), so the card would recur.
+                // Observability moves to the log — the branch had none before,
+                // and the card used to be the only trace of "summary came back
+                // empty". Manual /compact still shows it.
+                AppLogger.warning(
+                    ChatViewModel.TAG,
+                    "[Compact] summary came back with no body (chars=${summary.length}, " +
+                        "silent=$silent) — nothing folded",
+                )
+                if (!silent) {
+                    withContext(Dispatchers.Main) {
+                        appendSystemInfo(context.getString(R.string.sysmsg_compact_empty_summary), "compact")
+                    }
                 }
                 return@launch
             }
@@ -291,7 +329,7 @@ internal fun ChatViewModel.compactAll(
             // the original anchorIdx until we find an entry whose id is
             // both non-empty AND present in rawDbIds.
             val rawDbIds: Set<String> = try {
-                chatRepository.dao.loadMessages(sid).map { it.id }.toSet()
+                chatRepository.loadMessages(sid).map { it.id }.toSet()
             } catch (e: CancellationException) {
                 // [fix/clearchat-compact-ce-1002] A stop press cancels
                 // compactJob (fix/compact-cancel-on-stop-1002). The summary
@@ -321,8 +359,14 @@ internal fun ChatViewModel.compactAll(
             }
             if (verifiedAnchorIdx < 0) {
                 Log.w(ChatViewModel.TAG, "[Compact] No agentHistory entry has a DB-persisted dbMessageId; aborting")
-                withContext(Dispatchers.Main) {
-                    appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_failed), "compact")
+                // [fix/compact-silent-abort-cards-1016] Gated with !silent like
+                // its :139 pre-summary twin (same stuck-anchor family — when
+                // reachable it recurs every eligible attempt, so a silent
+                // auto-compact must not print it). Manual /compact keeps it.
+                if (!silent) {
+                    withContext(Dispatchers.Main) {
+                        appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_failed), "compact")
+                    }
                 }
                 return@launch
             }
@@ -336,6 +380,16 @@ internal fun ChatViewModel.compactAll(
             val lastCompactedDbId = history[verifiedAnchorIdx].dbMessageId
                 ?: run {
                     Log.w(ChatViewModel.TAG, "[Compact] verified anchor at idx=$verifiedAnchorIdx lost dbMessageId; aborting")
+                    // [fix/compact-silent-abort-cards-1016] Deliberately NOT
+                    // silent-gated, unlike the three sibling abort cards. Criterion:
+                    // a silent auto-compact must stay invisible only for cards that
+                    // can be re-emitted; this branch is provably unreachable —
+                    // LLMMessage.dbMessageId is a `val` on an immutable data class,
+                    // and the guard above only lets a non-empty id through (both
+                    // the rawDbIds walk-back and resolveCompactAnchorIdx require
+                    // "not null and not empty"). If it ever fires the in-memory
+                    // invariant itself broke, and that is a one-time notice the
+                    // user should see rather than a repeatable card.
                     withContext(Dispatchers.Main) {
                         appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_id_missing), "compact")
                     }
@@ -368,19 +422,31 @@ internal fun ChatViewModel.compactAll(
             // [audit-0917] "compacted in memory, full history after reload"
             // inconsistency this guard exists to prevent). Rethrow
             // cancellation; other failures keep the best-effort semantics.
-            val markerSaved = try {
+            // [fix/r3-b11-compact-F02] The contract above was quoted but not
+            // enforced: a failed insert only logged a warning, then
+            // _compactSummary/_cachedLatestMarker were published anyway, the
+            // UI was greyed and a divider + "compacted N bubbles" card
+            // announced success, and compactSucceeded still kicked the queued
+            // drain. Reload then silently replayed the full history (no row),
+            // and the divider's Revert affordance failed with
+            // sysmsg_revert_failed_db (deleteCompactMarker → 0 rows). A
+            // non-persisted marker is now a COMPACT FAILURE: it throws into
+            // compactAll's own catch, so nothing in-memory is published, no
+            // greying/divider is painted, the queue is not kicked, and the
+            // caller falls back to the hard trim exactly like every other
+            // compact failure (the auto path detects `folded == false`).
+            // Manual /compact sees sysmsg_compact_failed with the underlying
+            // DB error; silent auto-compacts stay silent, same !silent policy
+            // as the sibling failure branches.
+            try {
                 chatRepository.dao.insertCompactMarker(marker)
-                true
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(ChatViewModel.TAG, "Failed to persist compact marker: ${e.message}")
-                false
-            }
-            if (!markerSaved) {
-                AppLogger.warning(
-                    ChatViewModel.TAG_STREAM,
-                    "compact marker not persisted; keeping the summary in memory only",
+                throw IllegalStateException(
+                    "compact marker not persisted: ${e.message ?: e.javaClass.simpleName}",
+                    e,
                 )
             }
             _compactSummary.value = summary
@@ -482,11 +548,26 @@ internal fun ChatViewModel.compactAll(
             throw e
         } catch (e: Exception) {
             Log.w(ChatViewModel.TAG, "Compact failed", e)
-            withContext(Dispatchers.Main) {
-                appendSystemInfo(
-                    text = context.getString(R.string.sysmsg_compact_failed, e.message ?: e.javaClass.simpleName),
-                    iconKind = "compact",
-                )
+            // [fix/compact-silent-abort-cards-1016] Gated with !silent: this is
+            // the most frequent compact-failure path (3 days of device logs:
+            // 11 "Compact failed" emissions, and all 134 compactAll() attempts
+            // in that window were silent=true), and it re-fires on every
+            // eligible attempt (provider timeouts persist across turns), so in
+            // silent mode it is exactly the "repeated card mid-answer" leak
+            // shape the 9 already-gated abort branches were closed for. The
+            // failure still surfaces downstream: in-loop the caller falls back
+            // to trimContextHistoryWindow (its trim notice is a separate
+            // feature the strip pass must not eat), the send entry gets the
+            // context-full advisory, and Log.w + the caller's
+            // "[AutoCompactLoop] folded=nothing" INFO stay. Manual /compact
+            // keeps the banner.
+            if (!silent) {
+                withContext(Dispatchers.Main) {
+                    appendSystemInfo(
+                        text = context.getString(R.string.sysmsg_compact_failed, e.message ?: e.javaClass.simpleName),
+                        iconKind = "compact",
+                    )
+                }
             }
         } finally {
             _isCompacting.value = false
@@ -536,8 +617,9 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
     // [feat/compact-pin-v0-1005] Pin v0: user verbatim text never passes
     // through a rewrite. Extraction + strip happen at the depth-0 entry
     // (BEFORE any LLM call); the re-append happens at the one exit below
-    // (AFTER the LLM). At depth > 0 previousSummary is always null and the
-    // recursion passes no pin — the split/merge prompts never see one.
+    // (AFTER the LLM). The split/merge prompts never see a pin block: the
+    // payload is stripped at the depth-0 entry and the recursion only ever
+    // receives the STRIPPED summary.
     // previousSummary comes from the previous round's summary and may carry
     // a `<pinned-user-messages>` block: strip it here, carry the payload,
     // and re-merge it with this fold's user text at the exit.
@@ -545,12 +627,7 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
     val pinCarried = if (depth == 0) pinnedSectionInner(previousSummary) else null
     val prevSummaryStripped = if (depth == 0) stripPinnedSection(previousSummary) else previousSummary
     val transcript = buildConversationTextForSummary(messages)
-    val conversationText = if (prevSummaryStripped.isNullOrBlank()) {
-        transcript
-    } else {
-        "Previous context summary:\n$prevSummaryStripped\n\n" +
-            "New conversation to merge:\n$transcript"
-    }
+    val conversationText = ContextCompactor.compactInputText(prevSummaryStripped, transcript)
     val summary = try {
         generateCompactSummary(conversationText)
     } catch (e: CancellationException) {
@@ -559,6 +636,7 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
         if (!isContextTooLargeError(e) || messages.size < 2 || depth >= 3) {
             throw e
         }
+        // equivalent-mutant arm: comment only
         val mid = messages.size / 2
         val firstHalf = messages.subList(0, mid).toList()
         val secondHalf = messages.subList(mid, messages.size).toList()
@@ -566,7 +644,20 @@ internal suspend fun ChatViewModel.generateCompactSummaryWithSplitting(
             ChatViewModel.TAG,
             "[Compact] Splitting ${messages.size} messages into ${firstHalf.size} + ${secondHalf.size} (depth=$depth)",
         )
-        val summary1 = generateCompactSummaryWithSplitting(firstHalf, null, depth + 1)
+        // [fix/r3-b11-compact-F01] The first half is the OLDER material, so it
+        // is exactly the half that must be summarized ON TOP OF the previous
+        // rounds' summary. Passing `null` here dropped prevSummaryStripped the
+        // moment the depth-0 pass hit ContextTooLarge: summary1 then covered
+        // only this fold's first half, the merge prompt merged those two
+        // halves, and the returned string replaced the previous summary in the
+        // marker (`compactAll` persists it) — erasing every earlier compact
+        // round, tool conclusion and decision, irreversibly. The second half
+        // keeps `null`: it has no older context to sit on (the previous
+        // summary was already incorporated by the first half, and feeding it
+        // to both halves would double-count it in the merge). At depth > 0
+        // prevSummaryStripped is the pushed-down summary, so a re-split inside
+        // the first half keeps the chain intact instead of cutting it again.
+        val summary1 = generateCompactSummaryWithSplitting(firstHalf, prevSummaryStripped, depth + 1)
         val summary2 = generateCompactSummaryWithSplitting(secondHalf, null, depth + 1)
         val mergeInput = buildString {
             append("Merge these partial summaries into a single cohesive context summary. ")
@@ -684,9 +775,16 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     // counts as a failure and tries the next candidate — a truncated
     // summary must never replace the context. withTimeoutOrNull swallows ONLY
     // its own TimeoutCancellationException — a user cancel still propagates
-    // (termination path unchanged) — and an exhausted chain throws
-    // lastFailure exactly as before, so the splitter's halving retry is
-    // untouched. See ordersCompactionCandidates for the ordering logic.
+    // (termination path unchanged) — and an exhausted chain throws lastFailure
+    // exactly as before, so the splitter's halving retry is
+    // untouched.
+    // [fix/compact-lastfailure-pin-1016] "exactly as before" 有一个刻意的例外：
+    // 链上出现过 ContextTooLarge 分类的失败时，抛出的必须是它，而不是链尾的
+    // 最后一个普通失败（超时 / 5xx / unavailable）—— 否则外层 catch 的
+    // isContextTooLargeError 分支永远看不到容量证据，「halving retry is
+    // untouched」就只是注释里的空话（真实日志：Splitting 事件 3 天 0 次）。
+    // 普通失败链的语义不变：仍然抛最后一条。See ordersCompactionCandidates
+    // for the ordering logic.
     // [feat/compact-model-pin-1005] The user-pinned compaction model
     // (Settings → Model Groups → 压缩模型, moved from Runtime Limits) rides
     // the chain head. It works
@@ -730,10 +828,45 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     }
     val deadlineAt = SystemClock.elapsedRealtime() + ChatViewModel.COMPACT_SUMMARY_TOTAL_BUDGET_MS
     var lastFailure: Exception = IllegalStateException("compaction failed")
+    // [fix/compact-lastfailure-pin-1016] ContextTooLarge 的原始失败必须钉住：
+    // 二分拆解（recursive halving）只认 `isContextTooLargeError`，而判定发生在
+    // **外层** catch —— 本函数把异常抛出去之后。若 TooLarge 被后续候选的普通
+    // 失败（超时 / 5xx / unavailable / truncated）覆盖，链上唯一的容量证据就
+    // 丢了：外层按普通失败处理 → 不拆解、不重试，整条链当失败收场，而这正是
+    // :691 注释里「halving retry is untouched」契约的反面。真实时序量过：
+    // 候选 1/2 回 400 context length、候选 2/2 超时，修复后外层看到的必须是 400。
+    var tooLargeFailure: Exception? = null
+    // [fix/compact-timeout-dedup-1022] A TIMEOUT says something about the
+    // ROUTE (host + model), not about the account behind it. 2026-10-22 device
+    // log: three tierflow entries sharing https://tierflow.cn and model
+    // `tierflow` each died at exactly 30000ms inside ONE chain, so the chain
+    // paid the same wall three times and handed the genuinely different member
+    // (codebuddy-cn/hy4-preview) only what the deadline had left — 25 such
+    // chains that day. Remember the routes that timed out in THIS chain and
+    // skip their siblings; the freed deadline goes to a candidate that can
+    // still answer. Route failures (401 / 429 / 5xx) are deliberately NOT
+    // recorded: those are per-credential, and the sibling accounts exist for
+    // exactly them — only the latency verdict is a route property.
+    val timedOutRoutes = mutableSetOf<String>()
     for ((index, step) in chain.withIndex()) {
         val (candidate, entryId) = step
+        val label = if (entryId != null) "entry=$entryId" else "active"
+        val route = compactionCandidateKey(
+            customBaseUrl = candidate.instanceContext?.customBaseURL,
+            instanceId = candidate.instanceContext?.id,
+            modelId = candidate.model.id,
+        )
+        if (route in timedOutRoutes) {
+            AppLogger.info(
+                ChatViewModel.TAG,
+                "[Compact] summary skip candidate=${index + 1}/${chain.size} " +
+                    "($label ${candidate.model.displayName}) — route $route already timed out in this chain",
+            )
+            continue
+        }
         val budgetMs = compactionCandidateBudgetMs(
             candidate.model.declaresNoEffortTiers,
+            estimatedInput,
             SystemClock.elapsedRealtime(),
             deadlineAt,
         )
@@ -750,7 +883,6 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
         val started = SystemClock.elapsedRealtime()
         val r = withTimeoutOrNull(budgetMs) { sendVia(candidate) }
         val ms = SystemClock.elapsedRealtime() - started
-        val label = if (entryId != null) "entry=$entryId" else "active"
         if (r == null) {
             AppLogger.info(
                 ChatViewModel.TAG,
@@ -760,6 +892,10 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
             lastFailure = IllegalStateException(
                 "compaction summary timed out after ${budgetMs}ms on ${candidate.model.displayName}",
             )
+            // [fix/compact-timeout-dedup-1022] Latency verdict → route-level:
+            // see the declaration of timedOutRoutes. Sibling entries on the
+            // same host+model are skipped from here on within this chain.
+            timedOutRoutes.add(route)
             continue
         }
         when (r) {
@@ -790,7 +926,19 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
                     "[Compact] summary failed on ${if (entryId != null) "fallback $label" else "active member"} " +
                         "(${r.code}: ${r.message}) — trying next of ${chain.size - index - 1} candidate(s)",
                 )
-                lastFailure = IllegalStateException("compaction failed (${r.code}): ${r.message}")
+                // [fix/compact-lastfailure-pin-1016] 归约规则单源在
+                // [ContextCompactor.chainFailureAfter]：链上唯一的容量证据在此
+                // 钉住，任何后续候选的普通失败都不得覆盖它（见 tooLargeFailure
+                // 声明处的时序注释）。
+                val candidateFailure = IllegalStateException("compaction failed (${r.code}): ${r.message}")
+                val reduced = ContextCompactor.chainFailureAfter(
+                    lastOrdinary = lastFailure,
+                    pinnedTooLarge = tooLargeFailure,
+                    candidate = candidateFailure,
+                    isTooLarge = ::isContextTooLargeError,
+                )
+                lastFailure = reduced.first
+                tooLargeFailure = reduced.second
             }
             is ProviderExecutionGateway.SendResult.Unavailable -> {
                 AppLogger.info(
@@ -801,6 +949,11 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
             }
         }
     }
+    // [fix/compact-lastfailure-pin-1016] 链全败收场时：TooLarge 优先于普通失败
+    // 抛出 —— 让外层 catch 的 isContextTooLargeError 分支（二分拆解重试）拿到
+    // 它该看到的证据，而不是被链尾的最后一个普通失败冲掉。终态规则单源在
+    // [ContextCompactor.chainTerminalFailure]。
+    lastFailure = ContextCompactor.chainTerminalFailure(lastFailure, tooLargeFailure)
     throw lastFailure
 }
 
@@ -825,7 +978,14 @@ internal fun ChatViewModel.resolveCompactionPinProvider(entryId: String): LLMPro
     if (!instance.isEnabled) return null
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return null
     return try {
-        ProviderFactory.create(instance, apiKey, entry.model, context)
+        // [dv24-FIX-8 R3] Enriched model, same as every other create site:
+        // `entry.model` is the raw base model, whose modality/effort fields are
+        // null for built-in entries. :modelservice never initialises
+        // [ModelsDevApi], so the provider re-decides capabilities from the
+        // serialised object — an un-enriched model downgrades an attachment to
+        // `[attached image: …]` and clamps a MAX thinking pick (same reasoning
+        // as [ChatViewModel.providerModelFor]).
+        ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
     } catch (_: Exception) {
         null
     }
@@ -840,6 +1000,12 @@ internal fun ChatViewModel.resolveCompactionPinProvider(entryId: String): LLMPro
  * deadline yields a non-positive budget and the caller's `budgetMs <= 0`
  * branch ends the chain.
  *
+ * [fix/compact-timeout-budget-1022] [materialTokens] is the estimated size of
+ * the summary material this chain will send; above
+ * COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS it opens the same 60s budget the
+ * noisy members get, because the measured success latency on those relays
+ * crowds the 30s floor as soon as the fold material grows.
+ *
  * Top-level (not a ChatViewModel extension) so JVM unit tests call it
  * without instantiating the VM — same pattern as [ordersCompactionCandidates]
  * (the companion consts it reads are compile-time inlined, no Android
@@ -847,15 +1013,54 @@ internal fun ChatViewModel.resolveCompactionPinProvider(entryId: String): LLMPro
  */
 internal fun compactionCandidateBudgetMs(
     declaresNoEffortTiers: Boolean?,
+    materialTokens: Int,
     nowMs: Long,
     deadlineAt: Long,
 ): Long {
-    val perCandidate = if (declaresNoEffortTiers == true) {
+    // [fix/compact-timeout-budget-1022] Two independent reasons to admit the
+    // member cannot answer inside the quiet floor: the catalog says its relay
+    // cannot be silenced ([LLMModel.declaresNoEffortTiers] == true), or the
+    // summary material is large enough that the measured success latency
+    // itself crowds the floor (2026-10-22: 25.0s / 28.2s / 29.1s successes on
+    // the same members whose larger folds timed out at exactly 30000ms). See
+    // ChatViewModel.COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS for the measurement.
+    val largeMaterial = materialTokens > ChatViewModel.COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS
+    val perCandidate = if (declaresNoEffortTiers == true || largeMaterial) {
         ChatViewModel.COMPACT_SUMMARY_NOISY_CANDIDATE_BUDGET_MS
     } else {
         ChatViewModel.COMPACT_SUMMARY_CANDIDATE_BUDGET_MS
     }
     return minOf(perCandidate, deadlineAt - nowMs)
+}
+
+/**
+ * [fix/compact-timeout-dedup-1022] Route identity of a compaction candidate:
+ * the host it actually talks to plus the model it asks for. Two entries backed
+ * by the same relay host and the same model are the same route — a timeout on
+ * one predicts the timeout on the other, because the latency comes from the
+ * upstream model, not from the credential (2026-10-22: three tierflow entries
+ * sharing https://tierflow.cn + model `tierflow` all died at 30000ms in one
+ * chain; the account-swapping fallback exists for credential failures, which
+ * arrive as RemoteFailure/Unavailable and are therefore never recorded here).
+ *
+ * [customBaseUrl] is the instance's raw user field; the host is parsed out of
+ * it so `https://tierflow.cn/v1` and `https://tierflow.cn/` collapse together.
+ * Built-in provider types carry no custom base URL — there the instance id
+ * stands in for the host, which keeps distinct instances distinct (their hosts
+ * are not comparable from here, so no cross-instance claim is made). Model
+ * parsing failure falls back to the raw string rather than skipping the field.
+ */
+internal fun compactionCandidateKey(
+    customBaseUrl: String?,
+    instanceId: String?,
+    modelId: String,
+): String {
+    val host = customBaseUrl
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { url -> runCatching { java.net.URI(url).host }.getOrNull() }
+        ?: instanceId
+    return "${host ?: "?"}|$modelId"
 }
 
 /**

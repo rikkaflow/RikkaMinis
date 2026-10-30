@@ -67,6 +67,9 @@ private object GeminiModelListAdapter : ModelListProvider {
             // [FIX-1 / F-196] The 403→builtin fallback is an OAuth-only case.
             oauthCredential = instance.credentialType ==
                 com.rikkaminis.app.data.model.ProviderCredential.oauth,
+            // [T-provider-custom-user-agent] models-list UA override
+            // (da1020 ISSUE-05: was the only adapter family not passing it).
+            customUserAgent = instance.customUserAgent,
         )
     }
 }
@@ -80,7 +83,13 @@ private object OpenAIModelListAdapter : ModelListProvider {
         context: Context?,
     ): List<LLMModel> {
         if (apiKey == null) return emptyList()
-        val baseURL = instance.effectiveBaseURL
+        // [r3-b08 F-07] Azure needs the RAW customBaseURL: the data-plane list
+        // endpoint is `{root}/openai/models?api-version=…`, so the `?api-version`
+        // query has to stay LAST. `effectiveBaseURL` appends `/v1` to the whole
+        // string (query included), which put `/v1/models` inside the api-version
+        // VALUE — every Azure refresh 400'd. Same reason ProviderFactory hands
+        // the raw base to `azureUrl()`.
+        val baseURL = if (instance.azureMode) instance.customBaseURL else instance.effectiveBaseURL
         return OpenAIModelsApi.fetchModels(
             apiKey,
             baseURL,
@@ -89,6 +98,9 @@ private object OpenAIModelListAdapter : ModelListProvider {
             context = context,
             // [T-provider-custom-user-agent] models-list UA override.
             customUserAgent = instance.customUserAgent,
+            // [da1030 ISSUE-06] Azure instances auth with `api-key`; without
+            // this the models fetch 401s on every Azure provider.
+            azureMode = instance.azureMode,
             // Bypass the 7-day ProviderModelsCache so a freshly-added custom
             // provider re-validates its URL+key against the live endpoint.
             forceRefresh = forceRefresh,
@@ -110,6 +122,9 @@ private object OpenRouterModelListAdapter : ModelListProvider {
             apiKey,
             context = context,
             forceRefresh = forceRefresh,
+            // [T-provider-custom-user-agent] models-list UA override
+            // (da1020 ISSUE-05: was the only adapter family not passing it).
+            customUserAgent = instance.customUserAgent,
         )
     }
 }
@@ -148,6 +163,25 @@ private object KimiModelListAdapter : ModelListProvider {
             // [FIX-1 / F-208] Context forwarded — see the Anthropic adapter note.
             context = context,
             customUserAgent = instance.customUserAgent,
+            // [da1030 ISSUE-06] Deliberately NOT `instance.azureMode`: the
+            // Kimi chat path goes through OpenAIProvider WITHOUT passing
+            // isAzure (ProviderFactory ProviderType.kimiCode branch), so chat
+            // is Bearer-only here — the models fetch must match it. Kimi
+            // instances can't legitimately carry the flag (the Azure toggle
+            // needs providerType==openAI && apiKey), so a stale/imported true
+            // must not be allowed to break this one request.
+            azureMode = false,
+            // [dv18-A-08] These rows come from Kimi's OWN vendor base URL,
+            // which OpenAIModelsApi cannot recognise as "official OpenAI" —
+            // without a name they were all stamped "Custom", so
+            // ModelsDevApi's provider-aware enrichment (providerKeyMap) never
+            // hit for them and fell through to the order-dependent
+            // all-providers scan (the F-212 failure). The name is the family's
+            // canonical [ProviderType.displayName] (ARCH-03: the same value
+            // every add surface and the usage grouping write) — no literal
+            // here, so a rename of the family cannot silently drop the rows
+            // out of the key map.
+            providerName = ProviderType.kimiCode.displayName,
             forceRefresh = forceRefresh,
         )
     }

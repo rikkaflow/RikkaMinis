@@ -2,6 +2,9 @@ package com.rikkaminis.app.ui.markdown
 
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.SafeWebViewClient
+import com.rikkaminis.app.ui.preview.ReleaseStep
+import com.rikkaminis.app.ui.preview.WebViewReleaseLatch
+import com.rikkaminis.app.ui.preview.releasePlan
 import com.rikkaminis.app.ui.theme.ChatColors
 import androidx.compose.ui.res.stringResource
 import android.annotation.SuppressLint
@@ -20,8 +23,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -38,10 +39,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.rikkaminis.app.logging.AppLogger
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 private const val TAG = "KaTeXView"
+
+/**
+ * The render token handed to the shared asset HTML (`assets/katex/katex-render.html`).
+ *
+ * [bridge-arity] This renderer has exactly one in-flight `renderMath` call per
+ * WebView instance, so request identity is never used here — but the argument
+ * must be PRESENT. Chromium resolves `@JavascriptInterface` methods by name AND
+ * argument count, so the HTML's 5-argument `renderMath(..., token)` and its
+ * 4-argument `AndroidBridge.onRendered(..., token)` only reach a host that
+ * declares the same arity. `undefined` happens to coerce to 0 in the bridge, but
+ * writing the 0 explicitly keeps the JS side and the Kotlin side visibly paired
+ * at the call site. `KatexWebViewPool` passes a real monotonically increasing
+ * token; this file deliberately does not, because there is no second request a
+ * late callback could be misattributed to.
+ */
+private const val KATEX_RENDER_TOKEN = 0L
 
 /**
  * Renders a LaTeX string using KaTeX in an offscreen WebView, capturing the result as a bitmap.
@@ -68,6 +83,21 @@ object KaTeXRendererCache {
     val cache = object : LruCache<String, CacheEntry>(64 * 1024) {
         override fun sizeOf(key: String, value: CacheEntry): Int =
             (value.bitmap.byteCount / 1024).coerceAtLeast(1)
+    }
+
+    /**
+     * Drop every cached formula bitmap. (ARCH-03)
+     *
+     * [cache] is byte-budgeted but had NO reclaim path: the app's
+     * memory-pressure hooks called `KatexWebViewPool.clearRenderCacheForMemoryPressure()`
+     * — a different object that merely shares the "KaTeX cache" prefix in its
+     * name — so up to 64 MB of native bitmaps survived `onTrimMemory(TRIM_MEMORY_COMPLETE)`
+     * even though the cache is pure derived state (the next render is a cache miss
+     * and simply re-renders). This is the counterpart of that pool method; both
+     * caches are now cleared at every reclaim site in `MinisApp`.
+     */
+    fun clearForMemoryPressure() {
+        runCatching { cache.evictAll() }
     }
 
     fun cacheKey(latex: String, displayMode: Boolean, isDark: Boolean = false): String =
@@ -180,7 +210,19 @@ fun KaTeXRenderView(
         // rendererEpoch discards this AndroidView and re-runs the factory with
         // a fresh WebView, instead of reusing an instance whose Chromium
         // process is gone (every call on such an instance is undefined).
-        key(rendererEpoch) {
+        // [dv17-3 B-03] `cacheKey` must stay in the key: `remember(cacheKey)`
+        // resets `rendererEpoch` to 0 when the key changes (streaming LaTeX
+        // updates / theme flips), so a bare `key(rendererEpoch)` never changes
+        // (0→0) and the factory never re-runs — while `renderedBitmap` /
+        // `renderError` below are `remember(cacheKey)` and *do* reset. The row
+        // therefore fell into the "placeholder while rendering" branch and
+        // stayed blank for the new formula, instead of rendering it.
+        key(cacheKey, rendererEpoch) {
+            // [deep-audit-1046 S-07] One latch per WebView instance. `key(...)`
+            // discards this block — and therefore this `remember` — whenever the
+            // renderer is replaced, so a released latch is never handed to the
+            // next WebView.
+            val releaseLatch = remember { WebViewReleaseLatch() }
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
@@ -199,8 +241,51 @@ fun KaTeXRenderView(
                         setBackgroundColor(android.graphics.Color.TRANSPARENT)
 
                         addJavascriptInterface(object {
+                            // [bridge-arity BUG-05] The asset HTML
+                            // (`assets/katex/katex-render.html`) has called
+                            // `AndroidBridge.onRendered(w, h, error, token)` with FOUR
+                            // arguments ever since the audit-0909 T2-M3 change added the
+                            // render token to the shared pool. Chromium resolves
+                            // `@JavascriptInterface` members by name AND argument count,
+                            // so this three-argument declaration never matched: every
+                            // call died as "Method not found" *inside the page*, the
+                            // `renderMath` callback threw in its `requestAnimationFrame`
+                            // (outside its own try/catch), `renderedBitmap` stayed null
+                            // for the whole life of the row, and each uncached formula
+                            // kept its WebView alive — exactly the retention the
+                            // `onRelease` teardown (audit-0909 T10-M1) exists to prevent.
+                            //
+                            // Both arities are declared here so a three-argument caller
+                            // (none today) keeps working. Never change the count on one
+                            // side only: `scripts/scan/katex_bridge_arity_check.py`
+                            // mechanically cross-checks the JS call sites against the
+                            // declarations and fails the build on a mismatch.
                             @JavascriptInterface
                             fun onRendered(width: Int, height: Int, error: String) {
+                                onRendered(width, height, error, KATEX_RENDER_TOKEN)
+                            }
+
+                            /**
+                             * Four-argument form — the one the HTML actually calls.
+                             *
+                             * [token] is the request identity `KatexWebViewPool` uses to
+                             * ignore a late callback from a render it already gave up on.
+                             * This renderer does not need it: a WebView instance here
+                             * renders exactly one formula (a fresh WebView per uncached
+                             * `latex`, destroyed by `onRelease` the moment the bitmap
+                             * lands), so there is no second request a late callback could
+                             * be attributed to. The parameter is accepted and
+                             * deliberately unused rather than omitted — omitting it is
+                             * what broke the bridge in the first place.
+                             */
+                            @JavascriptInterface
+                            fun onRendered(width: Int, height: Int, error: String, token: Long) {
+                                // [deep-audit-1046 S-07] The page can deliver this
+                                // while the row is being torn down (the first
+                                // successful render already replaced this
+                                // AndroidView with an Image). Nothing past this
+                                // point is meaningful on a released renderer.
+                                if (!releaseLatch.canRunDeferred()) return
                                 if (error.isNotEmpty()) {
                                     AppLogger.warning(TAG, "KaTeX render failed: $error · latex=${latex.take(80)}")
                                     renderError = error
@@ -233,11 +318,30 @@ fun KaTeXRenderView(
                                     )
                                 }
 
-                                // Resize WebView to content size, then capture
+                                // Resize WebView to content size, then capture.
+                                // [deep-audit-1046 S-07] BOTH hops are latch-
+                                // guarded. This callback arrives on the JS bridge
+                                // thread, and by the time either hop runs the row
+                                // may already be gone (the first successful render
+                                // replaces this AndroidView with an Image). Pre-fix
+                                // the 100 ms block ran on the destroyed WebView:
+                                // `draw()` produced an EMPTY bitmap and
+                                // `KaTeXRendererCache.cache.put()` stored it under
+                                // this formula's key — which is a cache HIT
+                                // forever after, so the formula rendered blank for
+                                // the life of the process. `onRelease`'s
+                                // `removeCallbacks(null)` never stopped it: AOSP
+                                // guards that method on `action != null`, i.e. the
+                                // null form removes nothing at all.
                                 post {
+                                    if (!releaseLatch.canRunDeferred()) return@post
                                     layoutParams = ViewGroup.LayoutParams(bitmapW, bitmapH)
                                     requestLayout()
-                                    postDelayed({
+                                    // Named so `onRelease` can remove it by
+                                    // identity — the only cancellation form that
+                                    // actually works.
+                                    val capture = Runnable {
+                                        if (!releaseLatch.canRunDeferred()) return@Runnable
                                         val bitmap = Bitmap.createBitmap(fit.width, fit.height, Bitmap.Config.ARGB_8888)
                                         val canvas = android.graphics.Canvas(bitmap)
                                         if (fit.scale < 1f) canvas.scale(fit.scale, fit.scale)
@@ -255,7 +359,9 @@ fun KaTeXRenderView(
                                         renderedCssWidth = width
                                         renderedCssHeight = height
                                         renderedBitmap = bitmap
-                                    }, 100)
+                                    }
+                                    releaseLatch.track(capture)
+                                    postDelayed(capture, 100)
                                 }
                             }
                         }, "AndroidBridge")
@@ -290,7 +396,7 @@ fun KaTeXRenderView(
                                     .replace("\n", "\\n")
                                     .replace("\r", "")
                                 evaluateJavascript(
-                                    "renderMath('$escapedLatex', $displayMode, $fontSize, $isDark)",
+                                    "renderMath('$escapedLatex', $displayMode, $fontSize, $isDark, $KATEX_RENDER_TOKEN)",
                                     null
                                 )
                             }
@@ -307,17 +413,34 @@ fun KaTeXRenderView(
                 // a live WebView + renderer process handle behind (no destroy()
                 // anywhere in this file), accumulating for the life of the app.
                 onRelease = { wv ->
-                    // [audit-0917] Cancel the pending capture callback BEFORE
-                    // destroying. The capture runs 100ms after the resize post, and
-                    // it calls draw(canvas) on this WebView — if the view left the
-                    // composition in that window (renderedBitmap already replaced
-                    // it, or the row scrolled away), destroy() had run and the
-                    // callback drew into a destroyed WebView. removeCallbacks(null)
-                    // drops everything queued on this view, which is safe here:
-                    // nothing else schedules work on it.
-                    wv.removeCallbacks(null)
-                    wv.stopLoading()
-                    wv.destroy()
+                    // [audit-0917 / deep-audit-1046 S-07] Cancel the pending
+                    // capture BEFORE destroying. The capture runs 100 ms after the
+                    // resize post and calls draw(canvas) on this WebView — if the
+                    // view left the composition in that window (renderedBitmap
+                    // already replaced it, or the row scrolled away), destroy()
+                    // had run and the callback drew into a destroyed WebView,
+                    // caching an empty bitmap for that formula.
+                    //
+                    // `removeCallbacks(null)` — what this used to call, and what
+                    // the comment above it claimed "drops everything queued on
+                    // this view" — removes NOTHING: AOSP is
+                    // `if (action != null) { … } return false;`. The runnables are
+                    // now registered with the latch and removed by identity, and
+                    // every deferred body carries its own latch guard.
+                    //
+                    // Order (releasePlan, derived so both hosts cannot drift):
+                    // latch → detach → drop tracked work → stopLoading → destroy.
+                    val outstanding = releaseLatch.release()
+                    for (step in releasePlan(attached = wv.parent != null)) {
+                        when (step) {
+                            ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                            ReleaseStep.DROP_DEFERRED -> {
+                                for (task in outstanding) wv.removeCallbacks(task)
+                            }
+                            ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                            ReleaseStep.DESTROY -> wv.destroy()
+                        }
+                    }
                 },
             )
         }

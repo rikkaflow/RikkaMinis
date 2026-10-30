@@ -21,6 +21,8 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.ref.WeakReference
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import kotlin.coroutines.resume
 
 /**
@@ -238,6 +240,12 @@ class DebugRPCHandler(private val context: Context) {
         }
 
         val baos = ByteArrayOutputStream()
+        // record-ok: deep-audit-1048 A-02 radius — this DEBUG RPC screenshot
+        // channel is outside the 5 production files in scope. A failed encode
+        // still answers a `size: 0` payload (latent, debug-only, no file is
+        // published). Deferred as §1048-A2 R5 with a trigger condition; fix it
+        // through saveOutcome(streamOpened = true, compressed = …) like the
+        // 1048 sites when that surface is next touched.
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, baos)
         bitmap.recycle()
         val pngBytes = baos.toByteArray()
@@ -294,7 +302,16 @@ class DebugRPCHandler(private val context: Context) {
         val recursive = params.optBoolean("recursive", false)
         val maxDepth = params.optInt("maxDepth", 3)
 
-        val hostFile = PRootKernel.resolveHostPath(path)
+        // [dv16-A03] The per-session bind mounts (workspace/attachments/
+        // offloads/browser) are NOT in the global bindMounts map, and the
+        // global resolveHostPath searches every minis-sessions/<id>/ tree for
+        // an existing match — an `ls` from one session would list whichever
+        // session's tree came first. The caller's session id (forwarded by
+        // DebugOffloadHandler, or sent directly by an external JSON-RPC
+        // client) scopes the resolution; null keeps the historical global
+        // behaviour for Coil-style callers without a session.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
             ?: throw RPCException(-32602, "Cannot resolve path: $path")
 
         if (!hostFile.isDirectory) throw RPCException(-32602, "Not a directory: $path")
@@ -372,7 +389,11 @@ class DebugRPCHandler(private val context: Context) {
         if (path.isEmpty()) throw RPCException(-32602, "Invalid params: 'path' is required")
         if (path.contains("..")) throw RPCException(-32602, "Invalid path: '..' not allowed")
 
-        val hostFile = PRootKernel.resolveHostPath(path)
+        // [dv16-A03] Session-scoped resolution — same shape as handleLS. A
+        // session hit never falls back to the global resolver, so a `read`
+        // from one session cannot pick up another session's same-named file.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
             ?: throw RPCException(-32602, "Cannot resolve path: $path")
 
         if (!hostFile.exists()) throw RPCException(-32602, "File not found: $path")
@@ -381,24 +402,54 @@ class DebugRPCHandler(private val context: Context) {
         val offset = params.optLong("offset", 0)
         // [fix/audit-s7l2] clamp limit like handleLogsRead/maxDepth/scale —
         // previously a token-authenticated client could pass Int.MAX_VALUE and
-        // trigger a huge readNBytes allocation. Cap at 4 MiB (read() may still
-        // return fewer bytes than requested when the file is smaller).
+        // trigger a huge allocation. Cap at 4 MiB (a short read is normal when
+        // the file is smaller).
         val limit = params.optInt("limit", 524_288).coerceIn(1, 4 * 1024 * 1024)
         val forceBase64 = params.optBoolean("base64", false)
 
-        val bytes = hostFile.inputStream().use { stream ->
-            if (offset > 0) stream.skip(offset)
-            stream.readNBytes(limit)
-        }
+        // [da1028-A] was `inputStream().use { it.skip(offset); it.readNBytes(limit) }`:
+        // readNBytes(int) is API 33+ (minSdk 26 → NoSuchMethodError on Android
+        // 8-12) and `skip`'s return value was dropped, so a short skip silently
+        // read from the wrong offset. RandomAccessFile.seek + bounded read has
+        // neither problem — same shape as AppLogger.readLogSegment.
+        val raw = readFileSegment(hostFile, offset, limit)
 
-        val isText = !forceBase64 && bytes.all {
-            it in 0x09..0x0D || it in 0x20..0x7E || it.toInt() and 0xFF > 0x7F
-        }
+        // [R4-R F-10] A page must not split a character. `offset`/`limit` are
+        // BYTE windows, so a 1000-byte page over a Chinese log used to cut a
+        // 3-byte UTF-8 sequence in half, and `String(bytes, UTF_8)` answered
+        // U+FFFD for the fragment — silently, on every page boundary. Trim the
+        // page back to the last complete character and report the trimmed size
+        // in `bytesRead`: a client advances by that, so the next page starts on
+        // the character's lead byte and nothing is lost.
+        // `bytesRead` is the caller's advance, so the trim must never empty the
+        // page: a `limit` shorter than the single character it starts with would
+        // otherwise answer 0 and loop forever. Fail open — keep the page and
+        // accept one replacement character.
+        val trimmedEnd = if (forceBase64) raw.size else utf8CompletePrefixLength(raw)
+        val textEnd = if (trimmedEnd == 0 && raw.isNotEmpty()) raw.size else trimmedEnd
+        val textCandidate = if (textEnd == raw.size) raw else raw.copyOf(textEnd)
+        // Binary detection is a real UTF-8 validity check rather than the old
+        // "any byte above 0x7F counts as text" whitelist, which decoded binary
+        // as text (U+FFFD soup) while refusing ANSI-coloured terminal output
+        // because ESC (0x1B) sat outside the allowlist.
+        val isText = !forceBase64 && looksLikeUtf8Text(textCandidate)
+        val bytes = if (isText) textCandidate else raw
 
+        // [R5-F F-F-08] The other half of the same boundary problem: R4-R F-10
+        // trims the page TAIL, but a caller that hand-picks an unaligned
+        // `offset` opens the window in the MIDDLE of a character, and
+        // `String(bytes, UTF_8)` then answered U+FFFD for those orphan
+        // continuation bytes — one per page, and with a `limit` that only covers
+        // a fragment the whole page was U+FFFD. [decodeUtf8Page] skips them,
+        // from the same index [looksLikeUtf8Text] validated, and drops them from
+        // `content` (never from `bytesRead`: the caller still advances past the
+        // fragment, so it cannot loop on the same offset). An aligned caller —
+        // one that advances by `bytesRead` — never trips this, because the
+        // previous page's tail trim already left it on a lead byte.
         return JSONObject().apply {
             put("size", fileSize)
             if (isText) {
-                put("content", String(bytes, Charsets.UTF_8))
+                put("content", decodeUtf8Page(bytes))
                 put("encoding", "utf8")
             } else {
                 put("content", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
@@ -929,10 +980,14 @@ class DebugRPCHandler(private val context: Context) {
 
     /**
      * Write a file into the proot-mounted Linux namespace. Resolves the
-     * Linux path through PRootKernel.resolveHostPath, creates parent dirs,
-     * writes the bytes, and best-effort applies the requested mode bits.
-     * No fakefs registration is needed — proot reads the host directly,
-     * so the guest sees the file the moment it lands on disk.
+     * Linux path through PRootKernel.resolvePathForSession ([dv16-A03]:
+     * session-scoped when the request carries a `sessionId`, so a write from
+     * one session cannot overwrite another session's same-named file, and a
+     * new session-relative file lands inside that session's tree instead of
+     * the rootfs ghost dir), creates parent dirs, writes the bytes, and
+     * best-effort applies the requested mode bits. No fakefs registration is
+     * needed — proot reads the host directly, so the guest sees the file the
+     * moment it lands on disk.
      */
     private fun handleWriteFile(params: JSONObject): JSONObject {
         val path = params.optString("path").ifEmpty {
@@ -945,11 +1000,25 @@ class DebugRPCHandler(private val context: Context) {
         val overwrite = params.optBoolean("overwrite", true)
         val modeStr = params.optString("mode", "0644")
 
-        // Pre-boot fallback: resolveHostPath returns null until proot boots
-        // (it lazy-initializes its RootfsManager). Test harnesses commonly
-        // want to stage files BEFORE booting, so route through the rootfs
-        // dir directly when the kernel isn't ready yet.
-        val hostFile = PRootKernel.resolveHostPath(path) ?: run {
+        // [da1031-C] ISSUE-04 B1: resolveHostPath lands on the real host file
+        // behind a bind mount, and T219's read-only mount lock is software-only
+        // — without this check `minis-debug write /var/minis/mounts/<ro>/f`
+        // modified a Locked mount's files. Same guard the write tools call
+        // before touching disk; -32000 = the family's server error code (the
+        // "File exists and overwrite=false" refusal below uses it too).
+        if (PRootKernel.isLinuxPathUnderReadOnlyMount(path)) {
+            throw RPCException(-32000, "Read-only mount: '$path' is not writable")
+        }
+
+        // Pre-boot fallback: the session resolver returns null until proot
+        // boots (it lazy-initializes its RootfsManager). Test harnesses
+        // commonly want to stage files BEFORE booting, so route through the
+        // rootfs dir directly when the kernel isn't ready yet.
+        // [dv16-A03] Session-scoped resolution — same shape as handleLS; the
+        // pre-boot rootfsDir fallback is unchanged and still catches every
+        // null (unresolvable path or pre-boot), so test staging keeps working.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context) ?: run {
             val rootfsDir = com.rikkaminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
             File(rootfsDir, path.removePrefix("/"))
         }
@@ -1041,6 +1110,12 @@ class DebugRPCHandler(private val context: Context) {
      * Params (one of):
      *   - {"args": ["exec", "id"]}            — argv past `android-shizuku-cli`
      *   - {"command": "exec id"}              — single string, whitespace-split
+     *
+     * [dv18-A05] Deliberately session-less: this drives a device-level
+     * privileged shell where the guest cwd has no meaning, so it keeps
+     * `cwd = "/"` / `sessionId = null` even though [handleModelUseExec] and
+     * [handleSessionsExec] take the caller's scope. Revisit if a caller ever
+     * needs the privileged shell scoped to a chat session.
      */
     private fun handleShizukuExec(params: JSONObject): JSONObject {
         val argvTail: List<String> = when {
@@ -1092,6 +1167,13 @@ class DebugRPCHandler(private val context: Context) {
             else -> throw RPCException(-32602, "Missing 'args' (array) or 'command' (string)")
         }
 
+        // [dv18-A05] The caller's session scope. `minis-debug model-use` runs
+        // through the offload handler, which forwards the shell's cwd and chat
+        // session id; an external JSON-RPC client may send them directly.
+        // Absent ⇒ the pre-fix behaviour (no session, guest root as cwd), so a
+        // relative `--input notes.txt` used to be resolved against "/".
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+
         // Optional `input` blob: write to host /tmp and inject `--input <linuxPath>`
         // so the handler reads it via readLinuxPath() exactly like a real shell
         // invocation would. We resolve the host path via PRootKernel to honour
@@ -1119,8 +1201,8 @@ class DebugRPCHandler(private val context: Context) {
                 pid = -1,
                 argv = listOf("minis-model-use") + finalArgv,
                 env = emptyMap(),
-                cwd = "/",
-                sessionId = null,
+                cwd = scope.cwd,
+                sessionId = scope.sessionId,
             )
             val result = handler.handle(request)
             return JSONObject().apply {
@@ -1153,6 +1235,12 @@ class DebugRPCHandler(private val context: Context) {
             else -> throw RPCException(-32602, "Missing 'args' (array) or 'command' (string)")
         }
 
+        // [dv18-A05] Same session scope contract as [handleModelUseExec]: the
+        // sessions CLI is session-aware (it lists/searches/reads chat
+        // transcripts), so a caller that names a session must reach the
+        // handler instead of the historical session-less "global" arm.
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+
         AppLogger.info("DebugRPC", "debug.sessions.exec argv=${argvTail.joinToString(" ")}")
         val app = context.applicationContext as com.rikkaminis.app.MinisApp
         val handler = com.rikkaminis.app.sandbox.offload.SessionsOffloadHandler(app.chatRepository, context)
@@ -1160,8 +1248,8 @@ class DebugRPCHandler(private val context: Context) {
             pid = -1,
             argv = listOf("minis-sessions-cli") + argvTail,
             env = emptyMap(),
-            cwd = "/",
-            sessionId = null,
+            cwd = scope.cwd,
+            sessionId = scope.sessionId,
         )
         val result = handler.handle(request)
         return JSONObject().apply {
@@ -1227,3 +1315,188 @@ class DebugRPCHandler(private val context: Context) {
 }
 
 internal class RPCException(val code: Int, override val message: String) : Exception(message)
+
+/**
+ * [da1028-A] Bounded segment read for `debug.readFile`, API-26 safe.
+ *
+ * The inline shape this replaces (`inputStream().use { it.skip(offset);
+ * it.readNBytes(limit) }`) had two defects:
+ *   1. `java.io.InputStream.readNBytes(int)` is API 33+ while minSdk is 26 and
+ *      desugaring is off — on Android 8-12 the call threw `NoSuchMethodError`,
+ *      which is an `Error`, not an `Exception` (the `catch (e: Exception)`
+ *      wrappers around RPC handling do not cover it, so the debug client saw a
+ *      dead socket instead of an error reply).
+ *   2. `skip()` may skip FEWER bytes than requested and its return value was
+ *      discarded: the read then started past (or short of) `offset` and
+ *      returned plausible-looking wrong bytes, with no way for the client to
+ *      notice.
+ *
+ * Shape mirrors [com.rikkaminis.app.logging.AppLogger.readLogSegment] (same
+ * offset/limit contract, already reviewed): clamp the window against the file
+ * size, then read exactly that many bytes with `RandomAccessFile`. EOF is not
+ * an error — the caller returns `bytesRead`/`truncated` from what it actually
+ * got — so a short read yields fewer bytes (no zero padding) and an offset at
+ * or past EOF yields an empty array.
+ */
+internal fun readFileSegment(file: File, offset: Long, limit: Int): ByteArray {
+    val size = file.length()
+    val start = offset.coerceIn(0L, size)
+    val end = (start + limit.coerceAtLeast(0).toLong()).coerceAtMost(size)
+    if (end <= start) return ByteArray(0)
+    val out = ByteArray((end - start).toInt())
+    java.io.RandomAccessFile(file, "r").use { raf ->
+        raf.seek(start)
+        var read = 0
+        while (read < out.size) {
+            val n = raf.read(out, read, out.size - read)
+            if (n < 0) break
+            read += n
+        }
+        return if (read == out.size) out else out.copyOf(read)
+    }
+}
+
+/**
+ * [R4-R F-10] Length of the longest prefix of [bytes] that ends on a UTF-8
+ * character boundary — `bytes.size` when the slice already does, the position
+ * of the trailing incomplete sequence's lead byte when it does not.
+ *
+ * Page reads are byte windows, so the LAST character of a sliced page can be
+ * cut in half. Walking back over at most three continuation bytes (a valid
+ * UTF-8 sequence has at most three) finds the lead byte; the sequence's own
+ * length decides whether the whole character made it into the slice. An
+ * invalid lead byte is not a boundary problem — the strict decode in
+ * [looksLikeUtf8Text] is what classifies those as binary.
+ */
+internal fun utf8CompletePrefixLength(bytes: ByteArray): Int {
+    var i = bytes.size - 1
+    var seen = 0
+    while (i >= 0 && (bytes[i].toInt() and 0xC0) == 0x80 && seen < 3) {
+        i--
+        seen++
+    }
+    if (i < 0) return bytes.size
+    val lead = bytes[i].toInt() and 0xFF
+    val needed = when {
+        lead and 0x80 == 0x00 -> 1
+        lead and 0xE0 == 0xC0 -> 2
+        lead and 0xF0 == 0xE0 -> 3
+        lead and 0xF8 == 0xF0 -> 4
+        else -> 1
+    }
+    return if (bytes.size - i >= needed) bytes.size else i
+}
+
+/**
+ * [R4-R F-10] Strict UTF-8 text classification for a sliced page.
+ *
+ * The old whitelist (`0x09..0x0D || 0x20..0x7E || > 0x7F`) accepted EVERY high
+ * byte as text — so a binary file decoded into U+FFFD soup — while refusing a
+ * plain ANSI-coloured terminal transcript because ESC (0x1B) was outside the
+ * allowlist. This is the same decision the text branch makes, made decodable:
+ * no NUL bytes (the whitelist's own "no null bytes" intent) and a decode with
+ * `CodingErrorAction.REPORT` that answers `false` on any malformed sequence.
+ * An empty slice is text, exactly as `bytes.all { … }` answered before.
+ *
+ * The decode starts at the first character boundary: [utf8CompletePrefixLength]
+ * only guarantees the page does not END mid-character, while a caller-supplied
+ * `offset` can land inside one — a leading continuation byte is a fragment of
+ * a character the caller asked to skip past, not evidence of binary content.
+ * [decodeUtf8Page] drops that same fragment from `content` (never from
+ * `bytesRead`), so the bytes this check approved are exactly the bytes the
+ * caller sees.
+ */
+internal fun looksLikeUtf8Text(bytes: ByteArray): Boolean {
+    if (bytes.any { it == 0.toByte() }) return false
+    // [R5-F F-F-08] Skip leading continuation bytes (up to 3 — the tail of a
+    // 4-byte sequence): the window may open mid-character, and the decoder
+    // must not even see the orphan tail. ONE rule shared with [decodeUtf8Page].
+    val head = utf8SkipLeadingContinuation(bytes)
+    val decoder = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    return runCatching {
+        decoder.decode(ByteBuffer.wrap(bytes, head, bytes.size - head))
+    }.isSuccess
+}
+
+/**
+ * [R5-F F-F-08] Decode one `debug.readFile` page: skip the orphan tail of a
+ * character the window opened inside, then decode. ONE definition for both the
+ * content field and (via [looksLikeUtf8Text]) the validity check, so the bytes
+ * the check approved are exactly the bytes that get decoded.
+ *
+ * Guarantees, in the terms the RPC contract speaks:
+ *  * the result never contains U+FFFD for a window that starts mid-character;
+ *  * a caller that walks the file page by page, advancing by `bytesRead`,
+ *    reconstructs the file exactly (its previous page already trimmed the tail,
+ *    so `skip == 0` on every aligned call);
+ *  * an unaligned `offset` costs only the ≤3 bytes of the fragment it opened
+ *    inside — they are dropped, never rendered as replacement characters.
+ */
+internal fun decodeUtf8Page(bytes: ByteArray): String {
+    val skip = utf8SkipLeadingContinuation(bytes)
+    return String(bytes, skip, bytes.size - skip, Charsets.UTF_8)
+}
+
+/**
+ * [R5-F F-F-08] How many bytes at the front of [bytes] are continuation bytes
+ * (`0x80..0xBF`, at most 3 — the tail of one 4-byte sequence).
+ *
+ * One rule, two consumers: [looksLikeUtf8Text] needs it so the validity check
+ * does not reject a page that merely starts mid-character, and `debug.readFile`
+ * needs it so `String(bytes, UTF_8)` does not answer U+FFFD for that same
+ * orphan tail. They used to be one inline loop in the first and nothing in the
+ * second — the decoder was told "starts at 0" after the check had looked at
+ * `head`, so a page cut inside a Chinese/emoji character decoded its tail into
+ * `content` as one replacement character per page boundary.
+ *
+ * Caller contract: an aligned caller (one that advances by the returned
+ * `bytesRead`) never trips this — the tail trim of the previous page already
+ * left it on a lead byte. Only a hand-picked unaligned `offset` pays, and what
+ * it pays is the fragment it asked for: the `<= 3` bytes are DROPPED from
+ * `content` (bytesRead still counts them, so the client cannot loop on the
+ * same offset), never decoded into U+FFFD.
+ */
+internal fun utf8SkipLeadingContinuation(bytes: ByteArray): Int {
+    var head = 0
+    while (head < bytes.size && head < 3 && (bytes[head].toInt() and 0xC0) == 0x80) head++
+    return head
+}
+
+
+/**
+ * [dv18-A05] The session scope a `debug.*.exec` entry point runs its offload
+ * handler under.
+ *
+ * [sessionId] is null for every caller that does not name a chat session — the
+ * historical behaviour (interactive terminals, and clients predating this key)
+ * where the handler's global resolver runs. [cwd] is the guest working
+ * directory a relative operand is joined onto (see
+ * [com.rikkaminis.app.sandbox.offload.resolveMaybeRelative]) and defaults to
+ * the guest root, which is what the exec entry points hardcoded before this
+ * fix — `debug.modelUse.exec` with `--input notes.txt` therefore resolved a
+ * path like `notes.txt` against "/" instead of the caller's directory.
+ */
+internal data class ExecScope(val sessionId: String?, val cwd: String) {
+    companion object {
+        /** The guest root — the pre-fix, session-less default. */
+        const val DEFAULT_CWD = "/"
+    }
+}
+
+/**
+ * [dv18-A05] Pure params → [ExecScope] mapping, shared by every exec entry
+ * point that builds an offload request. Absent/blank values fall back to the
+ * pre-fix behaviour instead of being invented: a blank session id stays null
+ * (the handler's global arm), a blank cwd keeps [ExecScope.DEFAULT_CWD].
+ *
+ * The cwd itself is passed through verbatim: the single relative-path join
+ * ([com.rikkaminis.app.sandbox.offload.resolveMaybeRelative]) is the one place
+ * that decides whether a cwd is usable — it only joins onto an absolute one —
+ * so a second validity rule here would be a second source of truth.
+ */
+internal fun execScopeOf(sessionIdRaw: String?, cwdRaw: String?): ExecScope = ExecScope(
+    sessionId = sessionIdRaw?.trim()?.takeIf { it.isNotEmpty() },
+    cwd = cwdRaw?.trim()?.takeIf { it.isNotEmpty() } ?: ExecScope.DEFAULT_CWD,
+)

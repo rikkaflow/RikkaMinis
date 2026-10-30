@@ -150,6 +150,65 @@ fun MinisSkillsBrowserScreen(
             // rendererEpoch below discards this AndroidView and re-runs the
             // factory with a fresh WebView.
             key(rendererEpoch) {
+            // [FIX-R22 D12] Hoist the client out of the factory so the
+            // `onRelease` below can reuse the shared
+            // [SafeWebViewClient.destroyDeadWebView] teardown instead of
+            // duplicating it.
+            val skillWebClient = object : SafeWebViewClient() {
+                /**
+                 * [GH#341] Renderer died. Rebuild the WebView and
+                 * reload — this screen has no unsaved state worth
+                 * preserving, so a fresh page load is the whole
+                 * recovery. Clearing the ref first keeps
+                 * [handleBack] from calling into a dead instance.
+                 * [FIX-R22 D12] The epoch bump below discards this
+                 * AndroidView, whose `onRelease` now also runs the
+                 * teardown — destroy here anyway so the dead instance
+                 * gives up its renderer handle slot immediately, not
+                 * on the next recomposition.
+                 */
+                override fun onRendererGone(view: WebView?) {
+                    if (webViewRef === view) webViewRef = null
+                    destroyDeadWebView(view)
+                    rendererEpoch += 1
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    url?.let { currentUrl = it }
+                }
+
+                // GitHub SPA uses pushState — capture URL changes here too
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    url?.let { currentUrl = it }
+                }
+
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val ctx = view?.context ?: return false
+                    val urlStr = request?.url?.toString()
+                    // T234: Google permanently disallows WebView
+                    // for sign-in / OAuth. Hand auth-domain nav
+                    // to Chrome Custom Tab.
+                    if (com.rikkaminis.app.browser.GoogleAuthRouter.shouldRouteExternally(urlStr)) {
+                        if (urlStr != null) {
+                            com.rikkaminis.app.browser.GoogleAuthRouter.openInCustomTab(ctx, urlStr)
+                        }
+                        return true
+                    }
+                    // T134: hand off intent:// / market:// /
+                    // tel: / mailto: links to the system so the
+                    // user doesn't see ERR_UNKNOWN_URL_SCHEME.
+                    return com.rikkaminis.app.ui.browser
+                        .BrowserExternalSchemeHandler
+                        .handle(ctx, request?.url)
+                }
+
+                /**
+                 * [FIX-R22 D12] Public bridge: the AndroidView `onRelease`
+                 * below sits outside this class and cannot reach the
+                 * protected [destroyDeadWebView] directly.
+                 */
+                fun releaseDeadInstance(view: WebView?) = destroyDeadWebView(view)
+            }
             AndroidView(
                 factory = { context ->
                     WebView(context).apply {
@@ -157,59 +216,33 @@ fun MinisSkillsBrowserScreen(
                         settings.domStorageEnabled = true
                         settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
 
-                        webViewClient = object : SafeWebViewClient() {
-                            /**
-                             * [GH#341] Renderer died. Rebuild the WebView and
-                             * reload — this screen has no unsaved state worth
-                             * preserving, so a fresh page load is the whole
-                             * recovery. Clearing the ref first keeps
-                             * [handleBack] from calling into a dead instance.
-                             */
-                            override fun onRendererGone(view: WebView?) {
-                                if (webViewRef === view) webViewRef = null
-                                // No `onRelease` on this AndroidView, so nothing
-                                // else will tear the dead instance down — and a
-                                // WebView whose renderer is gone still holds a
-                                // renderer handle slot until GC. Do it here,
-                                // then rebuild.
-                                destroyDeadWebView(view)
-                                rendererEpoch += 1
-                            }
-
-                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                url?.let { currentUrl = it }
-                            }
-
-                            // GitHub SPA uses pushState — capture URL changes here too
-                            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                                url?.let { currentUrl = it }
-                            }
-
-                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                val ctx = view?.context ?: return false
-                                val urlStr = request?.url?.toString()
-                                // T234: Google permanently disallows WebView
-                                // for sign-in / OAuth. Hand auth-domain nav
-                                // to Chrome Custom Tab.
-                                if (com.rikkaminis.app.browser.GoogleAuthRouter.shouldRouteExternally(urlStr)) {
-                                    if (urlStr != null) {
-                                        com.rikkaminis.app.browser.GoogleAuthRouter.openInCustomTab(ctx, urlStr)
-                                    }
-                                    return true
-                                }
-                                // T134: hand off intent:// / market:// /
-                                // tel: / mailto: links to the system so the
-                                // user doesn't see ERR_UNKNOWN_URL_SCHEME.
-                                return com.rikkaminis.app.ui.browser
-                                    .BrowserExternalSchemeHandler
-                                    .handle(ctx, request?.url)
-                            }
-                        }
+                        webViewClient = skillWebClient
 
                         webChromeClient = WebChromeClient()
 
-                        loadUrl("https://github.com/OpenMinis/MinisSkills")
+                        // [dv22-B6 §1042-B-07] Restore the page the user was
+                        // looking at instead of the repository root. This
+                        // factory re-runs whenever `key(rendererEpoch)` bumps
+                        // (renderer killed by the system / crash recovery),
+                        // and the hardcoded root URL used to throw the user
+                        // back to OpenMinis/MinisSkills mid-browse — losing
+                        // the very skill directory they were reading and,
+                        // with it, the URL the Import button acts on.
+                        // `currentUrl` tracks every navigation
+                        // (onPageStarted + doUpdateVisitedHistory); the
+                        // ifBlank fallback keeps the first-ever open pointed
+                        // at the catalogue.
+                        loadUrl(currentUrl.ifBlank { "https://github.com/OpenMinis/MinisSkills" })
                     }.also { webViewRef = it }
+                },
+                onRelease = { wv ->
+                    // [FIX-R22 D12] Normal screen exit used to leak the whole
+                    // WebView — only the crash path (onRendererGone) tore
+                    // anything down. Clear the ref first (keeps [handleBack]
+                    // from calling into a dead instance), then run the same
+                    // detach + destroy sequence.
+                    if (webViewRef === wv) webViewRef = null
+                    skillWebClient.releaseDeadInstance(wv)
                 },
                 modifier = Modifier.fillMaxSize(),
             )
@@ -272,8 +305,15 @@ private suspend fun importSkillFromCurrentUrl(
     skillRepository: SkillRepository,
     onStateChange: (HudState, String) -> Unit,
 ) {
+    // [meta-audit-1028 E5 / B06 F-11] Normalize ONCE, then use the normalized
+    // value everywhere: GitHub page URLs arrive with page anchors / query
+    // strings (`…/tree/main/exa-search#install`, `?tab=readme`), and
+    // toRawGitHubUrl splices "/SKILL.md" onto the path — an anchor left in
+    // place lands INSIDE that path, so the pre-fetch requested the directory
+    // and 404'd, aborting the import with "this folder has no SKILL.md".
+    val sourceUrl = stripUrlAnchor(url).trim()
     // Check if URL points to a specific skill directory (not repo root)
-    if (!isSkillDirectoryUrl(url)) {
+    if (!isSkillDirectoryUrl(sourceUrl)) {
         onStateChange(HudState.HINT, context.getString(R.string.skills_browser_error_not_folder))
         delay(3000)
         onStateChange(HudState.HIDDEN, "")
@@ -283,25 +323,20 @@ private suspend fun importSkillFromCurrentUrl(
     onStateChange(HudState.IMPORTING, "")
 
     try {
-        // Hand the GitHub directory URL to the repository's full-fat
-        // importer. importFromGitHub fetches SKILL.md, imports it, then
-        // recurses through the GitHub Contents API to pull every sibling
-        // file (scripts/, references/, sub-directories) into the skill's
-        // local directory. The previous flow only fetched SKILL.md via
-        // toRawGitHubUrl + importFromContent, which left bundled
-        // scripts on the server and the skill non-runnable on first use.
-        val skill = skillRepository.importFromGitHub(url)
-        if (skill != null) {
-            onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_imported, skill.name))
-            delay(3000)
-            onStateChange(HudState.HIDDEN, "")
-            return
-        }
-
-        // importFromGitHub returned null — the SKILL.md was either
-        // missing or duplicate. Fall back to the prior "fetch + try
-        // updating existing" path so users can refresh in place.
-        val rawUrl = toRawGitHubUrl(url)
+        // [dv22-B6 §1042-B-07] Pre-dedup: fetch the raw SKILL.md once to learn
+        // the incoming skill's name, then resolve the local record this
+        // catalogue page updates (by name slug, else by display name) BEFORE
+        // importing. Passing that id into importFromGitHub routes the import
+        // to importFromContent's replace-in-place branch, so:
+        //   * an already-installed skill is refreshed under its EXISTING id —
+        //     a local record under a different id (renamed / custom id) is no
+        //     longer duplicated under slugify(name), and
+        //   * the HUD tells the truth: "updated" vs "imported". Before this,
+        //     importFromGitHub's replace branch always returned non-null, so
+        //     `if (skill != null)` was always true and the in-place refresh
+        //     below was unreachable for every skill whose id equals its name
+        //     slug (the screen always claimed "imported").
+        val rawUrl = toRawGitHubUrl(sourceUrl)
         val content = withContext(Dispatchers.IO) {
             val conn = URL(rawUrl).openConnection() as HttpURLConnection
             conn.connectTimeout = 15_000
@@ -324,23 +359,83 @@ private suspend fun importSkillFromCurrentUrl(
             return
         }
 
-        val parsed = parseSkillName(content)
-        if (parsed != null) {
-            val updated = skillRepository.update(
-                id = slugify(parsed),
-                body = extractBody(content),
-            )
-            if (updated) {
-                onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_updated, parsed))
-                delay(3000)
-                onStateChange(HudState.HIDDEN, "")
-            } else {
-                onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_invalid))
-                delay(4000)
-                onStateChange(HudState.HIDDEN, "")
-            }
-        } else {
+        val parsed = skillRepository.parseSkillMdPublic(content)
+        if (parsed == null) {
             onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_format))
+            delay(4000)
+            onStateChange(HudState.HIDDEN, "")
+            return
+        }
+
+        val matchedId = resolveUpdateTargetId(
+            skillRepository.skills.value.map { it.id to it.name },
+            slug = slugify(parsed.name),
+            incomingName = parsed.name,
+        )
+
+        // Hand the GitHub directory URL to the repository's full-fat
+        // importer: importFromGitHub re-fetches SKILL.md, imports it under
+        // matchedId (replace-in-place when a local record matched), then
+        // recurses through the GitHub Contents API to pull every sibling
+        // file (scripts/, references/, sub-directories) into the skill's
+        // local directory — on the update path too, which the pre-fix
+        // fallback's update() alone never did.
+        val skill = skillRepository.importFromGitHub(sourceUrl, preferredId = matchedId)
+        if (skill != null) {
+            val messageRes =
+                if (matchedId != null) R.string.skills_browser_success_updated
+                else R.string.skills_browser_success_imported
+            onStateChange(HudState.SUCCESS, context.getString(messageRes, skill.name))
+            delay(3000)
+            onStateChange(HudState.HIDDEN, "")
+            return
+        }
+
+        // importFromGitHub returned null — the parsed name yields no
+        // adoptable id (blank slug, e.g. a pure-CJK name) and nothing matched
+        // at dedup time. Last-resort in-place refresh: re-resolve against a
+        // FRESH snapshot (a concurrent import may have landed the skill
+        // between the pre-dedup read and here) and write the parsed document,
+        // so a manual-id record still gets refreshed instead of erroring out.
+        // [FIX-R22 B32b] Resolve the real record id by name OR slug (pure
+        // helper below, JVM-covered) — skills whose local id differs from the
+        // name slug (renamed or imported with a custom id) never matched
+        // when the old call used `slugify(parsed)` as the id — and pass the
+        // full ParsedSkill, running the repository write on IO (db.execSQL +
+        // writeSkillMd are disk IO).
+        // [da1030-A ISSUE-02] The landing document's frontmatter block
+        // travels with the managed fields: update() re-seeds its copy from
+        // the on-disk SKILL.md when no block is passed, so omitting it would
+        // shadow `subagent` / `max_turns` / `allowed_tools` with whatever the
+        // disk already said. Same contract as updateFromURL /
+        // "update from file".
+        val targetId = resolveUpdateTargetId(
+            skillRepository.skills.value.map { it.id to it.name },
+            slug = slugify(parsed.name),
+            incomingName = parsed.name,
+        ) ?: slugify(parsed.name)
+        val updated = withContext(Dispatchers.IO) {
+            skillRepository.update(
+                id = targetId,
+                name = parsed.name,
+                description = parsed.description,
+                // [rv1014-E3] The other in-place update paths (refreshFromDisk,
+                // importFromContent, importFromArchive) all refresh version
+                // too — keep the browser refresh consistent. parseSkillMd
+                // defaults a missing frontmatter version to "1.0.0", so a
+                // SKILL.md without one resets the stored version to that
+                // default (accepted: same exposure as refreshFromDisk).
+                version = parsed.version,
+                body = parsed.body,
+                frontmatter = parsed.frontmatter.ifBlank { null },
+            )
+        }
+        if (updated) {
+            onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_updated, parsed.name))
+            delay(3000)
+            onStateChange(HudState.HIDDEN, "")
+        } else {
+            onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_invalid))
             delay(4000)
             onStateChange(HudState.HIDDEN, "")
         }
@@ -351,72 +446,34 @@ private suspend fun importSkillFromCurrentUrl(
     }
 }
 
+// [meta-audit-1028 E5 / B06 F-11] isSkillDirectoryUrl / toRawGitHubUrl moved
+// to SkillSourceUrl.kt (internal, JVM-tested): both must judge the URL AFTER
+// the anchor/query is stripped, and the decision belongs with the tests that
+// pin it rather than inside a Composable file the JVM cannot compile.
+
 /**
- * Check if the URL points to a specific skill directory (not repo root or non-skill pages).
- * e.g. github.com/OpenMinis/MinisSkills/tree/main/exa-search → true
- *      github.com/OpenMinis/MinisSkills → false
- *      github.com/OpenMinis/MinisSkills/issues → false
+ * [FIX-R22 B32b] Resolve the id of the existing skill a browser refresh
+ * targets: prefer the record whose id equals the name slug, else the record
+ * whose display name equals the incoming name (custom id case), else null —
+ * the caller falls back to the slug and the repository reports "not found".
+ *
+ * [rv1014-E2] The implementation used to be a per-record OR inside one
+ * `firstOrNull`, i.e. "first match wins": when one record matched by name
+ * (id != slug) but an earlier/later record matched by id, it returned the
+ * name-match first, silently replacing the wrong skill. Now it is the
+ * two-pass lookup the KDoc always described: id == slug over all records
+ * first, then name == incomingName.
+ *
+ * Pure so JVM tests cover the mapping (SkillRepository needs Android's
+ * Context/SQLite and can't be unit-tested directly).
  */
-private fun isSkillDirectoryUrl(url: String): Boolean {
-    if (!url.contains("github.com")) return true // Non-GitHub URL, let it try
-    if (url.endsWith("SKILL.md")) return true
-
-    // Must contain /tree/ or /blob/ with a path after the branch name
-    // e.g. /tree/main/skill-name or /blob/main/skill-name/SKILL.md
-    val treePattern = Regex("github\\.com/[^/]+/[^/]+/(tree|blob)/[^/]+/.+")
-    if (treePattern.containsMatchIn(url)) return true
-
-    // Reject known non-skill pages
-    val nonSkillPages = listOf("/issues", "/pulls", "/pull/", "/actions", "/settings", "/wiki")
-    if (nonSkillPages.any { url.contains(it) }) return false
-
-    return false
-}
-
-private fun toRawGitHubUrl(url: String): String {
-    // Handle github.com/user/repo/tree/branch/path → find SKILL.md
-    if (url.contains("github.com") && url.contains("/blob/")) {
-        return url.replace("github.com", "raw.githubusercontent.com")
-            .replace("/blob/", "/")
-    }
-    if (url.contains("github.com") && !url.contains("raw.githubusercontent.com")) {
-        val withFile = if (!url.endsWith("SKILL.md")) {
-            // Try tree → add SKILL.md
-            val cleaned = url.replace("/tree/", "/").trimEnd('/')
-            "$cleaned/SKILL.md"
-        } else {
-            url
-        }
-        return withFile.replace("github.com", "raw.githubusercontent.com")
-            .replace("/blob/", "/")
-            .replace("/tree/", "/")
-    }
-    return url
-}
-
-private fun parseSkillName(content: String): String? {
-    val trimmed = content.trimStart()
-    if (!trimmed.startsWith("---")) return null
-    val endIdx = trimmed.indexOf("---", 3)
-    if (endIdx < 0) return null
-    val frontmatter = trimmed.substring(3, endIdx)
-    for (line in frontmatter.lines()) {
-        val colonIdx = line.indexOf(':')
-        if (colonIdx < 0) continue
-        val key = line.substring(0, colonIdx).trim()
-        val value = line.substring(colonIdx + 1).trim()
-        if (key == "name") return value
-    }
-    return null
-}
-
-private fun extractBody(content: String): String {
-    val trimmed = content.trimStart()
-    if (!trimmed.startsWith("---")) return content
-    val endIdx = trimmed.indexOf("---", 3)
-    if (endIdx < 0) return content
-    return trimmed.substring(endIdx + 3).trimStart()
-}
+internal fun resolveUpdateTargetId(
+    skills: List<Pair<String, String>>,
+    slug: String,
+    incomingName: String,
+): String? =
+    skills.firstOrNull { (id, _) -> id == slug }?.first
+        ?: skills.firstOrNull { (_, name) -> name == incomingName }?.first
 
 private fun slugify(name: String): String =
     name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')

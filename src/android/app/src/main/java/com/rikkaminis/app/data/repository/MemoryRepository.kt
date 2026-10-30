@@ -68,6 +68,42 @@ class MemoryRepository(private val memoryDir: File) {
         // back into the next LLM call. Counted as UTF-8 bytes (matches
         // what the provider sees over the wire).
         private const val MAX_OUTPUT_BYTES = 30 * 1024  // 30 KB
+
+        // Canonical daily-log entry marker — the same boundaries writeMemory
+        // (`<!-- ts -->\ncontent\n\n`, appendText) and
+        // MemoryRepository.revokeEntry/replaceEntryBody (:575/:614) rely on.
+        private val TIMESTAMP_MARKER_LINE = Regex("""<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -->[^\S\n]*\n""")
+
+        /**
+         * Newest-first line preview for an append-mode daily log [P1-append].
+         * Entries live bottom-up on disk (writeMemory appends). Splits the
+         * file into entries on the canonical timestamp markers (marker-less
+         * files count as a single entry), reverses the ENTRY order — never
+         * the lines within an entry, which is what per-line
+         * `takeLast(n).reversed()` did and what mangled multi-line entries
+         * line-by-line (sweep-1014 B9) — then takes the first [injectLines]
+         * lines of the ordered text.
+         *
+         * Returns the preview text plus the total line count of the ordered
+         * text, for the caller's "N more lines" continuation hint.
+         */
+        fun newestFirstPreview(content: String, injectLines: Int): Pair<String, Int> {
+            val starts = TIMESTAMP_MARKER_LINE.findAll(content).map { it.range.first }.toList()
+            val chunks = mutableListOf<String>()
+            if (starts.isEmpty()) {
+                chunks.add(content)
+            } else {
+                if (starts[0] > 0) chunks.add(content.substring(0, starts[0]))
+                for ((i, s) in starts.withIndex()) {
+                    val e = starts.getOrNull(i + 1) ?: content.length
+                    chunks.add(content.substring(s, e))
+                }
+            }
+            chunks.reverse()  // newest (bottom) first — entry-level reversal
+            val ordered = chunks.joinToString("\n") { it.trim('\n') }
+            val lines = ordered.lines()
+            return Pair(lines.take(injectLines).joinToString("\n"), lines.size)
+        }
     }
 
     init {
@@ -78,38 +114,82 @@ class MemoryRepository(private val memoryDir: File) {
     fun memoryDirectory(): File = memoryDir
 
     /**
+     * [debt-1026 B5] Everything the system prompt needs about daily logs, from
+     * ONE walk of [dailyLogSizes].
+     *
+     * [dailyLogSizeSummary] and [largestDailyLogBytes] each walked that list,
+     * and the walk is not cheap: it reads MEMORY-ROLLUP.md in full plus EVERY
+     * candidate daily log in full ([dv28-A3] — judging "still holds something
+     * distillable" needs the content, not the byte length). The prompt
+     * assembler called both, so every system-prompt build read the whole memory
+     * directory twice and re-ran the rollup classification regexes twice over
+     * the same bytes. Both fields are derived from a single walk here; the two
+     * public accessors below are kept (other callers exist) and now delegate,
+     * so their output is byte-identical to before.
+     */
+    data class DailyLogRollupMetrics(
+        /** Same text [dailyLogSizeSummary] returns; null when nothing is pending. */
+        val summary: String?,
+        /** Same value [largestDailyLogBytes] returns; 0 when nothing is pending. */
+        val largestBytes: Long,
+    )
+
+    fun dailyLogRollupMetrics(): DailyLogRollupMetrics {
+        val sizes = dailyLogSizes()
+        if (sizes.isEmpty()) return DailyLogRollupMetrics(null, 0L)  // F-9: maxOf on empty throws
+        val total = sizes.sumOf { it.second }
+        val largest = sizes.first()  // list is sorted by size desc — first IS largest
+        return DailyLogRollupMetrics(
+            summary = "largest daily log ${largest.first} (${formatFileSize(largest.second)}), " +
+                "total ${sizes.size} logs ${formatFileSize(total)}",
+            largestBytes = largest.second,
+        )
+    }
+
+    /**
      * Compact per-file size summary of daily logs, used by the system prompt
      * to decide whether a memory_rollup is worth triggering. Returns the
      * largest daily log (name + size) plus the total, or null when empty.
      */
-    fun dailyLogSizeSummary(): String? {
-        val sizes = dailyLogSizes()
-        if (sizes.isEmpty()) return null  // F-9: maxOf on empty throws
-        val total = sizes.sumOf { it.second }
-        val largest = sizes.first()  // list is sorted by size desc — first IS largest
-        return "largest daily log ${largest.first} (${formatFileSize(largest.second)}), " +
-            "total ${sizes.size} logs ${formatFileSize(total)}"
-    }
+    fun dailyLogSizeSummary(): String? = dailyLogRollupMetrics().summary
 
     /**
      * Largest daily log size in bytes (0 when no daily logs exist). Used by
      * the system prompt to decide whether to suggest memory_rollup.
      */
-    fun largestDailyLogBytes(): Long {
-        return dailyLogSizes().firstOrNull()?.second ?: 0L
-    }
+    fun largestDailyLogBytes(): Long = dailyLogRollupMetrics().largestBytes
 
     private fun dailyLogSizes(): List<Pair<String, Long>> {
+        // [dv15-A4] The candidate口径 must match the rollup executor
+        // (MemoryRollupRunner.pickLargestEligibleDate): a past, non-empty
+        // YYYY-MM-DD.md with no rollup section yet — judged by the shared
+        // MemoryRollupEngine.isRollupCandidate. Before this the filter only
+        // dropped three file-name literals, so an ALREADY-DISTILLED log stayed
+        // the "largest daily log" forever: every turn the system prompt
+        // re-suggested memory_rollup for it and the agent got SKIPPED_ALREADY
+        // back.
+        // [dv28-A3] That predicate now also owns the content dimension ("does
+        // the log still hold anything distillable"), which used to live only in
+        // the executor — so a 60 KB log made entirely of in-flight notes was
+        // named as the pending one and every memory_rollup answered
+        // NOTHING_TO_DISTILL. The read below is the price of judging exactly
+        // what the executor would do; it happens only for logs that already
+        // passed the cheap dimensions (date shape / not yet distilled), and the
+        // statistics stay read-only.
+        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val rollupContent = File(memoryDir, ROLLUP_FILE)
+            .takeIf { it.isFile }
+            ?.let { runCatching { it.readText() }.getOrDefault("") }
+            .orEmpty()
         return memoryDir.listFiles()
+            ?.filter { it.isFile }
             ?.filter {
-                it.extension == "md" &&
-                    it.name != GLOBAL_FILE &&
-                    it.name != ROLLUP_FILE &&
-                    // Same exclusion as readRecentDailyLogs below: SOUL.md
-                    // lives in this directory but is not a daily log —
-                    // counting it could name it as "largest daily log" and
-                    // mislead the memory_rollup suggestion.
-                    it.name != SOUL_FILE
+                com.rikkaminis.app.workspace.MemoryRollupEngine.isRollupCandidate(
+                    it.name,
+                    it.length(),
+                    todayStr,
+                    rollupContent,
+                ) { runCatching { it.readText() }.getOrNull() }
             }
             ?.map { it.name to it.length() }
             ?.sortedByDescending { it.second }
@@ -227,8 +307,17 @@ class MemoryRepository(private val memoryDir: File) {
                 // Return file preview
                 val lines = content.lines()
                 val take = minOf(lines.size, budget)
-                val preview = lines.take(take).joinToString("\n")
-                val truncated = if (lines.size > take) " (showing first $take of ${lines.size} lines)" else ""
+                // [E2-F07] Keep the TAIL, not the head. writeMemory appends
+                // ([P1-append]), so line 0 is the OLDEST entry of the day: taking
+                // the head under the 500-line dump cap meant memory_get with no
+                // keywords returned this morning's entries and silently dropped
+                // everything written since — the exact opposite of what an agent
+                // asking "what do I remember" needs, and invisible in the result
+                // (the note said "showing first N" only in the label). Only the
+                // truncated branch changes: an untruncated file is returned
+                // verbatim below, so short logs are byte-identical to before.
+                val truncated = if (lines.size > take) " (showing last $take of ${lines.size} lines)" else ""
+                val preview = if (lines.size > take) lines.takeLast(take).joinToString("\n") else content
                 totalLines += take
                 totalMatchedFiles += 1
                 "[$label$truncated]\n$preview"
@@ -255,18 +344,29 @@ class MemoryRepository(private val memoryDir: File) {
                     val merged = mergeRanges(matchedRanges)
                     val fileMatches = mutableListOf<String>()
 
-                    for (range in merged) {
+                    // [E2-F07] Fill the line budget from the NEWEST match
+                    // backwards, then print in file order. The scan above walks
+                    // line 0 upward, so the old forward fill spent the whole
+                    // budget on the oldest matches and dropped the recent ones —
+                    // the same append-ordering inversion as the full dump above.
+                    // A partial chunk now keeps its TAIL (the newest lines of
+                    // that ±2 window) for the same reason.
+                    val keptNewestFirst = mutableListOf<IntRange>()
+                    for (range in merged.asReversed()) {
                         val chunkLines = range.last - range.first + 1
                         if (totalLines + chunkLines > lineCap) {
                             val remaining = lineCap - totalLines
                             if (remaining > 0) {
-                                fileMatches.add(lines.subList(range.first, range.first + remaining).joinToString("\n"))
+                                keptNewestFirst.add((range.last - remaining + 1)..range.last)
                                 totalLines += remaining
                             }
                             break
                         }
-                        fileMatches.add(lines.subList(range.first, range.last + 1).joinToString("\n"))
+                        keptNewestFirst.add(range)
                         totalLines += chunkLines
+                    }
+                    for (range in keptNewestFirst.asReversed()) {
+                        fileMatches.add(lines.subList(range.first, range.last + 1).joinToString("\n"))
                     }
 
                     if (fileMatches.isNotEmpty())
@@ -417,18 +517,20 @@ class MemoryRepository(private val memoryDir: File) {
             if (file.exists()) {
                 val content = try { file.readText() } catch (_: Exception) { "" }
                 if (content.isNotEmpty()) {
-                    val lines = content.lines()
                     // [P1-append] Entries are now appended (newest at bottom).
-                    // Reverse so system prompt gets newest-first, matching old prepend.
-                    val preview = lines.takeLast(injectLines).reversed().joinToString("\n")
+                    // Split into entries and reverse the ENTRY order so the
+                    // system prompt gets newest-first, matching old prepend —
+                    // a multi-line entry is never read backwards
+                    // (sweep-1014 B9: per-line takeLast().reversed() mangled it).
+                    val (preview, orderedLineCount) = newestFirstPreview(content, injectLines)
                     val label = when (dayOffset) {
                         0 -> "Today's"
                         1 -> "Yesterday's"
                         else -> dateStr
                     }
                     var entry = "$label daily log ($dateStr.md):\n$preview"
-                    if (lines.size > injectLines) {
-                        entry += "\n... (${lines.size - injectLines} more lines, use memory_get to search)"
+                    if (orderedLineCount > injectLines) {
+                        entry += "\n... (${orderedLineCount - injectLines} more lines, use memory_get to search)"
                     }
                     fragments.add(entry)
                 }
@@ -526,6 +628,27 @@ class MemoryRepository(private val memoryDir: File) {
     }
 
     fun saveFile(name: String, content: String) {
+        // [1028B-2 / backlog L9096] SOUL.md is the one file in this directory
+        // that has a *second* owner with stronger write rules: SoulStore.
+        // Writing it here with a bare `writeText` meant the chat memory sheet
+        // and Settings → Memory's editor got neither the pre-overwrite backup
+        // nor the atomic temp+rename, while every other writer of the same file
+        // (Settings → Soul, minis-config, the five ConfigBuiltins points) got
+        // both. One file, two durability classes.
+        //
+        // Explicit early return, not a change to the shared implementation:
+        // this method is the generic write point for daily logs / GLOBAL.md /
+        // MEMORY-ROLLUP.md, and `ConfigBackup` restores through it by name
+        // (Stage 6), so its signature and its behaviour for every other file
+        // name must stay exactly as they were.
+        //
+        // `saveRawTo` (not `save` / `saveTo`) because the caller hands over the
+        // editor's full text verbatim — re-serializing here would reorder the
+        // frontmatter and drop fields the user typed.
+        if (name == SOUL_FILE) {
+            com.rikkaminis.app.agent.SoulStore.saveRawTo(File(memoryDir, name), content)
+            return
+        }
         File(memoryDir, name).writeText(content)
     }
 
@@ -534,6 +657,12 @@ class MemoryRepository(private val memoryDir: File) {
         // [FIX-6 / F-224] Same guard for the persona file: it is not a daily
         // log, and deleting it re-seeds the default content on next launch.
         if (name == SOUL_FILE) return false
+        // [FIX-E / ISSUE-09] And the rollup product file. It is regenerable in
+        // principle, but regenerating it needs the old daily logs, which are
+        // exactly what it already distilled away: losing it silently drops
+        // every distilled rule. Same "not a user-editable daily log" class as
+        // GLOBAL.md / SOUL.md, so it is refused here too.
+        if (name == ROLLUP_FILE) return false
         return File(memoryDir, name).delete()
     }
 
@@ -572,7 +701,21 @@ class MemoryRepository(private val memoryDir: File) {
     fun revokeEntry(writtenContent: String): EntryMutationResult {
         val trimmedTarget = writtenContent.trim()
         val candidates = candidateDateStrings()
-        val markerRegex = Regex("""<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -->\n""")
+        // [E2-F07] Single-sourced from [TIMESTAMP_MARKER_LINE]. The local copy
+        // used to spell the boundary as `--> \n` — no in-line whitespace
+        // tolerance at all — while the read paths (newestFirstPreview) use the
+        // canonical pattern with `[^\S\n]*`. The two disagreed on exactly the
+        // files a *human* touched: a marker line that picked up trailing spaces
+        // (or CRLF, which is what restoring a log written on another platform
+        // leaves behind) was invisible here, so the preceding entry's body
+        // swallowed the next marker and `body.trim() == target` could never hold:
+        // the revoke/edit button became a silent no-op (NotFound) with no error
+        // shown, and — worse — the reverse case (a body match that spans an
+        // invisible marker) would have taken the next entry's text with it in
+        // removeRange below. `[^\S\n]*` keeps the tolerance inside the line: it
+        // accepts trailing blanks and `\r` but never crosses a newline, so the
+        // marker can't glue two entries together.
+        val markerRegex = TIMESTAMP_MARKER_LINE
 
         for (dateStr in candidates) {
             val file = File(memoryDir, "$dateStr.md")
@@ -611,7 +754,8 @@ class MemoryRepository(private val memoryDir: File) {
         val trimmedOld = oldContent.trim()
         val trimmedNew = newContent.trim()
         val candidates = candidateDateStrings()
-        val markerRegex = Regex("""<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -->\n""")
+        // [E2-F07] Same single-sourcing as [revokeEntry] — see the comment there.
+        val markerRegex = TIMESTAMP_MARKER_LINE
 
         for (dateStr in candidates) {
             val file = File(memoryDir, "$dateStr.md")

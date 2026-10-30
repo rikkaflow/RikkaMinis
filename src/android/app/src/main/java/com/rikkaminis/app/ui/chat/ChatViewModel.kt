@@ -1,35 +1,17 @@
 package com.rikkaminis.app.ui.chat
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.compose.foundation.lazy.LazyListState
-import com.rikkaminis.app.agent.runtime.AgentExecutionBudget
 import com.rikkaminis.app.agent.runtime.AgentRunEvent
 import com.rikkaminis.app.agent.runtime.AgentRunPhase
-import com.rikkaminis.app.agent.runtime.AgentRunState
-import com.rikkaminis.app.agent.runtime.AgentTerminal
-import com.rikkaminis.app.agent.runtime.AgentTerminalReason
-import com.rikkaminis.app.agent.runtime.ProviderAttemptOutcome
-import com.rikkaminis.app.agent.Level
 import com.rikkaminis.app.agent.ToolLoopDetector
-import com.rikkaminis.app.browser.BrowserActionInput
 import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.data.db.MessageEntity
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.outlined.Build
-import androidx.compose.material.icons.outlined.Extension
-import com.rikkaminis.app.data.BPETokenizer
-import com.rikkaminis.app.data.ContextOffload
-import com.rikkaminis.app.data.ContextPolicy
 import com.rikkaminis.app.conversation.ContextCompactor
 import com.rikkaminis.app.conversation.ContextGrowthTracker
 import com.rikkaminis.app.conversation.compactAll
@@ -41,18 +23,19 @@ import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
+import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ThinkingLevel
-import com.rikkaminis.app.sandbox.offload.ModelStreamErrorException
-import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.catalogMaxThinkingLevel
 import com.rikkaminis.app.provider.effectiveMaxThinkingLevel
@@ -60,15 +43,6 @@ import com.rikkaminis.app.sandbox.ExecutionCoordinator
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.tools.AgentTraceRecorder
 import com.rikkaminis.app.tools.AgentTools
-import com.rikkaminis.app.tools.FileEditTool
-import com.rikkaminis.app.tools.FileReadTool
-import com.rikkaminis.app.tools.FileWriteTool
-import com.rikkaminis.app.tools.MemoryRollupTool
-import com.rikkaminis.app.tools.MemoryTools
-import com.rikkaminis.app.tools.ReadImageTool
-import com.rikkaminis.app.tools.SubagentSkill
-import com.rikkaminis.app.tools.SubagentToolCall
-import com.rikkaminis.app.tools.ToolConcurrencyPolicy
 import com.rikkaminis.app.tools.ToolExecutionResult
 import com.rikkaminis.app.tools.ToolFailureHook
 import com.rikkaminis.app.offload.OffloadPermissionManager
@@ -89,22 +63,15 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 // [T-android-split-chat] StreamingDelta / ChatMessage / QueuedPrompt /
 // ToolBlockStatus / SlashCommand / AssistantBlock moved verbatim to ChatModels.kt.
@@ -367,7 +334,30 @@ class ChatViewModel(
         // 35s summary) gets cut and demoted to last-resort | 升级触发: compact
         // failures reported on members that succeed within 30-60s → raise
         // COMPACT_SUMMARY_CANDIDATE_BUDGET_MS or make it adaptive.
+        // ↑ 触发已命中（2026-10-22，见下方 [fix/compact-timeout-budget-1022] 常量）。
         internal const val COMPACT_SUMMARY_CANDIDATE_BUDGET_MS = 30_000L
+        // [fix/compact-timeout-budget-1022] Material-size adaptive budget — the
+        // upgrade trigger declared on the ponytail note above fired on
+        // 2026-10-22: a long agent run has no new user turn to fold, so the
+        // budget anchor hands the whole agent history to ONE summary call
+        // (estTokens 110670 / 140490 in the range-composition line) and the
+        // chain then TIMEOUT'd on every candidate at exactly 30000ms — 25
+        // timeouts that day, 32 "Compact failed", 119 "folded nothing", and 8
+        // runs ended on `finish=length ×3 empty output — giving up` because
+        // nothing folded while the hard trim could not keep the context under
+        // the window. Those candidates are NOT declared
+        // [LLMModel.declaresNoEffortTiers] — a user-configured relay entry
+        // never declares it — so they drew the 30s quiet floor while their own
+        // success latencies that same day sat at 25.0s / 28.2s / 29.1s: a
+        // working member cut by the wall. The material-size proxy separates
+        // the two measured regimes cleanly (≤ ~700 est tokens → every small
+        // fold succeeded in 6.8–25.1s; ≥ ~2 100 est tokens → all 25 failures),
+        // so anything larger than this threshold takes the noisy 60s budget.
+        // The 120s chain deadline still clamps every candidate, and
+        // within-chain timeout de-duplication ([compactionCandidateKey]) keeps
+        // a chain of same-route members from spending that deadline three
+        // times over.
+        internal const val COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS = 1_000
         // [fix/compact-truncation-guard-1005] Noisy-member adaptation of the
         // per-candidate budget: a member that declares no effort tiers
         // (declaresNoEffortTiers == true → ThinkingLevel.OFF has no wire
@@ -431,13 +421,23 @@ class ChatViewModel(
     // [T-chat-sysinfo-coalesce] Pending coalesce window for appendSystemInfo.
     // Same-iconKind calls within SYSINFO_COALESCE_WINDOW_MS are merged into one
     // ChatMessage with accumulated toolBlocks; different iconKind flushes the
-    // current window immediately. Runs on Main so the single _messages.value
-    // write is atomic from the UI's perspective.
-    private var pendingSysInfoJob: Job? = null
-    private var pendingSysInfoIconKind: String? = null
-    private var pendingSysInfoBlocks: MutableList<AssistantBlock> = mutableListOf()
-    private var pendingSysInfoPayload: String? = null
-    private var pendingSysInfoFirstId: String? = null
+    // current window immediately.
+    //
+    // [FIX-G da1016-sysinfo-race] The window STATE (iconKind/firstId/payload/
+    // blocks) lives in [SysInfoCoalescer] behind a single lock: two callers
+    // reach it from different threads — the agent loop (sendMessage →
+    // Dispatchers.IO) reaches appendSystemInfo through
+    // ChatContextWindow.trimContextHistoryWindow, while the UI / slash-command /
+    // compact paths (checkContextBeforeSend, /compact, revertCompact,
+    // setProviderName) run on Main. The old loose fields had no mutual
+    // exclusion: an IO append interleaved with a Main flush could lose a
+    // notice, emit a ChatMessage whose id and toolBlocks came from different
+    // windows, or crash the UI thread on a torn ArrayList.
+    // Only the timer handle is kept here — it is written last-wins per thread
+    // and every cancel precedes the cancelling thread's own re-assign, so the
+    // handle can never end up dead while a window is pending.
+    private val sysInfoCoalescer = SysInfoCoalescer<AssistantBlock>(idOf = { it.id })
+    private var sysInfoFlushJob: Job? = null
 
     // ── Long-session window cap ────────────────────────────────────────
     //
@@ -778,6 +778,46 @@ class ChatViewModel(
     internal val _inputText = MutableStateFlow("")
     val inputText: StateFlow<String> = _inputText.asStateFlow()
 
+    /**
+     * [dv25-B08 / deep-audit-1045 B-08] The composer's pending 150 ms IME burst
+     * snapshot, published by `ChatInputArea` (the only place that can see the
+     * field's live `TextFieldValue`).
+     *
+     * `_inputText` is committed per keystroke for ordinary typing but a large
+     * burst (voice dictation / pinyin, see `shouldDebounceImeBurst`) is buffered
+     * locally and flushed 150 ms later. Anything that must act on "what the user
+     * has typed" outside the composer — today only `promoteDraftIfNeeded` — would
+     * otherwise read the PRE-burst string and silently drop the tail. The field
+     * publishes the snapshot here while it is pending and nulls it the moment the
+     * field commits past it, so this value is always the newest one and never
+     * outlives its own flush (the `fix/ttfb-thinktag-composer` lesson).
+     */
+    internal val _pendingComposerText = MutableStateFlow<String?>(null)
+
+    /** [dv25-B08] See [_pendingComposerText]. Null = the field and [_inputText] agree. */
+    fun publishPendingComposerText(text: String?) {
+        if (_pendingComposerText.value != text) _pendingComposerText.value = text
+    }
+
+    /**
+     * [dv25-B08 / deep-audit-1045 B-08] Session ownership bit for a draft
+     * promotion in flight.
+     *
+     * `promoteDraftIfNeeded` inserts the session row (`ensureSession`) and writes
+     * the first message several suspends later. In that window the row exists but
+     * has `messageCount == 0`, which is exactly what `cleanupIfEmptyOnExit` (fired
+     * from `ChatScreen`'s onDispose when the user taps the top-bar New Chat) reads
+     * before deleting the row and releasing this ViewModel — cancelling the
+     * promotion coroutine after the composer copy was already dropped.
+     *
+     * `@Volatile`: written on the main thread by the promotion, read by
+     * `cleanupIfEmptyOnExit` from wherever the caller happens to run it. The bit
+     * is the guard; it is not a time window, so it needs no timer and no grace
+     * period.
+     */
+    @Volatile
+    internal var promoteInFlight: Boolean = false
+
     // [T-context-exhausted-dialog] iOS-parity prompt for send-at-capacity. When
     // the context reaches EXHAUSTED the send is NOT silently dropped (Android
     // pre-fix behaviour) nor hard-blocked behind an inline message — instead
@@ -894,13 +934,20 @@ class ChatViewModel(
     fun appendToInputText(snippet: String) {
         val cleaned = snippet.trim()
         if (cleaned.isEmpty()) return
-        val current = _inputText.value
-        val joined = if (current.isBlank()) {
-            "$cleaned "
-        } else {
-            current.trimEnd() + " " + cleaned + " "
-        }
-        setInputText(joined, caretOverride = joined.length)
+        // [dv24/B-05] The append target is the composer's LIVE text, not
+        // [inputText] — that copy lags a dictation / paste burst by the 150 ms
+        // IME debounce, so appending here pasted the snippet onto a stale
+        // string and the burst's own flush then overwrote the result. The
+        // composer resolves it (minimal `appendToInputText` semantics kept:
+        // separator " ", trimmed tail, one trailing space).
+        requestComposerCommand(
+            ComposerCommand.AppendText(
+                text = cleaned,
+                separator = " ",
+                trimExistingEnd = true,
+                trailingSpace = true,
+            ),
+        )
     }
 
     internal val _isStreaming = MutableStateFlow(false)
@@ -1072,6 +1119,31 @@ class ChatViewModel(
     internal val _forceScrollToBottom = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val forceScrollToBottom: SharedFlow<Unit> = _forceScrollToBottom.asSharedFlow()
 
+    /**
+     * [fix/dv23-b3] Composer intents. The composer's single writer is
+     * `ChatInputArea`: it alone owns the live field state
+     * (`inputFieldValue.text`) and the 150 ms IME-burst job. ChatScreen used to
+     * reach into the composer directly for the slash-menu toggle/dismiss and
+     * the clear-chat wipe, resolving them against [_inputText] — the value that
+     * LAGS the field by the debounce window — so a fresh dictation/paste was
+     * rolled back to a stale snapshot (and, when the computed text equalled the
+     * current value, the write was dropped by the StateFlow anyway). Those
+     * intents now travel here and are executed by the composer with its own
+     * live text.
+     *
+     * Fire-and-forget by design: with no composer on screen there is nothing to
+     * command, and replaying a queued intent after re-entry would wipe a draft
+     * the user typed in the meantime (hence no replay / no buffering across
+     * an absent collector).
+     */
+    internal val _composerCommand = MutableSharedFlow<ComposerCommand>(extraBufferCapacity = 16)
+    val composerCommand: SharedFlow<ComposerCommand> = _composerCommand.asSharedFlow()
+
+    /** Route a composer intent to the composer (see [_composerCommand]). */
+    fun requestComposerCommand(command: ComposerCommand) {
+        _composerCommand.tryEmit(command)
+    }
+
     internal val _availableGroups = MutableStateFlow<List<ModelGroup>>(emptyList())
     val availableGroups: StateFlow<List<ModelGroup>> = _availableGroups.asStateFlow()
 
@@ -1212,10 +1284,27 @@ class ChatViewModel(
     // stored reference nothing could cancel it — a stop press left the
     // summary call burning tokens in the background for up to ~2 min
     // (2026-10-01 14:43:48 stop → 14:45:56 "11 UI bubbles folded"). The
-    // CancellationException path is safe by construction: the compact
-    // pipeline rethrows it everywhere and nothing is persisted before the
-    // commit block, so a cancelled compact leaves zero trace (no marker,
-    // no folded bubbles).
+    // CancellationException path is safe by construction up to the commit
+    // block: the compact pipeline rethrows it everywhere and nothing is
+    // persisted before that block, so a cancelled summary call leaves no
+    // marker and no folded bubbles.
+    //
+    // [§47 N-2] That claim stops exactly AT the commit block, not before it.
+    // The block — insertCompactMarker (a suspend DB write) →
+    // _compactSummary.value → _cachedLatestMarker → withContext(Dispatchers.
+    // Main) — has no suspension point BETWEEN the two in-memory writes, but a
+    // cancel can still land on the insert itself: either before the row
+    // commits (marker absent = the "no trace" half) or after the row landed
+    // while the coroutine never resumes. In that second window a cancelled
+    // compact leaves LESS text than it folded — a DB marker row without its
+    // in-memory mirror, which the next session load rebuilds from the row —
+    // and it never writes twice; it does not leave "zero trace". No
+    // ensureActive/isActive guard is added there on purpose: the writes in
+    // that window are finalize-only (one marker insert + two in-memory
+    // assignments; there is nothing for a guard to undo), while a guard on
+    // the normal cancel path would throw CancellationException out of the one
+    // block where the work is already done — a hard failure replacing a
+    // harmless "UI catches up on reload".
     @Volatile
     internal var compactJob: Job? = null
     // [fix/compact-cancel-on-stop-1002] sendMessage's outer shell job. The
@@ -1404,6 +1493,10 @@ class ChatViewModel(
         ): Flow<LLMStreamChunk> = this@ChatViewModel.streamChatTurnOffloaded(
             provider, messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
         override fun generateSessionTitleIfNeeded() = this@ChatViewModel.generateSessionTitleIfNeeded()
+        // [fix/rv1014-g1] Semantic auto-title trigger (shared criterion with
+        // the title-already-set guard inside generateSessionTitleIfNeeded).
+        override val sessionTitleNeedsGeneration: Boolean
+            get() = sessionTitleNeedsGenerationOf(_sessionTitle.value)
         override suspend fun injectQueuedPromptsAsNewTurn(
             finishedAssistantId: String,
             finishedAccumulatedText: String,
@@ -1784,13 +1877,20 @@ class ChatViewModel(
      * chat reads the same flag. The provider reads FastModePrefs directly at
      * request-build time, so this flow only drives the menu row + nav badge.
      */
-    internal val _fastModeEnabled =
-        MutableStateFlow(com.rikkaminis.app.data.FastModePrefs.isEnabled())
-    val fastModeEnabled: StateFlow<Boolean> = _fastModeEnabled.asStateFlow()
+    // [dv25-B05 / deep-audit-1045 B-05] Single source: the process-level flow
+    // owned by FastModePrefs. This used to be a VM-local MutableStateFlow seeded
+    // ONCE at construction, so an already-cached conversation (ViewModels live in
+    // ChatViewModelStore) kept rendering the flag as it was when that chat was
+    // first opened: toggle Fast Mode in chat A, go back to chat B, and the menu
+    // row / nav ⚡ badge still showed the old value while every request builder
+    // (FastModePrefs.isEnabled(), read per request) already used the new one. The
+    // screen and the wire disagreeing about the same flag is the defect; one flow
+    // read by both removes the second copy rather than re-syncing it.
+    val fastModeEnabled: StateFlow<Boolean> = com.rikkaminis.app.data.FastModePrefs.enabled
 
     fun setFastModeEnabled(enabled: Boolean) {
+        // FastModePrefs publishes to that same flow — no local mirror to update.
         com.rikkaminis.app.data.FastModePrefs.setEnabled(context, enabled)
-        _fastModeEnabled.value = enabled
     }
 
     /**
@@ -1863,7 +1963,12 @@ class ChatViewModel(
         // launch by MinisApp); reading via a closure means the index sees
         // an up-to-date snapshot on every rescan without a manual refresh.
         FileMentionIndex(
-            filesDir = java.io.File(context.applicationContext.filesDir, "minis-global"),
+            // [fix/sweep1014-b8] Was File(filesDir, "minis-global") — Layer 1
+            // scanned minis-global/workspace/<sid>, which never exists (the
+            // per-session trees live under filesDir/minis-sessions/<sid>/),
+            // so session-local files were 100% invisible to `@`. Pass the
+            // filesDir root; FileMentionIndex resolves both layers from it.
+            filesDir = context.applicationContext.filesDir,
             mountsProvider = {
                 com.rikkaminis.app.sandbox.PRootKernel
                     .mountEntriesForIndex(context.applicationContext)
@@ -1903,8 +2008,48 @@ class ChatViewModel(
     internal val _mentionSelectedIndex = MutableStateFlow(-1)
     val mentionSelectedIndex: StateFlow<Int> = _mentionSelectedIndex.asStateFlow()
 
+    // [deep-audit-1043 B-07] ONE live-model resolution for the four capability /
+    // context readers below. `currentModel` is a snapshot written by
+    // [AgentLoopHost.updateCurrentModel] from `newEntry.model` — the entry's
+    // BASE model: 33 of the 39 built-in models carry no `contextWindow` /
+    // `maxOutputTokens` / `inputModalities` of their own and depend on
+    // models.dev enrichment, so reading the snapshot reported their window as
+    // `HEURISTIC`, dropped the max-output row and under-reported vision
+    // support. Re-resolving the active entry through
+    // `ModelsDevApi.effectiveModel` gives every reader the same enriched +
+    // override-folded model the real request would use; a group-resolved turn
+    // (no active entry id) falls back to the snapshot, enriched the same way.
+    internal fun liveEffectiveModel(): LLMModel? =
+        _activeEntryId.value
+            ?.let { id -> providerRepository.config.value.modelEntries.find { it.id == id } }
+            ?.let { ModelsDevApi.effectiveModel(it) }
+            ?: currentModel?.let { ModelsDevApi.enrichModel(it) }
+
+    /**
+     * [deep-audit-1044 B-03] THE model a provider-construction site must hand
+     * to `ProviderFactory.create` — and, at the same time, to `currentModel`,
+     * which is the snapshot every later reader (and the wire) trusts.
+     *
+     * `entry.model` is `baseModel.withOverrides(overrides)` and never touches
+     * models.dev, so 33 of the 39 built-ins answer with no `inputModalities` /
+     * `catalogMaxThinkingLevel` / `declaresNoEffortTiers` / `maxOutputTokens`.
+     * The provider then re-decides those same capabilities FROM that object
+     * (`"image" in model.inputModalities`, `clampThinkingLevel`,
+     * `injectThinkingParams`) inside `:modelservice` — a process that never
+     * initialises [ModelsDevApi] and only ever sees the serialised
+     * `LLMModel` — so an un-enriched model silently downgrades an attachment
+     * to `[attached image: …]` and clamps a `MAX` thinking pick back to XHIGH.
+     *
+     * Order matters: enrich the BASE first, fold the user's overrides SECOND
+     * ([ModelsDevApi.effectiveModel]). The reverse — enriching the already
+     * override-folded model — lets a registry `reasoning = true` overwrite an
+     * explicit user `supportsReasoning = false` (dv23-A04).
+     */
+    internal fun providerModelFor(entry: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(entry)
+
     val currentModelSupportsReasoning: Boolean
-        get() = currentModel?.supportsReasoning != false
+        get() = liveEffectiveModel()?.supportsReasoning != false
 
     // §27a: does the currently-bound model actually consume images on the
     // wire? The providers gate the same predicate ("image" in
@@ -1913,7 +2058,8 @@ class ChatViewModel(
     // Lenient default (allow) when the model is unknown: never block on a
     // missing declaration.
     val currentModelSupportsImages: Boolean
-        get() = currentModel?.inputModalities?.any { it.equals("image", ignoreCase = true) } ?: true
+        get() = liveEffectiveModel()?.inputModalities?.normalizeModalities()
+            ?.any { it.equals("image", ignoreCase = true) } ?: true
 
     /**
      * [T-android-thinking-level-arch] The thinking ceiling the currently-bound
@@ -1930,7 +2076,15 @@ class ChatViewModel(
             if (entry != null) {
                 return entry.effectiveMaxThinkingLevel
             }
-            val model = currentModel ?: return ThinkingLevel.XHIGH
+            // [deep-audit-1044 B-04] The no-entry fallback is reached by a
+            // group-resolved turn and by any snapshot written before the
+            // active entry was known. Reading `currentModel` raw skipped
+            // models.dev, so a model whose effort tiers live in the registry
+            // reported its catalogue default (or no ceiling at all) and the
+            // picker offered tiers the wire would clamp. Route the fallback
+            // through the same live exit as the other readers — it enriches
+            // the snapshot exactly like the entry branch does.
+            val model = liveEffectiveModel() ?: return ThinkingLevel.XHIGH
             return model.catalogMaxThinkingLevel
         }
 
@@ -1968,9 +2122,10 @@ class ChatViewModel(
      * the bound group's `contextLimitTokens` takes effect on the very next
      * judgment without re-picking the model/group (mirrors iOS fcc22b66):
      *   1. the active entry's model is re-resolved from the current repository
-     *      config (folds ModelOverrides live), falling back to the snapshot
-     *      only when the entry can't be found (e.g. synced sessions before
-     *      config finished loading);
+     *      config through [liveEffectiveModel] (models.dev enrichment + live
+     *      ModelOverrides folded in), falling back to the snapshot only when
+     *      the entry can't be found (e.g. synced sessions before config
+     *      finished loading);
      *   2. the result is clamped by the bound group's `contextLimitTokens`
      *      (null / <=0 = unlimited).
      *
@@ -1988,11 +2143,9 @@ class ChatViewModel(
      * model physically supports.
      */
     internal fun effectiveContextWindowTokens(): Int? {
-        val config = providerRepository.config.value
-        val liveModel = _activeEntryId.value
-            ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-            ?: currentModel
+        val liveModel = liveEffectiveModel()
         val window = liveModel?.contextWindowTokens ?: return null
+        val config = providerRepository.config.value
         val groupLimit = _selectedGroupId.value
             ?.let { gid -> config.modelGroups.find { it.id == gid }?.contextLimitTokens }
             ?.takeIf { it > 0 }
@@ -2021,16 +2174,10 @@ class ChatViewModel(
      * must not raise the "heuristic guess" red flag.
      */
     val currentModelContextWindowSource: LLMModel.ContextWindowSource?
-        get() {
-            val config = providerRepository.config.value
-            val liveModel = _activeEntryId.value
-                ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-                ?: currentModel
-            return liveModel?.contextWindowSource
-        }
+        get() = liveEffectiveModel()?.contextWindowSource
 
     val currentModelMaxOutputTokens: Int?
-        get() = currentModel?.maxOutputTokens
+        get() = liveEffectiveModel()?.maxOutputTokens
 
     /**
      * The bound group's configured context limit for the current session,
@@ -2103,11 +2250,16 @@ class ChatViewModel(
      * [T-chat-sysinfo-coalesce] Consecutive same-iconKind calls within
      * [SYSINFO_COALESCE_WINDOW_MS] are merged into ONE ChatMessage whose
      * toolBlocks accumulate in call order; payload takes the last non-null
-     * value. Different iconKind flushes the current window first. The merge
-     * runs on Main via viewModelScope so the single _messages.value write is
-     * atomic from the UI's perspective and avoids the per-call
-     * read-modify-write that used to recompose the entire LazyColumn on every
-     * system notice during compact/revert failure chains.
+     * value. Different iconKind flushes the current window first.
+     *
+     * [FIX-G da1016-sysinfo-race] The merge no longer depends on the caller's
+     * dispatcher: the window state AND the _messages.value read-modify-write
+     * run inside [SysInfoCoalescer]'s lock, so a Main caller
+     * (checkContextBeforeSend / `/compact` / revertCompact / setProviderName)
+     * and an IO caller (the agent loop's trimContextHistoryWindow) can
+     * interleave safely while still landing one write per flush — which is what
+     * keeps the LazyColumn from recomposing on every system notice during
+     * compact/revert failure chains.
      */
     internal fun appendSystemInfo(text: String, iconKind: String, payload: String? = null) {
         val block = AssistantBlock(
@@ -2120,47 +2272,57 @@ class ChatViewModel(
             // affordance opening a detail sheet (mirrors iOS CompactSummarySheet).
             toolArgs = payload.orEmpty(),
         )
-        // Different iconKind → flush any pending window first (preserve ordering).
-        if (pendingSysInfoIconKind != null && pendingSysInfoIconKind != iconKind) {
-            flushPendingSysInfo()
+        // [FIX-G da1016-sysinfo-race] Window mutation, the "different iconKind
+        // flushes first" rule and the drain+publish of that flush all happen
+        // inside SysInfoCoalescer's lock, so a concurrent IO append can no
+        // longer interleave with this thread's window bookkeeping.
+        sysInfoCoalescer.append(block, iconKind, payload) { window ->
+            publishSysInfoWindow(window)
         }
-        // Start or extend the coalesce window.
-        if (pendingSysInfoIconKind == null) {
-            pendingSysInfoIconKind = iconKind
-            pendingSysInfoFirstId = block.id
-            pendingSysInfoBlocks.clear()
-            pendingSysInfoPayload = payload
-        } else {
-            // Same kind: accumulate. Last non-null payload wins.
-            if (payload != null) pendingSysInfoPayload = payload
-        }
-        pendingSysInfoBlocks.add(block)
-        // Schedule (or reschedule) the flush at the end of the window.
-        pendingSysInfoJob?.cancel()
-        pendingSysInfoJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+        // Schedule (or reschedule) the flush at the end of the window. This
+        // handle is the only sysinfo state left outside the coalescer, and it is
+        // safe unlocked: cancels only ever precede the cancelling thread's own
+        // re-assign, so the last assignment in the write order is always a live
+        // job (see the field comment).
+        sysInfoFlushJob?.cancel()
+        sysInfoFlushJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
             kotlinx.coroutines.delay(SYSINFO_COALESCE_WINDOW_MS)
             flushPendingSysInfo()
         }
     }
 
-    /** Flush the pending coalesce window into a single ChatMessage. Idempotent. */
+    /**
+     * Flush the pending coalesce window into a single ChatMessage. Idempotent.
+     *
+     * [FIX-G da1016-sysinfo-race] Deliberately does NOT cancel [sysInfoFlushJob]:
+     * the timer is re-armed by the appender, and a stale timer that finds an
+     * empty window is a no-op. Cancelling here would re-introduce the
+     * cross-thread handle race the window lock just removed — a Main flush
+     * could kill the timer an IO append had re-armed a moment earlier,
+     * stranding the fresh window until the next sysinfo event.
+     */
     private fun flushPendingSysInfo() {
-        pendingSysInfoJob?.cancel()
-        pendingSysInfoJob = null
-        pendingSysInfoIconKind ?: return
-        val blocks = pendingSysInfoBlocks.toList()
-        val id = pendingSysInfoFirstId ?: "sysinfo_${System.currentTimeMillis()}"
-        pendingSysInfoIconKind = null
-        pendingSysInfoBlocks.clear()
-        pendingSysInfoPayload = null
-        pendingSysInfoFirstId = null
-        if (blocks.isEmpty()) return
+        sysInfoCoalescer.flush { window -> publishSysInfoWindow(window) }
+    }
+
+    /**
+     * Turn one drained coalesce window into a system notice row.
+     *
+     * [FIX-G da1016-sysinfo-race] Runs INSIDE [SysInfoCoalescer]'s lock (via the
+     * publish lambda), which makes the read-modify-write on [_messages] below
+     * atomic against a concurrent flush on another thread — otherwise two
+     * flushes could each read the same snapshot and the second write would drop
+     * the first notice. Keep it allocation-only: no suspension, no re-entry into
+     * the coalescer. [window].blocks is never empty (the coalescer starts a
+     * window and adds its first block in one critical section).
+     */
+    private fun publishSysInfoWindow(window: SysInfoCoalescer.Window<AssistantBlock>) {
         val list = _messages.value
         val notice = ChatMessage(
-            id = id,
+            id = window.firstId,
             role = "system",
             content = "",
-            toolBlocks = blocks,
+            toolBlocks = window.blocks,
         )
         // [fix/compact-divider-ux] A system notice must never land *below*
         // an answer that is still growing. The in-loop auto-compact path
@@ -2474,16 +2636,34 @@ class ChatViewModel(
         // session never shows one.
         viewModelScope.launch {
             canResume.collect { interrupted ->
+                // [FIX-R4-P F-10] Key the badge by the id the session LIST
+                // renders. A draft session (`__new__<uuid>`) has no row there,
+                // so pushing under `sessionId` wrote a PAUSED entry nothing ever
+                // reads — a chat started from "new" never showed the badge after
+                // a Stop / turn-limit stop — and the stale key also survived
+                // promotion. `activeSessionId` is the real id once ensureSession()
+                // has promoted the draft, and equals `sessionId` for every VM
+                // that was loaded from history (so no behaviour change there).
+                val badgeKey = activeSessionId
                 if (interrupted) {
                     com.rikkaminis.app.service.SessionBadgeStore.push(
-                        sessionId,
+                        badgeKey,
                         com.rikkaminis.app.service.SessionBadgeStore.SessionBadgeState.PAUSED,
                     )
                 } else {
                     com.rikkaminis.app.service.SessionBadgeStore.remove(
-                        sessionId,
+                        badgeKey,
                         com.rikkaminis.app.service.SessionBadgeStore.SessionBadgeState.PAUSED,
                     )
+                    // Also clear a badge that was pushed under the pre-promotion
+                    // draft key, otherwise that stale entry lingers in the
+                    // persisted map for the life of the install.
+                    if (sessionId != badgeKey) {
+                        com.rikkaminis.app.service.SessionBadgeStore.remove(
+                            sessionId,
+                            com.rikkaminis.app.service.SessionBadgeStore.SessionBadgeState.PAUSED,
+                        )
+                    }
                 }
             }
         }
@@ -2607,7 +2787,14 @@ class ChatViewModel(
                             currentProvider = ProviderFactory.create(
                                 freshInstance,
                                 freshKey,
-                                cachedProvider.model,
+                                // [deep-audit-1044 B-03] Rebuild IN PLACE for the
+                                // same entry, so the model must stay the one the
+                                // cached provider was created with — but resolved
+                                // through the live exit (a provider built by a
+                                // path that predates this fix still carries the
+                                // raw, un-enriched base model).
+                                liveEffectiveModel()?.takeIf { it.id == cachedProvider.model.id }
+                                    ?: cachedProvider.model,
                                 context,
                             )
                             AppLogger.info(
@@ -2697,7 +2884,12 @@ class ChatViewModel(
     fun dismissContextExhaustedDialog(restoreInput: Boolean) {
         _showContextExhaustedDialog.value = false
         if (restoreInput) {
-            setInputText(pendingExhaustedText)
+            // [dv24/B-05] Restore through the composer, which writes BOTH the
+            // ViewModel string and the field. The old single write was dropped
+            // whenever the composer's live text already equalled the stash
+            // (equal StateFlow write) — and it never cancelled the pending IME
+            // burst, so the burst's snapshot landed over the restored message.
+            requestComposerCommand(ComposerCommand.ReplaceText(text = pendingExhaustedText))
         }
         pendingExhaustedText = ""
         pendingExhaustedHasAttachments = false
@@ -2721,9 +2913,11 @@ class ChatViewModel(
         // _compactSummary/_cachedLatestMarker over the wiped session — the
         // deleted transcript's summary becomes the context of the fresh
         // chat (old messages "revived" as compacted history). Cancellation
-        // is safe by construction: see the compactJob KDoc — the pipeline
-        // rethrows CE and nothing is persisted before the commit block, so
-        // a cancelled compact leaves zero trace; the next turn re-evaluates
+        // is safe for the transcript: see the compactJob KDoc — the pipeline
+        // rethrows CE and nothing is persisted before the commit block (the
+        // one window inside it is finalize-only: worst case a marker row
+        // without its in-memory mirror, rebuilt on the next session load),
+        // so a cancelled compact never writes twice; the next turn re-evaluates
         // context pressure from live state and re-fires a fresh compact if
         // still needed.
         compactJob?.cancel()
@@ -2747,6 +2941,11 @@ class ChatViewModel(
         // both; the next turn re-evaluates pressure from live state.
         _compactSummary.value = null
         toolLoopDetector.reset()
+        // [FIX-R4-P F-02] The wiped transcript's pressure reading must not
+        // survive the wipe: `contextPressure()` re-derives EXHAUSTED from a
+        // stale `_lastTurnContextTokens`, so the Context-Full dialog the user
+        // just cleared came straight back on the new chat's first send.
+        resetContextPressureState()
         _canResume.value = false
         _attachments.value = emptyList()
         // [sweep-p1] Editing state must go too (backlog §72): a mid-edit
@@ -2761,12 +2960,18 @@ class ChatViewModel(
         // newly cleared chat doesn't briefly flash a stale tool's sheet
         // before the existence-guard catches up.
         _selectedToolDetailId.value = null
-        // Drop any browser tabs the agent spawned for this session, and
+        // Drop the browser tabs the agent spawned for this session, and
         // delete the persisted tab snapshot so a future open starts clean.
         // iOS calls BrowserTabPool.deletePersistedData(for:) +
         // BrowserUseOffloadBridge.releasePool(forSession:); on Android the
-        // pool is per-VM (lazy), so releasing tabs here is sufficient.
-        _browserTabPoolRef?.releaseAllTabs()
+        // pool is per-VM (lazy), so discarding its tabs here is sufficient.
+        // [fw-1030b A / r3-B09 F-05] `discardAllTabs()`, not `releaseAllTabs()`:
+        // release keeps the live Tab objects on purpose (BrowserSheet's
+        // takeover hands them to the user), so the delete below was undone by
+        // the very next save — the pool's own trailing saveState() in release,
+        // then the sheet's "+" (newTabFromUI), any browser_use action, or
+        // trim/evict — and the cleared chat's tabs came back on reopen.
+        _browserTabPoolRef?.discardAllTabs()
         runCatching {
             java.io.File(context.filesDir, "browser_tabs/$sid.json").delete()
         }
@@ -2799,7 +3004,7 @@ class ChatViewModel(
      * an [InputAttachment] and add it to the composer. Called by
      * ChatScreen when draining a [com.rikkaminis.app.share.PendingShare].
      */
-    fun addAttachmentFromStagedShare(file: java.io.File): InputAttachment? {
+    suspend fun addAttachmentFromStagedShare(file: java.io.File): InputAttachment? {
         if (!file.exists()) return null
         val ext = file.extension.lowercase()
         val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
@@ -2814,16 +3019,27 @@ class ChatViewModel(
         // the LLM payload, leaving the model staring at "what is this?" with no
         // picture. Copy the staged bytes into our own private dir so the
         // attachment outlives the share-extension cleanup.
-        val durableDir = java.io.File(context.cacheDir, "share_inbound").apply { mkdirs() }
-        val durable = java.io.File(durableDir, "${java.util.UUID.randomUUID()}-${file.name}")
-        try {
-            file.inputStream().use { input ->
-                durable.outputStream().use { output -> input.copyTo(output) }
+        // [fix/da1024-A] deep-audit-1024 ISSUE-01: `mkdirs` + the 24h orphan prune
+        // + the (100 MB-capable) stream copy are disk work — run them on IO so
+        // draining a share cannot stall the UI thread; addAttachment stays on Main.
+        val durable = withContext(Dispatchers.IO) {
+            val durableDir = java.io.File(context.cacheDir, "share_inbound").apply { mkdirs() }
+            // Nothing ever deleted this dir before (it is under cacheDir but not the
+            // system cache, so the OS has no reason to reclaim it). A prune failure
+            // must never block the copy.
+            runCatching { pruneExpiredShareInboundFiles(durableDir, System.currentTimeMillis()) }
+                .onFailure { Log.w(TAG, "share_inbound prune failed: ${it.message}") }
+            val f = java.io.File(durableDir, "${java.util.UUID.randomUUID()}-${file.name}")
+            try {
+                file.inputStream().use { input ->
+                    f.outputStream().use { output -> input.copyTo(output) }
+                }
+                f
+            } catch (e: Exception) {
+                Log.w(TAG, "failed to copy staged share file ${file.name}: ${e.message}")
+                null
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "failed to copy staged share file ${file.name}: ${e.message}")
-            return null
-        }
+        } ?: return null
         val attachment = InputAttachment(
             fileName = file.name,
             uri = android.net.Uri.fromFile(durable),
@@ -2967,7 +3183,9 @@ class ChatViewModel(
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob so cancelStream() can
+        // kill the whole turn (same shape/rationale as sendMessage / resume).
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
             try {
                 val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
@@ -3024,6 +3242,19 @@ class ChatViewModel(
                     // + all later turns while keeping (then overwriting) this one.
                     chatRepository.deleteMessagesAfter(sid, row.sortOrder + 1)
                     chatRepository.updateMessageParts(row.id, keptArr.toString())
+                    // [R5-C C-C-04①] Sub-message cut: the row SURVIVES (rewritten
+                    // in place), so its primary key stays in agentHistory and
+                    // `dropCompactMarkerIfRewound` — "no anchor among the live
+                    // ids" — reads this rewind as intact. But if the compaction
+                    // marker folded the history up to and INCLUDING this row
+                    // (`lastCompactedMessageId`, the v2 authoritative anchor),
+                    // its summary now describes the tool call and turns this cut
+                    // just dropped. Drop it explicitly here; the deleted-row case
+                    // below is still covered by dropCompactMarkerIfRewound. The
+                    // predicate-level fix ("this row's content was truncated")
+                    // belongs to ChatSessionLifecycle (C1) — see the fix report's
+                    // division-of-labour note.
+                    dropCompactMarkerIfAnchoredOnRow(sid, row.id)
                     Log.i(TAG, "rerunFromToolBlock sub-message cut tuId=${targetToolUseId.take(12)} keepCount=${row.sortOrder + 1} partIdx=$cutPartIdx trimmedRow=${row.id.take(8)}")
                 }
 
@@ -3092,8 +3323,14 @@ class ChatViewModel(
                 for (entity in chatRepository.loadMessages(sid)) {
                     agentHistory.add(entity.toLLMMessage())
                 }
+                // [FIX-R4-P F-05/F-02] Block-boundary rerun is a rewind too:
+                // everything from the target block onward was deleted, so a
+                // marker anchored there summarizes removed turns, and the
+                // pressure reading describes the pre-rewind transcript.
+                dropCompactMarkerIfRewound(sid)
+                resetContextPressureState()
 
-                streamLaunched = runRerunStreamTail(initialProvider, "rerunFromToolBlock")
+                streamLaunched = runRerunStreamTail(initialProvider, "rerunFromToolBlock", sendEpoch, claimToken)
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
@@ -3134,7 +3371,12 @@ class ChatViewModel(
         val message = messages[index]
         // [T-android-tool-autoscroll] Start-of-turn snap — see resume().
         _forceScrollToBottom.tryEmit(Unit)
-        if (message.role != "user" || message.content.isBlank()) return
+        // [B-05 deep-audit-1037] The old guard was content-only: a pure
+        // attachment message (blank caption, attachments present) could never
+        // be retried. The verdict goes through the ONE shared predicate.
+        if (message.role != "user" ||
+            !userRowHasVisibleContent(message.content, message.imageUris, message.attachmentUris)
+        ) return
 
         val initialProvider = currentProvider
         if (initialProvider == null) {
@@ -3209,7 +3451,8 @@ class ChatViewModel(
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob — see rerunFromToolBlock.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             // If setup throws before the inner streamJob is launched, the
             // streaming flag would be stuck true forever. Reset on the
             // unhappy paths; happy path resets in the streamJob's tail.
@@ -3234,15 +3477,13 @@ class ChatViewModel(
                     // or the cutoff anchors one user message too early and the
                     // retried bubble (plus the whole last turn) is silently
                     // dropped from the rebuilt history (mirrors the iOS fix).
-                    val hasText = try {
-                        val arr = org.json.JSONArray(entity.partsJson)
-                        (0 until arr.length()).any { i ->
-                            val o = arr.getJSONObject(i)
-                            val v = o.optString("value", "")
-                            o.optString("type") == "text" && v.isNotBlank() &&
-                                !v.trimStart().startsWith("<system-reminder>")
-                        }
-                    } catch (_: Exception) { true }
+                    // [B-05 deep-audit-1037] One shared predicate with
+                    // truncateBeforeEdit: the old text-only copy disagreed with
+                    // the edit path's XML-stripped count for pure-attachment
+                    // rows (non-blank XML inventory text vs stripped-blank), so
+                    // the two cutoffs landed on different rows. A mediaRef part
+                    // (an attachment) IS a visible user turn.
+                    val hasText = userPartsJsonHasVisibleContent(entity.partsJson)
                     if (hasText) {
                         if (visibleUserCount == visibleUserIndex) {
                             cutoffSortOrder = entity.sortOrder + 1
@@ -3263,8 +3504,18 @@ class ChatViewModel(
             for (entity in remaining) {
                 agentHistory.add(entity.toLLMMessage())
             }
+            // [FIX-R4-P F-05] The retry deleted everything after the message
+            // we are re-answering. A compaction marker anchored inside the
+            // deleted range is now a summary of turns the user just removed —
+            // and `loadSession()`'s createdAt heal would even re-anchor it to
+            // the truncated tail and PERSIST that, so the deleted content keeps
+            // coming back as context. Drop it here instead of at load time.
+            // [FIX-R4-P F-02] Same rewind: the pressure reading described the
+            // longer transcript that no longer exists.
+            dropCompactMarkerIfRewound(sid)
+            resetContextPressureState()
 
-            streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
+            streamLaunched = runRerunStreamTail(provider, "retryFromMessage", sendEpoch, claimToken)
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
@@ -3483,6 +3734,25 @@ class ChatViewModel(
         val trimmed = text.trim()
         // While streaming, enqueue instead of silently dropping (iOS: send vs enqueuePrompt).
         if (_isStreaming.value) {
+            // [FIX-R4-P F-13] An edit is a REWRITE of the transcript, not a new
+            // turn. Queueing it — the branch below — appends the edited text as
+            // a fresh message at the tail, never runs the truncation the edit
+            // implies, and never consumes `_editingMessageId` (that happens far
+            // below, past this early return), so the "Editing message" banner
+            // sticks until the user cancels it manually. The state IS reachable
+            // even though editMessage() refuses to start editing mid-stream: a
+            // queued drain / resume can start a turn while the user is already
+            // editing. Refuse to queue in that case, keep the edit state intact
+            // and put the text back in the composer (ChatInputArea clears the
+            // field before calling us), so nothing is lost.
+            if (_editingMessageId.value != null) {
+                appendSystemInfo(
+                    text = context.getString(R.string.sysmsg_edit_wait_stream),
+                    iconKind = "info",
+                )
+                setInputText(text)
+                return
+            }
             enqueuePrompt(text)
             // [T-user-message-preempts-agent] User messages win over the
             // running agent task: immediately cancel the in-flight stream so
@@ -3523,7 +3793,31 @@ class ChatViewModel(
         // to start a new session / clear chat / cancel (iOS 'Context Full'
         // alert parity) instead of leaving them stranded behind an inline
         // "Send blocked" notice.
-        if (!checkContextBeforeSend()) {
+        //
+        // [R5-C C-C-05] An edit send REWRITES the transcript tail, so the
+        // pressure these gates read (`_lastTurnContextTokens` from the last
+        // turn of the FULL history) describes turns this send is about to
+        // delete. Running them first blocked a shortening edit behind the
+        // context-full dialog — and the dialog's Cancel left
+        // `_editingMessageId` alive, so the NEXT plain send consumed it and
+        // ran truncateBeforeEdit against a message the user was no longer
+        // editing (visible history silently deleted). And at NEEDS_COMPACT it
+        // fired a full compaction over the very history the edit discards.
+        // The edit path truncates first and calls resetContextPressureState()
+        // inside the shell, so pressure re-derives from the post-edit
+        // transcript on the next send — skip all three gates for edits.
+        val editingSend = _editingMessageId.value != null
+        if (!editingSend && !checkContextBeforeSend()) {
+            // [R5-C C-C-05] Structural invariant for this stash path: a refused
+            // send must never leave edit state owned by a send that never
+            // happened. With the edit-skip above this branch cannot see an edit
+            // today; the clear keeps the invariant if the gate order is ever
+            // re-tightened (the stale-edit chain it guards against is the
+            // data-loss arm of this finding).
+            if (_editingMessageId.value != null) {
+                _editingMessageId.value = null
+                _preEditAttachments.value = null
+            }
             pendingExhaustedText = trimmed
             pendingExhaustedHasAttachments = _attachments.value.isNotEmpty()
             _showContextExhaustedDialog.value = true
@@ -3535,7 +3829,8 @@ class ChatViewModel(
         // happen BEFORE `_isStreaming` flips true below, or compactAll aborts
         // on the in-stream guard; the send coroutine awaits completion before
         // persisting the user message (see awaitAutoCompactIfNeeded).
-        maybeTriggerAutoCompact()
+        // [R5-C C-C-05] Skipped for edit sends — see the block above.
+        if (!editingSend) maybeTriggerAutoCompact()
         // [fix/compact-exhausted-rescue-1005] A real user send re-arms the
         // EXHAUSTED rescue gate: this message is about to be persisted, so
         // this is the "new user message" reset per the 2026-10-05 design
@@ -3641,12 +3936,24 @@ class ChatViewModel(
             // above, wait for it to finish so the persisted user message is
             // appended AFTER the compacted range. The outgoing request then
             // sees: summary + recent tail + the new user message.
-            awaitAutoCompactIfNeeded()
+            // [R5-C C-C-05] Skipped for edit sends: an edit never fired a
+            // compact (gate skipped above), so awaiting one here would either
+            // no-op or — if a compact was queued from elsewhere — run it over
+            // the pre-edit transcript the shell is about to truncate.
+            if (!editingSend) awaitAutoCompactIfNeeded()
             // Ensure session exists in DB (creates on first message for draft sessions)
             val activeSessionId = ensureSession()
 
             if (editingId != null) {
                 truncateBeforeEdit(editingId)
+                // [FIX-R4-P F-05] Editing an old message truncates everything
+                // after it — markers anchored in the deleted range summarize
+                // content the user just removed, and `loadSession()`'s created-
+                // at heal would re-anchor + persist them over the short tail.
+                // [FIX-R4-P F-02] And the context-pressure reading belongs to
+                // the pre-edit transcript.
+                dropCompactMarkerIfRewound(activeSessionId)
+                resetContextPressureState()
             }
 
             val prepared = prepareUserAttachments(currentAttachments, activeSessionId)
@@ -3707,6 +4014,20 @@ class ChatViewModel(
             val systemPrompt = baseSystemPrompt
 
             // Start agent loop with fallback. _isStreaming was set synchronously at top.
+            // [dv29-B01] Second line of defence (the shell itself is held in
+            // sendShellJob and cancelStream() cancels it, so a stopped turn
+            // normally never reaches here): the claim can also be SUPERSEDED
+            // while this shell runs — cancelStream() mints a fresh token and a
+            // newer turn claims — and a superseded shell must not start a
+            // stream. Same guard shape as resume().
+            if (!isActive ||
+                !_isStreaming.value ||
+                sendEpoch != streamingClaimEpoch ||
+                claimToken !== streamingClaimToken
+            ) {
+                AppLogger.info(TAG_STREAM, "send shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                return@launch
+            }
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "send streamJob ENTER sid=$activeSessionId")
@@ -3898,8 +4219,10 @@ class ChatViewModel(
         // ("zombie send"). Uniform across cancelStream callers: every caller
         // (stop button, notification onStop, mid-stream preempt, clearChat,
         // headless teardown) means "this turn's work stops NOW", and a
-        // killed compact is always safe (nothing persisted before the commit
-        // block) — the next turn re-evaluates context pressure from live
+        // killed compact is always safe for the transcript (nothing is
+        // persisted before the commit block; inside it the worst case is a
+        // marker row the next session load rebuilds from — see the
+        // compactJob KDoc) — the next turn re-evaluates context pressure from live
         // state and re-fires a fresh compact if still needed.
         compactJob?.cancel()
         sendShellJob?.cancel()
@@ -3988,119 +4311,221 @@ class ChatViewModel(
         // behind the input bar.
         _forceScrollToBottom.tryEmit(Unit)
 
-        // If history ends with assistant (Case 2: text-cancel committed a
-        // partial assistant turn), append a continue reminder as a user
-        // message. If it ends with user tool_result (Case 1), it's already
-        // a valid starting point for the next API call — no reminder needed.
-        val historyEndsWithAssistant =
-            agentHistory.lastOrNull()?.role == LLMMessage.Role.ASSISTANT
-        if (historyEndsWithAssistant) {
-            val reminder =
-                "<system-reminder>The user stopped the previous response but now wants to continue. Pick up exactly where you left off.</system-reminder>"
-            val parts = listOf<AgentContentPart>(AgentContentPart.Text(reminder))
-            agentHistory.add(
-                LLMMessage(
-                    role = LLMMessage.Role.USER,
-                    content = reminder,
-                    contentParts = parts,
-                )
-            )
-            viewModelScope.launch(Dispatchers.IO) {
-                val partsJson = """[{"type":"text","value":${escapeJson(reminder)}}]"""
-                chatRepository.appendMessage(activeSessionId, "user", partsJson)
-            }
-        }
+        // [B-08 deep-audit-1048] Claim _isStreaming SYNCHRONOUSLY, before any
+        // coroutine starts — the same discipline sendMessage / retryFromMessage
+        // / rerunFromToolBlock already follow. This used to be minted INSIDE
+        // the setup coroutine, after systemPromptForSession() had already hit
+        // disk (SoulStore / memory / skill dirs), which opened two windows:
+        //   · every entry guard (`if (_isStreaming.value)` in sendMessage /
+        //     retryFromMessage / rerunFromToolBlock) still read false, so a
+        //     second turn could start while this one was still preparing;
+        //   · cancelStream() only had the previous streamJob to cancel — the
+        //     setup coroutine owned no handle, survived the Stop, and started a
+        //     stream the user had already stopped ("Stop 后诈尸").
+        AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+        // flips, so a predecessor's finally landing anywhere during this claim
+        // is a no-op instead of a flip that hides the new turn's Stop button.
+        // See streamingClaimToken KDoc.
+        streamingClaimToken = Any()
+        _isStreaming.value = true
+        streamEpoch++
+        // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
+        // finally can't flip _isStreaming off during the setup window.
+        streamingClaimEpoch = streamEpoch
+        val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val baseSystemPrompt = systemPromptForSession()
-            val systemPrompt = baseSystemPrompt
+        // [FIX-R4-P F-07] The continue reminder used to be appended HERE, before
+        // the setup shell ran. It is a real persisted user turn, so writing it
+        // outside the claim window meant a Stop during the prompt build left a
+        // reminder pinned to the tail with no answer behind it (see the block
+        // inside the shell below for the full consequences). It now lives
+        // inside the shell, after the claim-revocation check.
 
-            AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sid=$activeSessionId)")
-            streamingClaimToken = Any()
-            _isStreaming.value = true
-            streamEpoch++
-            // [T-stale-finally-vs-new-claim] Publish the claim so an older
-            // job's finally can't flip _isStreaming off during setup.
-            streamingClaimEpoch = streamEpoch
-            val sendEpoch = streamingClaimEpoch
-            val claimToken = streamingClaimToken
-            streamJob = launch(Dispatchers.IO) {
-                AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
-                try {
-                    SessionConcurrencyManager.acquireSlot(activeSessionId)
-                    AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
+        // [B-08 deep-audit-1048] Hold the setup shell in sendShellJob so
+        // cancelStream() can kill the whole turn (same rationale + shape as the
+        // send path's shell): during the prompt build below `streamJob` is still
+        // null, so `streamJob?.cancel()` alone reaches nothing and the shell
+        // would go on to start a stream after the user pressed Stop.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
+            var streamLaunched = false
+            try {
+                val baseSystemPrompt = systemPromptForSession()
+                val systemPrompt = baseSystemPrompt
 
+                // [B-08 deep-audit-1048] The claim published above can be
+                // revoked while the prompt build runs: cancelStream() clears
+                // _isStreaming under this same epoch, and a newer turn mints a
+                // fresh claim token. Never start a stream for a stopped turn.
+                if (!isActive ||
+                    !_isStreaming.value ||
+                    sendEpoch != streamingClaimEpoch ||
+                    claimToken !== streamingClaimToken
+                ) {
+                    AppLogger.info(TAG_STREAM, "resume shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                    return@launch
+                }
+
+                // [FIX-R4-P F-07 → R5-C C-C-06] The continuation reminder moved
+                // INTO the streamJob, after the concurrency slot is acquired
+                // (see the reminder block inside the inner try). It is a real
+                // persisted USER row: writing it before the slot wait still left
+                // two stop-windows with a broken tail — a Stop while this job
+                // queued on the slot saw historyEndsWithAssistant=false (the
+                // reminder, not the run), so handleUserCancelledCleanup took the
+                // persist arm and appended the PREVIOUS turn's committed text a
+                // second time (duplicate pair); a Stop after the placeholder
+                // insert but before the first packet dropped the placeholder and
+                // left the reminder orphaned with _canResume=false. Keeping the
+                // write inside the claim window AND behind the slot wait makes
+                // the reminder exactly as cancellable as the turn it belongs to
+                // (same invariant as F-07, one window later), and the stop
+                // cleanup's reminder-tail probe (planStopCleanup) now self-heals
+                // the remaining pre-first-packet window.
+
+                streamLaunched = true
+                streamJob = launch(Dispatchers.IO) {
+                    AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
                     try {
-                        // [audit-0920] Guarded region widened — same fix and
-                        // same rationale as the send path above (and the
-                        // [audit-0917] template in ChatTurnPersistence):
-                        // setActive / strategy / fallback-build must be inside
-                        // the try that owns the releaseSlot finally, or a
-                        // non-CE throw from any of them leaks the concurrency
-                        // slot and escapes the coroutine.
-                        SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
-                        val activeFallbackStrategy = run {
-                            val groupId = _selectedGroupId.value
-                            groupId?.let {
-                                providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy
-                            } ?: com.rikkaminis.app.data.model.FallbackStrategy.default
+                        SessionConcurrencyManager.acquireSlot(activeSessionId)
+                        AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
+
+                        try {
+                            // [audit-0920] Guarded region widened — same fix and
+                            // same rationale as the send path above (and the
+                            // [audit-0917] template in ChatTurnPersistence):
+                            // setActive / strategy / fallback-build must be inside
+                            // the try that owns the releaseSlot finally, or a
+                            // non-CE throw from any of them leaks the concurrency
+                            // slot and escapes the coroutine.
+
+                            // [R5-C C-C-06] Continue reminder — written HERE,
+                            // after the slot is acquired, Case 2 only (history
+                            // ends with an ASSISTANT: a text-cancel committed a
+                            // partial turn, so the next request needs a user turn
+                            // to answer; a tool_result tail is already a valid
+                            // starting point). A Stop before this point cancels
+                            // the job while it is still queued on the slot, so no
+                            // reminder row exists and the stop cleanup sees the
+                            // true tail shape; a Stop after this point is handled
+                            // by the reminder-tail arm in planStopCleanup.
+                            // Capture the row id: the reminder is a real
+                            // transcript row, so the in-memory entry must know
+                            // its dbMessageId or compact boundary resolution
+                            // (which is id-based) cannot see it. Text is
+                            // single-sourced as CONTINUATION_REMINDER_TEXT
+                            // (StopCleanupPlan.kt) so the tail matcher agrees
+                            // verbatim with the writer.
+                            if (!isActive ||
+                                !_isStreaming.value ||
+                                sendEpoch != streamingClaimEpoch ||
+                                claimToken !== streamingClaimToken
+                            ) {
+                                AppLogger.info(TAG_STREAM, "resume streamJob aborted after slot (claim revoked; sid=$activeSessionId)")
+                                return@launch
+                            }
+                            if (agentHistory.lastOrNull()?.role == LLMMessage.Role.ASSISTANT) {
+                                val reminder = CONTINUATION_REMINDER_TEXT
+                                val parts = listOf<AgentContentPart>(AgentContentPart.Text(reminder))
+                                val reminderRow = runCatching {
+                                    chatRepository.appendMessage(
+                                        activeSessionId,
+                                        "user",
+                                        """[{"type":"text","value":${escapeJson(reminder)}}]""",
+                                    )
+                                }.onFailure {
+                                    AppLogger.warning(TAG, "resume: continue-reminder persist failed: ${it.message}")
+                                }.getOrNull()
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = reminder,
+                                        contentParts = parts,
+                                        dbMessageId = reminderRow?.id,
+                                    )
+                                )
+                            }
+
+                            SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
+                            val activeFallbackStrategy = run {
+                                val groupId = _selectedGroupId.value
+                                groupId?.let {
+                                    providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy
+                                } ?: com.rikkaminis.app.data.model.FallbackStrategy.default
+                            }
+                            val fallbackProviders = buildFallbackProviders(provider)
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop CALL")
+                            runAgentLoop(
+                                provider = provider,
+                                systemPrompt = systemPrompt,
+                                fallbackProviders = fallbackProviders,
+                                fallbackStrategy = activeFallbackStrategy,
+                            )
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop RETURN normal")
+                            drainQueuedPrompts(provider, systemPrompt, activeFallbackStrategy)
+                            AppLogger.info(TAG_STREAM, "resume drainQueuedPrompts RETURN")
+                        } catch (e: CancellationException) {
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop CANCELLED")
+                            Log.d(TAG, "Agent loop cancelled (resume)")
+                        } catch (e: Exception) {
+                            AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
+                            Log.e(TAG, "Agent loop error (resume)", e)
+                            reportAgentLoopError(e)
+                            // [fix/da1015-sched-errorprop] Flag the run as failed for
+                            // the same reason the send / retryLast boundaries do: this
+                            // finally unwinds through setInactive, and a resumed run
+                            // that dies must not settle as a clean completion.
+                            SessionActivityTracker.markStreamError(activeSessionId)
+                        } finally {
+                            AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
+                            // [T-claim-token-vs-stale-finally] Only the current turn
+                            // may tear down run-state — see the send path's finally.
+                            if (claimToken === streamingClaimToken) {
+                                // [audit-0907 B2] Reset queue-position state — same
+                                // rationale as the send path's finally: whatever the
+                                // worker reported while queued must not leak into the
+                                // next run's typing indicator.
+                                resetQueueWaitingAhead()
+                                // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                                resetAwaitingResponseSince()
+                                // [T-android-overlay-reply-status-34599] Surface
+                                // the assistant's most recent reply text to the
+                                // overlay BEFORE setInactive so the post-completion
+                                // overlay state (no-running, has-outcome) carries a
+                                // non-null excerpt. Reading _messages here is safe:
+                                // we're in the finally block of the agent loop and
+                                // the stream has already flushed its last delta.
+                                publishOverlayReplyExcerpt(activeSessionId)
+                                SessionActivityTracker.setInactive(activeSessionId)
+                            }
+                            SessionConcurrencyManager.releaseSlot(activeSessionId)
+                            AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
                         }
-                        val fallbackProviders = buildFallbackProviders(provider)
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CALL")
-                        runAgentLoop(
-                            provider = provider,
-                            systemPrompt = systemPrompt,
-                            fallbackProviders = fallbackProviders,
-                            fallbackStrategy = activeFallbackStrategy,
-                        )
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop RETURN normal")
-                        drainQueuedPrompts(provider, systemPrompt, activeFallbackStrategy)
-                        AppLogger.info(TAG_STREAM, "resume drainQueuedPrompts RETURN")
                     } catch (e: CancellationException) {
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CANCELLED")
-                        Log.d(TAG, "Agent loop cancelled (resume)")
-                    } catch (e: Exception) {
-                        AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
-                        Log.e(TAG, "Agent loop error (resume)", e)
-                        reportAgentLoopError(e)
-                    } finally {
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
-                        // [T-claim-token-vs-stale-finally] Only the current turn
-                        // may tear down run-state — see the send path's finally.
-                        if (claimToken === streamingClaimToken) {
-                            // [audit-0907 B2] Reset queue-position state — same
-                            // rationale as the send path's finally: whatever the
-                            // worker reported while queued must not leak into the
-                            // next run's typing indicator.
-                            resetQueueWaitingAhead()
-                            // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                            resetAwaitingResponseSince()
-                            // [T-android-overlay-reply-status-34599] Surface
-                            // the assistant's most recent reply text to the
-                            // overlay BEFORE setInactive so the post-completion
-                            // overlay state (no-running, has-outcome) carries a
-                            // non-null excerpt. Reading _messages here is safe:
-                            // we're in the finally block of the agent loop and
-                            // the stream has already flushed its last delta.
-                            publishOverlayReplyExcerpt(activeSessionId)
-                            SessionActivityTracker.setInactive(activeSessionId)
-                        }
-                        SessionConcurrencyManager.releaseSlot(activeSessionId)
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
+                        AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
+                        Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
                     }
-                } catch (e: CancellationException) {
-                    AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
-                    Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
+                    // [T-android-stale-streamjob-clears-isstreaming] guard +
+                    // epoch gate (see runRerunStreamTail).
+                    if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
+                        _isStreaming.value = false
+                    } else {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
+                    }
+                    AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
                 }
-                // [T-android-stale-streamjob-clears-isstreaming] guard +
-                // epoch gate (see runRerunStreamTail).
-                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
-                    _isStreaming.value = false
-                } else {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
+            } finally {
+                if (!streamLaunched) {
+                    // [T-stale-finally-vs-new-claim] Only clear under our own claim.
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false (setup aborted)")
+                        _isStreaming.value = false
+                    } else {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false SKIPPED (superseded; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch)")
+                    }
                 }
-                AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
             }
         }
     }
@@ -4152,6 +4577,9 @@ class ChatViewModel(
      * Called from ChatScreen's onDispose. Gates:
      *   - realSessionId must be non-empty (a row was actually inserted)
      *   - not currently streaming (background agent work would be lost)
+     *   - no attachments staged (the user handed us files with no message yet)
+     *   - no draft promotion in flight ([promoteInFlight] — the row belongs to
+     *     the promotion; its first message row has not landed yet)
      *   - persisted message count == 0 (authoritative DB check — `_messages`
      *     also contains ephemeral system-info bubbles that aren't persisted,
      *     so a state-only check would over-count).
@@ -4162,13 +4590,38 @@ class ChatViewModel(
      */
     fun cleanupIfEmptyOnExit() {
         val sid = realSessionId
-        if (sid.isEmpty()) return
-        if (_isStreaming.value) return
-        if (_attachments.value.isNotEmpty()) return
+        // [dv25-B08 / deep-audit-1045 B-08] The four reasons a departure must NOT
+        // reap the row live in one pure predicate (PromoteDraftPolicy) so the
+        // decision is JVM-pinnable. `promoteInFlight` is a session-ownership bit,
+        // not a grace period: between `ensureSession()` and the promotion's first
+        // `messages` row the count IS legitimately zero, and deleting there also
+        // releases this ViewModel — cancelling the very coroutine that was about
+        // to fill the row, after the composer copy had already been dropped.
+        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val count = chatRepository.messageCount(sid)
                 if (count > 0) return@launch
+                // [dv25-B08] Re-read the ownership bit AFTER the IO hop: a
+                // promotion that started while this coroutine was in flight owns
+                // the row now, and the count is legitimately zero until its first
+                // message lands. Deleting here would also release the ViewModel
+                // and cancel the promotion itself.
+                if (promoteInFlight) {
+                    AppLogger.info(
+                        TAG,
+                        "cleanupIfEmptyOnExit: skipping $sid — a draft promotion owns it",
+                    )
+                    return@launch
+                }
                 AppLogger.info(
                     TAG,
                     "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
@@ -4198,14 +4651,32 @@ class ChatViewModel(
         buildChatMessagesTranscript(parsed, mediaStore.mediaBaseDir) { msg ->
             Log.w(TAG, msg)
         }
+    /**
+     * [debt-1026 B1] `resizeForInference` makes the RELOAD path apply the same
+     * downscale the composer applies before the first send (`resizeImageBytes`,
+     * max edge 2000). Without it the original full-resolution bytes were
+     * re-inlined on every reload, so a session with historical photos re-sent
+     * megabytes of base64 per turn that the composer had deliberately shrunk.
+     * The resizer is injected here rather than called from the builder because
+     * `ChatStreamToolHelpers` is deliberately Android-free (and JVM-covered);
+     * every caller of these two entry points is already on
+     * `Dispatchers.IO` (verified: `sendShellJob`/rerun/retry launches and
+     * `truncateBeforeEdit`), so the decode does not run on Main.
+     */
+    private fun inferenceImageResizer(rawBytes: ByteArray, mimeType: String): ByteArray? =
+        resizeImageBytes(rawBytes, mimeType, maxEdge = 2000)
+
     internal fun MessageEntity.toLLMMessage(): LLMMessage {
         val parts = parsePartsJson(partsJson).stripOrphanThinkClosersForRole(role)
         val malformed = parts.isEmpty() && partsJson.isNotBlank()
-        return buildSingleLlmMessage(this, partsJson, parts, malformed, mediaStore.mediaBaseDir)
+        return buildSingleLlmMessage(
+            this, partsJson, parts, malformed, mediaStore.mediaBaseDir,
+            ::inferenceImageResizer,
+        )
     }
 
     internal fun buildLlmMessages(parsed: List<ParsedRow>): List<LLMMessage> =
-        buildLlmMessagesFromParsed(parsed, mediaStore.mediaBaseDir)
+        buildLlmMessagesFromParsed(parsed, mediaStore.mediaBaseDir, ::inferenceImageResizer)
 
 }
 
@@ -4236,6 +4707,49 @@ internal fun sanitizeAgentHistoryMessages(messages: MutableList<LLMMessage>) {
  *
  * Pure + JVM-testable (no ViewModel dependencies).
  */
+
+/**
+ * [R5-C C-C-04①] Pure anchor test for sub-message truncation: does the live
+ * compaction marker fold the history up to and INCLUDING [rowId]? The v2
+ * marker's `lastCompactedMessageId` is the authoritative "everything to this
+ * id is in the summary" anchor, so a sub-message cut that rewrites that row IN
+ * PLACE (`updateMessageParts` keeps the primary key) leaves the summary
+ * describing tool calls and turns that no longer exist.
+ *
+ * Pure + JVM-testable (no ViewModel dependencies).
+ */
+internal fun compactMarkerAnchoredOnRow(marker: CompactMarkerEntity?, rowId: String): Boolean =
+    marker?.lastCompactedMessageId?.takeIf { it.isNotEmpty() } == rowId
+
+/**
+ * [R5-C C-C-04①] Drop the live compaction marker when the row it is anchored
+ * on was just truncated IN PLACE by a sub-message tool rerun.
+ *
+ * Why a caller-side trigger: `dropCompactMarkerIfRewound` (ChatSessionLifecycle)
+ * classifies a rewind as "no marker anchor among the live ids" — a sub-message
+ * cut keeps the truncated row's primary key alive, so that predicate reads the
+ * rewind as intact while the summary describes dropped content. The
+ * predicate-level fix belongs to ChatSessionLifecycle (C1's file); until that
+ * lands, the rerun call site triggers the drop explicitly here, scoped to the
+ * ONE anchor whose content this cut actually invalidated
+ * (`lastCompactedMessageId`). Anchors on earlier rows keep their summaries
+ * (those turns were untouched by the cut); anchors on deleted rows are already
+ * handled by `dropCompactMarkerIfRewound`.
+ */
+internal suspend fun ChatViewModel.dropCompactMarkerIfAnchoredOnRow(sid: String, truncatedRowId: String) {
+    if (!compactMarkerAnchoredOnRow(_cachedLatestMarker, truncatedRowId)) return
+    val deleted = runCatching { chatRepository.dao.deleteCompactMarkers(sid) }
+        .onFailure {
+            Log.w(ChatViewModel.TAG, "[Compact] anchor-row marker drop failed (sid=${sid.take(8)}): ${it.message}")
+        }
+        .isSuccess
+    _cachedLatestMarker = null
+    _compactSummary.value = null
+    Log.i(
+        ChatViewModel.TAG,
+        "[Compact] rerun truncated the marker's anchored row (row=${truncatedRowId.take(8)}, deleted=$deleted) — summary cleared [R5-C C-C-04①]",
+    )
+}
 
 /**
  * RC3: Roll the current turn's assistant blocks back to [turnStartBlockIndex],
@@ -4328,3 +4842,190 @@ internal fun coalesceSystemInfoBlocks(blocks: List<AssistantBlock>): List<Assist
 /** Pure: last non-null payload wins; all-null → null. */
 internal fun resolveCoalescedPayload(payloads: List<String?>): String? =
     payloads.lastOrNull { it != null }
+
+// [FIX-G da1016-sysinfo-race] Single home for the pending system-notice coalesce
+// window. Before this class the window lived in four loose `pendingSysInfo*`
+// fields on ChatViewModel that two threads mutated: Main (UI notices —
+// checkContextBeforeSend, `/compact`, revertCompact, setProviderName) and the
+// agent loop's IO coroutine (ChatContextWindow.trimContextHistoryWindow, reached
+// from AgentLoopEngine :658 / :864). Interleaving them lost notices, emitted a
+// ChatMessage whose id came from one window while its toolBlocks came from
+// another, and could tear the backing ArrayList on the UI thread.
+//
+// Every mutation and every snapshot now happens under one lock, and the publish
+// callback of a drain runs inside that lock, so the owner's read-modify-write on
+// its message list is atomic as well.
+//
+// Generic on purpose: pure JVM, no Android/ViewModel dependency, so the state
+// machine is directly unit-testable (SysInfoCoalescerTest).
+internal class SysInfoCoalescer<T>(private val idOf: (T) -> String) {
+
+    /**
+     * One drained coalesce window.
+     *
+     * [blocks] is never empty: a window is created and given its first block
+     * inside one critical section, and only an existing window can be drained.
+     */
+    internal class Window<T>(
+        val firstId: String,
+        val iconKind: String,
+        /** Last non-null payload seen in the window; null when every call passed null. */
+        val payload: String?,
+        val blocks: List<T>,
+    )
+
+    /** Window identity — the trio that must never disagree with each other. */
+    private class WindowState(val iconKind: String, val firstId: String, val payload: String?)
+
+    private val lock = Any()
+    private var current: WindowState? = null
+    private val blocks = ArrayList<T>()
+
+    /**
+     * Append [block] to the pending window. A pending window of a different
+     * [iconKind] is drained — and handed to [publish] — before the new window
+     * starts, which preserves call order. [publish] runs INSIDE the lock.
+     */
+    fun append(block: T, iconKind: String, payload: String?, publish: (Window<T>) -> Unit) {
+        synchronized(lock) {
+            val open = current
+            if (open != null && open.iconKind != iconKind) {
+                publishLocked(publish)
+            }
+            val stillOpen = current
+            if (stillOpen == null) {
+                current = WindowState(iconKind = iconKind, firstId = idOf(block), payload = payload)
+            } else if (payload != null) {
+                // Last non-null payload wins — parity with the old
+                // pendingSysInfoPayload write, which nothing consumed
+                // (backlog :2525 R5 is a deliberate negative decision). Kept so
+                // the write sequence stays identical; do NOT wire it up here.
+                current = WindowState(stillOpen.iconKind, stillOpen.firstId, payload)
+            }
+            blocks.add(block)
+        }
+    }
+
+    /**
+     * Drain the pending window (if any) into [publish]. No-op when no window is
+     * open, so a stale timer that fires after a flush cannot emit an empty card.
+     * [publish] runs INSIDE the lock.
+     */
+    fun flush(publish: (Window<T>) -> Unit) {
+        synchronized(lock) {
+            publishLocked(publish)
+        }
+    }
+
+    /** Caller must hold [lock]: snapshot the window, clear it, then publish. */
+    private fun publishLocked(publish: (Window<T>) -> Unit) {
+        val state = current ?: return
+        val drained = Window(
+            firstId = state.firstId,
+            iconKind = state.iconKind,
+            payload = state.payload,
+            blocks = blocks.toList(),
+        )
+        current = null
+        blocks.clear()
+        publish(drained)
+    }
+}
+
+// [fix/da1024-A] deep-audit-1024 ISSUE-01: retention window for the staged
+// system-share copies under `cacheDir/share_inbound/`. 24h — the same window as
+// the sibling cacheDir prunes (LargeContentGuard, FullscreenImageViewer,
+// ChatMutationMethods.pruneStaleAttachments).
+internal const val SHARE_INBOUND_TTL_MS = 24L * 60L * 60L * 1000L
+
+/**
+ * Delete `share_inbound` copies older than [maxAgeMs]; `0` when the dir is
+ * missing or empty (`listFiles()` null). Pure JVM — no Android dependency — so
+ * the TTL boundary is unit-testable. Only regular files count, and a failed
+ * delete counts as kept: the prune must never block the copy it precedes.
+ *
+ * @param nowMs clock reading, injected so the boundary is testable.
+ * @param maxAgeMs retention window; defaults to [SHARE_INBOUND_TTL_MS].
+ *
+ * ponytail: 只在入站拷贝前顺带清扫（无后台巡检）| 天花板: 分享过就不再分享的人，
+ * 副本会留到 cache 被系统回收 | 升级触发: share_inbound 在存储诊断里成为可增长目录
+ */
+internal fun pruneExpiredShareInboundFiles(
+    inboundDir: java.io.File,
+    nowMs: Long,
+    maxAgeMs: Long = SHARE_INBOUND_TTL_MS,
+): Int {
+    val children = inboundDir.listFiles() ?: return 0
+    val cutoff = nowMs - maxAgeMs
+    var deleted = 0
+    for (f in children) {
+        if (f.isFile && f.lastModified() < cutoff && runCatching { f.delete() }.getOrDefault(false)) {
+            deleted++
+        }
+    }
+    return deleted
+}
+
+/**
+ * [fix/dv23-b3] Composer intents raised OUTSIDE the composer.
+ *
+ * The composer has exactly one writer: `ChatInputArea`. It owns the live field
+ * state and the 150 ms IME-burst debounce, so any intent that touches the
+ * composer must be resolved there, against the field's live text — never here
+ * against [ChatViewModel.inputText], which lags by the debounce window.
+ *
+ * Intentionally tiny: an enum-like command set, not a general bus. Adding a
+ * member is only justified when a caller cannot reach the composer state at all
+ * (it lives in the child composable's `remember`).
+ */
+sealed interface ComposerCommand {
+    /**
+     * Toolbar `/` button: open the slash menu over the current text, or close
+     * it when already open. Never clobbers existing composer content (see
+     * `showSlashMenuOverInput`).
+     */
+    data object ToggleSlashMenu : ComposerCommand
+
+    /** Tap outside / system back: close the slash menu, keep the body text. */
+    data object DismissSlashMenu : ComposerCommand
+
+    /**
+     * Clear-chat confirmation: wipe the composer through the three-write funnel
+     * (`clearComposerInput`) — a bare `setInputText("")` is dropped by the
+     * StateFlow when the value already equals "".
+     */
+    data object Clear : ComposerCommand
+
+    /**
+     * [dv24/B-05] Replace the whole composer body with [text] — the message
+     * edit prefill and the 'Context Full' restore.
+     *
+     * Resolved by the composer against its live text so the write reaches BOTH
+     * copies (ViewModel string + field). Writing only the ViewModel string is
+     * an equal write when the draft already reads [text], and `MutableStateFlow`
+     * drops it: the field keeps its old selection and, worse, the still-live
+     * 150 ms IME burst flushes its pre-edit snapshot over the edit.
+     */
+    data class ReplaceText(
+        val text: String,
+        /** null = caret to the end of [text]. */
+        val caretOverride: Int? = null,
+    ) : ComposerCommand
+
+    /**
+     * [dv24/B-05] Append [text] to whatever the composer holds right now —
+     * the system share injection, the cross-session Move-to transfer and the
+     * selection "add to input" action.
+     *
+     * The separator is a parameter because the three callers disagree on
+     * purpose (a shared paragraph starts on its own line; a text snippet is
+     * inline), and [trimExistingEnd] / [trailingSpace] encode the two tail
+     * conventions that were previously spelled out at each caller.
+     */
+    data class AppendText(
+        val text: String,
+        val separator: String = " ",
+        val trimExistingEnd: Boolean = true,
+        val trailingSpace: Boolean = true,
+    ) : ComposerCommand
+}

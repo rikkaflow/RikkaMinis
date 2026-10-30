@@ -1,6 +1,7 @@
 package com.rikkaminis.app.ui.markdown
 
 import com.rikkaminis.app.R
+import com.rikkaminis.app.ui.chat.decodeUriPath
 import androidx.compose.ui.res.stringResource
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -53,9 +54,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import com.rikkaminis.app.ui.chat.LocalMarkdownSessionId
-import com.rikkaminis.app.ui.chat.resolveMdMediaFile
-import kotlinx.coroutines.CompletableDeferred
+import com.rikkaminis.app.ui.chat.rememberMdMediaFile
+import com.rikkaminis.app.ui.media.resolvedMediaSourceKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -122,8 +125,8 @@ private fun BlockContent(
         is MarkdownParser.Block.Paragraph -> ParagraphBlock(block.content, color, baseStyle, mathSpans)
         is MarkdownParser.Block.CodeBlock -> CodeBlockView(block)
         is MarkdownParser.Block.Blockquote -> BlockquoteView(block, color, baseStyle, mathSpans)
-        is MarkdownParser.Block.BulletList -> BulletListView(block, color, baseStyle)
-        is MarkdownParser.Block.NumberedList -> NumberedListView(block, color, baseStyle)
+        is MarkdownParser.Block.BulletList -> BulletListView(block, color, baseStyle, mathSpans)
+        is MarkdownParser.Block.NumberedList -> NumberedListView(block, color, baseStyle, mathSpans)
         is MarkdownParser.Block.Table -> TableView(block, color, baseStyle, mathSpans)
         is MarkdownParser.Block.MathBlock -> MathBlockView(latex = block.latex)
         is MarkdownParser.Block.ThematicBreak -> HorizontalDivider(
@@ -314,6 +317,7 @@ private fun BulletListView(
     block: MarkdownParser.Block.BulletList,
     color: Color,
     baseStyle: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         for (item in block.items) {
@@ -337,10 +341,11 @@ private fun BulletListView(
                         modifier = Modifier.padding(end = 8.dp),
                     )
                 }
-                InlineContent(
+                MathAwareInlineContent(
                     text = item.content,
                     color = color,
                     style = baseStyle,
+                    mathSpans = mathSpans,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -355,6 +360,7 @@ private fun NumberedListView(
     block: MarkdownParser.Block.NumberedList,
     color: Color,
     baseStyle: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         for ((index, item) in block.items.withIndex()) {
@@ -365,10 +371,11 @@ private fun NumberedListView(
                     style = baseStyle,
                     modifier = Modifier.padding(end = 8.dp),
                 )
-                InlineContent(
+                MathAwareInlineContent(
                     text = item.content,
                     color = color,
                     style = baseStyle,
+                    mathSpans = mathSpans,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -502,6 +509,63 @@ private fun TableCellContent(
 
 // -- Inline Content --
 
+/**
+ * [da1034-b3] Inline content that resolves inline-math placeholders the same
+ * way [ParagraphBlock] and [TableCellContent] do.
+ *
+ * `Block.BulletList` / `Block.NumberedList` come out of the parser's
+ * `restoreMath` pass *with their placeholders intact* (only paragraphs are
+ * re-walked there — see `restoreBlock`), so before this helper existed every
+ * `$…$` inside a list item reached [InlineContent], hit that function's
+ * placeholder-cleanup pass and was dropped without a trace: no KaTeX tile, no
+ * leftover glyph, nothing. Lists nested inside a blockquote are covered for
+ * free because [BlockquoteView] re-enters [BlockContent] with the same span
+ * list.
+ *
+ * Items without a placeholder fall straight through to [InlineContent], so
+ * plain lists (the overwhelming majority of them) don't pay for an extra
+ * Column.
+ */
+@Composable
+private fun MathAwareInlineContent(
+    text: String,
+    color: Color,
+    style: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
+    modifier: Modifier = Modifier,
+) {
+    if (mathSpans.isEmpty() || !text.contains('￼')) {
+        InlineContent(text = text, color = color, style = style, modifier = modifier)
+        return
+    }
+    val byPlaceholder = remember(mathSpans) { mathSpans.associateBy { it.placeholder } }
+    val regex = remember { Regex("\\uFFFC" + "MATH(\\d+)" + "\\uFFFC") }
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        var cursor = 0
+        for (match in regex.findAll(text)) {
+            val span = byPlaceholder[match.value] ?: continue
+            if (match.range.first > cursor) {
+                val segment = text.substring(cursor, match.range.first)
+                if (segment.isNotBlank()) {
+                    InlineContent(text = segment, color = color, style = style)
+                }
+            }
+            // Inline math: non-display KaTeX, no fillMaxWidth, start-aligned —
+            // the same shape [ParagraphBlock] uses for its inline spans.
+            KaTeXRenderView(latex = span.latex, displayMode = false)
+            cursor = match.range.last + 1
+        }
+        if (cursor < text.length) {
+            val tail = text.substring(cursor)
+            if (tail.isNotBlank()) {
+                InlineContent(text = tail, color = color, style = style)
+            }
+        }
+    }
+}
+
+// -- Inline Content (plain) --
+
 @Composable
 private fun InlineContent(
     text: String,
@@ -513,12 +577,14 @@ private fun InlineContent(
     val inlineCodeColor = MaterialTheme.colorScheme.primary
     val linkColor = MaterialTheme.colorScheme.primary
 
-    // Strip any leftover math placeholders (U+FFFC MATH<n> U+FFFC). The
-    // ParagraphBlock split path resolves them when math spans are
-    // threaded through; lists/headings don't carry the span list (table
-    // cells DO via TableView/TableCell) — collapsing the placeholder here
-    // keeps the U+FFFC sentinel from leaking into the rendered glyph
-    // stream for the paths that can't resolve it.
+    // Strip any leftover math placeholders (U+FFFC MATH<n> U+FFFC). The split
+    // paths ([ParagraphBlock], [TableCellContent] and [MathAwareInlineContent]
+    // — the last one backs both list views) resolve the placeholders they can
+    // before calling in; headings still carry their inline placeholders into
+    // this function because HeadingBlock has no span list to resolve them
+    // with. Collapsing the sentinel here keeps U+FFFC from leaking into the
+    // rendered glyph stream on that path (and on any future one that calls
+    // this helper without spans).
     val cleaned = remember(text) {
         if (text.contains('￼')) {
             text.replace(Regex("\\uFFFCMATH\\d+\\uFFFC"), "")
@@ -680,28 +746,22 @@ private fun parseInline(
 }
 
 // ─── Media blocks (inline image / video / audio) ────────────────────────────
-
-/**
- * Resolve a URL used in Markdown (`minis://...` or a plain path) to a host
- * File, suitable for MediaPlayer, MediaMetadataRetriever, or file share
- * intents. Returns null when the path can't be resolved or the file is
- * missing.
- *
- * T10-M5: delegates to the chat renderer's session-scoped resolver instead of
- * keeping a second copy of the rules here. With a sessionId the lookup goes
- * straight to that session's directory; without one it can only fall back to
- * the global bind-mount map (last-writer-wins across open chats) and, on a
- * miss, a scan of every `minis-sessions/<id>/` tree.
- */
-private fun resolveMediaFile(context: Context, url: String, sessionId: String?): File? =
-    resolveMdMediaFile(context, url, sessionId)
+//
+// [dv19-B06] The media blocks resolve their URL through the chat renderer's
+// `rememberMdMediaFile` (produceState + Dispatchers.IO) instead of a local
+// synchronous `remember { ... }`. The old private delegate here —
+// `private fun resolveMediaFile(context, url, sessionId) =
+// resolveMdMediaFile(context, url, sessionId)` — became dead code with that
+// change and is gone: the resolution rules live in one place
+// (StreamingMarkdownText.resolveMdMediaFile, which is session-scoped and falls
+// back to the bind-mount map / a full `minis-sessions/<id>/` scan on a miss).
 
 private fun filenameFromUrl(url: String): String {
     val stripped = url.substringBefore('?')
     val last = stripped.substringAfterLast('/')
-    return try {
-        java.net.URLDecoder.decode(last, "UTF-8")
-    } catch (_: Throwable) { last }
+    // [rv1014-B1] decodeUriPath never throws and leaves `+` intact, so the
+    // try/catch around the old URLDecoder.decode is no longer needed.
+    return decodeUriPath(last)
 }
 
 /**
@@ -729,17 +789,52 @@ private fun openMediaExternally(context: Context, file: File, mime: String) {
     val chooser = Intent.createChooser(intent, file.name).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    try { context.startActivity(chooser) } catch (_: Throwable) { /* no handler */ }
+    try {
+        context.startActivity(chooser)
+    } catch (t: Throwable) {
+        // [deep-audit-1049 B-03] This exit used to be an empty catch: a device
+        // with no handler for the mime type looked exactly like a share that
+        // worked. Same family as the other share entries — keep the trace.
+        com.rikkaminis.app.logging.AppLogger.warning(
+            "MdMedia",
+            "openMediaExternally failed for ${file.name}: ${t.message}",
+        )
+    }
 }
 
 // -- Image block --
 
 @Composable
 private fun MinisImageBlock(block: MarkdownParser.Block.Image) {
+    val context = LocalContext.current
+    val sessionId = LocalMarkdownSessionId.current
+    // [dv20-B03] Same two seams the chat renderer's image branch and the
+    // video/audio blocks below already use, so the three blocks cannot drift:
+    //  * `model = block.url` (bare) forces the AsyncImage fetcher to resolve
+    //    the host path against the GLOBAL bindMounts map, which is
+    //    last-writer-wins across sessions — inside session A the resolver can
+    //    hand back session B's path and the image renders as a blank 0-height
+    //    box. rememberMdMediaFile resolves it for THIS session, off the main
+    //    thread (produceState + IO).
+    //  * with no ImageRequest, Coil is handed a model with no size hint while
+    //    the column reports an unbounded height, so a tall image (chart
+    //    screenshot, long scan) is decoded at its intrinsic size and can
+    //    exceed the RecordingCanvas draw ceiling — the OOM/215 MB crash that
+    //    DisplayBitmapLimits documents. The ceiling is the shared
+    //    `limitDisplaySize()` extension, not a local copy.
+    // `remember(file, block.url)` keeps the request stable across the
+    // streaming-token recompositions that re-enter this block.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val surfaceBg = MaterialTheme.colorScheme.surfaceVariant
     val borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+    val imageRequest = remember(file, block.url) {
+        ImageRequest.Builder(context)
+            .data(file ?: block.url)
+            .limitDisplaySize()
+            .build()
+    }
     AsyncImage(
-        model = block.url,
+        model = imageRequest,
         contentDescription = block.alt.ifEmpty { filenameFromUrl(block.url) },
         contentScale = ContentScale.Fit,
         modifier = Modifier
@@ -761,7 +856,14 @@ private fun MinisVideoBlock(block: MarkdownParser.Block.Video) {
     }
     val context = LocalContext.current
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMediaFile(context, block.url, sessionId) }
+    // [dv19-B06] Off-main (produceState + IO) like the chat renderer's
+    // rememberMdMediaFile, instead of `remember(block.url, sessionId) {
+    // resolveMediaFile(...) }`: on a cache miss that resolver walks every
+    // `minis-sessions/<id>/` tree with listFiles()/exists() — a directory
+    // scan in composition, on the main thread, on the first frame of the
+    // block. The consumers below key on the absolute path, so the
+    // null→File transition re-runs them exactly once.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromUrl(block.url) }
     val surfaceBg = MaterialTheme.colorScheme.surfaceVariant
     val borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
@@ -856,34 +958,65 @@ private fun MinisVideoBlock(block: MarkdownParser.Block.Video) {
 private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
     val context = LocalContext.current
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMediaFile(context, block.url, sessionId) }
+    // [dv19-B06] Same off-main resolver as MinisVideoBlock above (see the note
+    // there); this used to run the session-directory scan in composition.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromUrl(block.url) }
 
-    val player = remember(file?.absolutePath) {
+    val player = remember(resolvedMediaSourceKey(file)) {
         if (file == null) null else MediaPlayer()
     }
-    var prepared by remember(file?.absolutePath) { mutableStateOf(false) }
+    // [r3-c / B09 F-12, P2] One serial worker per player instance. Before this,
+    // `prepare()` ran on Dispatchers.IO while `release()` ran on the main thread
+    // the moment the block left composition — cancelling the coroutine cannot
+    // interrupt a thread already inside native `prepare()`, so the same native
+    // handle was prepared and released concurrently (JNI crash / undefined
+    // state). prepare + release now take turns on this single thread.
+    val serialOps = remember(player) { player?.let { SerialMediaOps() } }
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    // Whether the last prepare attempt FAILED (as opposed to not having finished
+    // yet). Needed because the click target below is disabled until
+    // `prepared` — which used to make its own "open in an external player"
+    // fallback unreachable for exactly the files that need it (a container
+    // MediaPlayer cannot decode).
+    var prepareFailed by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
     // T10-M5: setDataSource() opens and parses the container header — real
     // disk/codec work that used to run inside remember{}, i.e. on the main
     // thread during composition. Open the source together with prepare() on
     // Dispatchers.IO so a cold file can't stall the first frame.
-    LaunchedEffect(player, file?.absolutePath) {
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
         val p = player ?: return@LaunchedEffect
         val f = file ?: return@LaunchedEffect
-        prepared = withContext(Dispatchers.IO) {
+        val ops = serialOps ?: return@LaunchedEffect
+        val ok = withContext(Dispatchers.IO) {
             runCatching {
-                p.setDataSource(f.absolutePath)
-                p.prepare()
-                true
+                ops.runPreparing {
+                    p.setDataSource(f.absolutePath)
+                    p.prepare()
+                    true
+                }
             }.getOrDefault(false)
         }
+        prepared = ok
+        prepareFailed = !ok
     }
     DisposableEffect(player) {
-        onDispose { try { player?.release() } catch (_: Throwable) {} }
+        onDispose {
+            val p = player
+            val ops = serialOps
+            if (p != null && ops != null) {
+                // Queued, not called inline: if `prepare()` is still running on
+                // the serial worker, `release()` runs after it returns. Release
+                // must not wait on the main thread, so it cannot take a lock
+                // here instead.
+                ops.enqueue { p.release() }
+                ops.shutdown()
+            }
+        }
     }
 
-    var isPlaying by remember { mutableStateOf(false) }
-    var positionMs by remember { mutableStateOf(0) }
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
     val durationMs = if (prepared && player != null) {
         runCatching { player.duration }.getOrDefault(0)
     } else 0
@@ -924,7 +1057,12 @@ private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
             .clip(RoundedCornerShape(10.dp))
             .background(cardBg)
             .border(0.5.dp, borderColor, RoundedCornerShape(10.dp))
-            .clickable(enabled = file != null && (player == null || prepared)) {
+            // [r3-c / B09 F-12] `prepareFailed` is part of the enable gate on
+            // purpose. The gate used to be `prepared` only, while the tap
+            // handler below already had an `!prepared` branch that hands the file
+            // to an external player — so a container MediaPlayer cannot decode
+            // disabled its own fallback and the user was stuck with a dead card.
+            .clickable(enabled = file != null && (player == null || prepared || prepareFailed)) {
                 if (player == null || !prepared) {
                     file?.let { openMediaExternally(context, it, "audio/*") }
                 } else {

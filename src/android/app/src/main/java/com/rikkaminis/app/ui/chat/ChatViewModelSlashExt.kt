@@ -5,75 +5,10 @@ package com.rikkaminis.app.ui.chat
 // dispatcher executeSlashCommand stays in the class (entangled with compact/
 // thinking/memory). 7 slash-state fields flipped private->internal. Verbatim.
 
-import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.net.Uri
-import android.util.Log
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
-import androidx.compose.foundation.lazy.LazyListState
-import com.rikkaminis.app.agent.Level
-import com.rikkaminis.app.agent.ToolLoopDetector
-import com.rikkaminis.app.browser.BrowserActionInput
-import com.rikkaminis.app.browser.BrowserTabPool
-import com.rikkaminis.app.data.db.MessageEntity
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Extension
-import com.rikkaminis.app.data.BPETokenizer
-import com.rikkaminis.app.data.ContextOffload
-import com.rikkaminis.app.data.ContextPolicy
-import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.data.FileMentionIndex
-import com.rikkaminis.app.data.db.CompactMarkerEntity
-import com.rikkaminis.app.data.model.AgentContentPart
-import com.rikkaminis.app.data.model.AgentToolDefinition
-import com.rikkaminis.app.data.model.LLMMessage
-import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.LLMStreamChunk
-import com.rikkaminis.app.data.model.LLMUsage
-import com.rikkaminis.app.data.model.ModelGroup
-import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.R
-import com.rikkaminis.app.data.repository.ChatRepository
-import com.rikkaminis.app.data.repository.MemoryRepository
-import com.rikkaminis.app.data.repository.ProviderRepository
-import com.rikkaminis.app.provider.ImageBudget
-import com.rikkaminis.app.provider.LLMProvider
-import com.rikkaminis.app.provider.ProviderFactory
-import com.rikkaminis.app.sandbox.ExecutionCoordinator
-import com.rikkaminis.app.terminal.MinisOpenUrlBroker
-import com.rikkaminis.app.terminal.MinisUrlMarker
-import com.rikkaminis.app.tools.AgentTools
-import com.rikkaminis.app.tools.FileEditTool
-import com.rikkaminis.app.tools.FileReadTool
-import com.rikkaminis.app.tools.FileWriteTool
-import com.rikkaminis.app.tools.MemoryTools
-import com.rikkaminis.app.tools.ReadImageTool
-import com.rikkaminis.app.tools.ToolExecutionResult
-import com.rikkaminis.app.offload.OffloadPermissionManager
-import com.rikkaminis.app.service.SessionActivityTracker
-import com.rikkaminis.app.service.SessionConcurrencyManager
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 
 /** Filter available commands by current filter text, with dynamic
  *  localized subtitles. Subtitles read strings.xml via the injected
@@ -87,14 +22,26 @@ import java.io.ByteArrayOutputStream
  *  uninstalling it.
  *
  *  [T-session-skill-toggle-override-global-android] Enablement is
- *  resolved per-session, not globally: [SkillRepository.isEnabledForSession]
- *  returns the session-scoped override when one exists and falls back to
- *  the global toggle otherwise. The previous code filtered on the raw
+ *  resolved per-session, not globally: the session-scoped override wins when
+ *  one exists and the global toggle applies otherwise. The previous code filtered on the raw
  *  global `isEnabled` flag, so a skill turned off globally but turned ON
  *  for this session never appeared in the `/` picker even though the
  *  prompt-injection path ([SkillRepository.skillPromptFragment]) already
  *  honored the override — the agent knew about the skill but the user
  *  couldn't surface it via slash. (DM 𝙓𝙄𝙉 304891.)
+ *
+ *  [dv22-B4] Two changes, contract UNCHANGED (override → global → false):
+ *  1. The per-session resolution goes through the BATCHED
+ *     [SkillRepository.sessionEnablementMap] /
+ *     [MCPRepository.sessionEnablementMap] — ONE `IN (…)` SELECT per
+ *     repository instead of one `isEnabledForSession` rawQuery per row. The
+ *     function now costs a constant number of queries regardless of how many
+ *     skills + MCP servers exist.
+ *  2. The function is now called from the slash menu's IO producer
+ *     (see ChatInputArea) — every state it reads is a StateFlow `.value`
+ *     snapshot or an immutable list, so it is safe to run OFF the main
+ *     thread and MUST stay that way: no compose reads, no main-thread-only
+ *     APIs may be added to this body.
  */
 internal fun ChatViewModel.filteredSlashCommands(): List<SlashCommand> {
     val filter = _slashFilter.value.lowercase()
@@ -113,39 +60,47 @@ internal fun ChatViewModel.filteredSlashCommands(): List<SlashCommand> {
         }
     }
     val sid = activeSessionId
-    val skillRows: List<SlashCommand> = skillRepository?.skills?.value
-        ?.filter { skillRepository.isEnabledForSession(it.id, sid) }
-        ?.sortedBy { it.name.lowercase() }
-        ?.map { skill ->
-            val trimmed = skill.description.trim()
-            val sub = if (trimmed.isNotEmpty()) trimmed else "Skill · v${skill.version}"
-            SlashCommand(
-                id = "skill:${skill.id}",
-                icon = Icons.Outlined.Extension,
-                title = skill.name,
-                subtitle = sub,
-                isSkill = true,
-            )
-        } ?: emptyList()
+    val skillRows: List<SlashCommand> = skillRepository?.let { repo ->
+        val skills = repo.skills.value
+        // [dv22-B4] one batched query for the whole list (was N rawQuery
+        // per keystroke via isEnabledForSession).
+        val enablement = repo.sessionEnablementMap(sid, skills.map { it.id })
+        skills.filter { enablement[it.id] == true }
+            .sortedBy { it.name.lowercase() }
+            .map { skill ->
+                val trimmed = skill.description.trim()
+                val sub = if (trimmed.isNotEmpty()) trimmed else "Skill · v${skill.version}"
+                SlashCommand(
+                    id = "skill:${skill.id}",
+                    icon = Icons.Outlined.Extension,
+                    title = skill.name,
+                    subtitle = sub,
+                    isSkill = true,
+                )
+            }
+    } ?: emptyList()
     // [T-mcp-integration-android] MCP servers appear in the / picker too,
     // tagged [mcp] with a wrench icon to distinguish them from skills (⚡).
     // All servers enabled for this session are shown (not just the Top-20
     // disclosed in the system prompt). Tapping fills the composer with the
     // server name; discovery/call happens model-side via minis-mcp-cli.
-    val mcpRows: List<SlashCommand> = mcpRepository?.servers?.value
-        ?.filter { mcpRepository.isEnabledForSession(it.id, sid) }
-        ?.sortedBy { it.id.lowercase() }
-        ?.map { server ->
-            val note = server.note?.trim().orEmpty()
-            val sub = if (note.isNotEmpty()) "[mcp] $note" else "[mcp] ${server.transportSummary}"
-            SlashCommand(
-                id = "mcp:${server.id}",
-                icon = Icons.Outlined.Build,
-                title = server.id,
-                subtitle = sub,
-                isMcp = true,
-            )
-        } ?: emptyList()
+    val mcpRows: List<SlashCommand> = mcpRepository?.let { repo ->
+        val servers = repo.servers.value
+        val enablement = repo.sessionEnablementMap(sid, servers.map { it.id })
+        servers.filter { enablement[it.id] == true }
+            .sortedBy { it.id.lowercase() }
+            .map { server ->
+                val note = server.note?.trim().orEmpty()
+                val sub = if (note.isNotEmpty()) "[mcp] $note" else "[mcp] ${server.transportSummary}"
+                SlashCommand(
+                    id = "mcp:${server.id}",
+                    icon = Icons.Outlined.Build,
+                    title = server.id,
+                    subtitle = sub,
+                    isMcp = true,
+                )
+            }
+    } ?: emptyList()
     val all = base + skillRows + mcpRows
     return if (filter.isEmpty()) all else all.filter { it.title.lowercase().contains(filter) }
 }

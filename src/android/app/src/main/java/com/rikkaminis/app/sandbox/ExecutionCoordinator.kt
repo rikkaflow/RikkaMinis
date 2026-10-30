@@ -1,23 +1,27 @@
 package com.rikkaminis.app.sandbox
 
-import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Debug
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.agent.runtime.CommandFailureKind
 import com.rikkaminis.app.agent.runtime.RetryOutcome
 import com.rikkaminis.app.agent.runtime.RetryPolicy
 import com.rikkaminis.app.agent.runtime.RetrySafety
+import com.rikkaminis.app.agent.runtime.ToolRetrySafetyRegistry
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.diagnostics.MemorySpikeRecorder
 import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.sandbox.offload.ChatStreamOffloadHandler
-import com.rikkaminis.app.sandbox.offload.ModelExecutionMailbox
 import com.rikkaminis.app.service.MemoryPressureGate
 import com.rikkaminis.app.service.MemoryPressureLevel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -194,9 +198,26 @@ object ExecutionCoordinator {
     /**
      * [P3-shell-auto-retry] Pure decision: should the command be re-run on a
      * rebuilt shell? Delegates to the top-level [internalShouldRetryCommand].
+     *
+     * [fix/audit3-cancel-retry-1015 F-06] `memoryRecycled` is true when the
+     * in-flight memory monitor itself killed the shell to keep the app alive —
+     * the command is then never replayed (see the predicate for why).
+     *
+     * [deep-audit-1015 ARCH-01] LEGACY — no production call site any more. The
+     * live decision in [executeWithShellRetry] is
+     * [internalDecideShellRetryVerdict], which additionally consults the
+     * trusted side-effect registry ([ToolRetrySafetyRegistry]) before allowing
+     * a replay. This wrapper and its top-level delegate are kept as the
+     * same-inputs comparison arm for the "before vs after" judgment table (and
+     * for the pre-existing tests that pin the legacy contract).
      */
-    internal fun shouldRetryCommand(exitCode: Int, shellAlive: Boolean, attempt: Int): Boolean {
-        return internalShouldRetryCommand(exitCode, shellAlive, attempt, MAX_AUTO_RETRIES)
+    internal fun shouldRetryCommand(
+        exitCode: Int,
+        shellAlive: Boolean,
+        attempt: Int,
+        memoryRecycled: Boolean = false,
+    ): Boolean {
+        return internalShouldRetryCommand(exitCode, shellAlive, attempt, MAX_AUTO_RETRIES, memoryRecycled)
     }
 
     data class CommandResult(
@@ -326,14 +347,24 @@ object ExecutionCoordinator {
         // 多少内存」。与准入逻辑完全无关，任何失败静默。
         val spikeCmdClass = classifyCommand(command)
         MemorySpikeRecorder.onCommandStart(sessionId, spikeCmdClass.name, command)
+        // [LOOP-1030 R1-g] 影子水线挂在这里：准入读数就是决策读数（复用这一次
+        // 读，零额外 IO）。1s 周期采样看不到亚秒突发，别把它挪回 tick。
+        MemoryPressureGate.observeShadowAtAdmission(
+            anonBeforeMB, metricsBefore.rssMb, src = "shell-admission",
+        )
         if (MemoryPressureGate.levelFor(anonBeforeMB) == MemoryPressureLevel.CRITICAL) {
             MemoryPressureGate.reclaimAndWait(waitMs = 2_000L)
-            val anonAfterMB = MemoryPressureGate.anonMb()
+            val metricsAfter = MemoryPressureGate.metricsReader()
+            val anonAfterMB = metricsAfter.anonMb
+            // 回收完仍然越线 = 假设水线下的"拒绝准入"，单独一个 src 便于计数。
+            MemoryPressureGate.observeShadowAtAdmission(
+                anonAfterMB, metricsAfter.rssMb, src = "shell-post-reclaim",
+            )
             if (MemoryPressureGate.shouldRejectAfterReclaim(anonAfterMB)) {
-                Log.w(TAG, "[$sessionId] Process anon ${anonAfterMB}MB still critical after reclaim — rejecting command (anonBefore=${anonBeforeMB}MB, rss=${MemoryPressureGate.rssMb()}MB)")
+                Log.w(TAG, "[$sessionId] Process anon ${anonAfterMB}MB still critical after reclaim — rejecting command (anonBefore=${anonBeforeMB}MB, rss=${metricsAfter.rssMb}MB)")
                 MemorySpikeRecorder.onEvent(
                     "reject-anon",
-                    "session=$sessionId anonAfter=${anonAfterMB}MB anonBefore=${anonBeforeMB}MB rss=${MemoryPressureGate.rssMb()}MB :: ${MemorySpikeRecorder.previewOf(command, 60)}"
+                    "session=$sessionId anonAfter=${anonAfterMB}MB anonBefore=${anonBeforeMB}MB rss=${metricsAfter.rssMb}MB :: ${MemorySpikeRecorder.previewOf(command, 60)}"
                 )
                 return CommandResult(
                     "[System busy: process memory is critically high (anon ${anonAfterMB}MB). " +
@@ -375,8 +406,15 @@ object ExecutionCoordinator {
         // globalConcurrency（锁序一致无死锁）。等待超时（10min）说明另一
         // heavy 还在跑——排队而非并发叠加，防止多会话大任务把 memcg 推爆。
         val heavyGateTimeoutMs = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec() * 1000L
+        // [deep-audit-1016 FIX-D 4b] The wait must be interruptible — see
+        // [awaitHeavyGatePermitInterruptibly]. A cancel that lands while a HEAVY
+        // command is queued behind another HEAVY one (a wait of up to 10
+        // minutes) used to leave the thread parked inside `Semaphore.tryAcquire`
+        // with no suspension point: the coroutine went Cancelling, the shell
+        // stayed reserved, and the session's next command reported "System busy"
+        // until the timeout expired.
         val heavyGateAcquired = cmdClass == CommandClass.HEAVY &&
-            heavyGate.tryAcquire(heavyGateTimeoutMs, TimeUnit.MILLISECONDS)
+            awaitHeavyGatePermitInterruptibly(heavyGate, heavyGateTimeoutMs)
         if (cmdClass == CommandClass.HEAVY && !heavyGateAcquired) {
             Log.w(TAG, "[$sessionId] Heavy gate timeout after ${heavyGateTimeoutMs}ms — another heavy command still running")
             postRecycleMemoryRecovery()
@@ -391,10 +429,26 @@ object ExecutionCoordinator {
         // slots are occupied by other sessions, wait up to 60s before
         // giving up — this prevents a third concurrent session from
         // pushing the combined memory footprint past Scudo's limit.
-        val acquired = globalConcurrency.tryAcquire(60, TimeUnit.SECONDS)
+        //
+        // [deep-audit-1016 FIX-D 4a+4b] Same interruptible wait, PLUS the
+        // reason it is not a bare `tryAcquire` any more: this call sits between
+        // the heavyGate acquisition and the `try` whose `finally` releases it,
+        // so with the wait now interruptible an interrupt here would throw out
+        // of `execute` while still holding the ONE heavy permit — and a leaked
+        // heavy permit queues every HEAVY command in the process for the rest of
+        // its life. [awaitGlobalShellSlotInterruptibly] →
+        // [internalAcquireGlobalShellSlot] is the single place that can throw
+        // from inside that window, and it hands the permit back before
+        // rethrowing.
+        val acquired =
+            awaitGlobalShellSlotInterruptibly(
+                globalConcurrency = globalConcurrency,
+                heavyGate = heavyGate,
+                heavyGateHeld = heavyGateAcquired,
+            )
         if (!acquired) {
             if (heavyGateAcquired) heavyGate.release()
-            Log.w(TAG, "[$sessionId] Global concurrency slot timeout after 60s — rejecting command")
+            Log.w(TAG, "[$sessionId] Global concurrency slot timeout after ${GLOBAL_SHELL_SLOT_TIMEOUT_SEC}s — rejecting command")
             postRecycleMemoryRecovery()
             return CommandResult(
                 "[System busy: too many concurrent sessions (limit $maxConcurrentShells). " +
@@ -411,6 +465,15 @@ object ExecutionCoordinator {
 
                 // Auto-boot PRoot if not already booted
                 if (!PRootKernel.isBooted) {
+                    // [meta1028 D3-F02] False here means one of two things:
+                    // cold start (no shells yet, no-op) or a rootfs rebuild
+                    // under a live process — `RootfsManager.reset()` re-arms
+                    // the gate. In the second case every entry in [shells] was
+                    // spawned against the tree that was deleted: the process is
+                    // still alive but its cwd inode is unlinked, so reusing it
+                    // hands the command a ghost directory. Drop them; the
+                    // post-boot path mints fresh ones.
+                    dropShellsFromRebuiltRootfs()
                     Log.i(TAG, "[$sessionId] Auto-booting PRootKernel")
                     PRootKernel.boot(appContext)
                 }
@@ -441,9 +504,26 @@ object ExecutionCoordinator {
             // It used to take truncateIfNeeded's default (50 000) and compare
             // it against String.length, so the user's ceiling was ignored on
             // this path entirely and was 3× its declared value for CJK.
+            //
+            // [deep-audit-1015 BUG-09] …plus a suffix margin. By the time we get
+            // here the shell side has ALREADY clipped the capture to
+            // `shellOutputKb() * 1024` bytes (silently, by design), and
+            // executeWithShellRetry has appended its own trailing diagnostics
+            // ([internalMemoryRecycleNotice], the "(exit code: N)" trailer).
+            // Truncating at exactly the same ceiling therefore cut a SECOND
+            // time whenever the output landed within a suffix-length of the
+            // knob: a second "[... N bytes omitted ...]" marker with the tail of
+            // the real output and the diagnostics squeezed out. The margin is
+            // sized for the longest suffix this path appends (~350 chars) so the
+            // diagnostics survive intact and the single silent shell-side clip
+            // is the only truncation the agent ever sees.
+            // NOT fixed by moving the notice after the truncation: that only
+            // swaps which half gets cut (the notice would then be the clipped
+            // one), and it would introduce a "notice itself truncated" path.
             val truncated = TerminalSanitizer.truncateIfNeeded(
                 sanitized,
-                com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.shellOutputKb() * 1024,
+                com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.shellOutputKb() * 1024 +
+                    SHELL_OUTPUT_TRUNCATION_SUFFIX_MARGIN_BYTES,
             )
             // Combine host-side and shell-side truncation flags
             val outputTruncated = result.truncated || truncated != sanitized
@@ -539,7 +619,17 @@ object ExecutionCoordinator {
             // [mem-spike-diag] 命令结束归因：ΔRSS + PRoot 子进程聚合，落盘
             // memspike-<date>.log。诊断旁路，不影响返回值。
             MemorySpikeRecorder.onCommandEnd(durationMs, rssBeforeKb)
-            CommandResult(output = output, exitCode = result.exitCode, durationMs = durationMs, truncated = outputTruncated)
+            // [deep-audit-1018 ISSUE-03] L1: carry the retry verdict's outcomeKnown
+            // through the truncation re-wrap. Pre-fix this construction dropped it,
+            // so the SAME command's two exits disagreed (executeWithShellRetry
+            // stamped it, this wrap did not) and a withheld replay looked known.
+            CommandResult(
+                output = output,
+                exitCode = result.exitCode,
+                durationMs = durationMs,
+                truncated = outputTruncated,
+                outcomeKnown = result.outcomeKnown,
+            )
         }
     } finally {
         // [mem-spike-diag] 兜底配对：异常 / 提前 return 的路径也把命令上下文收尾，
@@ -583,6 +673,21 @@ object ExecutionCoordinator {
             val shell = getOrCreateShell(sessionId)
             lastShell = shell
 
+            // [fix/audit3-cancel-retry-1015 F-06] Did OUR OWN memory monitor
+            // recycle this shell while the command was in flight? Both kill
+            // paths of the in-flight monitor set this (child-RSS crossing and
+            // app-native-heap crossing). A shell that we killed for memory is
+            // NOT an infra death, so the command must not be replayed on the
+            // rebuilt shell — see internalShouldRetryCommand.
+            //
+            // Atomics, not a captured `var`: the monitor runs in its own
+            // coroutine on the IO pool (PersistentShell's `monitorJob`), while
+            // this flag is read back on the command's coroutine after
+            // `executeCommand` returns; a plain closure write has no
+            // happens-before edge between the two.
+            val recycledMidCommand = java.util.concurrent.atomic.AtomicBoolean(false)
+            val recycleReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
             // Inject environment variables as a full snapshot (T124a).
             val envVars = envVarRepository?.allAsDict() ?: emptyMap()
             val previousKeys = lastInjectedKeys[sessionId] ?: emptySet()
@@ -590,6 +695,24 @@ object ExecutionCoordinator {
                 shell.applyEnvironment(envVars, previousKeys = previousKeys)
                 lastInjectedKeys[sessionId] = envVars.keys.toSet()
             }
+
+            // [deep-audit-1015 ARCH-01] PRE_FLIGHT probe — the ONE signal that
+            // tells "the command never reached the PTY" (zero side effects, so
+            // re-issuing it is just its first execution) apart from "the command
+            // ran and its result was lost" (re-issuing an UNKNOWN command would
+            // repeat its side effects).
+            //
+            // `PersistentShell.executeCommand` itself starts with
+            // `ensureStarted()` and then bails out at `writer == null || !isAlive`
+            // with `CommandResult("[Shell not running]", -1)`. Running that same
+            // start step HERE first keeps the probe conservative: a shell that is
+            // alive afterwards is treated as "dispatched" even in the rare case
+            // where the write itself could still fail, so the probe can never
+            // upgrade a genuine dispatch into a licence to replay. Only a shell
+            // that refuses to come up — where the command provably never reached
+            // the PTY — reports `dispatched = false`.
+            shell.ensureStarted()
+            val commandDispatched = shell.isAlive
 
             val result = shell.executeCommand(
                 command = command,
@@ -600,10 +723,23 @@ object ExecutionCoordinator {
                     // child RSS ceiling and the app-native recycling point
                     // scale with system MemAvailable.
                     val memNow = systemMemAvailableMB()
-                    midCommandRecycleIfOversized(shell, sessionId, rssMB, childRssHighWaterMarkMB(memNow))
+                    val childRssMarkMB = childRssHighWaterMarkMB(memNow)
+                    if (midCommandRecycleIfOversized(shell, sessionId, rssMB, childRssMarkMB)) {
+                        recycledMidCommand.set(true)
+                        recycleReason.compareAndSet(
+                            null,
+                            "the PRoot command's RSS ${rssMB}MB crossed the ${childRssMarkMB}MB ceiling",
+                        )
+                    }
                     val appNativeMB = Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)
-                    if (appNativeMB > appNativeHighWaterMarkMB(memNow)) {
+                    val appNativeMarkMB = appNativeHighWaterMarkMB(memNow)
+                    if (appNativeMB > appNativeMarkMB) {
                         Log.w(TAG, "[$sessionId] App native heap ${appNativeMB}MB crossed mark in-flight — recycling shell")
+                        recycledMidCommand.set(true)
+                        recycleReason.compareAndSet(
+                            null,
+                            "the app's native heap ${appNativeMB}MB crossed the ${appNativeMarkMB}MB ceiling",
+                        )
                         sessionDidTerminate(sessionId)
                     }
                 },
@@ -618,7 +754,66 @@ object ExecutionCoordinator {
             // shell for those. `shellDied` here is only used to null out a
             // dead shell reference on the exhausted path.
             val shellDied = result.exitCode == -1 || !shell.isAlive
-            if (!shouldRetryCommand(result.exitCode, shell.isAlive, attempt)) {
+            val memoryRecycled = recycledMidCommand.get()
+            // [deep-audit-1015 ARCH-01] The T3 side-effect-aware policy takes
+            // over from the legacy `shouldRetryCommand` here. `shell_execute` is
+            // registered as RetrySafety.UNKNOWN ("the command string cannot be
+            // proven idempotent"), so a DISPATCHED command whose result was lost
+            // (-1 / dead shell / truncated output) is never transparently
+            // re-run: the agent gets `outcomeKnown = false` and decides. Only the
+            // pre-flight case above (provably not dispatched) keeps the
+            // rebuild-and-replay ability.
+            val verdict = internalDecideShellRetryVerdict(
+                exitCode = result.exitCode,
+                shellAlive = shell.isAlive,
+                truncated = result.truncated,
+                attempt = attempt,
+                safety = ToolRetrySafetyRegistry.lookup(SHELL_EXECUTE_TOOL_NAME),
+                maxRetries = MAX_AUTO_RETRIES,
+                memoryRecycled = memoryRecycled,
+                commandDispatched = commandDispatched,
+            )
+            // [SYMPTOM-A F-A2b] The verdict's two `outcomeKnown = false` exits live
+            // in the pure function above (`internalDecideShellRetryVerdict`), which
+            // is JVM-tested and Android-free — a log call there would break that and
+            // fire on every retry-policy evaluation. So the trace lands here, at the
+            // CONSUMPTION point, where the verdict becomes a CommandResult.
+            //
+            // Why it matters: without this line an untrustworthy shell result leaves
+            // no trace at all in the log. The only downstream evidence is the
+            // T7-D shadow reducer's "declined" warning (10-28: 11, 10-29: 12 — i.e.
+            // 17%/20% of runs), which reads like a failure and says nothing about
+            // WHICH command became untrustworthy. Metadata only — never the command
+            // text or any output (credentials leak through tool output; see the
+            // redaction rules in this package).
+            if (!verdict.outcomeKnown) {
+                Log.w(
+                    TAG,
+                    "[$sessionId] outcome unknown (reason=" +
+                        (if (memoryRecycled) "memory-recycled" else "outcome-unknown") +
+                        "): exit=${result.exitCode} alive=${shell.isAlive} " +
+                        "truncated=${result.truncated} attempt=$attempt/$MAX_AUTO_RETRIES " +
+                        "safety=${ToolRetrySafetyRegistry.lookup(SHELL_EXECUTE_TOOL_NAME)} " +
+                        "dispatched=$commandDispatched cmdLen=${command.length}",
+                )
+            }
+            if (!verdict.retry) {
+                if (memoryRecycled) {
+                    // [fix/audit3-cancel-retry-1015 F-06] Our own memory monitor
+                    // killed the shell mid-command. Re-running would rebuild a
+                    // shell and replay the very command that just crossed the
+                    // memory ceiling — it would cross it again (and repeat the
+                    // side effects of a non-idempotent command), so the agent
+                    // gets the death plus the reason instead. The kill site
+                    // already called sessionDidTerminate, so only the local
+                    // dead reference is dropped here (re-terminating would run
+                    // the recycle GC pass a second time for nothing).
+                    Log.w(
+                        TAG,
+                        "[$sessionId] Shell was memory-recycled mid-command (exit=${result.exitCode}) — " +
+                            "reporting to the agent instead of re-running the command",
+                    )
+                    lastShell = null
                 // [audit-RC7] Timeout must ALWAYS reclaim the shell. With
                 // withTimeoutOrNull only cancelling the coroutine, the command
                 // keeps running inside the PTY with pendingCallback already
@@ -633,7 +828,7 @@ object ExecutionCoordinator {
                 // so the branch fires on attempt 1 as well and the agent gets
                 // the timeout error immediately instead of after a silent
                 // re-run of the same command.
-                if (internalShouldReclaimOnExhaustedTimeout(result.exitCode)) {
+                } else if (internalShouldReclaimOnExhaustedTimeout(result.exitCode)) {
                     Log.w(
                         TAG,
                         "[$sessionId] Command timed out — reclaiming shell to kill the " +
@@ -653,13 +848,35 @@ object ExecutionCoordinator {
                 } else if (shellDied && attempt >= MAX_AUTO_RETRIES) {
                     lastShell = null // shell is dead and we're out of retries
                 }
-                return CommandResult(output = result.output, exitCode = result.exitCode, durationMs = 0L, truncated = result.truncated) to lastShell
+                // An exit code / output the agent can act on: a bare -1 with no
+                // explanation reads like an unexplained crash, so the memory
+                // kill carries the ceiling that was crossed.
+                val notice = if (memoryRecycled) internalMemoryRecycleNotice(recycleReason.get()) else ""
+                // [deep-audit-1015 ARCH-01] Carry the policy's verdict up:
+                // `outcomeKnown = false` marks "the command may have run but the
+                // result is not trustworthy" (see [CommandResult.outcomeKnown]).
+                // It is set on exactly the shapes where the replay was withheld
+                // — the two decisions are one decision.
+                return CommandResult(
+                    output = result.output + notice,
+                    exitCode = result.exitCode,
+                    durationMs = 0L,
+                    truncated = result.truncated,
+                    outcomeKnown = verdict.outcomeKnown,
+                ) to lastShell
             }
 
             Log.w(
                 TAG,
-                "[$sessionId] Shell died mid-command (exit=${result.exitCode}, alive=${shell.isAlive}) " +
-                    "— rebuilding and retrying (attempt $attempt/$MAX_AUTO_RETRIES)"
+                if (commandDispatched) {
+                    "[$sessionId] Retry policy allows a replay (exit=${result.exitCode}, " +
+                        "alive=${shell.isAlive}) — rebuilding and retrying " +
+                        "(attempt $attempt/$MAX_AUTO_RETRIES)"
+                } else {
+                    "[$sessionId] Command never reached the PTY (shell would not start) — " +
+                        "rebuilding the shell and dispatching it " +
+                        "(attempt $attempt/$MAX_AUTO_RETRIES)"
+                }
             )
             sessionDidTerminate(sessionId)
         }
@@ -669,12 +886,19 @@ object ExecutionCoordinator {
      * (it OOM'd), immediately recycle the session so the shell isn't held as
      * a zombie and the next command spawns fresh. Called from the executeCommand
      * in-flight monitor; rssMB of 0 means the child already died. The ceiling
-     * is dynamic ([memory-dynamic-budget]) — passed in by the caller. */
-    private fun midCommandRecycleIfOversized(shell: PersistentShell, sessionId: String, rssMB: Long, childRssMarkMB: Long) {
+     * is dynamic ([memory-dynamic-budget]) — passed in by the caller.
+     *
+     * [fix/audit3-cancel-retry-1015 F-06] Returns whether it actually recycled
+     * (rather than Unit, which the call site used to discard): a shell killed
+     * by the memory monitor is not an infra death, so the caller must refuse to
+     * replay the command that crossed the ceiling. */
+    private fun midCommandRecycleIfOversized(shell: PersistentShell, sessionId: String, rssMB: Long, childRssMarkMB: Long): Boolean {
         if (rssMB > childRssMarkMB) {
             Log.w(TAG, "[$sessionId] PRoot child RSS ${rssMB}MB crossed mark ${childRssMarkMB}MB mid-command — recycling")
             sessionDidTerminate(sessionId)
+            return true
         }
+        return false
     }
 
     /**
@@ -796,9 +1020,11 @@ object ExecutionCoordinator {
         // brand-new Mutex for the same session, acquire it immediately, and
         // run in parallel with the command still inside this withLock block
         // (breaking per-session command serialization). The mutex is small;
-        // it is now removed only by stopCurrentCommand / dispose paths that
-        // never hold it, and its lifetime is bounded by session id churn,
-        // not by shell recycling.
+        // [meta1028 D3-F04] it is now removed by NO path at all —
+        // stopCurrentCommand's `mutexes.remove`/`clear` were the same defect
+        // through the other door (it is called precisely while a command holds
+        // the lock) and are gone too, so "one live Mutex per session id" holds
+        // process-wide and its lifetime is bounded by session id churn.
         // T124a: drop the snapshot too — a future shell for the same id
         // restarts from a clean baseline, so the next applyEnvironment
         // shouldn't try to `unset` keys that don't exist in the new shell.
@@ -811,6 +1037,43 @@ object ExecutionCoordinator {
         // still held. Trigger GC + wait for it to settle so the next command
         // starts with a lower baseline.
         postRecycleMemoryRecovery()
+    }
+
+    /**
+     * [deep-audit-1016 FIX-D 4c] App-scoped IO scope for reclaim work that a
+     * main-thread caller must not run inline. Process-lifetime by design (this
+     * object is a singleton): the recovery is best-effort cleanup, never tied
+     * to a lifecycle that can be cancelled out from under it — which is also
+     * why nothing here checks `isActive` before launching.
+     */
+    private val recoveryScope: CoroutineScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+
+    /**
+     * [P2-app-native-oom] Post-recycle memory recovery, dispatched by caller
+     * thread.
+     *
+     * Background callers (the whole command path: the pre-exec rejection
+     * branches and [sessionDidTerminate] reached from the agent loop) keep the
+     * SYNCHRONOUS contract — the pre-exec rejection paths deliberately GC
+     * before returning so the caller's retry starts from a lower baseline.
+     *
+     * [deep-audit-1016 FIX-D 4c] Main-thread callers DEFER instead. They are
+     * real: Compose calls `promoteDraftIfNeeded()` (ChatScreen), which launches
+     * `ensureSession()` on viewModelScope (Dispatchers.Main.immediate), which
+     * calls `migrateDraftResources` → `ExecutionCoordinator.sessionDidTerminate`
+     * → here — so the first message in a NEW chat used to run up to three
+     * `System.gc()` rounds with a 120ms settle each on the UI thread, and
+     * `ViewModel.onCleared()` (also main) did the same on every chat screen
+     * close. Nothing on those paths consumes the synchronous side effect: the
+     * call sites discard the result (migrateDraftResources wraps it in
+     * runCatching) or are teardown.
+     */
+    private fun postRecycleMemoryRecovery() {
+        if (!::appContext.isInitialized) return
+        when (recycleDispatchMode(isOnMainThread = Looper.myLooper() == Looper.getMainLooper())) {
+            RecycleDispatch.DEFERRED -> recoveryScope.launch { postRecycleMemoryRecoveryNow() }
+            RecycleDispatch.INLINE -> postRecycleMemoryRecoveryNow()
+        }
     }
 
     /**
@@ -833,8 +1096,7 @@ object ExecutionCoordinator {
      * This directly addresses the "Post-recycle GC freed 0MB — session locked
      * forever" failure mode (2026-08-12, 5.5GB app native heap).
      */
-    private fun postRecycleMemoryRecovery() {
-        if (!::appContext.isInitialized) return
+    private fun postRecycleMemoryRecoveryNow() {
         try {
             val runtime = Runtime.getRuntime()
             val startingNative = Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)
@@ -882,57 +1144,16 @@ object ExecutionCoordinator {
             ))
             Log.w(TAG, "Post-recycle GC: native ${startingNative}→${nativeNow}MB (freed ${startingNative - nativeNow}MB), " +
                 "java ${startingJava}→${javaNow}MB (freed ${startingJava - javaNow}MB), rounds=$roundsUsed")
-            // [direction-A step4] Pressure reclaim: if the app native heap is still
-            // at/above the LOCKED floor after GC, kill the :modelservice process so the
-            // DirectByteBuffer/streaming native held there is returned to the OS. This
-            // keeps offloaded chat streaming from pushing the app to the lock point;
-            // the next offload startService restarts the service fresh.
-            maybeReclaimModelService(nativeNowMb = nativeNow)
+            // [FIX-FW-DEAD-SHUTDOWN-LEVER] A "pressure reclaim" step used to run
+            // here: it wrote a `shutdown` marker into cache/model-exec hoping the
+            // :modelservice worker would drain and die. The worker's state machine
+            // accepted that flag as a parameter and never read it, so the step could
+            // not free a byte — it was deleted rather than kept as a lever that only
+            // looks real. The worker still self-reaps on genuine quiescence (see
+            // ModelExecutionLifecycle), which is the only outcome the marker could
+            // ever have produced anyway.
         } catch (_: Throwable) {
             // Never let memory recovery break the calling flow.
-        }
-    }
-
-    /**
-     * [direction-A step4] Ask the :modelservice process to drain+die when the
-     * app native heap is still above the locked floor after GC. Unlike the old
-     * `stopService` (which killed the process out from under an in-flight
-     * stream and was reverted), TF-B uses a file-based shutdown REQUEST: the
-     * worker checks it via [ModelExecutionMailbox] and only kills itself after
-     * confirming quiescence (active==0, queue==0, no un-acked response, stream
-     * flushed). The request is written into the staging root; the worker
-     * re-checks on each request finish. A new request that arrives after the
-     * request simply revives the worker (onStartCommand → ACTIVE).
-     */
-    @SuppressLint("MissingPermission")
-    private fun maybeReclaimModelService(nativeNowMb: Long) {
-        if (!::appContext.isInitialized) return
-        // Only reclaim when the app is itself in the locked/pressure band; don't
-        // kill the service on every idle GC (level 0/1 are normal operation).
-        val memAvailMb = systemMemAvailableMB()
-        val phase = internalDegradationPhase(nativeNowMb, memAvailMb)
-        if (phase.ordinal < ShellPhase.CRITICAL.ordinal) return // not pressurized enough
-        // [B2] Never sever an in-flight stream. If a chat stream is actively being
-        // offloaded to :modelservice right now, killing the service would leave
-        // stream.jsonl truncated (no DONE, no error) and the UI silently stalled
-        // until the poll timeout. Skip the shutdown request and let the next
-        // non-streaming pressure tick handle it.
-        if (ChatStreamOffloadHandler.activeStreams > 0) {
-            Log.w(TAG, "[direction-A] skipped reclaim: active stream in progress " +
-                "(activeStreams=${ChatStreamOffloadHandler.activeStreams}, native ${nativeNowMb}MB)")
-            return
-        }
-        try {
-            // Write the shutdown REQUEST into the staging root; the worker
-            // drains and kills itself when quiescent. Never stopService — the
-            // worker owns its own death timing.
-            val root = File(appContext.cacheDir, "model-exec")
-            root.mkdirs()
-            ModelExecutionMailbox.writeShutdownRequest(root)
-            Log.w(TAG, "[direction-A] shutdown REQUESTED for :modelservice (native still ${nativeNowMb}MB, phase $phase) — " +
-                "worker self-reaps when quiescent")
-        } catch (e: Throwable) {
-            Log.w(TAG, "[direction-A] shutdown request write failed", e)
         }
     }
 
@@ -1042,10 +1263,13 @@ object ExecutionCoordinator {
      *  - the directory itself is never deleted — it is part of the rootfs;
      *  - an entry younger than [maxAgeMs] is never touched (see
      *    [AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin] for why the age gate sits on top of isBusy);
-     *  - a symlink is removed as a LINK ([java.nio.file.Files.deleteIfExists],
-     *    which never follows), because `File.deleteRecursively()` lists through
-     *    the link and would delete the TARGET's contents — an aged `tmp/x ->
-     *    /` symlink must not become "wipe the rootfs";
+     *  - the age gate reads the entry's OWN timestamp
+     *    ([internalGuestTmpEntryMtimeMs], i.e. `lstat`) — `File.lastModified()`
+     *    follows links, which aged-out fresh symlinks instantly;
+     *  - a symlink is removed as a LINK, and a directory is removed with
+     *    [internalGuestTmpDeleteTreeNoFollow], which never walks into a link:
+     *    an aged `tmp/x -> /` must not become "wipe the rootfs", and that has
+     *    to hold for links nested INSIDE an aged directory too;
      *  - an aged directory is removed whole; only if that fails do we descend,
      *    re-applying the same gate at each level (so the count reflects real
      *    deletions rather than double-counting a child of a deleted parent).
@@ -1063,15 +1287,28 @@ object ExecutionCoordinator {
         for (child in children) {
             val symlink = runCatching { java.nio.file.Files.isSymbolicLink(child.toPath()) }
                 .getOrDefault(false)
-            if (!internalGuestTmpIsAged(child.lastModified(), now, maxAgeMs)) continue
+            // [meta1028 D3-F05] `lastModified()` is `stat` — it follows the
+            // link, so a fresh dangling link read 0 ("definitely aged") and a
+            // link to an old target inherited the target's timestamp. Either
+            // way a link created seconds ago was reaped on the next 60 s tick.
+            // The ENTRY's own timestamp is what the age gate is asking about.
+            if (!internalGuestTmpIsAged(internalGuestTmpEntryMtimeMs(child.toPath()), now, maxAgeMs)) continue
             // [guest-tmp-activity-probe] Second chance before reaping: the age
             // gate read the entry's own mtime, which does not move when
             // something writes inside it. Probed only for aged candidates, so a
             // fresh entry never pays for it.
             if (guestTmpEntryStillInUse(child, symlink, now, maxAgeMs)) continue
             val ok = runCatching {
-                if (symlink) java.nio.file.Files.deleteIfExists(child.toPath())
-                else child.deleteRecursively()
+                if (symlink) {
+                    java.nio.file.Files.deleteIfExists(child.toPath())
+                } else {
+                    // [meta1028 D3-F05] NOT `deleteRecursively()`: that walks
+                    // with `File.listFiles()`/`isDirectory`, both of which
+                    // follow links, so an aged `/tmp/build` containing
+                    // `out -> /var/minis/workspace` deleted the TARGET's
+                    // contents. Links are unlinked as links, at every depth.
+                    internalGuestTmpDeleteTreeNoFollow(child.toPath())
+                }
             }.getOrDefault(false)
             if (ok) {
                 removed++
@@ -1103,6 +1340,35 @@ object ExecutionCoordinator {
     }
 
     /**
+     * [meta1028 D3-F02] Drop every shell that was spawned against a rootfs
+     * tree which has since been deleted and re-extracted
+     * ([RootfsManager.reset] → hook → `bootGate.invalidate`).
+     *
+     * Called only from [execute]'s `!isBooted` branch, i.e. under this
+     * session's mutex and before the re-boot. Shells of OTHER sessions are
+     * dropped too, deliberately: they were spawned into the same deleted tree,
+     * so any command issued through one is running against unlinked inodes —
+     * keeping it alive only converts "rebuild in progress" into a confusing
+     * per-command failure later. A reset is a process-wide event; a command
+     * caught mid-flight by it fails either way, and failing at the boundary is
+     * the honest place.
+     *
+     * Mutexes are NOT touched (same contract as [sessionDidTerminate], see the
+     * `[fix/audit-s4h4]` note there).
+     */
+    private fun dropShellsFromRebuiltRootfs() {
+        if (shells.isEmpty()) return
+        val dropped = shells.size
+        for ((id, shell) in shells) {
+            runCatching { shell.stop() }
+            lastInjectedKeys.remove(id)
+            lastActiveMs.remove(id)
+        }
+        shells.clear()
+        Log.i(TAG, "rootfs rebuilt — dropped $dropped shell(s) spawned into the pre-rebuild tree")
+    }
+
+    /**
      * Stop the shell for a specific session (e.g. user tapped cancel).
      * The shell process is killed; next command will recreate it.
      */
@@ -1112,10 +1378,30 @@ object ExecutionCoordinator {
             // T124a: snapshot belongs to the now-dead shell.
             lastInjectedKeys.remove(sessionId)
             lastActiveMs.remove(sessionId)
-            // [fix/audit-s4l2] sessionDidTerminate() also removes the session
-            // mutex; this stop path did not, so the mutex map grew forever on
-            // sessions stopped (not terminated). Keep the two paths consistent.
-            mutexes.remove(sessionId)
+            // [meta1028 D3-F04] NO `mutexes.remove(sessionId)` here. The
+            // `[fix/audit-s4l2]` line that used to sit here justified itself
+            // with "sessionDidTerminate also removes the mutex" — which had
+            // already been retracted by `[fix/audit-s4h4]` (it removed the map
+            // entry while the lock was HELD, letting a concurrent
+            // `mutexes.getOrPut` mint a second Mutex for the same session and
+            // run in parallel with the command still inside `withLock`).
+            //
+            // s4l2's premise was that this path "never holds the lock". That is
+            // exactly backwards: stopCurrentCommand's whole job is to interrupt
+            // a RUNNING command, and that command's coroutine is inside
+            // `mutex.withLock` right now. Removing the entry there reproduced
+            // the s4h4 defect through a different door — and the victim was the
+            // NEXT command: it got a fresh mutex, entered immediately, created
+            // a new PersistentShell, which the old coroutine's tail
+            // (`sessionDidTerminate` → `shells.remove(id)?.stop()`) then killed
+            // mid-command (`exitCode = -1`, `outcomeKnown = false`).
+            //
+            // The mutex map is therefore never pruned. Cost: one small Mutex
+            // per session id ever used — the same lifetime trade s4h4 already
+            // accepted, and the only one that keeps "one live Mutex object per
+            // session id" true. A refcount (or `if (!mutex.isLocked) remove`)
+            // does not help: the check and the remove are still a race against
+            // a newcomer that already holds the reference.
             shell?.stop()
             Log.i(TAG, "[$sessionId] Shell stopped by user")
         } else {
@@ -1124,8 +1410,11 @@ object ExecutionCoordinator {
             shells.clear()
             lastInjectedKeys.clear()
             lastActiveMs.clear()
-            // [fix/audit-s4l2] see above: clear the per-session mutexes too.
-            mutexes.clear()
+            // [meta1028 D3-F04] NO `mutexes.clear()`: same defect as above, and
+            // worse in blast radius — it rewrote EVERY session's mutex identity
+            // while their commands were mid-`withLock`. The map entry is the
+            // identity the serialization contract is built on; clearing it does
+            // not free anything the sweeper needs.
             // [audit-0919 F-217] No ShellExecutor.destroyCurrent() here. It was
             // a silent no-op: its only effect is `currentProcess?.let { … }`,
             // and `currentProcess` is assigned exclusively inside
@@ -1214,6 +1503,13 @@ object ExecutionCoordinator {
  * Extracted as a top-level function so it can be JVM-tested without loading
  * the [ExecutionCoordinator] object (which depends on `android.content.Context`
  * and `android.os.Debug`).
+ *
+ * [deep-audit-1015 ARCH-01] LEGACY: the production decision is now
+ * [internalDecideShellRetryVerdict] (side-effect aware, via
+ * [ToolRetrySafetyRegistry]). This predicate looks only at `exitCode == -1` and
+ * therefore replays a DISPATCHED command of unknown safety — the exact blind
+ * spot the audit found. Kept as the same-inputs comparison arm for the
+ * before/after table and as the contract guard the existing tests pin.
  */
 internal fun internalShouldRetryCommand(
     exitCode: Int,
@@ -1221,7 +1517,24 @@ internal fun internalShouldRetryCommand(
     attempt: Int,
     // Keep in sync with ExecutionCoordinator.MAX_AUTO_RETRIES (defaults to 2).
     maxRetries: Int = 2,
+    /**
+     * [fix/audit3-cancel-retry-1015 F-06] True when the in-flight memory
+     * monitor recycled the shell to keep the app alive (PRoot child RSS or the
+     * app's native heap crossed its dynamic ceiling). Same shape as the stall
+     * and timeout guards above, but the reason is direct rather than inferred:
+     * the shell died precisely BECAUSE this command was over the memory
+     * ceiling, so a retry rebuilds a shell and replays the very command that
+     * crossed it — it crosses it again (that is how it got there), doubling
+     * the memory pressure the kill just relieved and repeating the side
+     * effects of a non-idempotent command. The agent gets the death plus the
+     * ceiling that was crossed ([internalMemoryRecycleNotice]) and picks a
+     * smaller approach. Defaults to false so every pre-existing call site and
+     * test keeps its exact semantics: an ordinary infra death (killed shell,
+     * exit -1, nothing to do with memory) is still retried as before.
+     */
+    memoryRecycled: Boolean = false,
 ): Boolean {
+    if (memoryRecycled) return false
     // [fix/memory-hardening-stall] A stall-killed command already burned its
     // whole no-progress window; retrying the SAME command would hang again for
     // the same reason. Hand the error to the agent instead and let it change
@@ -1254,6 +1567,33 @@ internal fun internalShouldRetryCommand(
  * the pre-existing dead-shell path already handles those without this.
  */
 internal fun internalShouldReclaimOnExhaustedTimeout(exitCode: Int): Boolean = exitCode == TIMEOUT_EXIT_CODE
+
+/**
+ * [fix/audit3-cancel-retry-1015 F-06] Agent-facing explanation appended to the
+ * output of a command whose shell was recycled mid-flight by the memory guard.
+ *
+ * Precedent: the stall guard appends its own reason line
+ * ([com.rikkaminis.app.sandbox.stallMessage]) instead of handing back a bare
+ * non-zero exit code. A memory kill is the same situation with a different
+ * cause — the tool result would otherwise read as an unexplained `-1` and the
+ * agent would have no way to tell "the sandbox killed this to stay alive"
+ * apart from "the shell crashed". The reason (which ceiling, which measurement)
+ * is carried through so the agent can size its next attempt.
+ *
+ * Kept as a top-level pure function so it is JVM-testable and so both the kill
+ * reason and the wording have a single source.
+ */
+internal fun internalMemoryRecycleNotice(reason: String?): String = buildString {
+    append("\n[memory-recycle] the command was killed by the sandbox memory guard")
+    if (reason != null) append(": $reason")
+    append(".")
+    append(
+        " The shell was recycled to keep the app alive and the command was NOT re-run — " +
+            "replaying it would cross the same ceiling again. Reduce its memory footprint " +
+            "(smaller batches, streaming instead of buffering, fewer parallel workers) " +
+            "before retrying."
+    )
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // [T3-retry-side-effects] Side-effect-aware retry policy — pure functions
@@ -1330,6 +1670,120 @@ internal fun internalDecideShellRetry(
         hasVerification = hasVerification,
     )
 }
+
+/**
+ * [deep-audit-1015 ARCH-01] Trusted tool name for the agent's shell tool, as
+ * registered in [ToolRetrySafetyRegistry] (`shell_execute` → [RetrySafety.UNKNOWN]:
+ * a command string can never be *proven* idempotent from the outside).
+ */
+internal const val SHELL_EXECUTE_TOOL_NAME = "shell_execute"
+
+/**
+ * [deep-audit-1015 ARCH-01] The production shape of the T3 decision: what to do
+ * about this failure, and whether the result may be believed.
+ *
+ * [internalDecideShellRetry] answers only "may the command be re-run". This type
+ * pairs that answer with [ExecutionCoordinator.CommandResult.outcomeKnown]
+ * because the two must be decided together — replaying a non-idempotent command
+ * and passing an untrustworthy result off as a known one are two halves of the
+ * same mistake.
+ */
+internal data class ShellRetryVerdict(
+    /**
+     * true = re-issue the same command on a freshly built shell. Allowed only
+     * when the replay is provably safe ([RetryOutcome.SafeToRetry]: read-only,
+     * or an idempotent write with a verification hook) or when the command was
+     * **never dispatched** (zero side effects — re-issuing it IS its first
+     * execution).
+     */
+    val retry: Boolean,
+    /**
+     * false = the result is unknown ([RetryOutcome.OutcomeUnknown] /
+     * `MustVerifyFirst`): the command may have run and its side effects may
+     * have happened, but the returned output cannot be trusted. The caller must
+     * neither replay a non-idempotent command on this basis nor treat a partial
+     * result as completed.
+     */
+    val outcomeKnown: Boolean,
+)
+
+/**
+ * [deep-audit-1015 ARCH-01] Wire the T3 contract into the production decision:
+ * given the raw signals of one shell command, answer "replay?" and "believable?".
+ *
+ * The policy itself is [RetryPolicy.decideRetry]'s existing matrix — no new
+ * semantics are invented here. Only two inputs are layer-specific:
+ *  - [memoryRecycled]: the F-06 in-flight memory guard killed the shell. A
+ *    replay rebuilds a shell and re-sends the very command that crossed the
+ *    ceiling (it crosses it again), and the result of the killed command is not
+ *    trustworthy either.
+ *  - [commandDispatched]: whether the command actually reached the PTY. false =
+ *    the shell was already unusable before the write
+ *    (`PersistentShell.executeCommand` bails out at `writer == null || !isAlive`
+ *    with `"[Shell not running]"`), so nothing ran and nothing can have had a
+ *    side effect — here "retry" is a FIRST execution and must be kept. This is
+ *    the one place the policy is more permissive than "never retry".
+ *
+ * The blind spot this closes: `shell_execute` is always [RetrySafety.UNKNOWN],
+ * so once a command HAS been dispatched, a lost result (`exitCode == -1` /
+ * dead shell / truncated output) must never be transparently re-run. The legacy
+ * [internalShouldRetryCommand] looked only at `exitCode == -1` and therefore
+ * replayed `git commit`, `rm -rf`, `curl -X POST`, `python3 deploy.py` — up to
+ * `MAX_AUTO_RETRIES` total executions — after a HyperOS silent_kill, a tracer
+ * OOM or a pipe break.
+ */
+internal fun internalDecideShellRetryVerdict(
+    exitCode: Int,
+    shellAlive: Boolean,
+    truncated: Boolean,
+    attempt: Int,
+    safety: RetrySafety,
+    maxRetries: Int = 2,
+    hasVerification: Boolean = false,
+    memoryRecycled: Boolean = false,
+    commandDispatched: Boolean = true,
+): ShellRetryVerdict {
+    // [fix/audit3-cancel-retry-1015 F-06] Not an infra death: our own memory
+    // monitor killed the shell because THIS command was over the ceiling.
+    if (memoryRecycled) return ShellRetryVerdict(retry = false, outcomeKnown = false)
+
+    // PRE_FLIGHT: the command never reached the PTY → zero side effects. Bounded
+    // by the same retry budget, so the "rebuild the shell and re-run" ability
+    // the legacy predicate provided for this case is preserved unchanged.
+    if (!commandDispatched) {
+        return ShellRetryVerdict(retry = attempt < maxRetries, outcomeKnown = true)
+    }
+
+    return when (
+        internalDecideShellRetry(
+            exitCode = exitCode,
+            shellAlive = shellAlive,
+            truncated = truncated,
+            attempt = attempt,
+            safety = safety,
+            maxRetries = maxRetries,
+            hasVerification = hasVerification,
+        )
+    ) {
+        RetryOutcome.SafeToRetry -> ShellRetryVerdict(retry = true, outcomeKnown = true)
+        RetryOutcome.DoNotRetry -> ShellRetryVerdict(retry = false, outcomeKnown = true)
+        // Must-verify and outcome-unknown both mean "do not believe this result
+        // and do not transparently replay it".
+        RetryOutcome.MustVerifyFirst, RetryOutcome.OutcomeUnknown ->
+            ShellRetryVerdict(retry = false, outcomeKnown = false)
+    }
+}
+
+/**
+ * [deep-audit-1015 BUG-09] Extra byte ceiling granted to the host-side
+ * truncation pass so the diagnostics appended AFTER the shell-side clip are not
+ * cut a second time.
+ *
+ * Must stay ≥ the longest suffix [ExecutionCoordinator.executeWithShellRetry]
+ * can append to a clipped capture: [internalMemoryRecycleNotice] (~350 chars)
+ * plus the `"(exit code: N)"` trailer. 1024 leaves ~2.5× headroom.
+ */
+internal const val SHELL_OUTPUT_TRUNCATION_SUFFIX_MARGIN_BYTES = 1024
 
 // ──────────────────────────────────────────────────────────────────────────
 // [shell-generation-scheduler] Shell generation scheduler — pure functions
@@ -1530,4 +1984,104 @@ internal fun shouldContinueNativeReclaim(
     lockedFloorMb: Long,
 ): Boolean {
     return roundsUsed < maxRounds && nativeNowMb >= lockedFloorMb
+}
+
+// [deep-audit-1016 FIX-D 4a] How long a command waits for a global shell slot
+// before the "System busy" rejection. Named (it used to be a bare `60` in the
+// acquire call AND in the log line next to it — the two could drift apart, and
+// the log is what a user report gets triaged against). Value unchanged.
+private const val GLOBAL_SHELL_SLOT_TIMEOUT_SEC = 60L
+
+/**
+ * [deep-audit-1016 FIX-D 4a] Take the global shell slot, and on ANY failure
+ * hand back the heavy permit the caller may already be holding.
+ *
+ * Why this exists as its own function: it is the only statement in `execute`
+ * that can throw between acquiring the one global heavy permit (`heavyGate`,
+ * `Semaphore(1, true)`) and entering the `try` whose `finally` releases it.
+ * With 4b wrapping this wait in `runInterruptible`, an interrupt (user cancel)
+ * on exactly this line would otherwise throw out of `execute` still holding the
+ * permit — and a leaked heavy permit queues EVERY heavy command in the process
+ * until it dies. Before 4b there was no interrupt source, so the window was
+ * unreachable; the two halves ship together on purpose.
+ *
+ * Contract:
+ *  - returns true  → the global slot is held; the caller still holds the heavy
+ *                    permit (`heavyGateHeld`) and must release both.
+ *  - returns false → plain timeout, nothing acquired. The heavy permit is left
+ *                    to the caller (see the `if (!acquired)` branch), which
+ *                    releases it before returning the "System busy" result.
+ *  - throws        → the heavy permit has ALREADY been released; the caller
+ *                    holds nothing and must not release again.
+ *
+ * Blocking by design: the caller runs it inside `runInterruptible(Dispatchers.IO)`
+ * so a cancel interrupts the waiting thread. JVM-testable — plain
+ * `java.util.concurrent.Semaphore`, no Android, no coroutines.
+ */
+internal fun internalAcquireGlobalShellSlot(
+    globalConcurrency: Semaphore,
+    heavyGate: Semaphore,
+    heavyGateHeld: Boolean,
+    timeoutSec: Long = GLOBAL_SHELL_SLOT_TIMEOUT_SEC,
+): Boolean {
+    return try {
+        globalConcurrency.tryAcquire(timeoutSec, TimeUnit.SECONDS)
+    } catch (t: Throwable) {
+        // Interrupted while waiting (coroutine cancel) or any other throw:
+        // give the heavy permit back before propagating, or this process never
+        // runs another HEAVY command.
+        if (heavyGateHeld) heavyGate.release()
+        throw t
+    }
+}
+
+/** [deep-audit-1016 FIX-D 4c] Where a recovery call should run. */
+internal enum class RecycleDispatch { INLINE, DEFERRED }
+
+/**
+ * [deep-audit-1016 FIX-D 4c] The main-thread decision, split out so the
+ * "who runs the GC loop" question is testable without an Android runtime.
+ * `DEFERRED` = hand it to `recoveryScope`; `INLINE` = run it here (a blocking
+ * GC loop is fine — and for the pre-exec rejection paths, required — on a
+ * background thread).
+ */
+internal fun recycleDispatchMode(isOnMainThread: Boolean): RecycleDispatch =
+    if (isOnMainThread) RecycleDispatch.DEFERRED else RecycleDispatch.INLINE
+
+/**
+ * [deep-audit-1016 FIX-D 4b] Wait for the heavy serialization gate in a way a
+ * cancelled coroutine can actually break out of.
+ *
+ * `Semaphore.tryAcquire` is a blocking JUC call with no suspension point, so a
+ * coroutine cancelled while parked in it stayed parked (the shell stayed
+ * reserved behind it). `runInterruptible` interrupts the worker thread when the
+ * coroutine is cancelled, `tryAcquire` throws `InterruptedException`, and that
+ * surfaces as the cancellation the caller already handles.
+ *
+ * No permit is held when this throws (the interrupt lands while waiting, before
+ * the semaphore hands anything over), so there is nothing to hand back here —
+ * unlike [awaitGlobalShellSlotInterruptibly], which runs while a permit IS held.
+ */
+internal suspend fun awaitHeavyGatePermitInterruptibly(
+    heavyGate: Semaphore,
+    timeoutMs: Long,
+): Boolean = runInterruptible(Dispatchers.IO) {
+    heavyGate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
+}
+
+/**
+ * [deep-audit-1016 FIX-D 4b] Interruptible wait for a global shell slot.
+ *
+ * The body is [internalAcquireGlobalShellSlot] so the rollback of an already
+ * held heavy permit is part of the same (directly JVM-testable) function that
+ * runs inside the interruptible block — cancellation can land on any line of
+ * it, and the permit must come back on all of them.
+ */
+internal suspend fun awaitGlobalShellSlotInterruptibly(
+    globalConcurrency: Semaphore,
+    heavyGate: Semaphore,
+    heavyGateHeld: Boolean,
+    timeoutSec: Long = GLOBAL_SHELL_SLOT_TIMEOUT_SEC,
+): Boolean = runInterruptible(Dispatchers.IO) {
+    internalAcquireGlobalShellSlot(globalConcurrency, heavyGate, heavyGateHeld, timeoutSec)
 }

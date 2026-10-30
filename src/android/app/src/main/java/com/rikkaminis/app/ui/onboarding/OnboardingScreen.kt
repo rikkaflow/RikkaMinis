@@ -2,6 +2,9 @@ package com.rikkaminis.app.ui.onboarding
 
 import com.rikkaminis.app.R
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalContext
+import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.logging.AppLogger
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
@@ -20,11 +23,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -50,8 +50,12 @@ import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.rikkaminis.app.ui.components.MinisTextButton
+
+private const val TAG = "OnboardingScreen"
 
 /**
  * Multi-step onboarding flow shown on first launch.
@@ -109,9 +113,22 @@ private fun ApiKeyStep(
     onSkip: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    // [da1034-B1 / B-01] The post-save model fetch must outlive THIS step.
+    // `saved` unlocks Next a few lines down and the next tap moves to the
+    // picker, which disposes ApiKeyStep — a refresh launched on [scope] is
+    // cancelled mid-flight, the provider is saved with an empty model list and
+    // the picker has no retry. Same shape as AddProviderScreen's
+    // [T-provider-save-refresh] (deep-audit-1033 I05): the fetch runs on
+    // MinisApp's application scope when it is reachable.
+    val appContext = LocalContext.current.applicationContext
+    val appScope = (appContext as? MinisApp)?.applicationScope
     var selectedType by remember { mutableStateOf(ProviderType.anthropic) }
     var apiKey by remember { mutableStateOf("") }
     var saved by remember { mutableStateOf(false) }
+    // [deep-audit-1033 I05] The save is now a coroutine; without this the
+    // button stays live for the round trip and a double tap adds the provider
+    // twice (addInstance is not idempotent).
+    var saving by remember { mutableStateOf(false) }
 
     Scaffold { padding ->
         Column(
@@ -185,25 +202,60 @@ private fun ApiKeyStep(
 
             MinisButton(
                 onClick = {
-                    if (apiKey.isNotBlank()) {
+                    if (apiKey.isNotBlank() && !saving) {
+                        saving = true
                         val instance = ProviderInstance(
                             id = "${selectedType.name}_onboarding",
                             label = selectedType.displayName,
                             providerType = selectedType,
                             credentialType = com.rikkaminis.app.data.model.ProviderCredential.apiKey,
                         )
-                        providerRepository.addInstance(instance)
-                        providerRepository.saveApiKey(instance.id, apiKey.trim())
-                        // [T-provider-no-static-seed] No built-in model seeding —
-                        // a fresh provider starts empty and refreshModels() pulls
-                        // the real upstream /v1/models list. The onboarding's
-                        // ModelSelectionStep shows what's fetched; the picker's
-                        // stale-while-revalidate covers the rest.
-                        scope.launch { providerRepository.refreshModels(instance) }
-                        saved = true
+                        scope.launch {
+                            try {
+                                // [deep-audit-1033 I05] addInstance + saveApiKey
+                                // touch SQLite and EncryptedSharedPreferences;
+                                // both used to run inline in the click handler
+                                // (main thread), so the first keystore access
+                                // after an app update blocked the frame. The
+                                // refresh below still starts only once the key
+                                // is on disk — same order as before.
+                                withContext(Dispatchers.IO) {
+                                    providerRepository.addInstance(instance)
+                                    providerRepository.saveApiKey(instance.id, apiKey.trim())
+                                }
+                                // [T-provider-no-static-seed] No built-in model seeding —
+                                // a fresh provider starts empty and refreshModels() pulls
+                                // the real upstream /v1/models list. The onboarding's
+                                // ModelSelectionStep shows what's fetched; the picker's
+                                // stale-while-revalidate covers the rest.
+                                // Fire-and-forget: `saved` (and the Next button) must not
+                                // wait for the network fetch.
+                                // [da1034-B1 / B-01] ... and it must not be cancelled by
+                                // the screen it was started from: Next disposes this step
+                                // immediately after `saved` flips. Launch on the app scope;
+                                // the step's own scope is only a last-resort fallback so a
+                                // null app scope degrades to the old (cancellable)
+                                // behaviour instead of dropping the fetch.
+                                if (appScope == null) {
+                                    // refuse-instead-of-guess: the cast cannot fail in
+                                    // production (MinisApp IS the Application), so surface
+                                    // it loudly rather than skipping the refresh silently.
+                                    AppLogger.warning(
+                                        TAG,
+                                        "applicationContext is ${appContext::class.java.name}, " +
+                                            "not MinisApp — model refresh for ${instance.id} " +
+                                            "falls back to this step's scope",
+                                    )
+                                }
+                                (appScope ?: scope).launch { providerRepository.refreshModels(instance) }
+                                saved = true
+                            } finally {
+                                saving = false
+                            }
+                        }
                     }
                 },
-                enabled = apiKey.isNotBlank() && !saved,
+                enabled = apiKey.isNotBlank() && !saved && !saving,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(stringResource(if (saved) R.string.onboarding_saved else R.string.onboarding_save_api_key))
@@ -237,6 +289,10 @@ private fun ModelSelectionStep(
     val config by providerRepository.config.collectAsState()
     val selected = remember { mutableStateListOf<String>() } // entry UUIDs
     var searchText by remember { mutableStateOf("") }
+    // [R4-V F-13] Same one-shot gate as OnboardingModelSelectionScreen: the
+    // confirm button persisted two identical groups on a double tap because
+    // addGroup() is not idempotent and the nav transition outlives the tap.
+    var submitted by remember { mutableStateOf(false) }
 
     val enabledInstanceIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
     val allEntries = config.modelEntries.filter {
@@ -362,20 +418,25 @@ private fun ModelSelectionStep(
                 }
                 MinisButton(
                     onClick = {
-                        // Create default model group from selections
-                        if (selected.isNotEmpty()) {
-                            // [audit-0917] Same as OnboardingModelSelectionScreen:
-                            // the literal was persisted as the group title.
-                            val group = ModelGroup(name = defaultGroupName)
-                            group.memberEntryIds.addAll(selected)
-                            providerRepository.addGroup(group)
-                            if (config.defaultPrimaryGroupId == null) {
-                                providerRepository.defaultPrimaryGroupId = group.id
+                        // Create default model group from selections.
+                        // [R4-V F-13] The flag — not `enabled` — is the gate:
+                        // the second tap arrives before recomposition.
+                        if (!submitted) {
+                            submitted = true
+                            if (selected.isNotEmpty()) {
+                                // [audit-0917] Same as OnboardingModelSelectionScreen:
+                                // the literal was persisted as the group title.
+                                val group = ModelGroup(name = defaultGroupName)
+                                group.memberEntryIds.addAll(selected)
+                                providerRepository.addGroup(group)
+                                if (config.defaultPrimaryGroupId == null) {
+                                    providerRepository.defaultPrimaryGroupId = group.id
+                                }
                             }
+                            onComplete()
                         }
-                        onComplete()
                     },
-                    enabled = selected.isNotEmpty(),
+                    enabled = selected.isNotEmpty() && !submitted,
                 ) {
                     Text(stringResource(R.string.onboarding_done_count, selected.size))
                 }

@@ -1,11 +1,32 @@
 package com.rikkaminis.app.data.storage
 
 import android.content.Context
+import com.rikkaminis.app.data.ComposerDraftStore
+import com.rikkaminis.app.logging.AppLogger
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Paths
 import java.nio.file.attribute.BasicFileAttributes
+
+/**
+ * [da1040-A3] Draft-session alias prefix minted by [ComposerDraftStore]
+ * (`__new__<uuid>` — the same 36-char UUID shape behind a fixed prefix).
+ *
+ * Single constant on purpose: the shape predicate below is the ONLY place that
+ * knows the draft namespace. The old call-site `startsWith("__new__")` copy is
+ * how four of five orphan-sweep callers kept the narrower notion of
+ * "session-shaped" and deleted an active draft's files.
+ */
+private const val DRAFT_ID_PREFIX = "__new__"
+
+/**
+ * [P1-D] Log tag for this owner. The delete half is the only place in the
+ * session-file lifecycle that refuses to act, so it is also the only one that
+ * needs to say so out loud (the Storage page shows the refusal in the UI; the
+ * log is what survives after the user closes the dialog).
+ */
+private const val TAG = "SessionFileStore"
 
 /**
  * Singular owner of the on-disk footprint attached to a chat session.
@@ -31,8 +52,22 @@ import java.nio.file.attribute.BasicFileAttributes
  */
 class SessionFileStore internal constructor(
     private val filesDirForTestingOrProd: File,
+    /**
+     * [da1040-A3] Ids that already own on-disk state but have NO DB row yet:
+     * the composer's active draft slot (`__new__<uuid>`, minted by
+     * [ComposerDraftStore.nextDraftId] before the first message is sent).
+     *
+     * Threaded in as a *provider* rather than a snapshot so a scan sees the
+     * slot as it is at call time (the slot is re-minted/released while the app
+     * runs). Empty by default: JVM tests and any non-Android construction keep
+     * the DB-only behaviour.
+     */
+    private val activeDraftIds: () -> Set<String> = { emptySet() },
 ) {
-    constructor(context: Context) : this(context.filesDir)
+    constructor(context: Context) : this(
+        context.filesDir,
+        { ComposerDraftStore.activeDraftIds(context) },
+    )
 
     /** Root that holds one subdir per live session: filesDir/minis-sessions/<sid>/. */
     val sessionsRoot: File = File(filesDirForTestingOrProd, "minis-sessions")
@@ -40,11 +75,33 @@ class SessionFileStore internal constructor(
     /** Media root: filesDir/media/<date>/<sid>/. */
     private val mediaRoot: File = File(filesDirForTestingOrProd, "media")
 
+    /**
+     * Root of the browser tab-pool saved-state files:
+     * filesDir/browser_tabs/<sid>.json (written by BrowserTabPool.saveState).
+     * [da1025-D] A session's on-disk footprint is also THIS file — it holds
+     * the full tab URLs the session visited — yet it lived outside both
+     * deleteSessionFiles and orphan reclamation, so a deleted session's URL
+     * history stayed on disk forever (invisible even to the storage page's
+     * orphan sweep). Centralised here alongside the other two roots so the
+     * session-file lifecycle is owned in one place.
+     */
+    private val browserTabsRoot: File = File(filesDirForTestingOrProd, "browser_tabs")
+
     /** Test-only accessor for the media root (mirrors [mediaRoot]). */
     internal fun mediaRootForTesting(): File = mediaRoot
 
+    /** Test-only accessor for the browser-tabs root (mirrors [browserTabsRoot]). */
+    internal fun browserTabsRootForTesting(): File = browserTabsRoot
+
     /** Per-session directory under [sessionsRoot]. */
     fun sessionDir(sessionId: String): File = File(sessionsRoot, sessionId)
+
+    /**
+     * The browser tab-pool saved-state file for [sessionId]:
+     * filesDir/browser_tabs/<sid>.json (same path BrowserTabPool writes/reads
+     * — single source for the path shape, no literal drift).
+     */
+    fun browserTabFile(sessionId: String): File = File(browserTabsRoot, "$sessionId.json")
 
     /**
      * Recursive on-disk size of [dir] in bytes.
@@ -115,6 +172,10 @@ class SessionFileStore internal constructor(
      * trees are not a real shape).
      */
     fun scanMediaOnce(liveSessionIds: Set<String>): MediaScan {
+        // [da1040-A3] The composer's active draft owns media files under a
+        // `__new__<uuid>` leaf; without widening here the walk would count a
+        // live draft's media as reclaimable orphan bytes.
+        val live = withActiveComposerOwner(liveSessionIds)
         if (!mediaRoot.exists()) return MediaScan(emptyMap(), 0, 0L)
         val sizes = mutableMapOf<String, Long>()
         var orphanDirs = 0
@@ -126,7 +187,7 @@ class SessionFileStore internal constructor(
             if (children == null) {
                 // [Bug 2 parity] unreadable dir: assume orphan-leaf candidate
                 // (bytes unknowable — 0) so measurement never silently misses.
-                if (!parentOrphanLeaf && looksLikeSessionId(dir.name) && dir.name !in liveSessionIds) {
+                if (!parentOrphanLeaf && looksLikeSessionId(dir.name) && dir.name !in live) {
                     orphanDirs++
                 }
                 return
@@ -134,7 +195,7 @@ class SessionFileStore internal constructor(
             val isOrphanLeaf = !parentOrphanLeaf &&
                 children.none { it.isDirectory } && // File.isDirectory: same check as the old isOrphanMediaLeaf
                 looksLikeSessionId(dir.name) &&
-                dir.name !in liveSessionIds
+                dir.name !in live
             for (child in children) {
                 val attrs = try {
                     Files.readAttributes(
@@ -152,7 +213,7 @@ class SessionFileStore internal constructor(
                     val key = attrs.fileKey()
                     if (key != null && !seen.add(key)) continue
                     val sid = child.parentFile?.name ?: continue
-                    if (sid in liveSessionIds) {
+                    if (sid in live) {
                         sizes[sid] = (sizes[sid] ?: 0L) + attrs.size()
                     } else if (isOrphanLeaf) {
                         orphanBytes += attrs.size()
@@ -215,9 +276,10 @@ class SessionFileStore internal constructor(
         return out
     }
 
-    /** Recursively delete a session's bind-mounted dir + its media. No-op if absent. */
+    /** Recursively delete a session's bind-mounted dir + its media + its browser tab-pool state. No-op if absent. */
     fun deleteSessionFiles(sessionId: String): DeleteResult {
-        val sessionDeleted = deleteRecursivelyChecked(sessionDir(sessionId))
+        val sessionDeleted = deleteRecursivelyChecked(sessionDir(sessionId)) &&
+            deleteRecursivelyChecked(browserTabFile(sessionId))
         val mediaDeleted = mediaSessionDirs(sessionId).fold(true) { acc, dir ->
             deleteRecursivelyChecked(dir) && acc
         }
@@ -244,7 +306,18 @@ class SessionFileStore internal constructor(
         }
     }
 
-    /** Outcome of a session-file delete: which parts actually went away. */
+    /**
+     * Outcome of a session-file delete: which parts actually went away.
+     *
+     * [da1025-D] `sessionDeleted` now covers BOTH the bind-mounted session dir
+     * (minis-sessions/<sid>/) AND the browser tab-pool state file
+     * (browser_tabs/<sid>.json — the session's visited-URL history). Callers
+     * (ChatRepository.deleteSession, StorageManagementScreen) read only
+     * `fullyDeleted`, so folding the tab file into `sessionDeleted` widens the
+     * partial-failure signal without changing any caller contract. A session
+     * with no browsing history has no tab file: `deleteRecursivelyChecked`
+     * returns true for an absent file, so the outcome is unchanged there.
+     */
     data class DeleteResult(
         val sessionDeleted: Boolean,
         val mediaDeleted: Boolean,
@@ -256,29 +329,117 @@ class SessionFileStore internal constructor(
      * B: orphan reclamation. Any dir under [sessionsRoot] or any media subdir
      * whose id is NOT in [liveSessionIds] is a leftover from a deleted (or
      * never-committed) session. Returns the reclaimable bytes and reclaims them.
+     *
+     * [P1-D FINDING-26] This is the ONE destructive sweep in the app, and
+     * "not in the live set" is only evidence of garbage when the live set has
+     * something to say. It is built entirely from the DB (`listSessions()`), so
+     * an EMPTY set means "we know nothing about any session", not "there are no
+     * sessions": a rebuilt / partially restored / cleared `sessions` table makes
+     * every surviving session dir, media leaf and tab-state file look like
+     * residue, and one tap on the Storage page ("reclaim N items") would delete
+     * every workspace, attachment and offload on the device. [withActiveComposerOwner]
+     * cannot cover this — a draft id tells us about ONE slot, never about the
+     * DB's overall trustworthiness, which is why the guard reads the caller's
+     * raw set and not the widened one.
+     *
+     * The floor is deliberately lopsided: no live sessions ⇒ refuse the whole
+     * sweep (all three kinds) and return a [ReclaimReport.blocked] report that
+     * still carries the candidate counts, so the caller can SAY why nothing
+     * happened instead of reporting a silent success. An empty live set with
+     * nothing to reclaim stays a plain zero report — a fresh install must not
+     * see an error for "there was nothing to do".
      */
     fun reclaimOrphans(liveSessionIds: Set<String>): ReclaimReport {
-        val report = scanOrphans(liveSessionIds)
+        // [da1040-A3] One widening per public entry point; the private helpers
+        // below are reachable only from here, so they inherit [live].
+        val live = withActiveComposerOwner(liveSessionIds)
+        val report = withEmptyLiveFloor(scanOrphans(live), liveSessionIds)
+        if (report.blocked) {
+            // Not a silent skip: the refusal is logged AND returned, and the
+            // Storage page renders the blocked state instead of "reclaimed".
+            AppLogger.warning(
+                TAG,
+                "orphan reclaim BLOCKED (${report.blockReason}): the live session set is empty " +
+                    "but ${report.totalDirs} candidate(s) / ${report.totalBytes} B would have been " +
+                    "deleted — the DB says nothing about these sessions, so it cannot prove they " +
+                    "are orphans. Nothing was removed.",
+            )
+            return report
+        }
         with(report) {
             // Delete the scanned session dirs (ids in the report).
             if (sessionIds.isNotEmpty()) {
                 sessionIds.forEach { sessionDir(it).takeIf { d -> d.exists() }?.deleteRecursively() }
             }
             // Re-delete media leaves (walk again; ids may overlap session dirs).
-            deleteOrphanMediaLeaves(liveSessionIds)
+            deleteOrphanMediaLeaves(live)
         }
+        // [da1025-D] Also reclaim orphaned browser tab-pool state files
+        // (browser_tabs/<sid>.json for deleted sessions) — previously they
+        // leaked forever (full visited-URL history of a dead session left on
+        // disk, invisible to this sweep).
+        deleteOrphanBrowserTabFiles(live)
         return report
     }
 
     /**
-     * True if [name] looks like a session directory id. Session ids are always
-     * `UUID.randomUUID().toString()` (36 chars, 4 hyphens). Guarding on this
-     * shape means orphan reclamation can never mistake an unrelated folder or
-     * stray file under minis-sessions/ (or a media date path) for a session and
-     * delete it — fail-safe: unknown-looking names are simply never reclaimed.
+     * [P1-D FINDING-26] The empty-live-set floor, in ONE place.
+     *
+     * [ReclaimReport.blocked] is a decision about a CANDIDATE SET, so the scan
+     * half needs it too: the Storage page assembles its own report by hand (one
+     * media walk, see `StorageManagementScreen.reload`), renders the banner from
+     * it and only then calls [reclaimOrphans]. Without this the banner would
+     * advertise "N items, X MB" as reclaimable in exactly the world where the
+     * delete half refuses to touch them.
+     *
+     * Both halves call this function, so "what the banner offers" and "what the
+     * sweep will do" cannot drift — the caller passes the SAME raw live set it
+     * would pass to [reclaimOrphans] (see that function's KDoc for why the
+     * draft-widened set is the wrong input).
+     */
+    fun withEmptyLiveFloor(report: ReclaimReport, liveSessionIds: Set<String>): ReclaimReport =
+        if (report.totalDirs > 0 && liveSessionIds.isEmpty()) {
+            report.copy(
+                blocked = true,
+                blockReason = ReclaimReport.BLOCK_NO_LIVE_SESSIONS,
+            )
+        } else {
+            report
+        }
+
+    /**
+     * True if [name] is a session-shaped id: a bare session UUID
+     * (`UUID.randomUUID().toString()` — 36 chars, 4 hyphens) OR a draft alias
+     * (`__new__<uuid>`, see [DRAFT_ID_PREFIX]).
+     *
+     * [da1040-A3] The draft alias half used to live as a call-site
+     * `startsWith(DRAFT_ID_PREFIX)` branch inside ONE of the five sweep
+     * callers; the other four kept inheriting the narrower notion, so an
+     * in-flight draft's session dir / media leaf looked orphaned. Both shapes
+     * are now decided here and nowhere else.
+     *
+     * Guarding on this shape keeps reclamation fail-safe: an unrelated folder
+     * or stray file under minis-sessions/ (or a media date path) is never
+     * mistaken for a session, and a `__new__` name without a full UUID behind
+     * it (e.g. the bare `__new__` route placeholder) is not exempted either.
      */
     private fun looksLikeSessionId(name: String): Boolean {
-        return name.length == 36 && name.count { it == '-' } == 4
+        val uuid = if (name.startsWith(DRAFT_ID_PREFIX)) name.substring(DRAFT_ID_PREFIX.length) else name
+        return uuid.length == 36 && uuid.count { it == '-' } == 4
+    }
+
+    /**
+     * [da1040-A3] Widen a caller's live-DB-session set with the composer's
+     * active draft id(s). Every public orphan entry point calls this, so no
+     * caller (Storage page, ChatRepository) has to know that a draft owns
+     * files before its DB row exists — the caller's notion of "live" stays
+     * "what the DB says" and this class adds the slot that the DB cannot know
+     * about yet.
+     */
+    private fun withActiveComposerOwner(liveSessionIds: Set<String>): Set<String> {
+        val draftIds = activeDraftIds()
+        if (draftIds.isEmpty()) return liveSessionIds
+        return liveSessionIds + draftIds
     }
 
     /**
@@ -287,15 +448,56 @@ class SessionFileStore internal constructor(
      * banner that the user explicitly confirms before anything is removed.
      */
     fun scanOrphans(liveSessionIds: Set<String>): ReclaimReport {
-        val sessionPart = scanOrphanSessionDirs(liveSessionIds)
-        val media = scanMediaOnce(liveSessionIds)
+        val live = withActiveComposerOwner(liveSessionIds)
+        val sessionPart = scanOrphanSessionDirs(live)
+        val media = scanMediaOnce(live)
+        // [§1025-D R1] The tab-state half is part of the same number: it was
+        // being deleted without being counted, so "reclaimable" under-reported
+        // every session that ever opened the browser.
+        val tabs = scanOrphanBrowserTabFiles(live)
         return ReclaimReport(
             sessionIds = sessionPart.sessionIds,
             sessionDirs = sessionPart.sessionDirs,
             sessionBytes = sessionPart.sessionBytes,
             mediaDirs = media.orphanDirs,
             mediaBytes = media.orphanBytes,
+            browserTabsDirs = tabs.browserTabsDirs,
+            browserTabsBytes = tabs.browserTabsBytes,
         )
+    }
+
+    /**
+     * The `browser_tabs/<sid>.json` half of [scanOrphans] — measure only, no
+     * deletion. Public for the same reason [scanOrphanSessionDirs] is: the
+     * Storage page does ONE media walk and one tab walk and assembles the
+     * report itself, instead of triggering a full second scan on entry.
+     *
+     * Counts and sizes are for the SAME files [deleteOrphanBrowserTabFiles]
+     * removes. The rule is spelled out a second time rather than factored out:
+     * the delete half's predicate is pinned INLINE by the
+     * `browser_tabs_lifecycle_check` gate (see its KDoc), so a shared helper
+     * would either move the gate's anchor or leave the two disagreeing anyway.
+     * Drift is caught mechanically instead —
+     * `the scan and the delete half of the reclaim agree` runs both halves over
+     * the same fixture matrix and compares their sets.
+     */
+    fun scanOrphanBrowserTabFiles(liveSessionIds: Set<String>): ReclaimReport {
+        val live = withActiveComposerOwner(liveSessionIds)
+        var dirs = 0
+        var bytes = 0L
+        if (browserTabsRoot.exists()) {
+            browserTabsRoot.listFiles()?.forEach { file ->
+                if (!file.isFile) return@forEach
+                val stem = file.name.removeSuffix(".json")
+                if (stem == file.name) return@forEach // not a .json state file
+                val isSessionShaped = looksLikeSessionId(stem)
+                if (isSessionShaped && stem !in live) {
+                    dirs++
+                    bytes += file.length()
+                }
+            }
+        }
+        return ReclaimReport(browserTabsDirs = dirs, browserTabsBytes = bytes)
     }
 
     /**
@@ -304,11 +506,12 @@ class SessionFileStore internal constructor(
      * one media walk total instead of two.
      */
     fun scanOrphanSessionDirs(liveSessionIds: Set<String>): ReclaimReport {
+        val live = withActiveComposerOwner(liveSessionIds)
         val sessionIds = mutableListOf<String>()
         var sessionBytes = 0L
         if (sessionsRoot.exists()) {
             sessionsRoot.listFiles()?.forEach { dir ->
-                if (dir.isDirectory && looksLikeSessionId(dir.name) && dir.name !in liveSessionIds) {
+                if (dir.isDirectory && looksLikeSessionId(dir.name) && dir.name !in live) {
                     sessionIds += dir.name
                     sessionBytes += sizeOf(dir)
                 }
@@ -350,6 +553,40 @@ class SessionFileStore internal constructor(
     }
 
     /**
+     * [da1025-D] Delete orphaned browser tab-pool state files:
+     * browser_tabs/<stem>.json where the stem is session-shaped (bare UUID or
+     * a draft alias — BrowserTabPool writes under the draft id before
+     * ChatSessionEntryExt renames it on promotion) and is not live.
+     *
+     * [da1040-A3] The draft half is no longer spelled here: it belongs to
+     * [looksLikeSessionId] (single source for "session-shaped"), the same
+     * predicate the session-dir and media sweeps use. A local `startsWith`
+     * copy is exactly how the other four callers missed it.
+     *
+     * [§1025-D R1] These files are now COUNTED too ([ReclaimReport.browserTabsDirs]);
+     * the original "deliberately not counted" call left the storage page's
+     * reclaimable figure smaller than what the sweep actually frees.
+     *
+     * The predicate below is deliberately spelled INLINE here: the
+     * `browser_tabs_lifecycle_check` gate anchors on this body's
+     * `looksLikeSessionId(` + "stem is not live" pair (C3/C3b), and that anchor
+     * is the thing stopping the polarity flip that once deleted every LIVE
+     * session's tab state. [scanOrphanBrowserTabFiles] measures the same set —
+     * the two halves must stay textually parallel, and
+     * `the scan and the delete half of the reclaim agree` fails if they drift.
+     */
+    private fun deleteOrphanBrowserTabFiles(liveSessionIds: Set<String>) {
+        if (!browserTabsRoot.exists()) return
+        browserTabsRoot.listFiles()?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val stem = file.name.removeSuffix(".json")
+            if (stem == file.name) return@forEach // not a .json state file
+            val isSessionShaped = looksLikeSessionId(stem)
+            if (isSessionShaped && stem !in liveSessionIds) file.delete()
+        }
+    }
+
+    /**
      * Batch media-size lookup for many live sessions (avoids re-walking the
      * whole media tree once per session).
      *
@@ -363,14 +600,51 @@ class SessionFileStore internal constructor(
         return scanMediaOnce(sessionIds).liveSizes
     }
 
+    /**
+     * What one orphan scan found. THREE kinds of leftover are measured, and all
+     * three are summed by [totalDirs] / [totalBytes] so the Storage page's
+     * "reclaimable" figure matches what [reclaimOrphans] actually deletes:
+     *
+     *   - [sessionDirs] — `minis-sessions/<sid>/` of a dead session;
+     *   - [mediaDirs] — media leaves `<sid>/` under `media/<date>/`;
+     *   - [browserTabsDirs] — `browser_tabs/<sid>.json` state files
+     *     ([§1025-D R1] previously reclaimed but NOT counted, so the banner
+     *     promised less than the sweep freed). The field name keeps the
+     *     report's `…Dirs` family; the value counts state FILES, one per
+     *     session, because that is the shape this store keeps tab state in.
+     *
+     * Adding a fourth kind means adding it here AND to [scanOrphans], so the
+     * number the user confirms is the number that gets deleted.
+     *
+     * [P1-D FINDING-26] [blocked] / [blockReason] are the fourth thing a caller
+     * must look at: they say the candidate set itself is untrustworthy (the live
+     * session set was empty), so the counts above are a WARNING, not an offer.
+     * They default to "not blocked" because every other report in the codebase
+     * (scans, per-kind sub-reports) is a measurement, not a decision.
+     */
     data class ReclaimReport(
         val sessionIds: List<String> = emptyList(),
         val sessionDirs: Int = 0,
         val sessionBytes: Long = 0L,
         val mediaDirs: Int = 0,
         val mediaBytes: Long = 0L,
+        val browserTabsDirs: Int = 0,
+        val browserTabsBytes: Long = 0L,
+        /** True when the sweep refused to delete: see [SessionFileStore.reclaimOrphans]. */
+        val blocked: Boolean = false,
+        /** Stable, machine-readable reason code — null unless [blocked]. */
+        val blockReason: String? = null,
     ) {
-        val totalBytes: Long get() = sessionBytes + mediaBytes
-        val totalDirs: Int get() = sessionDirs + mediaDirs
+        val totalBytes: Long get() = sessionBytes + mediaBytes + browserTabsBytes
+        val totalDirs: Int get() = sessionDirs + mediaDirs + browserTabsDirs
+
+        companion object {
+            /**
+             * [P1-D] The live session set handed to the sweep was empty while
+             * orphan candidates existed. Reason code, not prose: the UI owns the
+             * wording (7 locales), the log and analytics own the identity.
+             */
+            const val BLOCK_NO_LIVE_SESSIONS = "no-live-sessions"
+        }
     }
 }

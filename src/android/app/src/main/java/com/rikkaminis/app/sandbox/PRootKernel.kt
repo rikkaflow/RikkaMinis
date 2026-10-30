@@ -5,15 +5,19 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.util.Log
 import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.data.MountedFoldersStore
+import com.rikkaminis.app.data.resolveVolumeRoot
 import java.io.File
 import java.io.IOException
 import java.util.TimeZone
 import kotlin.math.abs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * PRoot configuration holder and command builder.
@@ -25,8 +29,25 @@ object PRootKernel {
 
     private const val TAG = "PRootKernel"
 
-    var isBooted: Boolean = false
-        private set
+    /**
+     * True once [boot] has completed its critical section.
+     *
+     * [deep-audit-1016 FIX-C 3a] Backed by [bootGate] rather than a plain
+     * non-volatile `var`: the visibility flag and the mutual exclusion must be
+     * the same fact, or a concurrent entrant can observe "booted" while the
+     * install is still running.
+     */
+    val isBooted: Boolean
+        get() = bootGate.isDone
+
+    /**
+     * Serializes [boot]'s critical section. Two callers race on cold start —
+     * `ExecutionCoordinator`'s auto-boot and `TerminalSession`'s
+     * open-a-terminal — and the body *deletes and re-extracts the rootfs*
+     * (`RootfsManager.installIfNeeded`), so the second entrant used to destroy
+     * the tree the first was unpacking.
+     */
+    private val bootGate = BootOnceGate()
 
     /** Path to native library directory (for LD_LIBRARY_PATH). */
     var nativeLibDir: String = ""
@@ -47,8 +68,28 @@ object PRootKernel {
      *  supplied Context. */
     private var bootContext: Context? = null
 
-    /** Custom environment variables injected into every proot command. */
-    val customEnvironment: MutableMap<String, String> = mutableMapOf()
+    /**
+     * Custom environment variables injected into every proot command.
+     *
+     * [deep-audit-1016 FIX-C 3b] ConcurrentHashMap, not mutableMapOf(): writers
+     * are [boot] (a dozen putIfAbsent/put for PATH/LANG/TZ/PROOT_*),
+     * [updateTimezone] and [updateProxy] — the last two run from
+     * `MinisApp`'s timezone / proxy broadcasts, i.e. at arbitrary times while a
+     * shell is starting. Readers iterate it while building the child envp
+     * (`PersistentShell`, `ShellExecutor`, `TerminalSession`). A plain
+     * LinkedHashMap threw ConcurrentModificationException out of whichever
+     * shell_execute happened to be starting — the exact same race
+     * [bindMounts] was fixed for in [audit-0917], in the sibling declaration
+     * below: that fix changed one map and left this one. Env-var iteration
+     * order carries no meaning (the kernel takes an unordered envp block), so
+     * the weakly-consistent iterator is a strict improvement.
+     *
+     * Declared type stays `MutableMap<String, String>`: the three iteration
+     * sites keep compiling unchanged, and `putIfAbsent` keeps its atomic
+     * JDK-8 ConcurrentMap meaning (Kotlin's `MutableMap.putIfAbsent` delegates
+     * to `java.util.Map.putIfAbsent` when the receiver implements it).
+     */
+    val customEnvironment: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * Bind mounts: Linux path -> host filesystem path.
@@ -73,9 +114,34 @@ object PRootKernel {
             Log.d(TAG, "Already booted")
             return
         }
+        // [deep-audit-1016 FIX-C 3a] The fast path above stays lock-free; the
+        // gate re-checks under the lock and runs the body at most once. A loser
+        // waits here and then returns without touching the rootfs.
+        val performed = bootGate.run { bootCriticalSection(context) }
+        if (!performed) Log.d(TAG, "Already booted (concurrent entrant)")
+    }
 
+    /**
+     * [boot]'s one-shot body — rootfs install/repair, env, bind mounts, offload
+     * server. Split out so [boot] is only "fast path + gate"; never call this
+     * directly (it is the thing [bootGate] exists to serialize).
+     */
+    private suspend fun bootCriticalSection(context: Context) {
         bootContext = context.applicationContext
         rootfsManager = RootfsManager.getInstance(context)
+        // [meta1028 D3-F02] Wire the rebuild notification FIRST: a
+        // `RootfsManager.reset()` (manual reset, or autoRepair Stage 3) wipes
+        // and re-extracts the very tree the rest of this section materializes
+        // into, and `bootGate` has no reset edge of its own — so before this
+        // hook existed, `isBooted` stayed true after a mid-session reset and
+        // nothing ever re-ran installHandlerStubs / applyDefaultMountOverlay /
+        // applyMountedFoldersSnapshot: every offload stub answered `127: not
+        // found` and read-only mount guards were gone until the app restarted.
+        // The hook only re-arms the gate; the next `boot()` (command, terminal)
+        // re-runs this whole body, which is idempotent by design.
+        rootfsManager.afterRootfsReinstalled = {
+            onRootfsReinstalled(context)
+        }
         rootfsManager.installIfNeeded()
         rootfsManager.installProotIfNeeded()
 
@@ -215,15 +281,56 @@ object PRootKernel {
         // applyMountedFoldersSnapshot in MinisApp.onCreate ran before boot and
         // its mkdirs went nowhere; this re-run covers the mount entries that
         // were known at app launch.
-        applyMountedFoldersSnapshot(context)
+        //
+        // [dv20-A4-A06] Pin the IO hop at the call site: the snapshot does
+        // blocking host I/O (SAF resolution readdir, rootfs mkdirs, wrapper-
+        // script writes), and bootCriticalSection runs on whatever context its
+        // caller used — it must not depend on that.
+        withContext(Dispatchers.IO) { applyMountedFoldersSnapshot(context) }
 
-        isBooted = true
+        // [deep-audit-1016 FIX-C 3a] `bootGate` marks completion here — the
+        // flag-before-body ordering (`isBooted = true` used to sit one line
+        // earlier) would let a concurrent entrant skip the tail of this body.
         Log.i(TAG, "PRoot kernel booted " +
             "rootfs=${rootfsManager.rootfsDir.absolutePath} " +
             "nativeLibDir=$nativeLibDir " +
             "loader=$prootLoaderPath " +
             "bindMounts=${bindMounts.size} " +
             "offloadHandlers=${OffloadHandlerCatalog.allHandlerNames.sorted()}")
+    }
+
+    /**
+     * [meta1028 D3-F02] Called by [RootfsManager.reset] after the wipe +
+     * re-extract has landed (hook wired at the top of
+     * [bootCriticalSection]).
+     *
+     * Only re-arms the one-shot gate. That is the whole fix: `isBooted` is the
+     * single fact every entry point consults (`ExecutionCoordinator.execute`
+     * auto-boot, `TerminalSession.start`, `ShellExecutor`), so invalidating it
+     * makes the tree's dependents rebuild themselves through the ONE code path
+     * that knows how ([bootCriticalSection]) instead of a second, drifting copy
+     * of "what has to be re-applied after a wipe".
+     *
+     * Deliberately does NOT kill shells here. The two owners do that on their
+     * own next entry, where they can also serialize against a running command:
+     * [ExecutionCoordinator] drops shells built against the pre-wipe tree
+     * before its auto-boot, and [TerminalSession.start] restarts a PTY that is
+     * still pointing at it.
+     *
+     * Re-entrancy: when the wipe comes from inside [bootCriticalSection]
+     * (autoRepair Stage 3), this runs while `bootGate`'s mutex is held by that
+     * same body. `invalidate` is a plain volatile write with no lock, so there
+     * is no self-deadlock — and the body's own tail (stubs, overlay, mounts)
+     * re-materializes everything AFTER the reset, which is exactly why
+     * re-arming here is safe as well as necessary.
+     */
+    private fun onRootfsReinstalled(@Suppress("UNUSED_PARAMETER") context: Context) {
+        bootGate.invalidate()
+        Log.w(
+            TAG,
+            "rootfs re-extracted underneath a booted kernel — boot gate re-armed; " +
+                "the next boot re-applies stubs / mounts / default_mount overlay",
+        )
     }
 
     fun addBindMount(linuxPath: String, hostPath: String) {
@@ -270,7 +377,43 @@ object PRootKernel {
 
     // Sentinel in the read-only write-guard wrapper scripts so we can recognize
     // and remove our own wrappers (vs a user/busybox binary of the same name).
-    private const val GUARD_MARKER = "minis-mount-readonly-guard"
+    // internal: the test package pins the marker ([MountGuardScriptTest]).
+    internal const val GUARD_MARKER = "minis-mount-readonly-guard"
+
+    // Commands whose LAST positional argument is the write target; the earlier
+    // ones are sources (cp/ln). Everything else in [installMountWriteGuards]
+    // takes every positional argument as a target, except dd (writes via `of=`).
+    // [audit3 F-07] `mv` moved HERE from "last arg": `mv <read-only>/f /tmp/`
+    // deletes f from the mount, so a source IS a write target for mv — the B5a
+    // "sources are reads" model only holds for cp/ln (a cp source is read, an
+    // ln source is read).
+    // internal: the test package pins the shapes ([MountGuardScriptTest]).
+    internal val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "ln")
+
+    // [meta1028 D3-F06] Commands that accept `-t DIR` / `--target-directory[=]DIR`
+    // (in joined forms too: `-tDIR`, `-rtDIR`), i.e. the commands whose write
+    // target can arrive as a FLAG VALUE instead of the last positional.
+    // `mv` is in here WITHOUT being in [MOUNT_GUARD_LAST_ARG_CMDS]: with `-t`
+    // its positionals are all sources (must still be checked — audit3 F-07), so
+    // it takes the flag-value parse but keeps the check-every-positional rule.
+    internal val MOUNT_GUARD_TARGET_DIR_CMDS = setOf("cp", "ln", "mv")
+
+    // Full wrapper set installed by [installMountWriteGuards]. [audit3 F-07] the
+    // list is ALSO hardcoded into every generated script as an unwritable target:
+    // `rm /usr/local/bin/cp` issued through the `rm` wrapper used to be allowed —
+    // each wrapper only knew its own name — which deleted a sibling and reopened
+    // every bypass for that command.
+    // internal: pinned by [MountGuardScriptTest] + read by install + codegen.
+    internal val MOUNT_GUARD_CMDS =
+        listOf("touch", "tee", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "dd")
+
+    // Guest path of the read-only prefix list the wrappers read at run time.
+    // [audit3 F-07] hardcoded unwritable too — an absent list makes every check
+    // pass, so deleting it was the cheapest full bypass.
+    internal const val MOUNT_GUARD_CFG_LINUX_PATH = "/var/minis/.mount-readonly-prefixes"
+
+    // Guest dir the wrappers live in (rootfs `usr/local/bin`, first on PATH).
+    internal const val MOUNT_GUARD_BIN_LINUX_PREFIX = "/usr/local/bin"
 
     /**
      * Reference to the user-mounted folders store, set by [MinisApp] at
@@ -403,9 +546,14 @@ object PRootKernel {
      * shell-level wrapper is tracked as T219-4 follow-up (optional).
      */
     fun isLinuxPathUnderReadOnlyMount(linuxPath: String): Boolean {
-        if (!linuxPath.startsWith(MOUNTS_LINUX_PREFIX)) return false
+        // Normalize BEFORE matching the prefix (audit-1014 B5b): the raw string
+        // could carry `.`/`//` segments (`/var/minis/./mounts/...`), which
+        // slipped past the guard while resolveHostPath's safeResolveWithin
+        // still resolved the write INTO the read-only mount.
+        val normalized = normalizeLinuxPath(linuxPath)
+        if (normalized == null || !normalized.startsWith(MOUNTS_LINUX_PREFIX)) return false
         val store = mountedFoldersStore ?: return false
-        val rest = linuxPath.removePrefix(MOUNTS_LINUX_PREFIX)
+        val rest = normalized.removePrefix(MOUNTS_LINUX_PREFIX)
         val name = rest.substringBefore('/')
         if (name.isEmpty()) return false
         val entry = store.entries.value.firstOrNull { it.name == name } ?: return false
@@ -455,7 +603,10 @@ object PRootKernel {
             val parts = docId.split(':', limit = 2)
             val volumeId = parts.getOrNull(0).orEmpty()
             val relPath = parts.getOrNull(1).orEmpty()
-            val volumeRoot = resolveVolumeRoot(volumeId, context)
+            // [dv20-A4-A06] Single-source volume-root resolution (MountedFoldersStore.kt):
+            // the union rule keeps the < API 30 `/storage/<uuid>` fallback, so a
+            // removable volume resolves here too instead of dropping the mount.
+            val volumeRoot = resolveVolumeRoot(context, volumeId)
             if (volumeRoot == null) {
                 Log.w(TAG, "resolveTreeUriToHostPath: unknown volume '$volumeId' for $treeUriString")
                 null
@@ -515,22 +666,12 @@ object PRootKernel {
         }
     }
 
-    private fun resolveVolumeRoot(volumeId: String, context: Context): String? {
-        if (volumeId.equals("primary", ignoreCase = true) || volumeId.isEmpty()) {
-            return Environment.getExternalStorageDirectory()?.absolutePath
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager ?: return null
-            for (volume in sm.storageVolumes) {
-                if (volume.uuid?.equals(volumeId, ignoreCase = true) == true) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        return volume.directory?.absolutePath
-                    }
-                }
-            }
-        }
-        return null
-    }
+    // [dv20-A4-A06] The private `resolveVolumeRoot(volumeId, context)` that used
+    // to live here is gone: it was a drifted twin of MountedFoldersStore's copy
+    // with no < API 30 fallback, so a removable volume (API 26–29) resolved to
+    // null on this side and applyMountedFoldersSnapshot silently dropped the
+    // mount. Both readers now call the single top-level
+    // `resolveVolumeRoot(context, volumeId)` in MountedFoldersStore.kt.
 
     /**
      * Build a POSIX TZ string from the current system timezone.
@@ -766,19 +907,80 @@ object PRootKernel {
      *
      * Falls back to [resolveHostPath] for paths outside `/var/minis/` or for the
      * shared subdirs (memory/skills/shared) which don't depend on sessionId.
+     *
+     * [deep-audit-1016 FIX-C 2a] The decision lives in the pure
+     * [resolveSessionGuestHostPath], which normalizes `linuxPath` BEFORE any
+     * prefix match. The raw-string form this used to be (and the read-only
+     * guard's own [normalizeLinuxPath] call) disagreed on malformed input:
+     * `/var/minis/./workspace/x` extracted `subdir == "."`, matched no
+     * per-session scope and no bind mount, and fell through to the rootfs
+     * join — i.e. a *ghost* file at `<rootfs>/var/minis/workspace/x`, shared
+     * between sessions and invisible to the session's own workspace.
      */
-    fun resolveSessionHostPath(sessionId: String, linuxPath: String, context: Context): File? {
-        if (!linuxPath.startsWith("/var/minis/")) return resolveHostPath(linuxPath)
-        val rest = linuxPath.removePrefix("/var/minis/")
-        val slash = rest.indexOf('/')
-        val subdir = if (slash < 0) rest else rest.substring(0, slash)
-        if (subdir !in perSessionSubdirs) return resolveHostPath(linuxPath)
-        val sessionBase = File(context.filesDir, "minis-sessions/$sessionId/$subdir")
-        val tail = if (slash < 0) "" else rest.substring(slash + 1)
-        if (tail.isEmpty()) return sessionBase
-        // Normalize dot-segments and enforce the resolved path stays inside
-        // sessionBase (guards `..`/symlink escapes out of the session tree).
-        return safeResolveWithin(sessionBase, tail)
+    fun resolveSessionHostPath(sessionId: String, linuxPath: String, context: Context): File? =
+        resolveSessionGuestHostPath(
+            sessionId = sessionId,
+            linuxPath = linuxPath,
+            filesDir = context.filesDir,
+            perSessionSubdirs = perSessionSubdirs,
+            resolveGlobal = { resolveHostPath(it) },
+        )
+
+    /**
+     * Resolve a Linux path, honouring the owning session whenever one is known.
+     *
+     * [audit3 F-08] This is the single replacement for the hand-spelled
+     * `sessionId?.let { resolveSessionHostPath(it, p, ctx) } ?: resolveHostPath(p)`
+     * shape that callers used to repeat at each site (browser URL interception,
+     * file_upload, cookies-file, screenshot dir, config `set --file`, speech
+     * source, read_image, model-use). That shape conflated the two unrelated
+     * nulls [resolveSessionHostPath] can return:
+     *
+     *  - "no session scoping applies" (path outside `/var/minis/`, or a shared
+     *    subdir) — the global resolver is genuinely the right answer; and
+     *  - "[safeResolveWithin] rejected a `..`/symlink escape out of the session
+     *    tree" — the elvis then re-resolved the *rejected* path through
+     *    [resolveHostPath], which searches every `minis-sessions/<id>/` tree
+     *    and finally the rootfs placeholder. The containment check was defeated
+     *    by its own caller: a path refused for this session still resolved,
+     *    possibly to another session's file.
+     *
+     * Contract:
+     *  - `sessionId == null` → [resolveHostPath]. "No session in scope" is the
+     *    documented case for Coil / generic media callers — unchanged.
+     *  - `sessionId != null` → [resolveSessionHostPath] verbatim, including its
+     *    internal non-session fallbacks. A null from it means "rejected or
+     *    absent" and is returned as null; callers keep their existing
+     *    file-not-found / warning handling. Never re-resolve globally.
+     */
+    fun resolvePathForSession(sessionId: String?, linuxPath: String, context: Context): File? =
+        sessionScopedResolve(
+            sessionId = sessionId,
+            linuxPath = linuxPath,
+            resolveGlobal = { resolveHostPath(it) },
+            resolveSession = { sid, path -> resolveSessionHostPath(sid, path, context) },
+        )
+
+    /**
+     * Pure decision core of [resolvePathForSession]: no [Context], no
+     * filesystem, no [PRootKernel] state — so the JVM test source set can pin
+     * the three arms (no session → global; session hit → session; session
+     * *reject* → null, never the global resolver). Generic over the result type
+     * so tests can feed plain strings instead of [File]s.
+     *
+     * Keep the "session present ⇒ no global fallback" branch exactly as is: the
+     * `?:`/elvis form compiles, looks equivalent, and silently reopens the
+     * cross-session hole [resolvePathForSession] documents.
+     */
+    internal fun <T> sessionScopedResolve(
+        sessionId: String?,
+        linuxPath: String,
+        resolveGlobal: (String) -> T?,
+        resolveSession: (String, String) -> T?,
+    ): T? = if (sessionId == null) {
+        resolveGlobal(linuxPath)
+    } else {
+        resolveSession(sessionId, linuxPath)
     }
 
     /**
@@ -794,55 +996,19 @@ object PRootKernel {
      * that actually exists — the same fallback resolveMdMediaFile uses — so a
      * `minis://attachments/x.png` URL still resolves to a real file instead of
      * the empty rootfs placeholder.
+     *
+     * [deep-audit-1016 FIX-C 2a] Delegates to the pure [resolveGuestHostPath],
+     * which normalizes the guest path before every prefix match (bind mounts
+     * and the per-session subdir scan alike) — see
+     * [resolveSessionGuestHostPath] for the malformed-input symptom.
      */
-    fun resolveHostPath(linuxPath: String): File? {
-        // Check bind mounts (longest prefix match)
-        val sorted = bindMounts.keys.sortedByDescending { it.length }
-        for (mountPoint in sorted) {
-            if (linuxPath == mountPoint || linuxPath.startsWith("$mountPoint/")) {
-                val hostBase = bindMounts[mountPoint]!!
-                val relativePath = linuxPath.removePrefix(mountPoint).removePrefix("/")
-                if (relativePath.isEmpty()) {
-                    File(hostBase)
-                } else {
-                    // Normalize dot-segments and enforce the resolved path stays
-                    // inside hostBase (guards `..`/symlink escapes out of the mount).
-                    safeResolveWithin(File(hostBase), relativePath)
-                }.let { return it }
-            }
-        }
-
-        // Per-session subdir fallback: no session context available — search
-        // all minis-sessions/<id>/ trees for an existing file (or existing
-        // dir) at this Linux path. Picks the first match; ambiguity is
-        // acceptable here because these callers can't know the session anyway.
-        if (linuxPath.startsWith("/var/minis/")) {
-            val rest = linuxPath.removePrefix("/var/minis/")
-            val subdir = rest.substringBefore('/')
-            if (subdir in perSessionSubdirs) {
-                val sessionsRoot = bootContext?.filesDir?.let { File(it, "minis-sessions") }
-                val tail = rest.substringAfter('/', missingDelimiterValue = "")
-                if (sessionsRoot?.isDirectory == true) {
-                    sessionsRoot.listFiles()?.forEach { sessionDir ->
-                        if (!sessionDir.isDirectory) return@forEach
-                        val candidate = if (tail.isEmpty()) File(sessionDir, subdir)
-                        else safeResolveWithin(File(sessionDir, subdir), tail)
-                        if (candidate?.exists() == true) return candidate
-                    }
-                }
-                // No existing file in any session — fall through to rootfs
-                // placeholder (matches pre-existing behavior for missing files).
-            }
-        }
-
-        // Fallback: resolve relative to rootfs
-        if (!::rootfsManager.isInitialized) return null
-        val stripped = linuxPath.removePrefix("/")
-        if (stripped.isEmpty()) return rootfsManager.rootfsDir
-        // Normalize dot-segments and keep the resolved path inside the rootfs —
-        // never allow `..` (or symlinks) to climb out into the host filesystem.
-        return safeResolveWithin(rootfsManager.rootfsDir, stripped)
-    }
+    fun resolveHostPath(linuxPath: String): File? = resolveGuestHostPath(
+        linuxPath = linuxPath,
+        bindMounts = bindMounts,
+        perSessionSubdirs = perSessionSubdirs,
+        sessionsRoot = bootContext?.filesDir?.let { File(it, "minis-sessions") },
+        rootfsDir = if (::rootfsManager.isInitialized) rootfsManager.rootfsDir else null,
+    )
 
     /**
      * Create a stub executable inside the rootfs for every registered
@@ -997,6 +1163,16 @@ object PRootKernel {
      * (touch/cp/mv/tee/mkdir/rm/…). Pure shell `>` redirects are handled by the
      * OS itself — proot forwards the open(2) to the host FS, which returns EACCES
      * for a read-only mount — so those already fail truthfully.
+     *
+     * [audit-1014 B5a] the wrapper used to prefix-match EVERY positional
+     * argument, so `cp /var/minis/mounts/vault/f /var/minis/workspace/` —
+     * reading OUT of a read-only mount, perfectly legal — was refused; while
+     * conversely `dd of=<read-only path>` wrote straight past the guard
+     * (the `of=` value never matched the `"$prefix"` or `"$prefix"/…`
+     * patterns). The argument
+     * SELECTION is now command-specific ([mountGuardScript]); the guard
+     * semantics are unchanged — any write target under a read-only prefix
+     * still exits 1.
      */
     private fun installMountWriteGuards(context: Context, readOnlyLinuxPrefixes: List<String>) {
         val rootfs = try {
@@ -1004,9 +1180,9 @@ object PRootKernel {
         } catch (t: Throwable) {
             return
         }
-        val binDir = File(rootfs, "usr/local/bin").also { it.mkdirs() }
-        val guardedCmds = listOf("touch", "tee", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "dd")
-        val configFile = File(rootfs, "var/minis/.mount-readonly-prefixes")
+        val binDir = File(rootfs, MOUNT_GUARD_BIN_LINUX_PREFIX.trimStart('/')).also { it.mkdirs() }
+        val guardedCmds = MOUNT_GUARD_CMDS
+        val configFile = File(rootfs, MOUNT_GUARD_CFG_LINUX_PATH.trimStart('/'))
 
         if (readOnlyLinuxPrefixes.isEmpty()) {
             // No read-only mounts — remove the config + wrappers so plain busybox
@@ -1025,29 +1201,7 @@ object PRootKernel {
 
         for (name in guardedCmds) {
             val wrapper = File(binDir, name)
-            wrapper.writeText(
-                """#!/bin/sh
-                |# $GUARD_MARKER — reject writes into read-only mounted folders.
-                |# Auto-installed by MinisApp PRootKernel (T219-4).
-                |cfg=/var/minis/.mount-readonly-prefixes
-                |if [ -f "${'$'}cfg" ]; then
-                |    for arg in "${'$'}@"; do
-                |        case "${'$'}arg" in
-                |            -*) continue;;  # skip flags
-                |        esac
-                |        while IFS= read -r prefix; do
-                |            [ -z "${'$'}prefix" ] && continue
-                |            case "${'$'}arg" in
-                |                "${'$'}prefix"|"${'$'}prefix"/*)
-                |                    echo "$name: ${'$'}arg: read-only mounted folder — writes are disabled (toggle in Settings → Mount External Folders)" >&2
-                |                    exit 1;;
-                |            esac
-                |        done < "${'$'}cfg"
-                |    done
-                |fi
-                |exec /bin/busybox $name "${'$'}@"
-                |""".trimMargin(),
-            )
+            wrapper.writeText(mountGuardScript(name))
             wrapper.setExecutable(true, false)
         }
         Log.i(
@@ -1055,6 +1209,224 @@ object PRootKernel {
             "installMountWriteGuards: installed for ${guardedCmds.size} cmds, " +
                 "readOnlyPrefixes=${readOnlyLinuxPrefixes.joinToString(",")}",
         )
+    }
+
+    /**
+     * The shell wrapper for ONE guarded command. The argument selection is
+     * command-specific (audit-1014 B5a) — three shapes by write semantics:
+     *
+     *  - cp/ln: only the LAST positional argument is the write target. The
+     *    earlier ones are sources — `cp /var/minis/mounts/vault/f /tmp/`
+     *    (reading OUT of a read-only mount) must stay legal. `[audit3 F-07]`
+     *    exception: with `-t DIR` / `--target-directory[=]DIR` (clustered forms
+     *    `-rt DIR` / `-rtDIR` too) the write target is the FLAG VALUE and every
+     *    positional is a source, so the positional tail must NOT be checked.
+     *    `[meta1028 D3-F06]` the flag-value parse is character-wise (see the
+     *    selection block) and a `-t` with no value is REFUSED, not allowed;
+     *  - mv: every positional (plus the `-t` value, which is positional too) —
+     *    a mv SOURCE is destroyed, `mv <read-only>/f /tmp/` deletes f from the
+     *    mount, so B5a's "sources are reads" model does not hold here.
+     *    `[meta1028 D3-F06]` mv therefore gets the SAME flag-value parse as
+     *    cp/ln while keeping the check-every-positional rule: before, the
+     *    joined forms (`-tDIR`, `--target-directory=DIR`) began with `-` and
+     *    were skipped, so only the source was ever inspected;
+     *  - dd: the write target is the value of `of=`, never a positional
+     *    argument — and `oflag=`/`ofs=` must not be confused with `of=`;
+     *  - touch/tee/mkdir/rm/rmdir: every positional argument IS a target
+     *    (tee's files are all written, rm's are all destroyed).
+     *
+     * Flags are skipped in all shapes. The guard semantics are unchanged
+     * from the every-argument version: any selected target under a
+     * read-only prefix still exits 1 — only WHICH arguments are checked got
+     * command-specific.
+     *
+     * [audit3 F-07] every SELECTED target is canonicalized ([canon_target]
+     * below) and matched against the guard's own control files before the
+     * prefix list. The four bypasses that closes:
+     *
+     *  1. relative targets — `cd /var/minis/mounts/vault && rm secret.md` handed
+     *     `$1="secret.md"` to a raw `"$prefix"/…` match and was allowed through;
+     *  2. `.`/`..`/`//` spellings — `rm /var/minis/mounts/x/../../etc/f` (and
+     *     the inverse `cp a /var/minis/mounts/x/../x/b`) never matched the raw
+     *     prefix either, so the guard was blind in both directions;
+     *  3. self-destruction — `rm /var/minis/.mount-readonly-prefixes` deleted
+     *     the list, after which every later call allowed everything (the whole
+     *     check sat behind `if [ -f "$cfg" ]`); deleting a sibling wrapper
+     *     (`rm /usr/local/bin/cp` — each wrapper only knew its own name) had
+     *     the same effect for that command;
+     *  4. `cp -t <read-only dir> src` — only `src` was inspected;
+     *  5. `mv <read-only>/f /tmp/` — B5a classified a mv source as a read, but a
+     *     mv source is destroyed (see the shape list above), so moving a file
+     *     OUT of a read-only mount deleted it from the mount unchecked.
+     *
+     * Deliberate boundary (do not "fix" it here): this stays best-effort
+     * interception over the argv whitelist. Canonicalization is LEXICAL only —
+     * a symlinked alias of a mount is not resolved, because busybox `realpath`
+     * in this rootfs has no `-m` and `readlink -f` needs the target to exist,
+     * so an external dependency would either fail open (missing `-m`) or refuse
+     * every legal write (missing binary). `python3 -c "open(...)"`, `sed -i`,
+     * `> redirect` and the in-app [isLinuxPathUnderReadOnlyMount] guard cover
+     * those paths instead.
+     */
+    internal fun mountGuardScript(name: String): String {
+        // [audit3 F-07] hardcoded unwritable targets (self-protection): the
+        // prefix list + every wrapper of the set, this one included.
+        val guardBinPatterns = MOUNT_GUARD_CMDS
+            .joinToString(separator = "|") { "\"$MOUNT_GUARD_BIN_LINUX_PREFIX/$it\"" }
+        val selection = when {
+            name in MOUNT_GUARD_TARGET_DIR_CMDS -> {
+                // [meta1028 D3-F06] Two bypasses lived in this block:
+                //  1. `-[!-]*t?*) tdest="${arg##*[t]}"` used a GREEDY prefix
+                //     strip: `##*[t]` removes everything up to the LAST `t` in
+                //     the whole argument, not the option letter. Every mount
+                //     path contains `t` twice over ("/var/minis/moun**t**s/…"
+                //     plus most names), so `cp -rt/var/minis/mounts/vault f`
+                //     produced tdest="" (or a fragment like "s/vault") — and
+                //     the next line's `[ -z "$tdest" ] ||` SHORT-CIRCUITED on
+                //     the empty value and allowed the write. The positional
+                //     tail was skipped too, so nothing else caught it.
+                //  2. `mv` had no flag-value parse at all (it is not a
+                //     LAST_ARG cmd): `-tDIR` / `--target-directory=DIR` start
+                //     with `-` and the old `-*) continue` skipped them, so
+                //     only the source was checked.
+                // The fix parses the short cluster CHARACTER BY CHARACTER
+                // (`t` is the only value-taking option for these three), so
+                // the value is whatever follows that `t` and nothing else, and
+                // a missing value is REFUSED instead of allowed.
+                val positionalRule =
+                    if (name in MOUNT_GUARD_LAST_ARG_CMDS) "dest=\"${'$'}arg\""
+                    else "check_prefix \"${'$'}arg\" || exit 1"
+                """
+                |dest=""
+                |tdest=""
+                |tdir=""
+                |take=""
+                |endopts=""
+                |for arg in "${'$'}@"; do
+                |    if [ "${'$'}take" = 1 ]; then take=""; tdir=1; tdest="${'$'}{arg}"; continue; fi
+                |    if [ -n "${'$'}endopts" ]; then $positionalRule; continue; fi
+                |    case "${'$'}arg" in
+                |        --) endopts=1;;
+                |        --target-directory) take=1;;
+                |        --target-directory=*) tdir=1; tdest="${'$'}{arg#*=}";;
+                |        --*) ;;
+                |        -?*)
+                |            rest="${'$'}{arg#-}"
+                |            while [ -n "${'$'}rest" ]; do
+                |                ch="${'$'}{rest%"${'$'}{rest#?}"}"
+                |                rest="${'$'}{rest#?}"
+                |                if [ "${'$'}ch" = t ]; then
+                |                    tdir=1
+                |                    if [ -n "${'$'}rest" ]; then tdest="${'$'}rest"; rest=""; else take=1; fi
+                |                fi
+                |            done;;
+                |        *) $positionalRule;;
+                |    esac
+                |done
+                |if [ "${'$'}tdir" = 1 ]; then
+                |    if [ -z "${'$'}tdest" ]; then
+                |        echo "$name: -t/--target-directory given without a directory — refused by the read-only mount guard" >&2
+                |        exit 1
+                |    fi
+                |    check_prefix "${'$'}tdest" || exit 1
+                |elif [ -n "${'$'}dest" ]; then
+                |    check_prefix "${'$'}dest" || exit 1
+                |fi
+                """.trimMargin()
+            }
+            name == "dd" -> """
+                |for arg in "${'$'}@"; do
+                |    case "${'$'}arg" in
+                |        oflag=*|ofs=*) ;;
+                |        of=*) check_prefix "${'$'}{arg#of=}" || exit 1;;
+                |    esac
+                |done
+            """.trimMargin()
+            else -> """
+                |for arg in "${'$'}@"; do
+                |    case "${'$'}arg" in -*) continue;; esac
+                |    check_prefix "${'$'}arg" || exit 1
+                |done
+            """.trimMargin()
+        }
+        return """#!/bin/sh
+            |# $GUARD_MARKER — reject writes into read-only mounted folders.
+            |# Auto-installed by MinisApp PRootKernel (T219-4).
+            |cfg=$MOUNT_GUARD_CFG_LINUX_PATH
+            |canon_out=""
+            |# [audit3 F-07] POSIX-lexical canonicalization: collapses `//`, `/./`,
+            |# `/../` and a trailing `/`, and resolves RELATIVE paths against the
+            |# wrapper's cwd (the caller shell's cwd). Publishes through canon_out
+            |# instead of stdout so the common absolute argument costs no command
+            |# substitution. Lexical on purpose — see mountGuardScript's KDoc.
+            |canon_target() {
+            |    p=${'$'}1
+            |    case "${'$'}p" in
+            |        "") return 1;;
+            |        /*) ;;
+            |        *) cw=$(pwd) || return 1
+            |           [ -n "${'$'}cw" ] || return 1
+            |           p="${'$'}cw/${'$'}p";;
+            |    esac
+            |    out=""
+            |    while [ -n "${'$'}p" ]; do
+            |        case "${'$'}p" in
+            |            */*) seg=${'$'}{p%%/*}; p=${'$'}{p#*/};;
+            |            *) seg=${'$'}p; p="";;
+            |        esac
+            |        case "${'$'}seg" in
+            |            ""|.) continue;;
+            |            ..)
+            |                case "${'$'}out" in
+            |                    */*) out=${'$'}{out%/*};;
+            |                    *) out="";;
+            |                esac
+            |                continue;;
+            |        esac
+            |        out="${'$'}out/${'$'}seg"
+            |    done
+            |    [ -n "${'$'}out" ] || out="/"
+            |    canon_out="${'$'}out"
+            |    return 0
+            |}
+            |# $1 is one selected write target. Refuses (return 1) an unresolvable
+            |# target, the guard's own control files, and any target under a
+            |# read-only prefix; allows everything else.
+            |check_prefix() {
+            |    canon_target "${'$'}1" || {
+            |        echo "$name: ${'$'}1: cannot resolve the write target — refused by the read-only mount guard" >&2
+            |        return 1
+            |    }
+            |    resolved="${'$'}canon_out"
+            |    # Self-protection first, and independent of the list's existence:
+            |    # the list and every wrapper are writable targets for the very
+            |    # commands they gate, and destroying either turns the guard into a
+            |    # silent no-op for every later call.
+            |    if [ "${'$'}resolved" = "${'$'}cfg" ]; then
+            |        echo "$name: ${'$'}1: read-only mount list — writes are disabled (manage mounts in Settings → Mount External Folders)" >&2
+            |        return 1
+            |    fi
+            |    case "${'$'}resolved" in
+            |        $guardBinPatterns)
+            |            echo "$name: ${'$'}1: read-only mount guard wrapper — writes are disabled (manage mounts in Settings → Mount External Folders)" >&2
+            |            return 1;;
+            |    esac
+            |    if [ ! -f "${'$'}cfg" ]; then
+            |        return 0
+            |    fi
+            |    while IFS= read -r prefix; do
+            |        [ -z "${'$'}prefix" ] && continue
+            |        case "${'$'}resolved" in
+            |            "${'$'}prefix"|"${'$'}prefix"/*)
+            |                echo "$name: ${'$'}1: read-only mounted folder — writes are disabled (toggle in Settings → Mount External Folders)" >&2
+            |                return 1;;
+            |        esac
+            |    done < "${'$'}cfg"
+            |    return 0
+            |}
+            |$selection
+            |exec /bin/busybox $name "${'$'}@"
+            |""".trimMargin()
     }
 
     /**
@@ -1066,4 +1438,257 @@ object PRootKernel {
         tmpDir.mkdirs()
         return tmpDir
     }
+}
+
+/**
+ * Pure lexical normalization of a guest linux path: collapses `//`, `/./` and
+ * `seg/../` (POSIX rules — `/..` at the absolute root stays at the root).
+ * Returns null for an empty input or a relative path that climbs above its
+ * root (there is no meaningful mount check for such a string).
+ *
+ * [audit-1014 B5b] [PRootKernel.isLinuxPathUnderReadOnlyMount] used to match
+ * the mount prefix on the RAW string, so `/var/minis/./mounts/...` or
+ * `//var/minis/mounts/...` slipped past the guard while resolveHostPath's
+ * safeResolveWithin still resolved the write INTO the read-only mount — the
+ * guard was checked before the normalization that moved the path into it.
+ */
+internal fun normalizeLinuxPath(path: String): String? {
+    if (path.isEmpty()) return null
+    val absolute = path.startsWith("/")
+    val out = ArrayList<String>()
+    for (segment in path.split('/')) {
+        when (segment) {
+            "", "." -> Unit
+            ".." -> {
+                if (out.isNotEmpty()) {
+                    out.removeAt(out.size - 1)
+                } else if (!absolute) {
+                    return null
+                }
+            }
+            else -> out.add(segment)
+        }
+    }
+    return if (absolute) "/" + out.joinToString("/") else out.joinToString("/")
+}
+
+/**
+ * True when [path] carries a literal `..` segment ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Segment-wise, not a substring test: `a..b` is an ordinary file name. Used by
+ * the session-scoped write classifier to treat `..` as the deliberate-escape
+ * signal *before* normalization — normalizing it away would silently re-target
+ * the write (`workspace/../browser/c` → `browser/c`) instead of refusing it.
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps, like
+ * [normalizeLinuxPath].
+ */
+internal fun hasDotDotSegment(path: String): Boolean = path.split('/').any { it == ".." }
+
+/**
+ * One-shot initialization gate ([deep-audit-1016 FIX-C 3a]).
+ *
+ * `PRootKernel.boot()` used to be guarded by a bare `if (isBooted) return` on
+ * a non-volatile flag, and it is called from two independent places on cold
+ * start (`ExecutionCoordinator`'s auto-boot, `TerminalSession`'s
+ * open-a-terminal). Both could observe `false` and run the body concurrently;
+ * the body calls `RootfsManager.installIfNeeded`, which *deletes* the rootfs
+ * directory and re-extracts it — so the second entrant deleted the tree the
+ * first was still unpacking.
+ *
+ * A plain class (no Android, no `PRootKernel` state) so the concurrency
+ * contract is JVM-testable: [run] executes the body at most once across
+ * concurrent callers, and every later caller observes [isDone] == true and
+ * skips. The flag is the *same fact* as the mutual exclusion, so a reader can
+ * never see "done" while the body is still running.
+ *
+ * [meta1028 D3-F02] "At most once" is bounded by [invalidate]: the body writes
+ * files into the rootfs, and `RootfsManager.reset()` deletes that rootfs, so
+ * the latch has to have a reset edge or it asserts a state the disk no longer
+ * has. Re-arming is the only transition; [run] stays at-most-once per arming.
+ */
+internal class BootOnceGate {
+
+    private val mutex = Mutex()
+
+    /** True once [run]'s body has completed. Volatile: read from other threads. */
+    @Volatile
+    var isDone: Boolean = false
+        private set
+
+    /**
+     * Runs [body] unless it already completed; returns true when this call ran it.
+     *
+     * [body] is `suspend` because the only production caller is [PRootKernel.boot],
+     * whose body awaits `RootfsManager`'s suspend API. The first version of this
+     * refactor declared the parameter (and [PRootKernel.bootCriticalSection])
+     * non-suspend and CI's `compileReleaseKotlin` rejected the file — the local
+     * extraction harness slices fragments, so it cannot see a signature-level
+     * error in a body it does not extract.
+     */
+    suspend fun run(body: suspend () -> Unit): Boolean {
+        if (isDone) return false
+        return mutex.withLock {
+            if (isDone) return@withLock false
+            body()
+            isDone = true
+            true
+        }
+    }
+
+    /**
+     * [meta1028 D3-F02] Forget that the body completed, so the next [run]
+     * executes it again.
+     *
+     * Needed because the body's effect is not a one-way fact: it materializes
+     * files INSIDE `RootfsManager.rootfsDir` (offload handler stubs, the
+     * `default_mount` overlay, `/var/minis/mounts` placeholders, the read-only
+     * mount wrappers), and `RootfsManager.reset()` deletes that directory and
+     * re-extracts the factory tar. Without this edge the gate claimed "booted"
+     * about a tree that no longer contained any of it — the asymmetry was the
+     * defect: a one-way latch guarding a re-creatable artifact.
+     *
+     * Volatile store only, deliberately: callers never hold this class's mutex
+     * across it (the reset path may run inside the body, where taking the
+     * mutex again would deadlock), and a re-arm that races an in-flight [run]
+     * is resolved by [run]'s final `isDone = true` — the body's tail always
+     * re-materializes what the reset removed.
+     */
+    fun invalidate() {
+        isDone = false
+    }
+}
+
+/**
+ * Pure core of [PRootKernel.resolveSessionHostPath]
+ * ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Decides "this session's `<subdir>` tree, or hand the path to the global
+ * resolver" for a caller that knows the owning session. No `Context`, no
+ * `PRootKernel` state, no boot requirement — the session base comes in as
+ * [filesDir], the global arm as [resolveGlobal] — so the JVM test source set
+ * can pin the whole parse matrix (canonical, malformed, escaping, symlinked).
+ *
+ * ## Normalize first, then match
+ *
+ * Every prefix/length decision runs on [normalizeLinuxPath]'s output. Matching
+ * the RAW string (the pre-fix shape, and the shape [normalizeLinuxPath]'s own
+ * KDoc describes for the read-only guard) made `.`/`//`-noise paths fall
+ * through every scope check and land in the rootfs join instead — a ghost file
+ * at `<rootfs>/var/minis/<subdir>/...`, shared by all sessions, while the
+ * caller's real session directory stayed empty.
+ *
+ * ## Fail closed
+ *
+ * A null from [normalizeLinuxPath] (empty input, or a relative path that
+ * climbs above its root) returns null — it is NOT re-matched as a raw string.
+ * Falling back to the raw form here would reproduce the `?:` elvis hole
+ * `resolvePathForSession` documents (backlog §111 R3).
+ *
+ * @param resolveGlobal consulted only when no session scope applies — a path
+ *   outside `/var/minis/`, or one of the shared subdirs. Never consulted for a
+ *   path this function rejects.
+ */
+internal fun resolveSessionGuestHostPath(
+    sessionId: String,
+    linuxPath: String,
+    filesDir: File,
+    perSessionSubdirs: Set<String>,
+    resolveGlobal: (String) -> File?,
+): File? {
+    val normalized = normalizeLinuxPath(linuxPath) ?: return null
+    if (!normalized.startsWith("/var/minis/")) return resolveGlobal(normalized)
+    val rest = normalized.removePrefix("/var/minis/")
+    val slash = rest.indexOf('/')
+    val subdir = if (slash < 0) rest else rest.substring(0, slash)
+    if (subdir !in perSessionSubdirs) return resolveGlobal(normalized)
+    val sessionBase = File(filesDir, "minis-sessions/$sessionId/$subdir")
+    val tail = if (slash < 0) "" else rest.substring(slash + 1)
+    if (tail.isEmpty()) return sessionBase
+    // The resolved path must stay inside sessionBase (guards symlink escapes
+    // out of the session tree; dot-segments are already gone).
+    return PRootKernel.safeResolveWithin(sessionBase, tail)
+}
+
+/**
+ * Pure core of [PRootKernel.resolveHostPath] ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Longest-bind-mount-prefix match, then the per-session tree scan (no session
+ * context — picks the first existing match), then the rootfs join. State comes
+ * in as parameters ([bindMounts], [sessionsRoot], [rootfsDir] — the latter two
+ * null before boot) so the JVM test source set can pin the full parse matrix
+ * without an Android `Context`.
+ *
+ * Normalization happens ONCE, on entry, and every later match uses the
+ * normalized string — the pre-fix code matched prefixes on the raw input while
+ * [PRootKernel.safeResolveWithin] (and the read-only-mount guard) resolved
+ * dot-segments themselves, so the two disagreed about which file a malformed
+ * path named.
+ *
+ * Behaviour notes for the parse matrix (see the FIX-C report):
+ *  - `/var/minis/./workspace/x` and `//var/minis/workspace/x` now resolve like
+ *    `/var/minis/workspace/x` (pre-fix: rootfs ghost);
+ *  - `/var/minis/../etc/passwd` now resolves like `/etc/passwd` (pre-fix:
+ *    null). This is POSIX/PRoot semantics and matches
+ *    [com.rikkaminis.app.sandbox.GuestPathMapper.resolve]'s own normalization;
+ *    the result is still inside the sandbox (rootfs or a bind mount), never on
+ *    a host path outside it;
+ *  - `""` now returns null (pre-fix: the rootfs directory itself);
+ *  - every canonical path returns exactly what it returned before — that is
+ *    the regression contract pinned by `GuestPathParseMatrixTest`.
+ */
+internal fun resolveGuestHostPath(
+    linuxPath: String,
+    bindMounts: Map<String, String>,
+    perSessionSubdirs: Set<String>,
+    sessionsRoot: File?,
+    rootfsDir: File?,
+): File? {
+    val normalized = normalizeLinuxPath(linuxPath) ?: return null
+
+    // Check bind mounts (longest prefix match)
+    val sorted = bindMounts.keys.sortedByDescending { it.length }
+    for (mountPoint in sorted) {
+        if (normalized == mountPoint || normalized.startsWith("$mountPoint/")) {
+            val hostBase = bindMounts[mountPoint]!!
+            val relativePath = normalized.removePrefix(mountPoint).removePrefix("/")
+            if (relativePath.isEmpty()) {
+                File(hostBase)
+            } else {
+                // Keep the resolved path inside hostBase (guards `..`/symlink
+                // escapes out of the mount).
+                PRootKernel.safeResolveWithin(File(hostBase), relativePath)
+            }.let { return it }
+        }
+    }
+
+    // Per-session subdir fallback: no session context available — search
+    // all minis-sessions/<id>/ trees for an existing file (or existing
+    // dir) at this Linux path. Picks the first match; ambiguity is
+    // acceptable here because these callers can't know the session anyway.
+    if (normalized.startsWith("/var/minis/")) {
+        val rest = normalized.removePrefix("/var/minis/")
+        val subdir = rest.substringBefore('/')
+        if (subdir in perSessionSubdirs) {
+            val tail = rest.substringAfter('/', missingDelimiterValue = "")
+            if (sessionsRoot?.isDirectory == true) {
+                sessionsRoot.listFiles()?.forEach { sessionDir ->
+                    if (!sessionDir.isDirectory) return@forEach
+                    val candidate = if (tail.isEmpty()) File(sessionDir, subdir)
+                    else PRootKernel.safeResolveWithin(File(sessionDir, subdir), tail)
+                    if (candidate?.exists() == true) return candidate
+                }
+            }
+            // No existing file in any session — fall through to rootfs
+            // placeholder (matches pre-existing behavior for missing files).
+        }
+    }
+
+    // Fallback: resolve relative to rootfs
+    if (rootfsDir == null) return null
+    val stripped = normalized.removePrefix("/")
+    if (stripped.isEmpty()) return rootfsDir
+    // Keep the resolved path inside the rootfs — never allow a symlink to
+    // climb out into the host filesystem (dot-segments are already gone).
+    return PRootKernel.safeResolveWithin(rootfsDir, stripped)
 }

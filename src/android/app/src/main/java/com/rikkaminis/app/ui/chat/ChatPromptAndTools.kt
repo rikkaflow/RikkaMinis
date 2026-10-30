@@ -1,7 +1,6 @@
 package com.rikkaminis.app.ui.chat
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.viewModelScope
@@ -17,6 +16,7 @@ import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
+import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.tools.AgentTraceRecorder
 import com.rikkaminis.app.tools.FileEditTool
 import com.rikkaminis.app.tools.FileReadTool
@@ -26,7 +26,12 @@ import com.rikkaminis.app.tools.SandboxDefectRegistry
 import com.rikkaminis.app.tools.SubagentSkill
 import com.rikkaminis.app.tools.ToolExecutionResult
 import com.rikkaminis.app.tools.UnknownToolMessage
+import com.rikkaminis.app.ui.settings.SafRead
+import com.rikkaminis.app.ui.settings.readSafBytes
+import com.rikkaminis.app.util.ImageDecodeSizing
+import com.rikkaminis.app.util.ImageDecoding
 import com.rikkaminis.app.util.Utf16Sanitizer
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -40,6 +45,19 @@ import java.util.Locale
 // [FE-5 batch 6] Tool dispatch / prompt assembly / attachment prep /
 // title generation cluster extracted verbatim from ChatViewModel as
 // extension functions (same pattern as ChatSessionLifecycle / ChatToolExecutors).
+
+/**
+ * Cap for the ORIGINAL bytes of one image attachment, applied before anything
+ * decodes or copies them (debt-1026 #3, backlog B-07).
+ *
+ * 64 MiB is far above any camera original — a 48 MP RAW plus EXIF is well under
+ * a fifth of this — so the cap never touches a real photo. It only rejects the
+ * one shape this branch can OOM on: a file that claims an image MIME type and
+ * carries a multi-hundred-MB payload. Over the cap the attachment is REFUSED
+ * (logged, skipped), never truncated: a half image in the transcript is worse
+ * than none.
+ */
+private const val MAX_RAW_IMAGE_ATTACHMENT_BYTES = 64L * 1024 * 1024
 
 internal fun ChatViewModel.streamFlushThrottleMs(len: Int): Long = when {
     len < 500 -> 200L
@@ -119,62 +137,62 @@ internal fun ChatViewModel.applyRequestImageBudget(messages: List<LLMMessage>): 
     val attachmentsRoot = activeSessionId?.let { sid ->
         java.io.File(context.filesDir, "minis-sessions/$sid/attachments")
     }
-    val resolvedPaths = HashMap<ImageBudget.ImagePartId, String?>()
+    val droppedHashes = plan.droppedIds.mapTo(HashSet<Int>()) { it.identityHash }
+    val resolvedPaths = HashMap<Int, String?>()
     for (ref in images) {
         val id = ImageBudget.ImagePartId.of(ref.image.data)
         if (id !in plan.droppedIds) continue
         val existing = ref.image.linuxPath
-        if (existing != null) {
-            resolvedPaths[id] = existing
-        } else if (attachmentsRoot != null) {
-            resolvedPaths[id] = ImageBudget.ensureSpillover(
+        resolvedPaths[id.identityHash] = when {
+            existing != null -> existing
+            attachmentsRoot != null -> ImageBudget.ensureSpillover(
                 attachmentsRoot, ref.image.data, ref.image.mimeType,
             )
-        } else {
-            resolvedPaths[id] = null
+            else -> null
         }
     }
 
-    // Build a new message list with dropped image parts replaced by
-    // text placeholders. Same-message multiple drops collapse cleanly
-    // because we never touch parts whose ids weren't in droppedIds.
-    val byMsg = images.groupBy { it.msgIdx }
-    val mutated = messages.toMutableList()
-    for ((mi, refs) in byMsg) {
-        val msg = mutated[mi]
-        val newParts = msg.contentParts.toMutableList()
-        for (ref in refs) {
-            val id = ImageBudget.ImagePartId.of(ref.image.data)
-            if (id !in plan.droppedIds) continue
-            val path = resolvedPaths[id]
-            val placeholder = AgentContentPart.Text(ImageBudget.elidedImagePlaceholder(path))
-            val originalPart = newParts[ref.partIdx]
-            newParts[ref.partIdx] = when (originalPart) {
-                is AgentContentPart.ImageData -> placeholder
-                is AgentContentPart.ToolResult -> originalPart.copy(
-                    // Strip the bytes but keep the structural ToolResult
-                    // role; append the elision marker into content so
-                    // the model sees it next to the rest of the tool
-                    // output. linux path remains in the part for any
-                    // subsequent diagnostic round-trip.
-                    imageData = null,
-                    imageMimeType = null,
-                    content = originalPart.content +
-                        (if (originalPart.content.isEmpty()) "" else "\n") +
-                        ImageBudget.elidedImagePlaceholder(path),
-                )
-                else -> originalPart
-            }
-        }
-        mutated[mi] = msg.copy(contentParts = newParts)
-    }
+    // [debt-1026 B1] / [W-1027 W-05] The rewrite itself lives in
+    // `ImageElisionPlan.planImageElision` (pure, JVM-covered): `contentParts`
+    // placeholders and the `imageParts` filter must be driven by the SAME
+    // "this message really lost those bytes" set. That set is the part no
+    // gate or unit test used to touch — flipping its identity test made the
+    // elision a no-op for `imageParts` while every provider kept appending
+    // `+ msg.imageParts` (OpenAI :2277 / :3246, Gemini :515, Anthropic :917).
+    val elision = planImageElision(
+        messages = messages,
+        droppedIds = droppedHashes,
+        placeholder = ImageBudget::elidedImagePlaceholder,
+        pathFor = { hash -> resolvedPaths[hash] },
+    )
 
     _requestBudgetEvent.tryEmit(plan)
     AppLogger.info(
         ChatViewModel.TAG,
         "applyRequestImageBudget: dropped=${plan.droppedCount}/${plan.totalCount} keptBytes=${plan.keptBytes}B elidedBytes=${plan.elidedBytes}B",
     )
-    return mutated
+    return elision.messages
+}
+
+/**
+ * [debt-1026 B1] Drop the [LLMMessage.ImagePart]s whose bytes were elided from
+ * [ImageBudget.planRequestBudget].
+ *
+ * Identity, not content: `planRequestBudget` identifies a part by
+ * `System.identityHashCode` of its `ByteArray`, and the reload path hands the
+ * SAME array to both `imageParts` and `contentParts` — so the ids computed for
+ * a part in one list are exactly the ids to remove from the other. Parts that
+ * were not elided are returned in order, untouched (an empty [dropped] list
+ * returns the original list instance, so a turn with no drops allocates
+ * nothing).
+ */
+internal fun filterElidedImageParts(
+    parts: List<LLMMessage.ImagePart>,
+    dropped: Set<ImageBudget.ImagePartId>,
+): List<LLMMessage.ImagePart> {
+    if (parts.isEmpty() || dropped.isEmpty()) return parts
+    val kept = parts.filter { ImageBudget.ImagePartId.of(it.data) !in dropped }
+    return if (kept.size == parts.size) parts else kept
 }
 
 /**
@@ -193,6 +211,16 @@ internal fun ChatViewModel.setTransientInlineError(errorText: String) {
 
 /** Clear any inline error on the last assistant message (used after successful retry). */
 internal fun ChatViewModel.clearInlineError() {
+    // [fix/da1015-sched-errorprop] Pair of `setInlineError`'s
+    // SessionActivityTracker.markStreamError: the error state is being
+    // retracted (the retried attempt got through / the loop is moving on to a
+    // fallback provider and will re-flag if that fails too), so the run must
+    // not be reported as failed. Deliberately placed BEFORE the two early
+    // returns below: markStreamError fires unconditionally (including the
+    // no-assistant-message fallback that writes `_error`), so the retraction
+    // must not depend on a banner being present to undo it.
+    val sid = realSessionId.ifEmpty { sessionId }
+    if (sid.isNotEmpty()) SessionActivityTracker.clearStreamError(sid)
     val msgs = _messages.value.toMutableList()
     val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
     if (lastAssistantIdx < 0) return
@@ -205,7 +233,6 @@ internal fun ChatViewModel.clearInlineError() {
     // Clear by the message's source DB rows when known (the in-memory bubble
     // maps to one or more persisted rows via sourceDbIds); fall back to the
     // last-assistant-row update otherwise.
-    val sid = realSessionId.ifEmpty { sessionId }
     if (sid.isNotEmpty()) {
         val dbIds = msg.sourceDbIds
         viewModelScope.launch(Dispatchers.IO) {
@@ -352,8 +379,10 @@ internal suspend fun ChatViewModel.executeTool(
     )
     // T7-A: 观察 —— 工具结束（ToolFinished 语义）
     traceObserver.t7State(ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS), ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS), "ToolFinished($name)")
-    // T7-D: 旁路验证 —— 工具结束（resultKnown = 结果已到达）
-    traceObserver.t7Reduce(AgentRunEvent.ToolFinished(name, resultKnown = true))
+    // T7-D: 旁路验证 —— 工具结束。resultKnown 取自结果对象本身
+    // （[deep-audit-1018 ISSUE-03]）：shell 的 outcomeKnown=false 表示
+    // 重放被扣下、结果不可信，reducer 据此判 SUCCEED_WITH_UNKNOWN_TOOL。
+    traceObserver.t7Reduce(AgentRunEvent.ToolFinished(name, resultKnown = result.outcomeKnown))
 
     // T3: failure-learning automation hook. Side-channel only — the
     // failed result still flows to the LLM exactly as before; this just
@@ -457,6 +486,14 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
     }
 
     // 3. Build filtered tool set
+    // [R5-C C-C-07①] recordSkillUse sits AFTER the isSubagent gate (moved from
+    // step 2): the [FIX-R4-Q F-14] rationale is unchanged — dispatching a
+    // sub-agent IS a skill use and the "最近使用" ordering never saw sub-agent
+    // usage — but a dispatch that was then REJECTED (a non-subagent skill, the
+    // answer above IS the way back) was counted as a use all the same. Usage is
+    // something the model DID, not something it tried and was refused.
+    runCatching { skillRepository?.recordSkillUse(skill.id) }
+
     val subagentTools = SubagentSkill.buildFilteredTools(agentTools, config.allowedTools)
     if (subagentTools.isEmpty()) {
         return ToolExecutionResult(
@@ -500,6 +537,7 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
             false, toolTitle = title,
         )
     }
+
     return com.rikkaminis.app.ui.chat.runSubagentLoop(
         skillName = skillName,
         query = query,
@@ -507,6 +545,32 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
         config = config,
         systemPrompt = systemPrompt,
         streamProvider = { messages ->
+            // [FIX-R4-Q F-14] The sub-agent must not escape the run's
+            // observation budget: the main loop checks the deadline and
+            // consumes one PROVIDER_ATTEMPTS unit before every provider
+            // request (AgentLoopEngine:1201/:1226). Without these two gates a
+            // runaway sub-agent burned provider attempts the host budget never
+            // counted, so the budget line undercounted the run and the
+            // deadline guard could be exceeded. A denial aborts the sub-agent
+            // run with a visible reason (runSubagentLoop turns the throw into
+            // a failed ToolExecutionResult, so the dispatching agent learns
+            // the run was refused rather than timed out).
+            if (traceObserver.activeRunBudget?.isExpired() == true) {
+                throw SubagentBudgetExhaustedException(
+                    "run deadline reached — sub-agent request refused"
+                )
+            }
+            // Same single-line gate shape as the main loop (AgentLoopEngine
+            // :1226): the lambda and the `if` body open on the line that names
+            // the dimension, so source-shape probes see the refusal (the
+            // throw) inside this gate's body — a multi-line lambda makes the
+            // brace matcher close the body at `}) {` and read the gate as
+            // non-terminal.
+            if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_PROVIDER_ATTEMPTS) { it.consumeProviderAttempt() }) {
+                throw SubagentBudgetExhaustedException(
+                    "provider-attempt budget exhausted — sub-agent request refused"
+                )
+            }
             val instance = provider.instanceContext!!
             com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.stream(
                 context = context,
@@ -532,6 +596,36 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
         // [audit-0916] The sub-agent's own filtered list is passed in so a
         // rejected name is answered with the names this level may use.
         executeSubTool = { name, subArgs ->
+            // [R5-C C-C-07①] A tool executed INSIDE the sub-agent was invisible
+            // to the parent run's tool budget: the main dispatch consumes one
+            // TOOL_CALLS unit per call (executeTool), and the sub-agent's own
+            // REQUESTS consume PROVIDER_ATTEMPTS (streamProvider below —
+            // [FIX-R4-Q F-14]), but every in-tool execution here was free — a
+            // runaway sub-agent (a skill looping over files) could make
+            // thousands of tool calls the budget never counted and the deadline
+            // never capped. The SPAWN call itself is already charged by the main
+            // dispatch (that is what executeTool's gate pays for), so the unit
+            // belongs here, on each inner execution.
+            //
+            // Refusal shape = the file's own convention for a sub-agent gate:
+            // throw SubagentBudgetExhaustedException, which runSubagentLoop's
+            // catch turns into a VISIBLE failed result for the dispatching agent
+            // ("encountered an error after N turn(s) … Error: <reason>") instead
+            // of a refuse-and-retry loop on a run that is out of budget. The
+            // same marker keeps ShellBudgetStopSymmetryTest's contract intact:
+            // a dispatch-level gate is excluded from the RUN-level terminal
+            // gates (its KDoc), so the run-terminating gates stay exactly
+            // tool_calls + shell_commands.
+            if (traceObserver.activeRunBudget?.isExpired() == true) {
+                throw SubagentBudgetExhaustedException(
+                    "run deadline reached — sub-agent tool call refused",
+                )
+            }
+            if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_TOOL_CALLS) { it.consumeToolCall() }) {
+                throw SubagentBudgetExhaustedException(
+                    "tool-call budget exhausted — sub-agent tool call refused",
+                )
+            }
             executeSubagentTool(name, subArgs, subagentTools.map { it.name })
         },
         // [fix/same-class-cleanup] The residue policy resolves a drifted
@@ -548,6 +642,11 @@ internal suspend fun ChatViewModel.executeSpawnAgentTool(argsJson: String): Tool
  * assistantId, etc.) — the sub-agent produces file/memory results only.
  * Tools that are FORBIDDEN for sub-agents never reach this method
  * because [SubagentSkill.buildFilteredTools] excludes them.
+ *
+ * [R5-C C-C-07①] The parent run's deadline + TOOL_CALLS budget are gated by
+ * this method's ONLY caller (the spawn dispatch's `executeSubTool` lambda).
+ * A second call site must gate too, or inner executions escape the parent
+ * budget again.
  */
 internal suspend fun ChatViewModel.executeSubagentTool(
     name: String,
@@ -556,7 +655,20 @@ internal suspend fun ChatViewModel.executeSubagentTool(
     // (or forbidden) tool with the real options instead of a bare rejection.
     allowedToolNames: List<String>,
 ): ToolExecutionResult = when (name) {
-    FileReadTool.NAME -> FileReadTool.execute(argsJson, activeSessionId, context)
+    FileReadTool.NAME -> FileReadTool.execute(argsJson, activeSessionId, context).also { result ->
+        // [FIX-R4-Q F-14] Same arm as the main dispatch (executeTool's
+        // FileReadTool branch): a sub-agent reading SKILL.md is a skill use.
+        if (result.success) {
+            runCatching {
+                val readPath = JSONObject(argsJson).optString("path", "")
+                if (readPath.isNotEmpty()) {
+                    skillRepository?.skillIdFromPath(readPath)?.let { sid ->
+                        skillRepository.recordSkillUse(sid)
+                    }
+                }
+            }
+        }
+    }
     FileWriteTool.NAME -> FileWriteTool.execute(argsJson, activeSessionId, context).also {
         if (it.success) maybeReloadSkillsForPath(argsJson)
     }
@@ -618,7 +730,18 @@ internal suspend fun ChatViewModel.executeShellCommand(
 ): ToolExecutionResult {
     // T7-A: 观察 —— shell 命令消耗 shell_commands 预算（advisory，不阻断）
     // T7-C: shell_commands 预算耗尽 → 不执行命令，返回明确错误
+    // [deep-audit-1016 5a] 与上方 tool_calls 门逐字段对称：预算耗尽不只是
+    // 返回一条错误 —— 还要钉住**终态**（t7BudgetStopReason）并让 reducer
+    // 离开运行态。只返回错误的话，耗尽的事实不进 trace、不进
+    // AgentLoopExitDecision：run 会被记成正常完成（SUCCEEDED/COMPLETED），
+    // 用户看到的是"答完了"而不是"撞了预算"，`launch-beacon`/审计也查不到
+    // 哪一维预算耗尽了。reason 串只被既有通用模板消费（
+    // `budget_exhausted($reason)` 的 trace 标签 + "an execution budget was
+    // exhausted ($reason)" 横幅），无 per-reason 文案，故不需要新增
+    // 字符串资源。
     if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_SHELL_COMMANDS) { it.consumeShellCommand() }) {
+        traceObserver.t7BudgetStopReason = "shell_command_limit"
+        traceObserver.t7Reduce(AgentRunEvent.ProcessInterrupted("budget_exhausted(shell_commands)"))
         return ToolExecutionResult("Error: Agent budget exhausted (shell_commands)", false)
     }
     // T7-B: shell lease —— 执行期间占用 shell 资源，finally 无条件释放
@@ -669,12 +792,10 @@ internal suspend fun ChatViewModel.executeShellCommand(
             // leftovers (e.g. a future call site publishing progress).
             publishToolProgress(toolId, "")
         }
-        return ToolExecutionResult(
-            output = result.output,
-            success = result.success,
-            toolTitle = result.toolTitle,
-            timedOut = result.timedOut,
-        )
+        // [deep-audit-1018 ISSUE-03] single mapping (ToolResultShell ->
+        // ToolExecutionResult, outcomeKnown included) lives in
+        // ChatShellExecution.kt so the field cannot be dropped by re-inlining.
+        return result.toToolExecutionResult()
     } finally {
         // T7-B: 无条件释放 shell lease —— 覆盖成功、异常、取消路径
         traceObserver.t7ResourceRelease(
@@ -717,20 +838,27 @@ internal fun ChatViewModel.linuxPathToMinisURL(path: String): String? =
 /**
  * Resize a JPEG so its longest edge is at most `maxEdge` px. Returns null
  * if already within bounds. Mirrors iOS AIChatViewModel.resizedImageData.
+ *
+ * [audit2-PERF-03] The already-within-bounds case is decided from an
+ * `inJustDecodeBounds` header probe, and the decode itself goes through
+ * [ImageDecoding] so the full-resolution bitmap is never allocated (this used
+ * to be a bare `decodeByteArray` plus a post-hoc `createScaledBitmap`).
  */
 internal fun ChatViewModel.resizeJpegToMaxEdge(data: ByteArray, maxEdge: Int): ByteArray? {
-    val bmp = android.graphics.BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
-    val longest = maxOf(bmp.width, bmp.height)
-    if (longest <= maxEdge) { bmp.recycle(); return null }
-    val scale = maxEdge.toFloat() / longest
-    val w = (bmp.width * scale).toInt()
-    val h = (bmp.height * scale).toInt()
-    val resized = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true)
-    bmp.recycle()
-    val out = java.io.ByteArrayOutputStream()
-    resized.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
-    resized.recycle()
-    return out.toByteArray()
+    val source = ImageDecoding.probeBytes(data) ?: return null
+    if (ImageDecodeSizing.fitsWithin(source.width, source.height, maxEdge)) return null
+    val decoded = ImageDecoding.decodeBytesBounded(data, maxEdge, source) ?: return null
+    return try {
+        val out = java.io.ByteArrayOutputStream()
+        // [deep-audit-1048 A-02] `compress` returns false when the encoder wrote
+        // nothing; a dropped verdict uploaded an EMPTY image to the model. The
+        // documented contract above is "null on any decode/compress failure" —
+        // null is exactly the caller's "use the original bytes" path.
+        val encoded = decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        if (saveOutcome(streamOpened = true, compressed = encoded)) out.toByteArray() else null
+    } finally {
+        decoded.bitmap.recycle()
+    }
 }
 
 internal fun ChatViewModel.executeMemoryWriteTool(argsJson: String): ToolExecutionResult {
@@ -777,7 +905,11 @@ internal suspend fun ChatViewModel.executeConversationHistoryTool(argsJson: Stri
 // log into MEMORY-ROLLUP.md. Uses the same memory dir as the repository.
 internal fun ChatViewModel.executeMemoryRollupTool(): ToolExecutionResult {
     val repo = memoryRepository ?: return ToolExecutionResult("Error: Memory not available", false)
-    return com.rikkaminis.app.ui.chat.executeMemoryRollupTool(repo) { record ->
+    // [fix/da1020-memory-gate-provider-fields] Same gate as memory_write
+    // (below): a session with /memory off must not let a rollup call write
+    // MEMORY-ROLLUP.md. Covers both dispatch sites (main loop + sub-agent
+    // loop) — they share this single wrapper.
+    return com.rikkaminis.app.ui.chat.executeMemoryRollupTool(repo, _memoryEnabled.value) { record ->
         _memoryToolRecords.value = _memoryToolRecords.value + record
     }
 }
@@ -1247,7 +1379,7 @@ Memory system (currently DISABLED):
     val base = identitySection + """You should proactively use shell commands to accomplish the user's tasks — installing packages (apk add), writing and running scripts, managing files, networking, and any other operations a Linux terminal can perform.
 
 Available tools:
-- shell_execute: Run any shell command. Each invocation is an isolated process with stdout/stderr captured. Prefer this for most tasks — it is a real Linux environment with persistent filesystem. Common tools (python3, pip, curl, wget, git, ssh, etc.) can be installed via apk add; Python packages via pip install. Use `which <cmd>` to check if a tool is already installed before running apk add — many packages persist across sessions. When you need to wait before checking results (e.g. polling, waiting for a process), use the `delay` parameter instead of `sleep` in the command — delay blocks the agent flow without occupying the shell, so other concurrent tasks can use it during the wait. This avoids resource contention. Execution discipline for long-running or dispatched work: make tool calls immediately instead of describing intentions, and keep working until the task is complete. Without a scheduler or timed-callback tool, `delay` is your ONLY wait mechanism within a turn — to follow up on something still running, chain delay-then-check calls at a task-appropriate interval until you have the result or hit a sensible retry cap. NEVER end a turn with a promise of future action: 'I'll keep monitoring', 'will sync the result later', and ending right after a single still-running status check with 'let's keep waiting' are all the same violation — once your turn ends, NOTHING runs until the user's next message. If polling to completion is genuinely not worth blocking the turn, close honestly instead: state that the task keeps running in the background, that you will only learn its outcome when the user next messages (or they ask you to check), and — if something must fire on a schedule beyond this conversation — point them to the options under 'Scheduled tasks' later in this prompt (native alarm reminder or a system-level schedule; those notify the USER, they do not wake you).
+- shell_execute: Run any shell command. Each invocation is an isolated process with stdout/stderr captured. Prefer this for most tasks — it is a real Linux environment with persistent filesystem. CLEANUP/COPY/PACK on big trees: when the target directory may hold thousands of entries (work/, probe/, build output, git clones — /var/minis/shared/work currently holds ~137k entries / 5.2 GB), use minis-fastio rm -r / cp -r / tar / du instead of rm -rf / cp -a / tar / du -sb — rm and cp measured 7x faster on this device (rm -rf 6.0s → 0.84s, cp -a 23.0s → 3.2s on a 22k-entry tree; du's win is filesystem-dependent). For content search prefer rg (installed at /usr/bin/rg, 3.3x faster than grep -r); minis-fastio grep is 3x SLOWER than grep -r — do not substitute it. Common tools (python3, pip, curl, wget, git, ssh, etc.) can be installed via apk add; Python packages via pip install. Use `which <cmd>` to check if a tool is already installed before running apk add — many packages persist across sessions. When you need to wait before checking results (e.g. polling, waiting for a process), use the `delay` parameter instead of `sleep` in the command — delay blocks the agent flow without occupying the shell, so other concurrent tasks can use it during the wait. This avoids resource contention. Execution discipline for long-running or dispatched work: make tool calls immediately instead of describing intentions, and keep working until the task is complete. Without a scheduler or timed-callback tool, `delay` is your ONLY wait mechanism within a turn — to follow up on something still running, chain delay-then-check calls at a task-appropriate interval until you have the result or hit a sensible retry cap. NEVER end a turn with a promise of future action: 'I'll keep monitoring', 'will sync the result later', and ending right after a single still-running status check with 'let's keep waiting' are all the same violation — once your turn ends, NOTHING runs until the user's next message. If polling to completion is genuinely not worth blocking the turn, close honestly instead: state that the task keeps running in the background, that you will only learn its outcome when the user next messages (or they ask you to check), and — if something must fire on a schedule beyond this conversation — point them to the options under 'Scheduled tasks' later in this prompt (native alarm reminder or a system-level schedule; those notify the USER, they do not wake you).
 - file_read: Read file contents (faster than cat).
 - file_write: Create new files or overwrite existing files (faster than echo/tee).
 - file_edit: Edit existing files with exact string replacement (old_string → new_string). Preferred over file_write for modifications — always file_read first.
@@ -1341,8 +1473,8 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - android-a11y-cli — drive system UI (read screen, tap, type, swipe, scroll) via the Android AccessibilityService when enabled. Run with no args (or --help) for the subcommand list.
 - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Use android-open for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
 - minis-sessions-cli: Manage chat sessions. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read, `send` to create/continue a session, `retry` to re-run, `status` to check, `open` to navigate the app UI. Run --help for full options.
-- minis-fastio: File-intensive primitives executed by the app process directly on the real filesystem, bypassing the sandbox's per-syscall translation tax (~100-200µs/op → ~1µs/op). Every call costs a FIXED ~40 ms round trip, so on a handful of entries the guest's own tools are faster — reach for these primitives when a tree is large (thousands of entries), where the per-entry tax dominates. Reach for it when a file operation is dense enough that the plain shell version is slow, and prefer it on large trees: `minis-fastio du <path>...` (read-only file/dir counts + apparent bytes of file entries per tree, directories counted but contributing no bytes — same byte accounting as the guest's PATH `du -sb` — prefer it over `du -sb` / `find | wc -l` / `find | xargs stat`); `minis-fastio find <path> [-name GLOB] [-type f|d|l] [-limit N]` (read-only walk, compact JSON; totals cover the WHOLE tree even when the listing is capped at --limit, default 500 — prefer it over `find <path> -type f | wc -l` and over any `find` that stats every entry, which pays the tax once per entry; a bare `find | wc -l` does no stat and is already cheap); `minis-fastio grep <pattern> <path>... [-i] [-limit N]` (line search with java.util.regex — NOT PCRE/ripgrep; skips symlinks, binary files and files over 8 MiB and reports those skip counts); `minis-fastio cp [-r] <src> <dst>` and `minis-fastio mv <src> <dst>` (copy / rename real files — mv is a single host rename; both refuse to overwrite an existing target unless --force, treat an existing directory dst as "copy into it", and ask for permission first, each under its own Settings → Permissions row); `minis-fastio tar -cf <a.tar> <path>...` (pack a TREE into one POSIX ustar archive, `-czf` for gzip — use it instead of `tar -cf` over many files, and to hand one artifact to another step instead of copying a tree) and `minis-fastio tar -xf <a.tar> [-C dir]` (`-xzf` for gzip; the destination is tar-slip guarded — an entry that is absolute, that climbs out with `..`, or that would write through a symlink is refused and NOTHING is written, so a hostile archive cannot escape the destination); `minis-fastio rm [-r] <path>...` (recursive delete; asks for permission first). Paths are guest paths (/tmp, /var/minis/workspace, /var/minis/mounts/<name>) and are translated to the real host paths before use; nothing outside the app sandbox is reachable. Run --help for the full contract.
-- minis-model-use: Invoke other LLM models pre-configured by the user. Use `minis-model-use list` to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.
+- minis-fastio: File-intensive primitives executed by the app process directly on the real filesystem, bypassing the sandbox's per-syscall translation tax (~100-200µs/op → ~1µs/op). Every call costs a FIXED ~40 ms round trip, so on a handful of entries the guest's own tools are faster — reach for these primitives when the tree is large (thousands of entries; typical in this sandbox: work/, probe/, build output, git clones — /var/minis/shared/work holds ~137k entries). Measured on this device (22k-entry tree, f2fs): rm -rf 6.0s → rm -r 0.84s, cp -a 23.0s → cp -r 3.2s. The win is rm/cp/tar/du/find — for CONTENT search use rg instead (see grep below): `minis-fastio du <path>...` (read-only file/dir counts + apparent bytes of file entries per tree, directories counted but contributing no bytes — same byte accounting as the guest's PATH `du -sb` — prefer it over `du -sb` / `find | wc -l` / `find | xargs stat`); `minis-fastio find <path> [-name GLOB] [-type f|d|l] [-limit N]` (read-only walk, compact JSON; totals cover the WHOLE tree even when the listing is capped at --limit, default 500 — prefer it over `find <path> -type f | wc -l` and over any `find` that stats every entry, which pays the tax once per entry; a bare `find | wc -l` does no stat and is already cheap); `minis-fastio grep <pattern> <path>... [-i] [-limit N]` (line search with java.util.regex — NOT PCRE/ripgrep; skips symlinks, binary files and files over 8 MiB and reports those skip counts. AVOID it: measured 3x SLOWER than `grep -r` on the same tree — the bottleneck is content IO, not syscall translation, and it JSON-serialises every hit. Content search belongs to `rg`, installed at /usr/bin/rg, 3.3x faster than `grep -r`); `minis-fastio cp [-r] <src> <dst>` and `minis-fastio mv <src> <dst>` (copy / rename real files — cp -r measured 7.3x faster than `cp -a` on a 22k-entry tree: 23.0s → 3.2s; mv is a single host rename; both refuse to overwrite an existing target unless --force, treat an existing directory dst as "copy into it"; no permission prompt — their reachable set is the app's own sandbox, same as the guest shell); `minis-fastio tar -cf <a.tar> <path>...` (pack a TREE into one POSIX ustar archive, `-czf` for gzip — use it instead of `tar -cf` over many files, and to hand one artifact to another step instead of copying a tree) and `minis-fastio tar -xf <a.tar> [-C dir]` (`-xzf` for gzip; the destination is tar-slip guarded — an entry that is absolute, that climbs out with `..`, or that would write through a symlink is refused and NOTHING is written, so a hostile archive cannot escape the destination); `minis-fastio rm [-r] <path>...` (recursive delete — use it INSTEAD of `rm -rf` whenever the target may hold thousands of entries: measured 7x faster, 6.0s → 0.84s on a 22k-entry tree; no permission prompt — same sandbox-only reachable set as the guest shell's own rm). Paths are guest paths (/tmp, /var/minis/workspace, /var/minis/mounts/<name>) and are translated to the real host paths before use; nothing outside the app sandbox is reachable. Run --help for the full contract.
+- minis-model-use: Invoke other LLM models pre-configured by the user. Use `minis-model-use list` to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or a positional prompt argument (run --model <id> 'your prompt' — stdin is NOT read, the native_offload protocol has no stdin channel), output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.
 - minis-config: Read or change Minis settings programmatically. Run `minis-config --help` for subcommands and `minis-config topic-help <topic>` for details on a specific area. For array-valued fields (e.g. `models`, `groups`, `envvars`, `defaults.agentLoopEntries`) the `get` subcommand accepts `--filter <keywords>` (whitespace-AND, case-insensitive substring match against each element's JSON) and `--page <N> --page-size <N>` (default 20, max 100) — use these instead of dumping the full list when you only need a subset, and check the response's `pagination` / `agent_hint` fields for the next-page command. Every write triggers an in-app confirmation sheet and is logged to a revertable audit (1000-entry rolling log). After a successful change the response includes a `user_message` field — relay it (or paraphrase) so the user knows how to review or revert via Settings → Logs → Config Changes. If the call returns `permission_denied`, the user has disabled minis-config in [Settings → Permissions](minis://settings/permissions); relay that message and don't retry. You CAN add new providers and write their `apiKey` (literal string OR a `${'$'}${'$'}ENV_VAR` reference to copy from an env var at write time), but `get` never echoes API keys / OAuth tokens / env var values back — those reads return `permission_denied` by design. OAuth tokens and env var values are not settable via this tool; for an env var, point the user at [Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=) so they enter the value themselves.
 Interactive terminal: minis://open_terminal opens a terminal for tasks that require interactive stdin (passwords, ssh, TUI apps like htop/vi). Write it as a Markdown link in your response — the app opens it when tapped. The optional init_command parameter pre-fills (NOT executes) a command; it MUST be fully percent-encoded (spaces → %20, & → %26, | → %7C, etc.). Only use this for genuinely interactive sessions — for everything else, use shell_execute. Examples: [Open Terminal](minis://open_terminal), [Login to SSH](minis://open_terminal?init_command=ssh%20user%40host).
 
@@ -1421,8 +1553,13 @@ Sub-agent routing: the in-session sub-agent feature (spawn_agent) and cross-sess
     // MemoryRepository.loadRollupFragment() (tail-preferring byte cap)
     // instead of a verbatim readText() — the rollup grows monotonically
     // and previously inflated the send/retry prompt prefix unboundedly.
-    val rollupSizeHint = if (memoryOn) memoryRepository?.dailyLogSizeSummary() else null
-    val rollupBytes = if (memoryOn) memoryRepository?.largestDailyLogBytes() ?: 0L else 0L
+    // [debt-1026 B5] ONE snapshot for both values. `dailyLogSizeSummary()` and
+    // `largestDailyLogBytes()` each re-walked `dailyLogSizes()` — which reads
+    // MEMORY-ROLLUP.md plus every candidate daily log in full — so each
+    // system-prompt build paid that walk twice.
+    val rollupMetrics = if (memoryOn) memoryRepository?.dailyLogRollupMetrics() else null
+    val rollupSizeHint = rollupMetrics?.summary
+    val rollupBytes = rollupMetrics?.largestBytes ?: 0L
     val rollupFragment = if (memoryOn) memoryRepository?.loadRollupFragment() else null
 
     return buildString {
@@ -1469,6 +1606,16 @@ Sub-agent routing: the in-session sub-agent feature (spawn_agent) and cross-sess
         append("\n\nRuntime context:\n")
         append("- Current date: ").append(dateStr).append(" (").append(tzId).append(")\n")
         append("- Device language: ").append(lang).append("\n")
+        // [feat/storage-budget-loop L6] Give the producer its own bill. The
+        // agent is what grows filesDir (apk add, builds, clone/fixture trees,
+        // big offloads) but it had no way to see that it was consuming the
+        // user's disk — the number only existed inside the Storage screen.
+        // No IO here: StorageBudget keeps the daily sample in memory, so this
+        // is a string build over a cached value and changes at most once a day
+        // (prompt prefix caching is unaffected within a day).
+        com.rikkaminis.app.data.storage.StorageBudget.promptLine()?.let {
+            append(it).append("\n")
+        }
         append("- minis-model-use models available: ").append(modelUseCount)
     }
 }
@@ -1484,6 +1631,12 @@ Sub-agent routing: the in-session sub-agent feature (spawn_agent) and cross-sess
  *
  * Returns null when the source already fits within [maxEdge] (caller
  * should fall back to [rawBytes]) or on any decode/compress failure.
+ *
+ * [audit2-PERF-03] Both decisions come from a header probe: "already fits"
+ * costs an `inJustDecodeBounds` read instead of a full-size decode, and the
+ * resize itself goes through [ImageDecoding] so the oversized bitmap is never
+ * allocated (it used to decode at full resolution, then copy into the scaled
+ * bitmap — two large rectangles alive at once).
  */
 internal fun ChatViewModel.resizeImageBytes(
     rawBytes: ByteArray,
@@ -1491,22 +1644,20 @@ internal fun ChatViewModel.resizeImageBytes(
     maxEdge: Int = 2000,
 ): ByteArray? {
     return try {
-        val original = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
-        if (original.width <= maxEdge && original.height <= maxEdge) {
-            original.recycle()
-            return null
+        val source = ImageDecoding.probeBytes(rawBytes) ?: return null
+        if (ImageDecodeSizing.fitsWithin(source.width, source.height, maxEdge)) return null
+        val decoded = ImageDecoding.decodeBytesBounded(rawBytes, maxEdge, source) ?: return null
+        try {
+            val out = ByteArrayOutputStream()
+            val format = if (mimeType.contains("png")) Bitmap.CompressFormat.PNG
+            else Bitmap.CompressFormat.JPEG
+            // [deep-audit-1048 A-02] ditto: the KDoc promises null on encode
+            // failure, the dropped verdict promised nothing and shipped ''.
+            val encoded = decoded.bitmap.compress(format, 85, out)
+            if (saveOutcome(streamOpened = true, compressed = encoded)) out.toByteArray() else null
+        } finally {
+            decoded.bitmap.recycle()
         }
-        val scale = maxEdge.toFloat() / maxOf(original.width, original.height)
-        val w = (original.width * scale).toInt()
-        val h = (original.height * scale).toInt()
-        val scaled = Bitmap.createScaledBitmap(original, w, h, true)
-        val out = ByteArrayOutputStream()
-        val format = if (mimeType.contains("png")) Bitmap.CompressFormat.PNG
-        else Bitmap.CompressFormat.JPEG
-        scaled.compress(format, 85, out)
-        if (scaled !== original) scaled.recycle()
-        original.recycle()
-        out.toByteArray()
     } catch (_: Exception) {
         null
     }
@@ -1594,12 +1745,39 @@ internal fun ChatViewModel.prepareUserAttachments(
             // shell tools (read_image / cat) saw a 1024px JPEG instead
             // of the user's original picture. Matches iOS canonical
             // (AIChatViewModel.swift L1595-1617).
-            val rawBytes = try {
-                context.contentResolver.openInputStream(attachment.uri)?.use { it.readBytes() }
-            } catch (e: Exception) {
-                Log.w(ChatViewModel.TAG, "image read failed for ${attachment.fileName}: ${e.message}")
-                null
-            } ?: continue
+            //
+            // [debt-1026 #3 / backlog B-07] The read is BOUNDED: a raw
+            // `readBytes()` on a file that merely claims an image MIME
+            // type materialised the whole payload before any resize ran —
+            // the same OOM the non-image branch below streams around. The
+            // shared SAF helper gives both halves of the bound: a
+            // declared-size pre-check before the first byte, and a hard
+            // stop one byte past the cap on the stream. An over-cap pick
+            // is REFUSED with a log line, never truncated.
+            val rawBytes = when (
+                val read = readSafBytes(
+                    context.contentResolver,
+                    attachment.uri,
+                    MAX_RAW_IMAGE_ATTACHMENT_BYTES,
+                )
+            ) {
+                is SafRead.Ok -> read.bytes
+                SafRead.TooLarge -> {
+                    Log.w(
+                        ChatViewModel.TAG,
+                        "image attachment ${attachment.fileName} is over the " +
+                            "$MAX_RAW_IMAGE_ATTACHMENT_BYTES-byte cap; skipped",
+                    )
+                    continue
+                }
+                SafRead.Failed -> {
+                    Log.w(
+                        ChatViewModel.TAG,
+                        "image read failed for ${attachment.fileName}; skipped",
+                    )
+                    continue
+                }
+            }
             val ref = try {
                 mediaStore.saveMedia(
                     data = rawBytes,
@@ -1796,6 +1974,19 @@ internal fun ChatViewModel.uniqueUploadFileName(dir: java.io.File, original: Str
 
 /** LLM-based title + category generation, mirrors iOS generateSessionTitleIfNeeded(). */
 
+/**
+ * [fix/rv1014-g1] Pure + JVM-testable form of the auto-title trigger: does
+ * this session still need a title? Reads the SAME criterion the internal
+ * "title-already-set" guard below uses, so the trigger and the guard can
+ * never drift. The agent loop's call sites key off this (via
+ * AgentLoopHost.sessionTitleNeedsGeneration) instead of the old positional
+ * `turn == 0` guard — a first turn that stalls (empty round + recovery
+ * retry) reaches the decision point with turn != 0, and under the old
+ * condition the auto-title was skipped until the next send (or forever).
+ */
+internal fun sessionTitleNeedsGenerationOf(title: String): Boolean =
+    title == "New Chat" || title.isEmpty()
+
 internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) {
     // [T-android-titlegen-diag-logging] Unified "TitleGen" trail across
     // every path of this function — XIN 40454 reported sessions silently
@@ -1816,10 +2007,28 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
     // Skip if title already set (not "New Chat")
     // [feat/drawer-context-menu] The manual regenerate path (drawer context
     // menu) passes force=true to bypass this guard — the auto path keeps it.
-    if (!force && _sessionTitle.value != "New Chat" && _sessionTitle.value.isNotEmpty()) {
+    // [fix/rv1014-g1] Guard criterion now shared with the loop's trigger via
+    // sessionTitleNeedsGenerationOf — same source of truth, no drift.
+    if (!force && !sessionTitleNeedsGenerationOf(_sessionTitle.value)) {
         AppLogger.info("TitleGen", "skip guard=title-already-set title='${_sessionTitle.value.take(200)}'")
         return
     }
+    // [R5-C C-C-07②] The failure-shape predicate moved ABOVE the provider
+    // resolution: the `provider == null` branch below also consults it, and a
+    // local `fun` can only capture what appears before it lexically. The
+    // [FIX-R4-Q F-11] rationale is unchanged — one predicate for "this failure
+    // ends the title attempt" so a MANUAL regeneration cannot fail silently.
+    // With force=true the attempt counter is 1 after the first try, so the old
+    // `attempts >= TITLE_MAX_ATTEMPTS` gate made the click invisible for the
+    // two retries the user never sees. A manual attempt on a session that
+    // still has no real title falls back to the first-message title
+    // immediately; a manual attempt on an already-titled session keeps that
+    // title (needs-generation is false — the fallback must not overwrite a
+    // good title with a truncated first message).
+    fun titleFailureIsFinal(): Boolean =
+        titleGenerationAttempts >= TITLE_MAX_ATTEMPTS ||
+            (force && sessionTitleNeedsGenerationOf(_sessionTitle.value))
+
     // Prefer a dedicated sub-model (cheap, non-OAuth) — mirrors iOS resolveSubEntry.
     // Falls back to the primary provider if no sub-group is configured.
     // [T-title-gen-fallback-first-message-android] If no provider can be
@@ -1832,8 +2041,23 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
     val provider = subProvider ?: currentProvider
     if (provider == null) {
         AppLogger.warning("TitleGen", "no provider available (sub + current both null) — fallback-to-first-message path")
-        viewModelScope.launch(Dispatchers.IO) {
-            applyFallbackTitleFromFirstMessage("no provider available")
+        // [R5-C C-C-07②] The fallback UNCONDITIONALLY overwrites the session
+        // title (updateSessionTitle + _sessionTitle), so it was the one
+        // failure path that could clobber a good title: a manual regen
+        // (force) on an already-titled session with no provider resolved took
+        // the branch, needs-generation never got its say, and the user's
+        // chosen title became a truncated first message. Same criterion as
+        // every in-loop fallback below: when the failure is final for this
+        // shape (already-titled + manual), keep the current title.
+        if (!titleFailureIsFinal()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                applyFallbackTitleFromFirstMessage("no provider available")
+            }
+        } else {
+            AppLogger.info(
+                "TitleGen",
+                "no provider + already-titled manual regen — fallback skipped, title kept ('${_sessionTitle.value.take(120)}')",
+            )
         }
         return
     }
@@ -1912,7 +2136,7 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
                 // Cannot dispatch a provider-created title call without an
                 // instance — surface as a typed error (never in-process).
                 AppLogger.warning("TitleGen", "outcome=no-instance-context attempt=$titleGenerationAttempts")
-                if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+                if (titleFailureIsFinal()) {
                     applyFallbackTitleFromFirstMessage("no provider instance context")
                 }
                 return@launch
@@ -1938,7 +2162,7 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
                         "TitleGen",
                         "outcome=remote-failure attempt=$titleGenerationAttempts (${titleResult.code}): ${titleResult.message.take(200)}",
                     )
-                    if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+                    if (titleFailureIsFinal()) {
                         applyFallbackTitleFromFirstMessage("remote failure ${titleResult.code}")
                     }
                     return@launch
@@ -1948,7 +2172,7 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
                         "TitleGen",
                         "outcome=unavailable attempt=$titleGenerationAttempts: ${titleResult.reason}",
                     )
-                    if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+                    if (titleFailureIsFinal()) {
                         applyFallbackTitleFromFirstMessage("title service unavailable: ${titleResult.reason}")
                     }
                     return@launch
@@ -1983,7 +2207,7 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
                         "(empty / unparseable response) stopReason=${response.stopReason} " +
                         "textLen=${response.text.length}",
                 )
-                if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+                if (titleFailureIsFinal()) {
                     AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/$TITLE_MAX_ATTEMPTS) — applying first-message fallback title")
                     applyFallbackTitleFromFirstMessage("empty/unparseable title response")
                 }
@@ -1998,7 +2222,7 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
                 "outcome=exception attempt=$titleGenerationAttempts/$TITLE_MAX_ATTEMPTS " +
                     "${e.javaClass.simpleName}: ${e.message?.take(200)}",
             )
-            if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+            if (titleFailureIsFinal()) {
                 AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/$TITLE_MAX_ATTEMPTS) — applying first-message fallback title")
                 applyFallbackTitleFromFirstMessage("request failed: ${e.message?.take(200)}")
             }
@@ -2066,5 +2290,18 @@ internal fun ChatViewModel.resolveTitleProvider(): LLMProvider? {
     val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return null
 
-    return ProviderFactory.create(instance, apiKey, entry.model, context)
+    // [deep-audit-1044 B-03] Title generation sizes its token budget from
+    // `provider.model.supportsReasoning` and its provider must answer the same
+    // capability questions as the primary — pass the enriched model.
+    return ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
 }
+
+/**
+ * [FIX-R4-Q F-14] Raised from `executeSpawnAgentTool`'s streamProvider when the
+ * host run's observation budget refuses another provider request (deadline
+ * reached / attempts exhausted). A dedicated type so the sub-agent's failure
+ * text says WHY it stopped instead of looking like a provider error, and so a
+ * future change to the budget gate cannot be silently swallowed by a generic
+ * catch that assumes "provider went wrong".
+ */
+internal class SubagentBudgetExhaustedException(message: String) : RuntimeException(message)

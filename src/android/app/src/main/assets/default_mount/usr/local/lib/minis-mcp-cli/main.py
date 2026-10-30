@@ -30,19 +30,26 @@ stay pure-local (servers.json only) and never touch the daemon.
 
 import json
 import os
+import shlex
+import signal
 import socket
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from transport.http import MCPError  # noqa: E402
+from transport.http import MCPError, validate_server_name  # noqa: E402
 from utils import config  # noqa: E402
 
 LOG_PATH = "/var/minis/mcp-servers/mcp-cli.log"
 
 PID_FILE = "/tmp/minis-mcp-daemon.pid"
 PORT_FILE = "/tmp/minis-mcp-daemon.port"  # daemon publishes its 127.0.0.1 port here
+# [verify-1015 BUG-07] Loopback IPC auth token, derived from the port file so
+# the two sides can never drift. The daemon writes it 0600; every request
+# carries it, which is what keeps another local app from driving the user's
+# configured MCP servers (Android does not isolate 127.0.0.1 per app).
+TOKEN_FILE = PORT_FILE + ".token"
 LOCK_FILE = "/tmp/minis-mcp-daemon.lock"  # cold-start fork guard (one winner forks)
 CONN_TIMEOUT = 310.0  # socket recv timeout, slightly above the 300s RPC timeout
 LOCK_STALE_SECONDS = 12.0  # reclaim a cold-start lock older than this (crashed start)
@@ -221,12 +228,50 @@ def maybe_start_daemon():
         os._exit(0)
 
 
+def _read_daemon_token():
+    """[verify-1015 BUG-07] Read the loopback auth token, or None when the file
+    is absent (a pre-token daemon still running after an app update)."""
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def _retire_stale_daemon():
+    """[verify-1015 BUG-07] SIGTERM a daemon that predates the token (it cannot
+    authenticate us), then clear its files so the next call forks a fresh one.
+    The daemon handles SIGTERM and unlinks its own port/pid/token files."""
+    pid = None
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 3.0
+    while time.time() < deadline and os.path.exists(PORT_FILE):
+        time.sleep(0.1)
+    for path in (PORT_FILE, PID_FILE, TOKEN_FILE):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
 def send_to_daemon(request, timeout=CONN_TIMEOUT):
     """Send one newline-delimited JSON request over 127.0.0.1, return the parsed
     reply dict."""
     port = _read_daemon_port()
     if port is None:
         return {"ok": False, "error": "daemon not running", "code": "NO_DAEMON"}
+    token = _read_daemon_token()
+    if token:
+        # Attach at the single choke point so every subcommand is covered; an
+        # older daemon simply ignores the extra field.
+        request = dict(request, token=token)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -259,6 +304,15 @@ def call_daemon(request, pretty):
     retry if the daemon wasn't ready yet right after a fresh fork."""
     maybe_start_daemon()
     resp = send_to_daemon(request)
+    if not resp.get("ok") and resp.get("code") == "AUTH":
+        # [verify-1015 BUG-07] A daemon that was forked before the token existed
+        # cannot authenticate us: retire it and fork a fresh one rather than
+        # failing the user's tool call (the update lands mid-session, and a
+        # daemon can outlive it by its idle TTL).
+        _retire_stale_daemon()
+        maybe_start_daemon()
+        time.sleep(0.5)
+        resp = send_to_daemon(request)
     if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
         time.sleep(0.5)
         resp = send_to_daemon(request)
@@ -269,6 +323,30 @@ def call_daemon(request, pretty):
 
 
 # --- argument helpers -------------------------------------------------------
+
+def _reject_constant(name):
+    """[rv1014-C5] NaN/Infinity/-Infinity are RFC-invalid JSON literals —
+    json.loads accepts them by default and json.dumps would emit them, which
+    strict remote JSON parsers reject. Rejecting here keeps those values as
+    plain strings (pre-D4b behavior)."""
+    raise ValueError(name)
+
+
+def _parse_value(v):
+    """[sweep1014-D4b] key=value values are parsed as JSON literals first so
+    typed tool schemas work straight from the CLI: limit=10 → int,
+    recursive=true → bool, q=[1,2] → array, q={"a":1} → object. Anything that
+    isn't valid JSON (and the empty string) stays a plain string. To force a
+    string that looks like JSON, quote it: q='"10"' → "10". The --input '{}'
+    path is unaffected. [rv1014-C5] NaN/Infinity stay plain strings (see
+    _reject_constant)."""
+    if v == "":
+        return v
+    try:
+        return json.loads(v, parse_constant=_reject_constant)
+    except ValueError:
+        return v
+
 
 def _pop_flag(args, name):
     """Remove a boolean flag; return True if present."""
@@ -347,14 +425,18 @@ def cmd_call(args, pretty):
     arguments = {}
     if raw_input:
         try:
-            arguments = json.loads(raw_input)
+            # [rv1014-C5] Same NaN/Infinity guard as _parse_value — a literal
+            # NaN in --input would reach json.dumps and strict remote parsers.
+            arguments = json.loads(raw_input, parse_constant=_reject_constant)
         except ValueError as exc:
             _fail("invalid --input JSON: %s" % exc, "PARSE_ERROR", name, pretty)
-    # key=value pairs override / extend the --input object.
+    # key=value pairs override / extend the --input object. Values are parsed
+    # as JSON literals first ([sweep1014-D4b]) so integer/boolean/array schema
+    # params arrive typed, not as strings.
     for token in rest:
         if "=" in token:
             k, v = token.split("=", 1)
-            arguments[k] = v
+            arguments[k] = _parse_value(v)
         else:
             _fail("unexpected argument: %s" % token, "PARSE_ERROR", name, pretty)
     result = call_daemon({"cmd": "call", "server": name, "tool": tool, "args": arguments}, pretty)
@@ -376,6 +458,10 @@ def cmd_add(args, pretty):
     name = _pop_opt(args, "--name")
     if not name:
         _fail("add requires --name", "PARSE_ERROR", None, pretty)
+    # [sweep1014-D4a] The name is joined into file paths (client-secret handoff
+    # `<oauth-dir>/<name>.secret`, oauth bridge) — whitelist it at the write
+    # path, refuse rather than guess.
+    validate_server_name(name, "--name")
     url = _pop_opt(args, "--url")
     command = _pop_opt(args, "--command")
     note = _pop_opt(args, "--note")
@@ -417,7 +503,16 @@ def cmd_add(args, pretty):
     elif command:
         server["command"] = command
         if args_raw:
-            server["args"] = args_raw.split()
+            # [audit2-A5] Quote-aware split. `--args "-Dfoo=hello world -Dbar=1"`
+            # is two arguments, not four whitespace fragments — str.split() made
+            # any argument containing a space impossible to express. Plain
+            # unquoted input splits exactly as str.split() did, so existing
+            # invocations are unaffected; unbalanced quotes are refused instead
+            # of silently truncated.
+            try:
+                server["args"] = shlex.split(args_raw)
+            except ValueError as exc:
+                _fail("--args: %s" % exc, "PARSE_ERROR", name, pretty)
         env = {}
         for e in env_raw:
             if "=" in e:
@@ -525,6 +620,10 @@ Commands:
   call <server> <tool> [--input '{}'] [key=value ...]
                                         Invoke a tool. --input is a JSON object;
                                         trailing key=value pairs extend/override it.
+                                        key=value values are parsed as JSON literals
+                                        first (limit=10 → int, recursive=true → bool,
+                                        q=[1,2] → array); non-JSON values stay strings.
+                                        To force a string, quote it: q='"10"'.
   add --name <n> --url <url> [--header "K: V" ...] [--note "..."]
   add --name <n> --command <cmd> [--args "..."] [--env "K=V" ...] [--note "..."]
       [--startup-timeout <seconds>]

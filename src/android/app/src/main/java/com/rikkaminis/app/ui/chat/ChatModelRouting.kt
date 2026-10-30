@@ -79,17 +79,30 @@ internal fun prependCompactionPin(
 }
 
 fun ChatViewModel.selectGroup(groupId: String) {
-    _selectedGroupId.value = groupId
-    _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
     // [T-recovery] Explicit user selection clears all health state —
     // choosing a group is an explicit "I want to work with this group"
     // signal (also how a re-authed member becomes usable again).
+    //
+    // [deep-audit-1047 B-04] KEPT AHEAD of the resolution on purpose: clearing
+    // health is what makes a cooling / circuit-open member usable again, so it
+    // has to happen BEFORE the router is asked to pick one — moving it into the
+    // success branch would make a fully-demoted group unrecoverable by
+    // re-selection. (Health is routing state, not the display state this fix is
+    // about.)
     groupRouter.clearHealth()
-    // [T-per-message-load-balance] A group (re-)selection supersedes any
-    // pending member pick from a previous selection.
-    pendingEntryOverride = null
+    // [deep-audit-1047 B-04] Everything below is display + execution state and
+    // is written only once the group actually resolved. When it does not (every
+    // member disabled or credential-less, or a group holding nothing but System
+    // voice sentinels), the previous selection is left exactly as it was:
+    // writing the group id/name first used to leave the top bar showing group B
+    // while the session kept running on group A's provider + binding.
     val resolved = resolveProviderFromGroup(groupId)
     if (resolved) {
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
+        // [T-per-message-load-balance] A group (re-)selection supersedes any
+        // pending member pick from a previous selection.
+        pendingEntryOverride = null
         // [T-per-message-load-balance] resolveProviderFromGroup already
         // advanced the rotation to the member now shown in the top bar —
         // pin it so THIS member serves the next new user turn (otherwise
@@ -108,26 +121,40 @@ fun ChatViewModel.selectGroup(groupId: String) {
 
 /** Select a specific entry within a group (keeps group selected). */
 fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
-    _selectedGroupId.value = groupId
-    _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
     // [T-recovery] Explicit user pick overrides any recovery/cooldown
-    // policy — the user asked for THIS member, deliver it.
+    // policy — the user asked for THIS member, deliver it. (Ahead of the
+    // resolution for the same reason as in [selectGroup]: demoted members
+    // become usable again only because the health map was just cleared.)
     groupRouter.clearHealth()
     val resolved = resolveProviderFromGroup(groupId, entryId)
-    if (resolved) {
+    // [deep-audit-1047 B-04] ONE id for every consumer of this pick.
+    // `resolveProviderFromGroup` falls back off a member it cannot use
+    // (disabled instance / no credential), so the entry the user asked for is
+    // NOT necessarily the entry that is now serving: `_activeEntryId` is the
+    // truth. Persisting the raw `entryId` used to bind the session — and the
+    // next `rotateForNewTurn` with it — to a member that was just skipped.
+    val plan = planGroupSelect(
+        resolved = resolved,
+        resolvedId = _activeEntryId.value,
+        requestedId = entryId,
+    )
+    if (plan.applyUi) {
+        val resolvedEntryId = plan.effectiveEntryId ?: return
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
         // [T-per-message-load-balance] The user hand-picked THIS member. When
         // idle, it serves the NEXT new user turn (one-shot pick consumed by
         // rotateForNewTurn), then rotation resumes from it. When streaming,
         // switchModelAndRerun below already re-serves the current turn on the
         // pick — setting a pending override here would make it serve the next
         // message too (two turns in a row), so only arm it while idle.
-        if (!_isStreaming.value) pendingEntryOverride = entryId
-        persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$entryId"}""")
+        if (!_isStreaming.value) pendingEntryOverride = resolvedEntryId
+        persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$resolvedEntryId"}""")
         applyGroupSessionDefaults(groupId)
         // [T-newchat-default-model-fallback-android] Record the actually-
         // resolved active entry as last-used (resolveProviderFromGroup may
         // fall back off a disabled member, so _activeEntryId is the truth).
-        _activeEntryId.value?.let { providerRepository.lastUsedEntryId = it }
+        providerRepository.lastUsedEntryId = resolvedEntryId
         // [switchModelAndRerun] Model-switch-during-streaming (Plan A).
         if (_isStreaming.value) switchModelAndRerun("switchModel-groupEntry")
     }
@@ -137,8 +164,21 @@ fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
 fun ChatViewModel.selectEntry(entryId: String) {
     val config = providerRepository.config.value
     val entry = config.modelEntries.find { it.id == entryId } ?: return
-    val instance = providerRepository.instance(entry.providerInstanceId) ?: return
-    val apiKey = providerRepository.loadApiKey(instance.id) ?: return
+    // [deep-audit-1047 B-04] The direct-pick path used to re-derive
+    // "instance exists and has a key" inline and stopped there, so an entry
+    // whose provider instance was DISABLED but still carried a key was
+    // activated anyway — the disable switch was bypassable from the picker and
+    // from `HeadlessChatRunner.selectModel`. It now goes through the same
+    // single decision point the restore / load paths already use.
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) {
+        if (decision is SessionModelResolution.Unusable) {
+            logSessionModelUnusable("selectEntry", entry.id, decision.reason)
+        }
+        return
+    }
 
     // Apply the new model's state + persisted binding. This runs in BOTH
     // the idle and the streaming cases (the streaming case additionally
@@ -148,10 +188,14 @@ fun ChatViewModel.selectEntry(entryId: String) {
     // left the model fields already flipped while currentProvider was still the
     // previous one - a UI/provider split state. Doing the throwing call first
     // means a failure leaves the whole selection untouched.
-    val newProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
-    currentModel = entry.model
-    _modelName.value = entry.model.displayName
-    _providerName.value = instance.label.ifEmpty { entry.model.provider }
+    // [deep-audit-1044 B-03] Resolved through the single enriched exit, so the
+    // provider and the `currentModel` snapshot agree AND carry models.dev
+    // capabilities (`entry.model` is the raw base + overrides only).
+    val effectiveModel = providerModelFor(entry)
+    val newProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
     _selectedGroupId.value = null
     _selectedGroupName.value = ""
     _activeEntryId.value = entry.id
@@ -173,6 +217,36 @@ fun ChatViewModel.selectEntry(entryId: String) {
     // with the newly selected model (no more "UI shows B but the stream is
     // still calling A" split state).
     if (_isStreaming.value) switchModelAndRerun("switchModel-entry")
+}
+
+/**
+ * [dv24-A05] The fallback a session uses when it has NO usable model binding.
+ *
+ * `loadSession()` resolves a session's model in three priorities: (1) the
+ * persisted `model_binding`, (2) the persisted `model_id`, (3) the default
+ * group and then the new-chat default. Clearing the binding therefore means
+ * "run priority 3 now", not "pick one arbitrary entry".
+ *
+ * The config surface (`minis-config set session.primaryModel ""`) has to run
+ * the same fallback on the RESIDENT view model, otherwise the chat keeps
+ * showing the pin that was just cleared while the row already says "no
+ * binding" — the two disagree and the next picker tap writes the stale pin
+ * back.
+ *
+ * `applyNewChatDefaultModel` alone is not the same fallback: it skips the
+ * default GROUP (priority 3's first half). This is the shared entry both
+ * sides use.
+ */
+internal fun ChatViewModel.applyDefaultModelFallback(): Boolean {
+    val defaultGroupId = providerRepository.defaultPrimaryGroupId
+    if (defaultGroupId != null) {
+        val resolved = resolveProviderFromGroup(defaultGroupId)
+        if (resolved) {
+            _selectedGroupId.value = defaultGroupId
+            return true
+        }
+    }
+    return applyNewChatDefaultModel()
 }
 
 /**
@@ -210,6 +284,11 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
     if (streamJob?.isActive == true) {
         traceObserver.t7Reduce(AgentRunEvent.UserCancelled("switch_model"))
     }
+    // [dv29-B01] Also kill the predecessor's SETUP shell: sendMessage/resume
+    // hold their whole setup in sendShellJob, and only `streamJob?.cancel()`
+    // was called here — the old shell could survive this claim and reach its
+    // own `streamJob = launch`, i.e. two live streams under one _isStreaming.
+    sendShellJob?.cancel()
     streamJob?.cancel()
     flushAllStreamingDeltas()
     ExecutionCoordinator.stopCurrentCommand(activeSessionId)
@@ -223,69 +302,95 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
     // ── Phase 2: roll back the incomplete assistant turn in UI + history ──
     rollbackIncompleteTurn()
 
-    // ── Phase 3: re-sync DB + agentHistory to the last committed user
-    // message, then restart the loop on the (already-switched) provider. ──
+    // ── Phase 3: claim synchronously, then re-sync DB + agentHistory to the
+    // last committed user message and restart the loop on the (already
+    // switched) provider. ──
     val provider = currentProvider ?: run {
         AppLogger.warning(ChatViewModel.TAG, "switchModelAndRerun: no currentProvider after switch — aborting restart")
         return
     }
-    viewModelScope.launch(Dispatchers.IO) {
-        try {
-            val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
-            val dbMessages = chatRepository.loadMessages(sid)
-            val lastUserSortOrder = dbMessages.findLast { it.role == "user" }?.sortOrder
-            if (lastUserSortOrder != null) {
-                chatRepository.deleteMessagesAfter(sid, lastUserSortOrder + 1)
-            }
-            // Rebuild agentHistory from the trimmed DB so the retried loop
-            // starts from committed context only (defense in depth against
-            // any partial tool_result / assistant rows the cancelled loop
-            // may have persisted).
-            val remaining = chatRepository.loadMessages(sid)
-            agentHistory.clear()
-            toolLoopDetector.reset()
-            for (entity in remaining) agentHistory.add(entity.toLLMMessage())
-            // Drop stream-flush side-channel state for messages the rollback
-            // removed, so no stale delta can resurrect on a kept bubble
-            // (mirrors rerunFromToolBlock).
-            val keptIds = _messages.value.mapTo(mutableSetOf()) { it.id }
-            retainStreamFlushStates(keptIds)
-            if (_streamingById.value.isNotEmpty()) {
-                _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
-            }
-        } catch (e: Exception) {
-            // [audit-0917] Fail-closed: the re-sync half-applied (the DB trim
-            // and/or the history rebuild may be partial). Restarting the loop on a
-            // half-synced history would silently answer the CURRENT user message
-            // with wrong or empty context - surface the failure and leave the turn
-            // unanswered instead of guessing.
-            Log.w(ChatViewModel.TAG, "switchModelAndRerun: DB re-sync failed: ${e.message}")
-            _error.value = "Model switch failed: ${e.message}"
-            return@launch
-        }
-        // Restart the loop on the switched provider (mirrors retryFromMessage).
-        _error.value = null
-        _canResume.value = false
-        AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=true (sync, sid=$activeSessionId)")
-        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
-        // flips. This path is the one that failed in the field (2026-10-12
-        // 14:40:12): the cancel() above unwinds the predecessor while this
-        // claim is still running, and the epoch snapshot below lands too late
-        // to stop it. The token lands first and makes that finally a no-op.
-        streamingClaimToken = Any()
-        _isStreaming.value = true
-        streamEpoch++
-        // [T-stale-finally-vs-new-claim] Publish the claim SYNCHRONOUSLY
-        // here (not inside runRerunStreamTail, which runs after the
-        // system-prompt build): the epoch gate must already cover the whole
-        // claim window starting at _isStreaming=true.
-        streamingClaimEpoch = streamEpoch
+    // [dv29-B01] The claim is published HERE, before any suspension point: it
+    // used to be written inside the coroutine below, i.e. only after three
+    // DB round-trips. During that window `_isStreaming` read false (the
+    // cancelled predecessor's finally had already cleared it), so the entry
+    // guards of send/retry let a second turn in, and cancelStream() had no
+    // handle to stop this one: the user's Stop was a no-op and the turn came
+    // back to life once the DB work finished.
+    //
+    // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+    // flips. This path is the one that failed in the field (2026-10-12
+    // 14:40:12): the cancel() above unwinds the predecessor while this
+    // claim is still running, and the epoch snapshot below lands too late
+    // to stop it. The token lands first and makes that finally a no-op.
+    streamingClaimToken = Any()
+    _isStreaming.value = true
+    streamEpoch++
+    // [T-stale-finally-vs-new-claim] Publish the claim SYNCHRONOUSLY here
+    // (not inside runRerunStreamTail, which runs after the system-prompt
+    // build): the epoch gate must already cover the whole claim window
+    // starting at _isStreaming=true.
+    streamingClaimEpoch = streamEpoch
+    val switchEpoch = streamingClaimEpoch
+    val claimToken = streamingClaimToken
+    AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=true (sync, sid=$activeSessionId)")
+    _canResume.value = false
+
+    // [dv29-B01] Hold the setup shell in sendShellJob so cancelStream() can
+    // kill the DB re-sync window (before this, Stop reached only `streamJob`,
+    // which is still null here).
+    sendShellJob = viewModelScope.launch(Dispatchers.IO) {
         var streamLaunched = false
-        val switchEpoch = streamingClaimEpoch
-        val claimToken = streamingClaimToken
         try {
-            streamLaunched = runRerunStreamTail(provider, label)
+            try {
+                val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
+                val dbMessages = chatRepository.loadMessages(sid)
+                val lastUserSortOrder = dbMessages.findLast { it.role == "user" }?.sortOrder
+                if (lastUserSortOrder != null) {
+                    chatRepository.deleteMessagesAfter(sid, lastUserSortOrder + 1)
+                }
+                // Rebuild agentHistory from the trimmed DB so the retried loop
+                // starts from committed context only (defense in depth against
+                // any partial tool_result / assistant rows the cancelled loop
+                // may have persisted).
+                val remaining = chatRepository.loadMessages(sid)
+                agentHistory.clear()
+                toolLoopDetector.reset()
+                for (entity in remaining) agentHistory.add(entity.toLLMMessage())
+                // [R5-C C-C-04②] The re-sync rewound the transcript back to the
+                // last committed user message — same rewind rules as
+                // rerunFromToolBlock ([FIX-R4-P F-05/F-02]): a compaction marker
+                // anchored in the deleted range must not survive (its summary
+                // describes turns the switch just deleted, and the stale reading
+                // would be re-injected into the new provider's first request),
+                // and the context-pressure reading belongs to the PRE-switch
+                // transcript. Mirrors rerunFromToolBlock / retryLast.
+                dropCompactMarkerIfRewound(sid)
+                resetContextPressureState()
+                // Drop stream-flush side-channel state for messages the rollback
+                // removed, so no stale delta can resurrect on a kept bubble
+                // (mirrors rerunFromToolBlock).
+                val keptIds = _messages.value.mapTo(mutableSetOf()) { it.id }
+                retainStreamFlushStates(keptIds)
+                if (_streamingById.value.isNotEmpty()) {
+                    _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
+                }
+            } catch (e: Exception) {
+                // [audit-0917] Fail-closed: the re-sync half-applied (the DB trim
+                // and/or the history rebuild may be partial). Restarting the loop on a
+                // half-synced history would silently answer the CURRENT user message
+                // with wrong or empty context - surface the failure and leave the turn
+                // unanswered instead of guessing.
+                Log.w(ChatViewModel.TAG, "switchModelAndRerun: DB re-sync failed: ${e.message}")
+                _error.value = "Model switch failed: ${e.message}"
+                return@launch
+            }
+            // Restart the loop on the switched provider (mirrors retryFromMessage).
+            _error.value = null
+            streamLaunched = runRerunStreamTail(provider, label, switchEpoch, claimToken)
         } finally {
+            // [dv29-B01] The claim moved out of this coroutine, so every early
+            // return above (re-sync failure) must release it — otherwise
+            // _isStreaming stays true forever and every later send is refused.
             if (!streamLaunched) {
                 // [T-stale-finally-vs-new-claim] Only clear under our own claim.
                 if (switchEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
@@ -366,7 +471,10 @@ internal fun ChatViewModel.buildFallbackProviders(primaryProvider: LLMProvider):
         if (!instance.isEnabled) continue
         val apiKey = providerRepository.loadApiKey(instance.id) ?: continue
         val p = try {
-            ProviderFactory.create(instance, apiKey, entry.model, context)
+            // [deep-audit-1044 B-03] Fallback providers answer the same
+            // capability questions as the primary, so they get the enriched
+            // model too (raw `entry.model` lost vision + effort tiers here).
+            ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
         } catch (_: Exception) { continue }
         result.add(FallbackCandidate(p, entryId))
     }
@@ -415,7 +523,12 @@ internal fun ChatViewModel.rotateForNewTurn(label: String) {
     // assistant row already in the message list belongs to a PRIOR
     // completed turn. (Draft sessions start with an empty list.)
     if (_messages.value.none { it.role == "assistant" }) return
-    val members = providerRepository.enabledMemberEntries(group)
+    // [deep-audit-1047 B-04] Same credential filter as
+    // [resolveProviderFromGroup]: a member with no API key must not be picked
+    // by the rotation only to abort the whole rotation at
+    // `loadApiKey(...) ?: return` below (which silently froze the group on the
+    // member it happened to land on, skipping usable members behind it).
+    val members = usableGroupMembers(providerRepository.enabledMemberEntries(group))
     val targetId = groupRouter.nextLoadBalanceMember(
         group = group,
         currentEntryId = currentEntryId,
@@ -426,12 +539,58 @@ internal fun ChatViewModel.rotateForNewTurn(label: String) {
     val targetEntry = members.firstOrNull { it.id == targetId } ?: return
     val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return
-    currentModel = targetEntry.model
-    _modelName.value = targetEntry.model.displayName
-    _providerName.value = instance.label.ifEmpty { targetEntry.model.provider }
-    _activeEntryId.value = targetEntry.id
+    // [deep-audit-1044 B-03] Rotated-in member takes the same enriched path as
+    // an explicit pick (raw base model = no modalities / effort tiers on the wire).
+    val effectiveModel = providerModelFor(targetEntry)
+    // [meta-audit-1028 F-06] The throwing call comes FIRST, and its outcome is a
+    // value ([planTurnRotation]). These four fields used to be published BEFORE
+    // `ProviderFactory.create`, so a creation failure left the top bar / picker /
+    // `_activeEntryId` claiming the rotated-in member while `currentProvider`
+    // still answered with the previous one — rotation runs unattended on every
+    // message, so the split state could persist for the rest of the session.
+    // The direct-pick path fixed exactly this shape in `[audit-0917]`; rotation
+    // never got the same treatment.
+    var created: LLMProvider? = null
+    var createError: String? = null
+    try {
+        created = ProviderFactory.create(instance, apiKey, effectiveModel, context)
+    } catch (e: Exception) {
+        createError = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    }
+    val plan = planTurnRotation(
+        current = SessionModelSelection(
+            modelId = currentModel?.id,
+            modelName = _modelName.value,
+            providerName = _providerName.value,
+            activeEntryId = currentEntryId,
+            selectedGroupId = groupId,
+            selectedGroupName = _selectedGroupName.value,
+            // The one-shot pick was consumed above on purpose: it armed THIS
+            // turn, and re-arming it after an abort would retry a creation that
+            // just failed on every following turn.
+            pendingEntryOverride = null,
+        ),
+        targetEntryId = targetEntry.id,
+        targetModelId = effectiveModel.id,
+        targetModelName = effectiveModel.displayName,
+        targetProviderName = instance.label.ifEmpty { effectiveModel.provider },
+        created = created,
+        createError = createError,
+    )
+    if (!plan.applied) {
+        AppLogger.warning(
+            "ChatVMRouting",
+            "🔄LB $label rotate $currentEntryId -> $targetId ABORTED, session keeps " +
+                "the current member: ${plan.reason}",
+        )
+        return
+    }
+    currentModel = effectiveModel
+    _modelName.value = plan.state.modelName
+    _providerName.value = plan.state.providerName
+    _activeEntryId.value = plan.state.activeEntryId
     // [T-provider-key-roulette] Rotation happens inside ProviderFactory.create.
-    currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context)
+    currentProvider = plan.provider
     persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$targetId"}""")
     AppLogger.info(
         "ChatVMRouting",

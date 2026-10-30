@@ -35,8 +35,38 @@ object ChatViewModelStore {
      */
     private val aliases = mutableMapOf<String, String>()
 
+    /**
+     * [da1019-ISSUE-07] Read side of [aliases]. Every mutation of the map
+     * (`rename` / `release`) already runs under this object's monitor, but the
+     * lookups did not — `activeSessionId` is read from the offload worker
+     * thread (`minis-config session.*` → ConfigBuiltins' readers), so an
+     * unsynchronized `aliases[sessionId]` raced the main thread's
+     * `LinkedHashMap` mutation with no happens-before edge. A reader could
+     * miss a just-registered draft alias and resolve a draft key to itself
+     * (the config layer then reads the wrong session row), and concurrent
+     * structural mutation of a plain `LinkedHashMap` is undefined behaviour.
+     * Same lock as the writers, so reads and writes serialize.
+     */
+    @Synchronized
     private fun resolveKey(sessionId: String): String =
         aliases[sessionId] ?: sessionId
+
+    /**
+     * [da1023-F] Public view of [resolveKey] for callers that hold the nav-arg
+     * session id instead of the VM.
+     *
+     * A draft chat's route arg stays on `__new__<uuid>` for the lifetime of
+     * the screen even after the first send promotes it to a real session row
+     * (`ChatSessionEntryExt.ensureSession` → [rename]). In-chat callers read
+     * the live id through `viewModel.currentSessionId`; callers outside the
+     * screen (`AppNavigation` route builders) only have the route arg, so they
+     * need the same alias hop or they navigate session-scoped destinations
+     * into the orphan draft key. Unknown / canonical ids pass through
+     * unchanged, so non-draft callers see identical behaviour.
+     */
+    @Synchronized
+    fun resolveSessionId(sessionId: String): String =
+        resolveKey(sessionId)
 
     @Synchronized
     fun ownerFor(sessionId: String): ViewModelStoreOwner {
@@ -48,6 +78,34 @@ object ChatViewModelStore {
         return object : ViewModelStoreOwner {
             override val viewModelStore: ViewModelStore = store
         }
+    }
+
+    /**
+     * [dv24-A05] NON-CREATING lookup of a session's resident [ChatViewModel].
+     *
+     * [ownerFor] cannot be used for this: it `getOrPut`s a fresh
+     * [ViewModelStore], so calling it for a session that is not on screen
+     * allocates an owner that never receives a VM (leak) — or, once a caller
+     * resolves the VM through `ViewModelProvider`, materialises a whole
+     * ChatViewModel (agent-loop scope, repositories, provider) for a chat the
+     * user closed. Callers that merely want to *refresh* whatever is already
+     * resident must not have that side effect, and this is the only such entry
+     * point: it walks the existing stores and answers null otherwise.
+     *
+     * Used by `minis-config`'s `session.thinkingLevel` / `session.primaryModel`
+     * writers, which persist to Room and then have to push the same value into
+     * the live UI (see `ConfigBuiltins.writeSessionConfig`).
+     *
+     * @return the resident VM, or null when this session has no live VM.
+     */
+    @Synchronized
+    fun peekViewModel(sessionId: String): ChatViewModel? {
+        val store = stores[resolveKey(sessionId)] ?: return null
+        for (key in store.keys()) {
+            val vm = store.get(key)
+            if (vm is ChatViewModel) return vm
+        }
+        return null
     }
 
     /**
@@ -85,7 +143,10 @@ object ChatViewModelStore {
     private var activeSessionIdInternal: String? = null
 
     val activeSessionId: String?
-        get() = activeSessionIdInternal?.let { resolveKey(it) }
+        // [da1019-ISSUE-07] Same monitor as `setActiveSession` / `rename` /
+        // `release`: the offload thread that serves `minis-config session.*`
+        // must not read the alias table while the main thread mutates it.
+        @Synchronized get() = activeSessionIdInternal?.let { resolveKey(it) }
 
     @Synchronized
     fun setActiveSession(sessionId: String?) {

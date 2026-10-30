@@ -26,7 +26,6 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -65,6 +64,7 @@ import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS
 import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.effectiveMaxThinkingLevel
 import com.rikkaminis.app.data.repository.ProviderRepository
@@ -116,22 +116,27 @@ fun ModelGroupDetailScreen(
     val persistedGroup: ModelGroup = group
     fun currentGroup(): ModelGroup = config.modelGroups.find { it.id == groupId } ?: persistedGroup
 
-    var name by remember(group.id) { mutableStateOf(group.name) }
+    var name by remember(group.id, group.name) { mutableStateOf(group.name) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val nameSavedMsg = stringResource(R.string.model_group_name_saved)
-    var strategy by remember(group.id) { mutableStateOf(group.strategy) }
-    var fallbackStrategy by remember(group.id) { mutableStateOf(group.fallbackStrategy) }
-    // T312: Session Defaults — keyed on group.id so navigating to another
-    // group via NavBackStack rebuilds these from the new group's persisted
-    // values. Using `group` as key would also re-fire on every config
-    // refresh (since `group` is recomputed from the StateFlow each
-    // recomposition); id-keyed remember is the stable alternative.
-    var defaultThinkingLevel by remember(group.id) {
+    var strategy by remember(group.id, group.strategy) { mutableStateOf(group.strategy) }
+    var fallbackStrategy by remember(group.id, group.fallbackStrategy) {
+        mutableStateOf(group.fallbackStrategy)
+    }
+    // T312: Session Defaults — keyed on (group.id, group.<field>): navigating
+    // to another group via NavBackStack rebuilds these from the new group's
+    // persisted values, AND an external write to the same field (minis-config /
+    // Debug RPC / backup restore) re-seeds the editor instead of leaving the
+    // stale text on screen for the focus-loss save to write back. Keying on the
+    // whole `group` object would also re-fire on unrelated config refreshes
+    // (member reorder, another group edited), which is why the key is the id
+    // plus the exact field this editor owns.
+    var defaultThinkingLevel by remember(group.id, group.defaultThinkingLevel) {
         mutableStateOf(group.defaultThinkingLevel)
     }
-    var contextLimitTokens by remember(group.id) {
+    var contextLimitTokens by remember(group.id, group.contextLimitTokens) {
         mutableStateOf(group.contextLimitTokens)
     }
 
@@ -310,8 +315,13 @@ fun ModelGroupDetailScreen(
                     // persisted entries — resolve them to virtual entries so the
                     // default Voice Input/Output members render normally instead
                     // of as stale rows (mirrors iOS system virtual entries).
-                    val entry = config.modelEntries.find { it.id == entryId }
-                        ?: com.rikkaminis.app.data.model.SystemVoiceEntries.resolve(entryId)
+                    // [dv27-B3] Through the single source, like every other
+                    // reader of `memberEntryIds` (ModelGroupsScreen /
+                    // ModelEntryPicker / AgentLoop*). The hand-written
+                    // `find ?: resolve` pair here was the only copy that got the
+                    // second half right, and the remove dialog below was the same
+                    // pair with it forgotten.
+                    val entry = SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
 
                     if (entry == null) {
                         // Stale member: UUID no longer resolves to any ModelEntry
@@ -357,7 +367,18 @@ fun ModelGroupDetailScreen(
                     } else {
                         // Normal member row
                         val instance = config.instances.find { it.id == entry.providerInstanceId }
-                        val instanceLabel = instance?.label
+                        // [dv27-B3] A System voice entry has no ProviderInstance —
+                        // the device is its provider. Reading `instance?.label` and
+                        // falling back to "" left every row of a default Voice group
+                        // with a blank secondary line. The decision (including why a
+                        // stale persisted entry still shows nothing, and the
+                        // localized name a System member gets instead) lives in
+                        // SystemVoiceMemberPresentation so a plain JVM test can pin it.
+                        val instanceLabel = SystemVoiceMemberPresentation.memberSubtitle(
+                            instanceLabel = instance?.label,
+                            isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+                            systemLabel = stringResource(R.string.voice_provider_system),
+                        )
                         val providerDisabled = instance?.isEnabled == false
                         var showMenu by remember { mutableStateOf(false) }
 
@@ -368,7 +389,7 @@ fun ModelGroupDetailScreen(
                                 supportingContent = {
                                     if (providerDisabled) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(instanceLabel ?: "")
+                                            Text(instanceLabel)
                                             Text(
                                                 " · Provider disabled",
                                                 color = MaterialTheme.colorScheme.error,
@@ -376,7 +397,7 @@ fun ModelGroupDetailScreen(
                                             )
                                         }
                                     } else {
-                                        Text(instanceLabel ?: "")
+                                        Text(instanceLabel)
                                     }
                                 },
                                 leadingContent = {
@@ -396,36 +417,48 @@ fun ModelGroupDetailScreen(
                                             expanded = showMenu,
                                             onDismissRequest = { showMenu = false },
                                         ) {
-                                            // [T-recovery] Cost tier used by
-                                            // cheapestFirst strategy groups.
-                                            val currentTier = entry.costTier
-                                            Text(
-                                                text = stringResource(R.string.model_group_detail_cost_tier),
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                                            )
-                                            CostTier.entries.forEach { tier ->
-                                                DropdownMenuItem(
-                                                    text = { Text(stringResource(tier.labelRes)) },
-                                                    leadingIcon = {
-                                                        if (currentTier == tier.value) {
-                                                            Icon(
-                                                                Icons.Default.Check,
-                                                                contentDescription = null,
-                                                                tint = MaterialTheme.colorScheme.primary,
-                                                            )
-                                                        }
-                                                    },
-                                                    onClick = {
-                                                        showMenu = false
-                                                        if (currentTier != tier.value) {
-                                                            providerRepository.updateEntry(entry.copy(costTier = tier.value))
-                                                        }
-                                                    },
+                                            // [dv27-B3] A cost tier is a persisted field on a
+                                            // persisted entry; a System voice entry is virtual, so
+                                            // ProviderRepository.updateEntry() resolves the id to -1
+                                            // and drops the write — the tick would simply not move.
+                                            // 「Remove from group」 stays: taking a System voice member
+                                            // out of a custom group is a real user action.
+                                            if (
+                                                SystemVoiceMemberPresentation.canEditCostTier(
+                                                    SystemVoiceEntries.isSystemEntryId(entry.id),
                                                 )
+                                            ) {
+                                                // [T-recovery] Cost tier used by
+                                                // cheapestFirst strategy groups.
+                                                val currentTier = entry.costTier
+                                                Text(
+                                                    text = stringResource(R.string.model_group_detail_cost_tier),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                                )
+                                                CostTier.entries.forEach { tier ->
+                                                    DropdownMenuItem(
+                                                        text = { Text(stringResource(tier.labelRes)) },
+                                                        leadingIcon = {
+                                                            if (currentTier == tier.value) {
+                                                                Icon(
+                                                                    Icons.Default.Check,
+                                                                    contentDescription = null,
+                                                                    tint = MaterialTheme.colorScheme.primary,
+                                                                )
+                                                            }
+                                                        },
+                                                        onClick = {
+                                                            showMenu = false
+                                                            if (currentTier != tier.value) {
+                                                                providerRepository.updateEntry(entry.copy(costTier = tier.value))
+                                                            }
+                                                        },
+                                                    )
+                                                }
+                                                HorizontalDivider()
                                             }
-                                            HorizontalDivider()
                                             DropdownMenuItem(
                                                 text = { Text(stringResource(R.string.model_group_detail_remove_from_group), color = MaterialTheme.colorScheme.error) },
                                                 onClick = {
@@ -486,8 +519,16 @@ fun ModelGroupDetailScreen(
                         // (its appended rank 8 is an artifact, not intensity).
                         val groupMaxThinkingLevel = remember(group.memberEntryIds, config.modelEntries) {
                             group.memberEntryIds
+                                // [dv27-B3] System voice members are device-served
+                                // and declare no reasoning tiers: excluded BY IDENTITY
+                                // so the ceiling keeps answering 「what can the cloud
+                                // members do」. Resolving them into the roll-up would
+                                // read a models.dev row that does not exist for a
+                                // `system` model and could move the ceiling — this
+                                // filter keeps the pre-dv27 result byte-identical.
+                                .filterNot { SystemVoiceEntries.isSystemEntryId(it) }
                                 .mapNotNull { entryId ->
-                                    config.modelEntries.find { it.id == entryId }
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                         ?.effectiveMaxThinkingLevel
                                 }
                                 .filter { it != ThinkingLevel.OFF && it != ThinkingLevel.AUTO }
@@ -563,7 +604,16 @@ fun ModelGroupDetailScreen(
                             if (on) {
                                 // Restore last user-selected value verbatim,
                                 // defaulting to 128K for first-time activation.
-                                val restored = group.lastContextLimitTokens
+                                // [da1031-D ISSUE-06] Read the LATEST persisted
+                                // group, not the composition-time snapshot: the
+                                // ON branch previously read `group.
+                                // lastContextLimitTokens`, so a write that landed
+                                // between the last recomposition and this tap
+                                // (minis-config / Debug RPC groups.update / a
+                                // quick OFF→ON before the flow recomposed) was
+                                // overwritten by the stale restore — the 1027-E
+                                // family ("stale snapshot write覆盖外部写入").
+                                val restored = currentGroup().lastContextLimitTokens
                                     ?: DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS
                                 contextLimitTokens = restored
                                 providerRepository.updateGroup(
@@ -576,13 +626,17 @@ fun ModelGroupDetailScreen(
                                 // Stash the current value into lastContextLimitTokens
                                 // before nulling contextLimitTokens, so toggle ON
                                 // can restore it (even after navigating away).
+                                // [da1031-D ISSUE-06] Same latest-persisted read
+                                // as the ON branch: the `?: group.
+                                // lastContextLimitTokens` fallback used the stale
+                                // snapshot and could resurrect a pre-write value.
                                 val stash = contextLimitTokens
                                 contextLimitTokens = null
                                 providerRepository.updateGroup(
                                     currentGroup().copy(
                                         contextLimitTokens = null,
                                         lastContextLimitTokens = stash
-                                            ?: group.lastContextLimitTokens,
+                                            ?: currentGroup().lastContextLimitTokens,
                                     )
                                 )
                             }
@@ -641,13 +695,19 @@ fun ModelGroupDetailScreen(
     // Confirm remove model from group
     if (entryToRemove != null) {
         val removingId = entryToRemove!!
-        val removingEntry = config.modelEntries.find { it.id == removingId }
+        // [dv27-B3] Same single source as the member rows above. This lookup was
+        // the two-step pair with the System half forgotten, so removing a System
+        // voice entry from a group asked 「remove this model?」 with no name —
+        // and every member of a default Voice group is one.
+        val removingEntry = SystemVoiceEntries.resolveIn(config.modelEntries, removingId)
         AlertDialog(
             onDismissRequest = { entryToRemove = null },
             title = { Text(stringResource(R.string.model_group_detail_remove_model)) },
             text = {
-                val name = removingEntry?.model?.displayName
-                    ?: stringResource(R.string.model_group_detail_remove_this_model_fallback)
+                val name = SystemVoiceMemberPresentation.removalDisplayName(
+                    entryName = removingEntry?.model?.displayName,
+                    fallback = stringResource(R.string.model_group_detail_remove_this_model_fallback),
+                )
                 Text(stringResource(R.string.model_group_detail_remove_named_model_confirm, name))
             },
             confirmButton = {

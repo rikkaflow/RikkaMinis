@@ -8,6 +8,7 @@ package com.rikkaminis.app.ui.chat
 
 import android.util.Log
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -56,7 +57,12 @@ internal fun ChatViewModel.retryLast() {
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob — same shape/rationale
+        // as sendMessage / resume. Before this, a Stop during the DB cleanup
+        // below cancelled nothing (cancelStream() reached only `streamJob`,
+        // which is still the PREVIOUS turn's job here) and the shell went on to
+        // start a stream for a turn the user had just stopped.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
             try {
             val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
@@ -72,6 +78,17 @@ internal fun ChatViewModel.retryLast() {
             // (poppedAssistant is non-null Boolean here — the null case was
             // returned above.)
             if (poppedAssistant) {
+                // [R5-C C-C-04②] The rewind deleted the transcript's tail (the
+                // popped assistant row is gone from memory AND from the DB).
+                // Same rewind rules as rerunFromToolBlock / retryFromMessage
+                // ([FIX-R4-P F-05/F-02]): a marker anchored in the deleted
+                // range must not survive — its summary describes turns the user
+                // just rewound past, and the stale reading would be re-injected
+                // into the retry request (the createdAt heal can re-anchor it
+                // onto the retry rows) — and the context-pressure reading
+                // belongs to the PRE-rewind transcript.
+                dropCompactMarkerIfRewound(sid)
+                resetContextPressureState()
                 val dbMessages = chatRepository.loadMessages(sid)
                 val trailingAssistantSortOrder = dbMessages
                     .lastOrNull { it.role == "assistant" }?.sortOrder
@@ -93,6 +110,18 @@ internal fun ChatViewModel.retryLast() {
             val systemPrompt = baseSystemPrompt
 
             // _isStreaming was already set synchronously at the top.
+            // [dv29-B01] Claim-revocation guard before the stream launch: Stop
+            // (cancelStream) revokes the claim (epoch → stale, token → fresh)
+            // while this shell was doing DB work; never start a stream for a
+            // stopped turn (same guard shape as resume()'s shell).
+            if (!isActive ||
+                !_isStreaming.value ||
+                sendEpoch != streamingClaimEpoch ||
+                claimToken !== streamingClaimToken
+            ) {
+                AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                return@launch
+            }
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast streamJob ENTER sid=$activeSessionId")

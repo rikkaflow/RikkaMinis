@@ -33,6 +33,7 @@ import androidx.navigation.navArgument
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.chat.ChatScreen
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.settings.AddAgentLoopGroupsScreen
 import com.rikkaminis.app.ui.settings.AddAgentLoopModelsScreen
 import com.rikkaminis.app.ui.settings.AgentLoopModelsScreen
@@ -48,8 +49,13 @@ import com.rikkaminis.app.ui.settings.ProviderDetailScreen
 import com.rikkaminis.app.ui.settings.ProviderListScreen
 import com.rikkaminis.app.ui.sandbox.FileBrowserScreen
 import com.rikkaminis.app.ui.sandbox.FileBrowserViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.rikkaminis.app.ui.sandbox.FileItem
 import com.rikkaminis.app.ui.sandbox.FilePreviewScreen
+import com.rikkaminis.app.ui.sandbox.MirrorCategory
+import com.rikkaminis.app.ui.sandbox.MirrorCategoryDetailScreen
 import com.rikkaminis.app.ui.sandbox.RootfsManagementScreen
 import com.rikkaminis.app.ui.settings.EnvironmentVariablesScreen
 import com.rikkaminis.app.ui.settings.AppearanceScreen
@@ -111,6 +117,23 @@ private val NavBackStackEntry.isColdStartPlaceholder: Boolean
 
 object Routes {
     /**
+     * [da1020-F] Single encode口径 for a route **path segment**.
+     *
+     * The Nav library splits a route string on `/` *before* %-decoding each
+     * segment, so any id that carries a reserved character (`/`, space, `#`,
+     * `?`, …) must be percent-encoded by the builder — otherwise the built
+     * route no longer matches the registered pattern and `navigate()` throws
+     * `IllegalArgumentException: destination … cannot be found`.
+     *
+     * Every parameterised `Routes.*` builder below routes its interpolated id
+     * through this one helper. Callers must therefore pass the **raw** id
+     * (already decoded) — pre-encoding at a call site would double-encode.
+     * Mirrors the existing [modelEntryDetail] / [filePreview] / [fileBrowser]
+     * precedent (`android.net.Uri.encode` emits `%20` for spaces, never `+`).
+     */
+    internal fun seg(v: String): String = android.net.Uri.encode(v)
+
+    /**
      * [P0-0] `focusMessageId` is an OPTIONAL query arg: any caller that just
      * wants "open this session" keeps calling [chat] with one argument and
      * gets the exact pre-P0-0 behaviour (nav supplies null via defaultValue).
@@ -149,8 +172,41 @@ object Routes {
     const val STORAGE = "storage"
     const val SESSION_STORAGE_DETAIL = "session_storage/{sessionId}"
     const val ROOTFS_MANAGEMENT = "rootfs_management"
-    const val FILE_BROWSER = "file_browser"
-    const val FILE_PREVIEW = "file_preview"
+    /** [da1021-C] Per-mirror-category detail (speed-test results + per-mirror
+     *  switch). `categoryId` carries the [com.rikkaminis.app.ui.sandbox.MirrorCategory.key]
+     *  token ("alpine"/"pip"/"npm"); encoded through [seg] like every other
+     *  path-segment builder below. */
+    const val MIRROR_CATEGORY_DETAIL = "mirror_category/{categoryId}"
+    fun mirrorCategoryDetail(categoryId: String) = "mirror_category/${seg(categoryId)}"
+    // [sweep1014-D13] File-browser configuration (rootPath/rootLabel/linuxRoot/
+    // displayPrefix) travels as query params instead of the FilePreviewHolder
+    // static singleton — process death re-creates the VM from the route args,
+    // no stale/null static state. Mirrors the CHAT_FILES precedent.
+    const val FILE_BROWSER =
+        "file_browser?rootPath={rootPath}&rootLabel={rootLabel}" +
+            "&linuxRoot={linuxRoot}&displayPrefix={displayPrefix}"
+    fun fileBrowser(
+        rootPath: String,
+        rootLabel: String,
+        linuxRoot: String? = null,
+        displayPrefix: String? = null,
+    ): String {
+        fun enc(v: String) = android.net.Uri.encode(v)
+        val params = buildList {
+            add("rootPath=${enc(rootPath)}")
+            add("rootLabel=${enc(rootLabel)}")
+            if (linuxRoot != null) add("linuxRoot=${enc(linuxRoot)}")
+            if (displayPrefix != null) add("displayPrefix=${enc(displayPrefix)}")
+        }
+        return "file_browser?${params.joinToString("&")}"
+    }
+    // [sweep1014-D13] The previewed file's absolute path rides as a query
+    // param; the dialog rebuilds FileItem from it. Uri.encode emits %20 for
+    // spaces (never '+'), and the Nav framework %-decodes query values exactly
+    // once — so paths round-trip byte-for-byte (no second decode at the
+    // receiver, contrast SKILL_FILE below).
+    const val FILE_PREVIEW = "file_preview?path={path}"
+    fun filePreview(path: String) = "file_preview?path=${android.net.Uri.encode(path)}"
     const val ENV_VARS = "env_vars"
     /** [feat/runtime-limits-panel] Runtime Limits page (agent runtime knobs). */
     const val RUNTIME_LIMITS = "runtime_limits"
@@ -158,7 +214,7 @@ object Routes {
     const val SCHEDULED_TASKS = "scheduled_tasks"
     const val SCHEDULED_TASK_EDIT = "scheduled_task_edit/{taskId}"
     fun scheduledTaskEdit(taskId: String?) =
-        if (taskId == null) "scheduled_task_edit/-" else "scheduled_task_edit/$taskId"
+        if (taskId == null) "scheduled_task_edit/-" else "scheduled_task_edit/${seg(taskId)}"
     /** [feat/chat-tuning-panel] Chat Tuning page (reading / scrolling / composer knobs). */
     const val CHAT_TUNING = "chat_tuning"
     const val SKILLS = "skills"
@@ -166,12 +222,15 @@ object Routes {
     const val SKILL_FILE = "skill_file/{skillId}/{relativePath}"
     const val MINIS_SKILLS_BROWSER = "minis_skills_browser"
 
-    fun skillDetail(skillId: String) = "skill/$skillId"
+    fun skillDetail(skillId: String) = "skill/${seg(skillId)}"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {
         // Path may contain `/`, which the nav library treats as a route
         // separator. URL-encode so subdirectory paths survive a round-trip.
+        // [da1021-C] skillId now goes through seg() like the other path
+        // segments; relativePath keeps the URLEncoder encoding (its receiver
+        // hand-decodes — see the SKILL_FILE composable).
         val encoded = java.net.URLEncoder.encode(relativePath, "UTF-8").replace("+", "%20")
-        return "skill_file/$skillId/$encoded"
+        return "skill_file/${seg(skillId)}/$encoded"
     }
     const val TERMINAL = "terminal?initCommand={initCommand}&sessionId={sessionId}"
     fun terminal(initCommand: String? = null, sessionId: String? = null): String {
@@ -187,7 +246,7 @@ object Routes {
     }
     /** Chat-files browser: opens FileBrowser rooted at /var/minis for the session. */
     const val CHAT_FILES = "chat_files/{sessionId}"
-    fun chatFiles(sessionId: String) = "chat_files/$sessionId"
+    fun chatFiles(sessionId: String) = "chat_files/${seg(sessionId)}"
     const val MEMORY = "memory"
     /** [T-mcp-integration-android] MCP Integrations management screen. */
     const val MCP = "mcp"
@@ -213,15 +272,15 @@ object Routes {
     /** T219-2: Mount external folders settings + detail. */
     const val MOUNTED_FOLDERS = "mounted_folders"
     const val MOUNTED_FOLDERS_DETAIL = "mounted_folders_detail/{mountId}"
-    fun mountedFoldersDetail(mountId: String) = "mounted_folders_detail/$mountId"
+    fun mountedFoldersDetail(mountId: String) = "mounted_folders_detail/${seg(mountId)}"
     /** T235: Shared folders (Shared / Skills / Memory) — fixed list. */
     const val SHARED_FOLDERS = "shared_folders"
     const val BACKUP = "backup"
     const val SHARED_FOLDERS_DETAIL = "shared_folders_detail/{folderId}"
-    fun sharedFoldersDetail(folderId: String) = "shared_folders_detail/$folderId"
-    fun logDetail(fileName: String) = "log_detail/$fileName"
-    fun sessionStorageDetail(sessionId: String) = "session_storage/$sessionId"
-    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/$fileName/$isGlobal"
+    fun sharedFoldersDetail(folderId: String) = "shared_folders_detail/${seg(folderId)}"
+    fun logDetail(fileName: String) = "log_detail/${seg(fileName)}"
+    fun sessionStorageDetail(sessionId: String) = "session_storage/${seg(sessionId)}"
+    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/${seg(fileName)}/$isGlobal"
     /**
      * [P0-0] `focusMessageId` defaults to null so every existing single-arg
      * caller is unchanged. Encoded the same way as [terminal]: URLEncoder
@@ -230,15 +289,24 @@ object Routes {
      * protects against ids that ever carry reserved characters.
      */
     fun chat(sessionId: String, focusMessageId: String? = null): String {
-        val base = "chat/$sessionId"
+        // [da1021-C] sessionId is a path segment — encode through seg() like
+        // the other builders (UUIDs today, but a reserved character in a
+        // future id would otherwise hand nav a malformed route).
+        val base = "chat/${seg(sessionId)}"
         if (focusMessageId.isNullOrBlank()) return base
         val enc = java.net.URLEncoder.encode(focusMessageId, "UTF-8").replace("+", "%20")
         return "$base?focusMessageId=$enc"
     }
-    fun providerDetail(instanceId: String) = "provider/$instanceId"
-    fun providerConnection(instanceId: String) = "provider_connection/$instanceId"
-    fun modelGroupDetail(groupId: String) = "model_group/$groupId"
-    fun addModelsToGroup(groupId: String) = "add_models_to_group/$groupId"
+    // [da1020-F] Path-segment builders encode through [seg] — a deep link
+    // (`minis://settings/providers/<id>`, emitted by an LLM-generated markdown
+    // link or any external app, both of which can carry a space or a `/`) used
+    // to hand `nav.navigate` a malformed route → uncaught
+    // IllegalArgumentException. The receiver side (NavBackStackEntry arguments)
+    // %-decodes exactly once, so ids round-trip byte-for-byte.
+    fun providerDetail(instanceId: String) = "provider/${seg(instanceId)}"
+    fun providerConnection(instanceId: String) = "provider_connection/${seg(instanceId)}"
+    fun modelGroupDetail(groupId: String) = "model_group/${seg(groupId)}"
+    fun addModelsToGroup(groupId: String) = "add_models_to_group/${seg(groupId)}"
     // [T-android-model-entry-route-slash-crash] entryId is a composite key
     // "<instanceId>/<modelId>" (compositeEntryKey) — it CONTAINS a '/'. Left
     // raw, that slash splits the route into an extra path segment, so the
@@ -246,17 +314,18 @@ object Routes {
     // (model_entry/{instanceId}/{entryId}) and navigate() throws
     // IllegalArgumentException "destination … cannot be found" — a guaranteed
     // crash on tapping any model whose id carries a '/'. URL-encode it so the
-    // slash becomes %2F (one segment); the receiver decodes it back.
+    // slash becomes %2F (one segment); the nav framework %-decodes the segment
+    // exactly once on the way in (no decode at the receiver — [da1024-E]).
     fun modelEntryDetail(instanceId: String, entryId: String) =
-        "model_entry/${android.net.Uri.encode(instanceId)}/${android.net.Uri.encode(entryId)}"
-    fun addCustomModel(instanceId: String) = "add_custom_model/$instanceId"
+        "model_entry/${seg(instanceId)}/${seg(entryId)}"
+    fun addCustomModel(instanceId: String) = "add_custom_model/${seg(instanceId)}"
 }
 
-/** Holder for file preview navigation state (not serializable via nav args). */
-internal object FilePreviewHolder {
-    var currentItem: FileItem? = null
-    var fileBrowserViewModel: FileBrowserViewModel? = null
-}
+// [sweep1014-D13] Former FilePreviewHolder static singleton (currentItem /
+// fileBrowserViewModel) is gone: process death left it null → blank preview /
+// dead dialog, and it pinned the VM for the process lifetime. The previewed
+// file now travels as a route query param (Routes.filePreview) and the
+// browser VM is created via viewModel() bound to the NavBackStackEntry.
 
 @Composable
 fun AppNavigation(
@@ -303,7 +372,30 @@ fun AppNavigation(
         navController.awaitResumed()
         when (initialDeepLink) {
             is DeepLinkAction.OpenTerminal -> {
-                navController.safeNavigate(Routes.terminal(initialDeepLink.initCommand))
+                // [da1032-D] Symmetric with MainActivity.handleDeepLink and with
+                // onOpenTerminal further down: a terminal opened while a chat is
+                // on screen belongs to THAT session (minis-sessions/<sid>/ bind
+                // mounts + MINIS_CHAT_SESSION_ID), not to the global workspace.
+                // This cold-start dispatcher owns no chat destination, so there
+                // is no route arg to read: the source is the store's documented
+                // "chat currently on screen" seam, whose getter already resolves
+                // a draft key through the alias table. With no chat composed yet
+                // it is null — i.e. exactly the previous behaviour.
+                // [R4-V F-10] launchSingleTop: after a process-death restore a
+                // TERMINAL entry may already be on the back stack, and pushing a
+                // second one left TWO TerminalScreens alive. The old page's
+                // `onDispose` then flipped MinisOpenUrlBroker.terminalVisible to
+                // false while the new page was on screen (its tap-to-URL
+                // behaviour silently disabled), and the second destination
+                // started its own PTY from the same route args.
+                navController.safeNavigate(
+                    Routes.terminal(
+                        initialDeepLink.initCommand,
+                        sessionId = ChatViewModelStore.activeSessionId,
+                    ),
+                ) {
+                    launchSingleTop = true
+                }
             }
             is DeepLinkAction.OpenSession -> {
                 // T-double-chat-fix: on process-death recreation NavController
@@ -336,7 +428,21 @@ fun AppNavigation(
             // parser already resolved the path → route mapping so we
             // just navigate.
             is DeepLinkAction.OpenSettingsScreen -> {
-                navController.safeNavigate(initialDeepLink.route)
+                // [da1021-C] The route builders now percent-encode their ids
+                // (root-cause fix), so a malformed route should be impossible
+                // — this runCatching is the "never crash on a deep link"
+                // backstop for future routes that forget to encode, mirroring
+                // MainActivity's hot-start handler. Bare navigate() (not
+                // safeNavigate) is deliberate: this branch runs AFTER
+                // awaitResumed() above, so the back-then-tap race
+                // safeNavigate defangs cannot happen here — da1020-F moved
+                // the dispatch behind that wait for exactly this reason.
+                // Wrapping in runCatching does not reintroduce the race; it
+                // only stops a malformed route from crashing cold start.
+                runCatching { navController.navigate(initialDeepLink.route) }
+                    .onFailure {
+                        runCatching { navController.navigate(Routes.SETTINGS) }
+                    }
             }
             is DeepLinkAction.OpenPermissionSettings -> {
                 navController.safeNavigate(Routes.PERMISSIONS)
@@ -355,7 +461,36 @@ fun AppNavigation(
                 // when the launch intent carries one of these actions.
                 // Nothing to do here — see startDestination block below.
             }
-            else -> {}
+            // [da1029-A] Cold-start parity with MainActivity's warm-start
+            // handler (handleDeepLink → OpenAlarmList branch): minis://views/alarm
+            // opens the system Clock app directly. The in-app AlarmListScreen
+            // was a one-button passthrough doing the exact same thing (T297),
+            // so the android-alarm tool envelope keeps emitting this view_url
+            // for existing chat cards.
+            is DeepLinkAction.OpenAlarmList -> {
+                val showAlarms =
+                    android.content.Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                try {
+                    context.startActivity(showAlarms)
+                } catch (_: android.content.ActivityNotFoundException) {
+                    com.rikkaminis.app.logging.AppLogger.warning(
+                        "DeepLink",
+                        "OpenAlarmList: no Clock app handles SHOW_ALARMS",
+                    )
+                }
+            }
+            // [da1029-A] Terminal cases written *by name* instead of a catch-all
+            // `else -> {}`. The old `else` let a new DeepLinkAction subclass fall
+            // silently into the cold-start no-op path — which is exactly how
+            // OpenAlarmList went missing. Naming every remaining subclass makes
+            // the `when` exhaustive: adding one is now a compile error here until
+            // it gets a handler. `initialDeepLink` is `DeepLinkAction?`, so the
+            // null case is named too — without it the compiler rejects the
+            // `when` outright ("must be exhaustive").
+            is DeepLinkAction.OpenShare,
+            is DeepLinkAction.Unknown,
+            null -> {}
         }
     }
 
@@ -467,42 +602,40 @@ fun AppNavigation(
     // idempotent (one-shot consumeBuffer), so no double-inject.
 
     // Pinned-shortcut cold start: when launched via
-     // `minis://session/<id>/<resource-path>`, set the pending HTML
-     // preview synchronously and start NavHost directly at the matching
-     // chat so ChatScreen's LaunchedEffect consumes the pending state on
-     // first composition — no sessions-list flash, no launch-session
-     // preference detour.
-    val htmlShortcut = initialDeepLink as? DeepLinkAction.OpenHtmlPreview
-    // App-icon quick action cold start: mount NavHost directly at a fresh
-    // draft chat, seeding the pending action so ChatScreen consumes it on
-    // its first LaunchedEffect tick. Mirrors the htmlShortcut path —
-    // avoids a sessions-list flash and a duplicate back-stack entry.
-    val quickActionStart: String? = when (initialDeepLink) {
-        is DeepLinkAction.NewCameraChat -> {
-            DeepLinkCoordinator.setPendingChatAction(
-                DeepLinkCoordinator.ChatAction.OPEN_CAMERA,
-            )
-            Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
-        }
-        is DeepLinkAction.NewChat -> Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
-        else -> null
-    }
-    val startDestination = when {
-        htmlShortcut != null -> {
-            // Seed coordinator before NavHost composition so ChatScreen sees
-            // the pending state on its very first LaunchedEffect tick.
-            DeepLinkCoordinator.setPendingHtmlPreview(
-                htmlShortcut.sessionId,
-                htmlShortcut.resourcePath,
-                htmlShortcut.title,
-            )
-            Routes.chat(htmlShortcut.sessionId)
-        }
-        quickActionStart != null -> quickActionStart
-        // [remove-session-list] No stock session list: the conversation
-        // drawer is the only session switcher, so cold-start heads straight
-        // into a fresh draft chat (mirrors the New Chat launch mode).
-        else -> Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
+    // `minis://session/<id>/<resource-path>` or an app-icon quick action,
+    // seed the pending state synchronously and start NavHost directly at the
+    // matching chat so ChatScreen's LaunchedEffect consumes it on first
+    // composition — no sessions-list flash, no launch-session preference
+    // detour.
+    //
+    // [deep-audit-1038 B-02] The cold-start seeding + draft-id minting runs
+    // ONCE per cold start, inside `remember(initialDeepLink)`: this
+    // composable recomposes on theme / font-size / system dark-mode changes
+    // (it reads MaterialTheme.colorScheme.background for the NavHost
+    // transition surface), and the previous bare `val … = when (…)` bindings
+    // re-ran on every pass — replaying the camera / HTML-preview pending
+    // action into a live ChatScreen (reactively consumed since da1028-C)
+    // and re-minting the draft id once the slot was free, which drifted
+    // `startDestination` (NavGraph rebuild) and let saveText's slot guard
+    // drop the draft text the user was typing. `initialDeepLink` is an
+    // immutable MainActivity.onCreate parameter, so the remember key never
+    // changes within one composition lifetime. The decision itself lives in
+    // the Android-free [coldStartStartDestination] seam so plain JVM tests
+    // can count the seed calls.
+    val startDestination = remember(initialDeepLink) {
+        coldStartStartDestination(
+            initialDeepLink = initialDeepLink,
+            nextDraftId = { com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context) },
+            chatRoute = { Routes.chat(it) },
+            seedCamera = {
+                DeepLinkCoordinator.setPendingChatAction(
+                    DeepLinkCoordinator.ChatAction.OPEN_CAMERA,
+                )
+            },
+            seedHtmlPreview = { sessionId, resourcePath, title ->
+                DeepLinkCoordinator.setPendingHtmlPreview(sessionId, resourcePath, title)
+            },
+        )
     }
     NavHost(
         navController = navController,
@@ -619,13 +752,32 @@ fun AppNavigation(
                         launchSingleTop = true
                     }
                 },
+                // [da1023-F] Resolve the nav-arg id through the draft alias
+                // table before navigating: the route arg stays on the draft
+                // key after first-send promotion, so a bare pass-through opens
+                // the terminal/files browser under the orphan __new__ session.
                 onOpenTerminal = {
-                    navController.safeNavigate(Routes.terminal(sessionId = sessionId))
+                    // [R4-V F-10] Single top: a second TERMINAL entry would give
+                    // the stack two live TerminalScreens (see the cold-start
+                    // dispatcher above for what that does to terminalVisible).
+                    navController.safeNavigate(
+                        Routes.terminal(sessionId = ChatViewModelStore.resolveSessionId(sessionId)),
+                    ) {
+                        launchSingleTop = true
+                    }
                 },
                 onOpenTerminalWithCommand = { command ->
                     navController.safeNavigate(
-                        Routes.terminal(initCommand = command, sessionId = sessionId),
-                    )
+                        Routes.terminal(
+                            initCommand = command,
+                            sessionId = ChatViewModelStore.resolveSessionId(sessionId),
+                        ),
+                    ) {
+                        // [R4-V F-10] Single top: the terminal for this session is
+                        // already on screen — a duplicate destination started a
+                        // second PTY and re-sent `command` into it.
+                        launchSingleTop = true
+                    }
                 },
                 onMoveToSession = { targetId ->
                     navController.safeNavigate(Routes.chat(targetId)) {
@@ -633,11 +785,19 @@ fun AppNavigation(
                     }
                 },
                 onBrowseChatFiles = {
-                    navController.safeNavigate(Routes.chatFiles(sessionId))
+                    navController.safeNavigate(
+                        Routes.chatFiles(ChatViewModelStore.resolveSessionId(sessionId)),
+                    )
                 },
                 onPreviewAttachment = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    // [R5-F F-F-02] Pass the entry's HOST-READABLE path, not the
+                    // link's own host path: the route param is what the preview
+                    // dialog re-opens from disk, and for a container-absolute
+                    // link (`ln -s /var/minis/… dirLink`) the link's host path
+                    // points at a target the Android host does not have — the
+                    // preview came up empty. `hostPath == file` for every plain
+                    // entry, so this is a no-op for the normal case.
+                    navController.safeNavigate(Routes.filePreview(item.hostPath.absolutePath))
                 },
                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
                 // Chat-history drawer: open another conversation (same funnel
@@ -717,16 +877,16 @@ fun AppNavigation(
                         "memory" -> ctx.getString(com.rikkaminis.app.R.string.shared_folder_name_memory)
                         else -> folderId
                     }
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = hostPath,
-                        rootLabel = label,
-                        // Route reads through PRoot bind mounts so the host
-                        // dirs that back /var/minis/{shared,skills,memory}
-                        // resolve, matching how chat-files browse works.
-                        linuxRootPath = "/var/minis/$folderId",
-                        appContext = ctx.applicationContext,
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = hostPath.absolutePath,
+                            rootLabel = label,
+                            // Route reads through PRoot bind mounts so the host
+                            // dirs that back /var/minis/{shared,skills,memory}
+                            // resolve, matching how chat-files browse works.
+                            linuxRoot = "/var/minis/$folderId",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
                 },
             )
         }
@@ -755,11 +915,26 @@ fun AppNavigation(
                     val entry = mountedFoldersStore.entries.value.firstOrNull { it.id == mountId }
                     val hostPath = entry?.resolvedHostPath
                     if (hostPath != null) {
-                        FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                            rootPath = java.io.File(hostPath),
-                            rootLabel = entry.name,
+                        navController.safeNavigate(
+                            Routes.fileBrowser(
+                                rootPath = hostPath,
+                                rootLabel = entry.name,
+                                // [da1031-C] ISSUE-04 A2: this entry is the only
+                                // fileBrowser route that passed no linux prefix,
+                                // so listings bypassed the PRoot resolver and the
+                                // "Copy Absolute Path" + read-only-mount guard
+                                // both worked on a host path (or nothing). Pass
+                                // /var/minis/mounts/<name> for both roles — the
+                                // literal mirrors PRootKernel's private
+                                // MOUNTS_LINUX_PREFIX, kept private on purpose
+                                // (single owner: PRootKernel). An unbound prefix
+                                // resolves to null at list time and the VM falls
+                                // back to rootPath, so this cannot regress the
+                                // listing.
+                                linuxRoot = "/var/minis/mounts/${entry.name}",
+                                displayPrefix = "/var/minis/mounts/${entry.name}",
+                            ),
                         )
-                        navController.safeNavigate(Routes.FILE_BROWSER)
                     } else {
                         // resolvedHostPath null = SAF tree from a non-externalstorage
                         // provider (cloud / Drive). Picker normally rejects these at
@@ -911,14 +1086,22 @@ fun AppNavigation(
                 navArgument("entryId") { type = NavType.StringType },
             ),
         ) { backStackEntry ->
-            // [T-android-model-entry-route-slash-crash] Decode back the
-            // %2F-encoded composite ids so ModelEntryDetailScreen can match
-            // entry.id == "<instanceId>/<modelId>" (which carries a literal '/')
-            // against the repo. Mirrors the encode in Routes.modelEntryDetail.
+            // [T-android-model-entry-route-slash-crash] No second decode: the
+            // Nav framework already %-decodes each route path segment exactly
+            // once (NavDeepLink.getMatchingPathArguments -> Uri.decode), so the
+            // %2F-encoded composite key arrives as "<instanceId>/<modelId>"
+            // intact and matches entry.id in the repo — same contract as
+            // MIRROR_CATEGORY_DETAIL / SKILL_FILE_VIEWER below.
+            // [da1024-E] The previous extra Uri.decode corrupted any id that
+            // carries a literal '%': "100%25" was rewritten to "100%" and a
+            // bare '%' ("a%b") became U+FFFD (Uri.decode substitutes the
+            // replacement char, it does not throw on Android 13+), so the
+            // lookup missed and the screen popped straight back — tapping the
+            // model looked like a no-op.
             val instanceId = backStackEntry.arguments?.getString("instanceId")
-                ?.let { android.net.Uri.decode(it) } ?: return@composable
+                ?: return@composable
             val entryId = backStackEntry.arguments?.getString("entryId")
-                ?.let { android.net.Uri.decode(it) } ?: return@composable
+                ?: return@composable
             ModelEntryDetailScreen(
                 instanceId = instanceId,
                 entryId = entryId,
@@ -960,22 +1143,25 @@ fun AppNavigation(
                 chatDao = chatRepository.dao,
                 onBack = { navController.safePopBackStack() },
                 onBrowseFiles = { rootPath ->
-                    // [T-android-copy-abs-path-fullpath] This browser is rooted at
-                    // the per-session host dir (filesDir/minis-sessions/<sid>),
-                    // whose immediate children (workspace/ attachments/ offloads/
-                    // browser/) are exactly the PRoot /var/minis/* subdirs. The
-                    // host listing already resolves correctly so we keep rootPath
-                    // host-based (no linuxRootPath re-routing — that would redirect
-                    // /var/minis to the global/empty placeholder dir). We only pass
-                    // displayLinuxPrefix = "/var/minis" so "Copy Absolute Path"
-                    // emits the agent-visible /var/minis/workspace/foo.py instead of
-                    // the opaque /data/user/0/.../minis-sessions/<sid>/... host path.
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = java.io.File(rootPath),
-                        rootLabel = "Session Files",
-                        displayLinuxPrefix = "/var/minis",
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = rootPath,
+                            rootLabel = "Session Files",
+                            // [T-android-copy-abs-path-fullpath] This browser is
+                            // rooted at the per-session host dir
+                            // (filesDir/minis-sessions/<sid>), whose immediate
+                            // children (workspace/ attachments/ offloads/ browser/)
+                            // are exactly the PRoot /var/minis/* subdirs. The host
+                            // listing already resolves correctly so we keep the
+                            // root host-based (no linuxRoot re-routing — that would
+                            // redirect /var/minis to the global/empty placeholder
+                            // dir). We only pass displayPrefix = "/var/minis" so
+                            // "Copy Absolute Path" emits the agent-visible
+                            // /var/minis/workspace/foo.py instead of the opaque
+                            // /data/user/0/.../minis-sessions/<sid>/... host path.
+                            displayPrefix = "/var/minis",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
                 },
             )
         }
@@ -986,23 +1172,91 @@ fun AppNavigation(
                 onBack = { navController.safePopBackStack() },
                 onBrowseFiles = {
                     val rootfs = RootfsManager.getInstance(context.applicationContext)
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = rootfs.rootfsDir,
-                        rootLabel = "/",
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = rootfs.rootfsDir.absolutePath,
+                            rootLabel = "/",
+                            // [deep-audit-1036 B-06] This was the only
+                            // fileBrowser route that passed no linux root, so
+                            // every listing walked the rootfs tarball directly.
+                            // The bind mounts live under /var/minis/* inside
+                            // the guest: without re-routing, those entries
+                            // show Alpine's empty placeholder dirs instead of
+                            // the real backing content. Same shape as CHAT_FILES
+                            // ([da1031-C] T121), which roots at the same
+                            // rootfsDir with linuxRootPath = "/" — an unbound
+                            // prefix resolves to null and the VM falls back
+                            // to rootPath, so the root listing is unchanged.
+                            linuxRoot = "/",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
+                },
+                // [da1021-C] MirrorCategoryDetailScreen existed with zero call
+                // sites — the per-category row tap did nothing. Wire it up:
+                // the category key ("alpine"/"pip"/"npm") is the route token,
+                // encoded by Routes.mirrorCategoryDetail.
+                onMirrorCategoryClick = { cat ->
+                    navController.safeNavigate(Routes.mirrorCategoryDetail(cat.key))
                 },
             )
         }
 
-        composable(Routes.FILE_BROWSER) {
-            val vm = FilePreviewHolder.fileBrowserViewModel ?: return@composable
+        // [da1021-C] Mirror category detail. Nav percent-decodes path args
+        // exactly once, so getString returns the raw key; an unknown key is
+        // fail-closed — back out instead of rendering a null-category screen
+        // (a hand-typed deep link must never crash).
+        composable(
+            Routes.MIRROR_CATEGORY_DETAIL,
+            arguments = listOf(navArgument("categoryId") { type = NavType.StringType }),
+        ) { backStackEntry ->
+            val category = backStackEntry.arguments
+                ?.getString("categoryId")
+                ?.let { MirrorCategory.fromKey(it) }
+            if (category == null) {
+                LaunchedEffect(Unit) { navController.safePopBackStack() }
+            } else {
+                MirrorCategoryDetailScreen(
+                    category = category,
+                    onBack = { navController.safePopBackStack() },
+                )
+            }
+        }
+
+        // [sweep1014-D13] VM is created via viewModel() bound to this
+        // NavBackStackEntry — its configuration (rootPath/rootLabel/linuxRoot/
+        // displayPrefix) rides as route query params, so process death
+        // re-creates it from the route instead of reading a stale static
+        // singleton. The old FilePreviewHolder assignment kept the VM strongly
+        // referenced for the whole process lifetime and left the screen blank
+        // after the holder was nulled.
+        composable(Routes.FILE_BROWSER) { backStackEntry ->
+            val args = backStackEntry.arguments
+            val rootPath = args?.getString("rootPath") ?: return@composable
+            val rootLabel = args?.getString("rootLabel") ?: ""
+            val linuxRoot = args?.getString("linuxRoot")
+            val displayPrefix = args?.getString("displayPrefix")
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val vm: FileBrowserViewModel = viewModel(
+                factory = viewModelFactory {
+                    initializer {
+                        FileBrowserViewModel(
+                            rootPath = java.io.File(rootPath),
+                            rootLabel = rootLabel,
+                            linuxRootPath = linuxRoot,
+                            displayLinuxPrefix = displayPrefix,
+                            appContext = context.applicationContext,
+                        )
+                    }
+                },
+            )
             FileBrowserScreen(
                 viewModel = vm,
                 onBack = { navController.safePopBackStack() },
                 onPreviewFile = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    // [R5-F F-F-02] hostPath, not file: a container-absolute
+                    // symlink's own path is unreadable on the host — see
+                    // onPreviewAttachment.
+                    navController.safeNavigate(Routes.filePreview(item.hostPath.absolutePath))
                 },
             )
         }
@@ -1020,35 +1274,44 @@ fun AppNavigation(
             val rootfs = RootfsManager.getInstance(context.applicationContext)
             val varMinis = java.io.File(rootfs.rootfsDir, "var/minis")
             val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
-            val vm = remember(rootfs.rootfsDir.absolutePath, varMinis.absolutePath, sessionId) {
-                FileBrowserViewModel(
-                    rootPath = rootfs.rootfsDir,
-                    initialPath = varMinis.takeIf { it.exists() },
-                    rootLabel = "/",
-                    // T121: route directory listings through PRootKernel bind
-                    // mounts so /var/minis/{skills,memory,shared} resolve to
-                    // their backing host dirs (filesDir/minis-global/<subdir>).
-                    // Without this the browser walks the rootfs tarball
-                    // directly and shows the empty placeholder dirs that ship
-                    // inside Alpine's var/minis/ — every subdir reads as
-                    // "Empty folder" even though the agent has files there.
-                    linuxRootPath = "/",
-                    // T147: scope per-session subdirs (attachments / workspace
-                    // / offloads / browser) to THIS chat's host dir even when
-                    // another session was the last to boot a PRoot — that
-                    // global bindMounts state is last-writer-wins and would
-                    // otherwise hide the agent's generated files for the
-                    // session the user is looking at.
-                    sessionId = sessionId,
-                    appContext = context.applicationContext,
-                )
-            }
+            // [sweep1014-D13] viewModel() bound to this NavBackStackEntry
+            // (was remember{} — a config change rebuilt the VM and lost the
+            // browsing state).
+            val vm: FileBrowserViewModel = viewModel(
+                factory = viewModelFactory {
+                    initializer {
+                        FileBrowserViewModel(
+                            rootPath = rootfs.rootfsDir,
+                            initialPath = varMinis.takeIf { it.exists() },
+                            rootLabel = "/",
+                            // T121: route directory listings through PRootKernel bind
+                            // mounts so /var/minis/{skills,memory,shared} resolve to
+                            // their backing host dirs (filesDir/minis-global/<subdir>).
+                            // Without this the browser walks the rootfs tarball
+                            // directly and shows the empty placeholder dirs that ship
+                            // inside Alpine's var/minis/ — every subdir reads as
+                            // "Empty folder" even though the agent has files there.
+                            linuxRootPath = "/",
+                            // T147: scope per-session subdirs (attachments / workspace
+                            // / offloads / browser) to THIS chat's host dir even when
+                            // another session was the last to boot a PRoot — that
+                            // global bindMounts state is last-writer-wins and would
+                            // otherwise hide the agent's generated files for the
+                            // session the user is looking at.
+                            sessionId = sessionId,
+                            appContext = context.applicationContext,
+                        )
+                    }
+                },
+            )
             FileBrowserScreen(
                 viewModel = vm,
                 onBack = { navController.safePopBackStack() },
                 onPreviewFile = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    // [R5-F F-F-02] hostPath, not file: a container-absolute
+                    // symlink's own path is unreadable on the host — see
+                    // onPreviewAttachment.
+                    navController.safeNavigate(Routes.filePreview(item.hostPath.absolutePath))
                 },
             )
         }
@@ -1074,7 +1337,18 @@ fun AppNavigation(
                 decorFitsSystemWindows = false,
             ),
         ) {
-            val item = FilePreviewHolder.currentItem ?: return@dialog
+            // [sweep1014-D13] Rebuild the FileItem from the route's query param
+            // (Routes.filePreview) instead of the old FilePreviewHolder static —
+            // process death previously left the holder null → dead dialog.
+            val path = it.arguments?.getString("path") ?: return@dialog
+            val file = java.io.File(path)
+            val item = FileItem.from(file) ?: FileItem(
+                file = file,
+                name = file.name,
+                isDirectory = false,
+                isSymlink = false,
+                size = 0L,
+            )
             FilePreviewScreen(
                 item = item,
                 onBack = { navController.safePopBackStack() },
@@ -1161,8 +1435,12 @@ fun AppNavigation(
             ),
         ) { backStackEntry ->
             val skillId = backStackEntry.arguments?.getString("skillId") ?: return@composable
-            val rawPath = backStackEntry.arguments?.getString("relativePath") ?: "SKILL.md"
-            val relativePath = java.net.URLDecoder.decode(rawPath, "UTF-8")
+            // [sweep1014-B31] No second decode: the Nav framework already
+            // %-decodes the route's path segment once, so the value arrives
+            // intact. The previous URLDecoder.decode(rawPath) turned a '+'
+            // in a skill filename into a space and threw on a bare '%'
+            // (IllegalArgumentException → crash on open).
+            val relativePath = backStackEntry.arguments?.getString("relativePath") ?: "SKILL.md"
             if (skillRepository != null) {
                 SkillFileViewerScreen(
                     skillId = skillId,
@@ -1198,9 +1476,19 @@ fun AppNavigation(
             ),
         ) { backStackEntry ->
             val context = androidx.compose.ui.platform.LocalContext.current
+            // [R5-F F-C-10] `launchSingleTop` keeps this destination on top and
+            // REPLACES its NavBackStackEntry with a copy carrying the new route
+            // arguments (NavController.launchSingleTopInternal →
+            // NavBackStackEntry(entry, args)), so this lambda re-runs with the
+            // new args while the composition (and every `remember {}`) below is
+            // reused. Keying the session on `sessionId` is what makes that safe:
+            // the id is baked into the PTY at start (proot args + env), so a
+            // different session must be a different TerminalSession object —
+            // TerminalScreen's lifecycle effects are keyed on the object, which
+            // stops the old PTY and boots the new one exactly once.
             val initCommand = backStackEntry.arguments?.getString("initCommand")
             val sessionId = backStackEntry.arguments?.getString("sessionId")
-            val session = remember { TerminalSession(context.applicationContext) }
+            val session = remember(sessionId) { TerminalSession(context.applicationContext) }
             TerminalScreen(
                 terminalSession = session,
                 onBack = { navController.safePopBackStack() },
@@ -1283,9 +1571,14 @@ fun AppNavigation(
         }
 
         composable(Routes.USAGE_STATS) {
+            // Reactive read: `providerRepository.config.value` is a one-shot
+            // snapshot at composition time, so a config update (custom model
+            // entry added/renamed/removed) never reached UsageStatsScreen and
+            // its stats kept bucketing under the raw modelId / "Unknown".
+            val providerConfig by providerRepository.config.collectAsState()
             UsageStatsScreen(
                 chatDao = chatRepository.dao,
-                providerConfig = providerRepository.config.value,
+                providerConfig = providerConfig,
                 onBack = { navController.safePopBackStack() },
             )
         }

@@ -14,23 +14,23 @@ import okhttp3.Request
 import org.json.JSONObject
 
 object GeminiModelsApi {
-    private const val DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta"
     private const val TAG = "GeminiModelsApi"
 
     /**
      * [fix/audit-b22 / T5-L6] Mirror GeminiProvider's base handling: the base
      * carries the API version (`.../v1beta`), but users often paste either
      * form into the provider settings, so tolerate both.
+     *
+     * [deep-audit-1024 ISSUE-02] Delegates to [GeminiBasePath.normalize] instead of
+     * keeping a copy of the rule. The copy stripped each suffix **once**, so the
+     * `.../v1beta/v1` shape that `appendV1Suffix` (default `true`) produces on a
+     * `.../v1beta` base collapsed to `.../v1beta/v1beta` → the model list 404'd for
+     * exactly the custom/relay bases this helper exists to tolerate, while chat (which
+     * already delegated) worked. Blank input still falls back to the same public
+     * `.../v1beta` endpoint, now taken from [GeminiBasePath.DEFAULT_BASE] — the two
+     * literals were identical, so the default is unchanged.
      */
-    private fun normalizeBase(baseUrl: String?): String {
-        val raw = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE
-        // effectiveBaseURL appends "/v1" when the instance has
-        // appendV1Suffix=true (the OpenAI-shaped default). Gemini's version
-        // segment is "/v1beta", so collapse either suffix before adding ours —
-        // otherwise a relay base became ".../v1/v1beta/models".
-        val stripped = raw.removeSuffix("/v1beta").removeSuffix("/v1")
-        return "$stripped/v1beta"
-    }
+    private fun normalizeBase(baseUrl: String?): String = GeminiBasePath.normalize(baseUrl)
 
     private val client = OkHttpClient()
     private val cache = ProviderModelsCache("gemini")
@@ -57,6 +57,9 @@ object GeminiModelsApi {
         // [fix/audit-b22 / T5-L6] The Anthropic and OpenAI adapters pass
         // instance.effectiveBaseURL here; Gemini hardcoded the public endpoint,
         // so a relay/proxy base URL silently listed the wrong catalog.
+        // [fix/audit-b22 / T5-L6] Mirror GeminiProvider's base handling: the base
+        // carries the API version (`.../v1beta`), but users often paste either
+        // form into the provider settings, so tolerate both.
         baseUrl: String? = null,
         cloudCodeFallback: Boolean = false,
         context: Context? = null,
@@ -67,10 +70,22 @@ object GeminiModelsApi {
         // means the key was rejected, and answering it with the static catalog
         // hides that from the user.
         oauthCredential: Boolean = false,
+        // [T-provider-custom-user-agent] models-list UA override (da1020
+        // ISSUE-05: Gemini/OpenRouter were the only fetchers not accepting it).
+        customUserAgent: String? = null,
     ): List<LLMModel> = withContext(Dispatchers.IO) {
         if (cloudCodeFallback) return@withContext LLMModel.allGemini
 
         val base = normalizeBase(baseUrl)
+        // [r3-b08 F-02] A third-party relay is NOT Google: when its model list
+        // cannot be read there is no "builtin catalog" to answer with, and
+        // returning `LLMModel.allGemini` made a 404/502/parse failure look like a
+        // successful refresh whose result happened to be five Google models —
+        // ProviderRepository then replaced the relay's rows (and pruned group
+        // memberships) instead of preserving them. Same verdict the OpenAI
+        // fetcher reaches with `isCustomBase`.
+        val fallback: List<LLMModel> =
+            if (isOfficialGeminiBase(baseUrl)) LLMModel.allGemini else emptyList()
         val cacheKey = "key|$base|" + apiKey
         if (context != null && !forceRefresh) {
             cache.load(context, cacheKey)?.let { return@withContext it }
@@ -79,8 +94,9 @@ object GeminiModelsApi {
         val builder = Request.Builder()
         builder.url("$base/models?key=$apiKey")
 
-        // [T-android-default-ua] brand outbound /v1beta/models request.
-        builder.applyUserAgentOverride(null)
+        // [T-provider-custom-user-agent] models-list UA override; falls back to
+        // the branded default when the instance has no custom UA.
+        builder.applyUserAgentOverride(customUserAgent)
         // [audit-0917] execute() moved INSIDE the try. It was outside, so an
         // IOException (offline, DNS failure, TLS reset — the common case for a
         // model-list refresh) propagated out of fetchModels instead of
@@ -93,11 +109,11 @@ object GeminiModelsApi {
             // and hand back the builtin list.
             throw e
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "models fetch failed, using builtin list: ${e.message}")
-            return@withContext LLMModel.allGemini
+            android.util.Log.w(TAG, "models fetch failed (fallback=${fallback.size} rows): ${e.message}")
+            return@withContext fallback
         }
         try {
-            val body = response.body?.string() ?: return@withContext LLMModel.allGemini
+            val body = response.body?.string() ?: return@withContext fallback
 
             if (!response.isSuccessful) {
                 // [FIX-1 / F-196] 401/403 is an AUTH answer, not "this endpoint
@@ -111,7 +127,14 @@ object GeminiModelsApi {
                 // that case and let an api-key 401/403 surface as a failure.
                 if (response.code == 401 || response.code == 403) {
                     if (context != null) cache.invalidate(context, cacheKey)
-                    if (oauthCredential) {
+                    // [R5-E2 E-C-05①] The Cloud Code Assist fallback is a fact about
+                    // GOOGLE's endpoint, not about the credential: a relay in front of
+                    // the API answers 401/403 for its OWN reasons (disabled key, WAF,
+                    // quota) and has no "generative-language scope" to lack, so
+                    // answering it with the static Google catalog replaced the relay's
+                    // rows with five models it may not serve — and reported success.
+                    // Only an OAuth credential pointed AT Google keeps the fallback.
+                    if (oauthCredential && isOfficialGeminiBase(baseUrl)) {
                         // The documented case: OAuth without the
                         // generative-language scope. Builtin list is the best
                         // available answer, matching iOS.
@@ -119,16 +142,17 @@ object GeminiModelsApi {
                     }
                     android.util.Log.w(
                         TAG,
-                        "models fetch auth failure code=${response.code} — not falling back to builtin list: ${body.take(300)}",
+                        "models fetch auth failure code=${response.code} oauth=$oauthCredential " +
+                            "official=${isOfficialGeminiBase(baseUrl)} — not falling back to builtin list: ${body.take(300)}",
                     )
                     return@withContext emptyList()
                 }
-                return@withContext LLMModel.allGemini
+                return@withContext fallback
             }
 
             val models = try {
                 val json = JSONObject(body)
-                val arr = json.optJSONArray("models") ?: return@withContext LLMModel.allGemini
+                val arr = json.optJSONArray("models") ?: return@withContext fallback
                 val result = mutableListOf<LLMModel>()
                 for (i in 0 until arr.length()) {
                     val obj = arr.getJSONObject(i)
@@ -145,10 +169,10 @@ object GeminiModelsApi {
                         result.add(LLMModel(name, displayName, "Google"))
                     }
                 }
-                if (result.isEmpty()) return@withContext LLMModel.allGemini
+                if (result.isEmpty()) return@withContext fallback
                 ModelsDevApi.enrichModels(result)
             } catch (_: Exception) {
-                return@withContext LLMModel.allGemini
+                return@withContext fallback
             }
 
             if (context != null) cache.save(context, cacheKey, models)
@@ -157,4 +181,63 @@ object GeminiModelsApi {
             response.close()
         }
     }
+}
+
+/**
+ * [r3-b08 F-02] Whether this model-list request addresses Google itself.
+ *
+ * Blank/null (no custom base) means the public endpoint — the historical
+ * official instance. Any other host is a user relay, where the builtin catalog
+ * is not an answer to "what models does this endpoint serve".
+ *
+ * Host-based rather than `customBaseURL != null` so a user who pasted the
+ * public endpoint into the custom-base field is still treated as official.
+ *
+ * [R5-E2 E-C-05②] The test is the parsed HOSTNAME, not a substring of the whole
+ * URL. The old `contains("generativelanguage.googleapis.com")` said "official"
+ * for `https://relay.internal/generativelanguage.googleapis.com/v1beta`, i.e.
+ * for exactly the relay shape this helper exists to reject, and the two callers
+ * above then answered a relay failure with Google's static catalog (rows
+ * replaced, success reported). A base that cannot be parsed is NOT official:
+ * fail towards "preserve the user's rows".
+ *
+ * Callers branch on this because an official instance keeps the builtin Google
+ * list as its network-failure net, while a relay gets EMPTY: `ProviderRepository
+ * .refreshModels` then takes its `models.isEmpty()` path and PRESERVES the rows
+ * the user already has instead of replacing them with five Google models. (The
+ * `oauthCredential` 403 case is handled separately and deliberately keeps the
+ * builtin list — the documented Cloud Code Assist scope fallback,
+ * `[FIX-1 / F-196]`, now also gated on this predicate: only Google has that
+ * scope to lack.)
+ */
+internal fun isOfficialGeminiBase(baseUrl: String?): Boolean {
+    val raw = baseUrl?.trim().orEmpty()
+    if (raw.isEmpty()) return true
+    val host = geminiBaseHost(raw) ?: return false
+    return host in OFFICIAL_GEMINI_HOSTS
+}
+
+/** Hostnames served by Google itself (the two the old substring test covered). */
+private val OFFICIAL_GEMINI_HOSTS = setOf(
+    "generativelanguage.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+)
+
+/**
+ * [R5-E2 E-C-05②] Hostname of a user-typed base, or null when it cannot be
+ * parsed. Tolerates a missing scheme (`generativelanguage.googleapis.com/v1beta`
+ * is a shape users paste) by assuming https; a trailing DNS dot is stripped so
+ * `generativelanguage.googleapis.com.` still matches. Pure, no Android types.
+ */
+internal fun geminiBaseHost(baseUrl: String): String? {
+    val raw = baseUrl.trim()
+    if (raw.isEmpty()) return null
+    val withScheme = if (raw.contains("://")) raw else "https://$raw"
+    val parsed = try {
+        java.net.URI(withScheme)
+    } catch (_: Exception) {
+        return null
+    }
+    val host = parsed.host ?: return null
+    return host.trimEnd('.').lowercase().ifEmpty { null }
 }

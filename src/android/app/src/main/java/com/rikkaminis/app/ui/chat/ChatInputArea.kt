@@ -2,89 +2,37 @@ package com.rikkaminis.app.ui.chat
 
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
-import android.net.Uri
 import android.os.SystemClock
-import android.provider.OpenableColumns
 import android.widget.Toast
 import java.io.File
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.asAndroidBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.AudioFile
-import androidx.compose.material.icons.filled.FolderZip
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.VideoFile
-import androidx.compose.material.icons.automirrored.filled.Article
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.conflate
-import kotlinx.coroutines.flow.distinctUntilChanged
-import androidx.compose.runtime.snapshotFlow
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.wrapContentWidth
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -95,115 +43,44 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AppShortcut
-import androidx.compose.material.icons.filled.ArrowCircleUp
 import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.BugReport
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.CloseFullscreen
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lightbulb
-import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.StopCircle
-import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.RadioButtonChecked
-import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.Switch
-import com.rikkaminis.app.BuildConfig
 import com.rikkaminis.app.R
 import com.rikkaminis.app.config.AttachActionCatalog
-import com.rikkaminis.app.config.ChatActionCatalog
-import com.rikkaminis.app.config.ChatMenuPrefs
-import com.rikkaminis.app.config.isChatActionAvailable
-import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
-import com.rikkaminis.app.ui.components.MinisAlertDialog
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.data.ChatTuningPrefs
-import com.rikkaminis.app.ui.components.MinisMenuDivider
-import androidx.compose.material3.TextButton
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.TextFieldDefaults
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.rememberDrawerState
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.compositionLocalOf
-import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.zIndex
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.onPlaced
-import androidx.compose.ui.layout.boundsInWindow
-import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
@@ -213,86 +90,26 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
-import androidx.compose.material.icons.filled.TextFields
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.PlatformTextStyle
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.material.icons.filled.Cancel
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.outlined.Public
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.automirrored.filled.NoteAdd
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.EditNote
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.ArrowCircleDown
-import androidx.compose.material.icons.filled.AccountTree
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.style.TextDecoration
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import com.rikkaminis.app.offload.OffloadPermissionManager
-import com.mikepenz.markdown.compose.components.markdownComponents
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
-import org.intellij.markdown.ast.ASTNode
-import org.intellij.markdown.ast.getTextInNode
-import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.ModelEntry
-import com.rikkaminis.app.data.model.ModelGroup
-import com.rikkaminis.app.data.model.ProviderConfig
-import com.rikkaminis.app.data.model.ProviderType
-import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ChatRepository
-import com.rikkaminis.app.data.repository.MemoryRepository
-import com.rikkaminis.app.data.repository.ProviderRepository
-import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.theme.ChatColors
-import com.rikkaminis.app.ui.components.MinisTextButton
+import com.rikkaminis.app.util.ExternalIntent
 
 // [refactor/split-chatscreen] Batch 1: the composer/input area composable,
 // moved VERBATIM from ChatScreen.kt (was lines 4911-6439). Only change:
@@ -301,10 +118,9 @@ import com.rikkaminis.app.ui.components.MinisTextButton
 // send, slash/mention pickers, attachment chips) lives inside this composable
 // and does not read ChatScreen-scope state beyond its explicit parameters.
 //
-// NOTE on imports: kept the full original import list from ChatScreen.kt —
-// unused-import lint was already tolerated in the source file; a later pass
-// can prune. Verbatim-move discipline (comment archaeology preserved) trumps
-// lint cleanliness for this refactor.
+// NOTE on imports: the verbatim move copied the full original import list from
+// ChatScreen.kt; the 2026-10-27 dead-import sweep pruned it to the symbols this
+// file actually uses. Comment archaeology elsewhere is left intact.
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, kotlinx.coroutines.FlowPreview::class)
 @Composable
@@ -375,6 +191,177 @@ internal fun ChatInputArea(
     // nothing pending; the job is cancelled+replaced on every new burst.
     var imeBurstBuffer by remember { mutableStateOf<String?>(null) }
     var imeBurstJob by remember { mutableStateOf<Job?>(null) }
+    // [meta-audit-1028 C3/F-03] One-shot bridge from the hardware key handler to
+    // the soft-IME Enter intercept in `onValueChange`. Compose inserts the
+    // newline for a Shift+Enter itself (the key handler returns false), so the
+    // two paths are indistinguishable by text shape alone — only the key event
+    // knows which one it was. Set on KeyDown, consumed by the next
+    // `onValueChange` whatever it is (a flag outliving its insertion would eat
+    // the next genuine soft-keyboard Enter = a lost send).
+    var shiftEnterNewlinePending by remember { mutableStateOf(false) }
+    // [fix/dv19-b1] Drop the pending burst flush. Called at every point that acts
+    // on — or clears — the composer: send / Enter-send (the two sites that used to
+    // spell these three writes out inline) plus the slash dismiss, the slash
+    // command and the cross-session transfer, each of which now commits the
+    // field's LIVE value instead of the 150 ms-debounced VM string. Committing the
+    // live text makes the snapshot redundant, and leaving the job alive lets a
+    // stale snapshot land on a composer that has since been cleared or handed to
+    // another session (inputText is per-ViewModel, so the late write hit the old
+    // session's composer after a move).
+    val cancelPendingImeBurst: () -> Unit = {
+        imeBurstJob?.cancel()
+        imeBurstJob = null
+        imeBurstBuffer = null
+        // [dv25-B08] The buffer is gone, so the ViewModel's pending copy must go
+        // with it — every caller of this funnel commits the field's live text
+        // itself, which is newer than the snapshot.
+        viewModel.publishPendingComposerText(null)
+    }
+    // [dv20-B03] Single funnel for "clear the composer from outside
+    // onValueChange". Every clear entrance used to spell
+    // `viewModel.setInputText("")` on its own, and that write alone is a no-op
+    // on the FIELD: `_inputText` is a StateFlow, so clearing an already-empty
+    // composer is an equal write, it is suppressed, the
+    // `LaunchedEffect(inputText)` above never re-runs, and whatever the user
+    // typed during a >8-char IME burst (still buffered, not yet committed)
+    // stayed in the box after the message had been sent. Clearing is three
+    // writes, not one — drop the pending burst flush, commit the empty string,
+    // and reset the field plus the caret tracker. Declared before its
+    // consumers on purpose: a local `val` lambda cannot be referenced before
+    // its declaration (the 1039-B1 lesson — the compiler rejected the
+    // subscription written after its consumer).
+    val clearComposerInput: () -> Unit = {
+        cancelPendingImeBurst()
+        viewModel.setInputText("")
+        inputFieldValue = androidx.compose.ui.text.input.TextFieldValue("")
+        lastTrueCaretEnd = 0
+        // [meta-audit-1028 C3/F-04] Every clear entrance is a send / cancel —
+        // the message leaves the composer, and the pickers that were floating
+        // over it must leave with it. Neither `setInputText("")` nor the field
+        // write above touches menu state (a StateFlow-only write is not an
+        // `onValueChange`), so `@`/`/` used to stay on screen over an empty
+        // composer. Worse, `savedInputBeforeSlash` survived the send: the next
+        // tap on the chat list raises `DismissSlashMenu`, whose resolution
+        // restores that saved draft — a message already sent reappeared in the
+        // box. Drop the saved original FIRST (so `updateSlashMenuState` cannot
+        // take the over-content branch and re-open the menu on the way out).
+        viewModel.dismissMentionMenu()
+        viewModel.savedInputBeforeSlash = null
+        viewModel.updateSlashMenuState("")
+    }
+    // [dv24/B-05] Single funnel for "replace / append the composer body from
+    // outside onValueChange" — the twin of `clearComposerInput` for the two text
+    // intents. It writes BOTH copies on purpose: the ViewModel string feeds the
+    // inputText→field mirror, and the direct field write is what makes a write
+    // land when the new text already EQUALS the ViewModel string (the StateFlow
+    // drops the equal emission, and the mirror's `!=` guard then skips too — the
+    // message-edit prefill used to lose its caret that way, and the still-live
+    // 150 ms IME burst then flushed its pre-edit snapshot straight over the
+    // edit). Declared before its consumers for the same reason as the funnel
+    // above (1039-B1: a local `val` lambda cannot be referenced before its
+    // declaration).
+    //
+    // [deep-audit-1049 B-06] `caret` is nullable: the slash/`@` outlets below
+    // that carry no caret intent pass `null` and keep the user's true caret
+    // (`lastTrueCaretEnd`), which is exactly what the inputText mirror does for
+    // them. They used to call `viewModel.setInputText(...)` on their own, and
+    // that path is the one that can lose: while a >8-char IME burst is still
+    // buffered, `inputFieldValue` is AHEAD of `viewModel.inputText`, so
+    // `setInputText(newText)` where newText == the VM string is an equal write —
+    // the StateFlow suppresses it, the mirror never re-runs, and the field keeps
+    // the old slash prefix. `_pendingCaret` was also left dangling for the next
+    // input.
+    // [meta-audit-1028 C3/F-01] The funnel must also DRAIN the ViewModel's
+    // one-shot caret intent. Before: the four slash outlets pass `null` and the
+    // funnel resolved the caret from `lastTrueCaretEnd` alone, so the value
+    // `showSlashMenuOverInput` / `executeSlashCommand` had just parked in
+    // `_pendingCaret` was stranded — and it could never be picked up later
+    // either, because the funnel writes BOTH copies, so the
+    // `inputFieldValue.text != inputText` guard on the mirror effect (the only
+    // reader of `consumePendingCaret()`) is already false when it re-runs.
+    // Left the composer showing `/ hello wor|ld` (caret at the pre-slash index)
+    // and left a stale intent to hijack the caret on the NEXT external write.
+    // Drain unconditionally — a stale intent must never outlive a commit — and
+    // let an explicit caller caret win over it.
+    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->
+        cancelPendingImeBurst()
+        val at = composerFunnelCaret(
+            caret = caret,
+            pendingCaret = viewModel.consumePendingCaret(),
+            lastTrueCaretEnd = lastTrueCaretEnd,
+            length = text.length,
+        )
+        viewModel.setInputText(text)
+        inputFieldValue = androidx.compose.ui.text.input.TextFieldValue(
+            text = text,
+            selection = androidx.compose.ui.text.TextRange(at),
+            composition = null,
+        )
+        lastTrueCaretEnd = at
+    }
+    // [fix/dv23-b3] Composer intents raised outside the composer (topbar `/`
+    // button, tap on the chat list, system back, clear-chat confirm) are
+    // executed HERE. ChatScreen used to resolve them against
+    // `viewModel.inputText` — the 150 ms-debounced snapshot — which rolled a
+    // dictation/paste that had already landed in `inputFieldValue` back to a
+    // stale string; and because the slash menu's Popup sets
+    // `dismissOnClickOutside = false` / `focusable = false`, every outside tap
+    // reaches this path rather than the Popup's own onDismissRequest above.
+    // Declared after `clearComposerInput` on purpose: a local `val` lambda
+    // cannot be referenced before its declaration (the 1039-B1 lesson).
+    LaunchedEffect(Unit) {
+        viewModel.composerCommand.collect { command ->
+            when (command) {
+                ComposerCommand.ToggleSlashMenu -> {
+                    cancelPendingImeBurst()
+                    // [meta-audit-1028 C3/F-04] The two pickers are mutually
+                    // exclusive (`updateMentionMenuState` defers to the slash
+                    // menu), but opening the slash menu over a live `@` token
+                    // used to leave the mention popup underneath it — two
+                    // overlays stacked over one composer. Tapping `/` is an
+                    // explicit "switch pickers" intent, so drop the other one.
+                    viewModel.dismissMentionMenu()
+                    // Brace-less if/else on purpose: both resolutions sit in THIS
+                    // arm's block, the one that dropped the pending burst.
+                    val menuOpen = viewModel.showSlashMenu.value
+                    val next =
+                        if (menuOpen) viewModel.dismissSlashMenu(inputFieldValue.text)
+                        else viewModel.showSlashMenuOverInput(inputFieldValue.text)
+                    // [deep-audit-1049 B-06] Through the funnel: a bare
+                    // setInputText equal to the (burst-lagged) VM string is
+                    // suppressed, and the field keeps the pre-toggle text.
+                    commitComposerBody(next, null)
+                    runCatching { inputFocusRequester.requestFocus() }
+                    keyboardController?.show()
+                }
+                ComposerCommand.DismissSlashMenu -> {
+                    commitComposerBody(
+                        viewModel.dismissSlashMenu(inputFieldValue.text),
+                        null,
+                    )
+                }
+                ComposerCommand.Clear -> clearComposerInput()
+                // [dv24/B-05] The two text intents: resolved HERE against the
+                // field's live text, then committed through the funnel above.
+                is ComposerCommand.ReplaceText -> commitComposerBody(
+                    command.text,
+                    composerCaretFor(command.text, command.caretOverride),
+                )
+                is ComposerCommand.AppendText -> {
+                    // `inputFieldValue.text` inline on purpose: it is the
+                    // composer's own live value (E-family criteria anchor).
+                    val next = composeAppend(
+                        live = inputFieldValue.text,
+                        text = command.text,
+                        separator = command.separator,
+                        trimExistingEnd = command.trimExistingEnd,
+                        trailingSpace = command.trailingSpace,
+                    )
+                    commitComposerBody(next, next.length)
+                }
+            }
+        }
+    }
     // Paired with imeBurstBuffer: the caret that must be scanned against the
     // FLUSHED text when a debounced burst finally commits. Stored alongside
     // the buffer (not read late from inputFieldValue) so the mention scan in
@@ -431,13 +418,31 @@ internal fun ChatInputArea(
     // Live fingertip position inside the input bar (px). Hint floats ~60dp
     // above this point so it isn't hidden under the user's thumb.
     var sendSwipeLocation by remember { mutableStateOf(Offset.Zero) }
-    val swipeThresholdPx = with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() }
+    val swipeThresholdPxState = rememberUpdatedState(
+        with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },
+    )
+    // [fix/dv16-b] rememberUpdatedState, not a plain val capture: a dynamic
+    // ChatTuning adjustment of the threshold must reach the gesture without
+    // restarting pointerInput(Unit), which freezes the first composition's px.
     // Match iOS: haptic + capsule full-opacity + release-fires-send all
     // engage at this fraction (below 1.0 so user gets earlier confirmation).
     val swipeArmFraction = 0.8f
     val swipeHapticOffsetPx = with(LocalDensity.current) { 60.dp.toPx() }
     val swipeArrowHalfPx = with(LocalDensity.current) { 17.dp.toPx() }
     val swipeHaptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+
+    // [fix/dv16-b] Single send-eligibility predicate for the swipe-up gesture.
+    // The three decision sites (drag hint / release-send / empty-input
+    // keyboard) each used to re-derive it — the release branch even re-derived
+    // it INSIDE an already-`hasText`-guarded block, a dead branch that routed
+    // attachment-only drags to the keyboard instead of sending them. Reads the
+    // field's own TextFieldValue (the single-writer truth the user sees, never
+    // staler than the debounced VM string) + the live attachment list, both at
+    // call time — the gesture block is a long-lived pointerInput(Unit) closure,
+    // so eligibility must be read per-event, not captured once per composition.
+    val canSwipeSendNow: () -> Boolean = {
+        inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()
+    }
 
 
     val performSendOrEnqueue: () -> Unit = handler@{
@@ -454,12 +459,10 @@ internal fun ChatInputArea(
         // staler than the buffer or the VM value: onValueChange writes it
         // first on every path, and it is exactly what the user reads on
         // screen.
-        imeBurstJob?.cancel()
-        imeBurstJob = null
-        imeBurstBuffer = null
+        cancelPendingImeBurst()
         val toSend = inputFieldValue.text
         if (viewModel.tryExecuteInputAsSlashCommand(toSend)) {
-            viewModel.setInputText("")
+            clearComposerInput()
             keyboardController?.hide()
             focusManager.clearFocus()
             return@handler
@@ -471,7 +474,7 @@ internal fun ChatInputArea(
         // AFTER the insert would wrongly read "scrolled into history" for a
         // bottom-anchored sender. Snapshot first, then act.
         val wasScrolledIntoHistory = !isNearBottom.value
-        viewModel.setInputText("")
+        clearComposerInput()
         keyboardController?.hide()
         focusManager.clearFocus()
         viewModel.sendMessage(toSend)
@@ -523,14 +526,61 @@ internal fun ChatInputArea(
             // PopupProperties so its bottom edge sits just above this Column.
             // Tap-outside dismisses via dismissOnClickOutside.
             val showSlashMenu by viewModel.showSlashMenu.collectAsState()
-            val filteredSlashCommands = remember(
-                showSlashMenu,
-                viewModel.slashFilter.collectAsState().value,
-                viewModel.memoryEnabled.collectAsState().value,
-                viewModel.thinkingLevel.collectAsState().value,
-            ) { viewModel.filteredSlashCommands() }
+            // [dv17-4] The list is only ever RENDERED under `showSlashMenu` (the
+            // `if` below), yet it used to be computed on every composition: the
+            // remember ran unconditionally, so entering the chat, switching
+            // sessions or touching a key spent N+M synchronous `db.rawQuery`
+            // calls (one `isEnabledForSession` per skill + per MCP server) on
+            // the main thread and dropped the result on the very next line.
+            // The gate still wraps the whole computation — closed menu = no
+            // producer, no query. The keys name the live sources the body
+            // actually reads: `slashFilter` / `memoryEnabled` (built-in rows),
+            // `currentSessionId` and the two repositories' lists (the
+            // per-session override the picker filters on). `thinkingLevel` is
+            // gone: `/thinking` is no longer in `availableSlashCommands`, so
+            // that key had 0 reads in the body.
+            //
+            // [dv22-B4] The compute itself left the composition: it stayed a
+            // synchronous `remember` here, so every keystroke with the menu
+            // open still ran the N+M queries ON MAIN (inside composition), and
+            // `setSessionOverride` writes only the DB table — the `.skills` /
+            // `.servers` flows never re-emitted, so an open menu went stale
+            // after a toggle in SessionSkillsSheet/SessionMcpsSheet. Now:
+            //  - the load runs in a `produceState` producer, with
+            //    `withContext(Dispatchers.IO)` — the producer inherits the
+            //    composition's context (Main), so the IO hop is explicit
+            //    (1041-B3 lesson: produceState is NOT an IO context);
+            //  - the two `sessionOverridesRevision` keys are the new
+            //    invalidation channel: both repositories bump their revision
+            //    on every override-table write, so an open menu refreshes
+            //    after a toggle — no polling;
+            //  - `filteredSlashCommands()` itself is batched (one `IN (…)`
+            //    SELECT per repository — see ChatViewModelSlashExt), so the IO
+            //    cost is a constant two queries per producer run.
+            val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {
+                produceState(
+                    initialValue = SlashMenuPayload(),
+                    viewModel.slashFilter.collectAsState().value,
+                    viewModel.memoryEnabled.collectAsState().value,
+                    viewModel.currentSessionId,
+                    viewModel.skillRepository?.skills?.collectAsState()?.value,
+                    viewModel.mcpRepository?.servers?.collectAsState()?.value,
+                    viewModel.skillRepository?.sessionOverridesRevision?.collectAsState()?.value,
+                    viewModel.mcpRepository?.sessionOverridesRevision?.collectAsState()?.value,
+                ) {
+                    withContext(Dispatchers.IO) {
+                        value = SlashMenuPayload(
+                            commands = viewModel.filteredSlashCommands(),
+                            loaded = true,
+                        )
+                    }
+                }
+            } else {
+                remember { mutableStateOf(SlashMenuPayload()) }
+            }
+            val filteredSlashCommands = slashMenuPayload.value.commands
 
-            if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
+            if (showSlashMenu && (filteredSlashCommands.isNotEmpty() || !slashMenuPayload.value.loaded)) {
                 val effectiveThinkingLevelState by viewModel.thinkingLevel.collectAsState()
                 // [T-thinking-effective-level] The two are DIFFERENT values and
                 // must not be swapped. `effectiveThinkingLevelState` (above) is
@@ -568,7 +618,16 @@ internal fun ChatInputArea(
                         }
                     },
                     onDismissRequest = {
-                        viewModel.setInputText(viewModel.dismissSlashMenu(inputText))
+                        // [fix/dv19-b1] Commit the field's LIVE text: the debounced
+                        // VM string can be empty (or a burst behind) inside the
+                        // 150 ms window, and dismissSlashMenu() echoes that string
+                        // back as the composer's value — clearing the dictation or
+                        // paste the user just made. Drop the pending flush first so
+                        // the stale snapshot cannot restore itself afterwards.
+                        commitComposerBody(
+                            viewModel.dismissSlashMenu(inputFieldValue.text),
+                            null,
+                        )
                     },
                     properties = androidx.compose.ui.window.PopupProperties(
                         focusable = false,
@@ -584,6 +643,17 @@ internal fun ChatInputArea(
                         dismissOnClickOutside = false,
                     ),
                 ) {
+                    // [dv22-B4] First open of the menu: the producer has been
+                    // launched but the IO round-trip has not landed yet —
+                    // draw the same fixed frame with a single subdued row so
+                    // the popup does not appear empty-then-jump. Once the
+                    // first load lands, key changes keep the previous value
+                    // (produceState holds it across relaunches), so typing
+                    // never flashes this placeholder again.
+                    if (!slashMenuPayload.value.loaded) {
+                        SlashMenuLoadingPanel()
+                        return@Popup
+                    }
                     // [T-slash-picker-fixed-height port from iOS 73f1b94a]
                     // Locked popup height = 4 rows × 46dp + 8dp = 192dp.
                     // Short lists show empty space below the last row;
@@ -610,13 +680,22 @@ internal fun ChatInputArea(
                                 .verticalScrollbar(slashListState),
                         ) {
                         itemsIndexed(filteredSlashCommands, key = { _, c -> c.id }) { index, cmd ->
-                            // Section divider between builtins and
-                            // installed Skills (mirrors iOS divider
-                            // at the first skill row). Drawn as the
-                            // top of the skill row, not between every
-                            // row — keeps the menu visually grouped
-                            // without splitting every command.
-                            if (cmd.isSkill && index > 0 && !filteredSlashCommands[index - 1].isSkill) {
+                            // Section divider between builtins and the
+                            // installed rows (skills + MCP servers —
+                            // mirrors iOS divider at the first installed
+                            // row). Drawn as the top of the row, not
+                            // between every row — keeps the menu visually
+                            // grouped without splitting every command.
+                            // [fix/dv16-b] MCP rows live in the installed
+                            // section too (they come after the skills), so
+                            // the divider condition is the shared installed
+                            // predicate — a bare isSkill test left the first
+                            // MCP row visually merged into the skill group.
+                            val isInstalledRow = cmd.isSkill || cmd.isMcp
+                            val prevIsInstalledRow = index > 0 &&
+                                (filteredSlashCommands[index - 1].isSkill ||
+                                    filteredSlashCommands[index - 1].isMcp)
+                            if (isInstalledRow && index > 0 && !prevIsInstalledRow) {
                                 HorizontalDivider(
                                     thickness = 0.5.dp,
                                     color = ChatColors.toolBorder,
@@ -641,8 +720,18 @@ internal fun ChatInputArea(
                                                 // [T-android-slash-menu-clears-input] Pass the
                                                 // LIVE input so an action command keeps the
                                                 // user's body text instead of wiping it.
-                                                viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputText))
-                                                // For Skill rows, "/<name> "
+                                                // [fix/dv19-b1] "LIVE" now means the field's
+                                                // own TextFieldValue: the VM string lags it by
+                                                // the 150 ms burst window, and the pending
+                                                // flush is dropped so it cannot re-commit a
+                                                // snapshot over the post-command value.
+                                                cancelPendingImeBurst()
+                                                commitComposerBody(
+                                                    viewModel.executeSlashCommand(cmd, inputFieldValue.text),
+                                                    null,
+                                                )
+                                                // For the typing-aid rows
+                                                // (skill + MCP), "/<name> "
                                                 // is a typing aid — the user
                                                 // still needs to type
                                                 // arguments. Bring the IME
@@ -650,7 +739,11 @@ internal fun ChatInputArea(
                                                 // they can keep typing
                                                 // without an extra tap on
                                                 // the composer.
-                                                if (cmd.isSkill) {
+                                                // [fix/dv16-b] MCP rows are
+                                                // typing aids too — a bare
+                                                // isSkill test dropped the
+                                                // keyboard on an MCP tap.
+                                                if (cmd.isSkill || cmd.isMcp) {
                                                     try {
                                                         inputFocusRequester.requestFocus()
                                                     } catch (_: IllegalStateException) {
@@ -852,16 +945,23 @@ internal fun ChatInputArea(
                                                 },
                                             )
                                             .clickable {
+                                                // [fix/dv23-b3] Drop the pending 150 ms burst FIRST. A
+                                                // paste containing "@doc" is still buffered; the flush
+                                                // would compare its snapshot against the completed text,
+                                                // see a difference, and write the un-completed text back —
+                                                // silently undoing the mention the user just picked.
+                                                cancelPendingImeBurst()
                                                 val (newText, newCaret) = viewModel.selectMention(
                                                     entry,
                                                     currentText = inputFieldValue.text,
                                                     currentCaret = inputFieldValue.selection.end,
                                                 )
-                                                // [fix/setinputtext-caret-intent] Pass the explicit caret
-                                                // intent so the consuming LaunchedEffect places the cursor
-                                                // exactly here — replaces the old manual TextFieldValue
-                                                // double-write that raced the effect's pendingCaret read.
-                                                viewModel.setInputText(newText, caretOverride = newCaret)
+                                                // [fix/setinputtext-caret-intent] Explicit caret intent:
+                                                // the funnel places the field's selection exactly here, so
+                                                // the consuming LaunchedEffect does not have to race it.
+                                                // [deep-audit-1049 B-06] …and it goes through the funnel so
+                                                // an equal-to-VM write still lands on the field.
+                                                commitComposerBody(newText, newCaret)
                                             }
                                             .padding(horizontal = 12.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically,
@@ -970,13 +1070,12 @@ internal fun ChatInputArea(
                             }
                             change.consume()
                             if (totalDy < 0) {
-                                // Swiping up. Show hint only when there
-                                // is text to send; otherwise keep the
-                                // overlay hidden and defer keyboard
-                                // activation to onEnd.
-                                val hasText = inputText.isNotBlank()
-                                if (hasText) {
-                                    val newProgress = (-totalDy / swipeThresholdPx).coerceIn(0f, 1f)
+                                // Swiping up. Show the hint only when there is
+                                // something to send (text or attachments);
+                                // otherwise keep the overlay hidden and defer
+                                // keyboard activation to onEnd.
+                                if (canSwipeSendNow()) {
+                                    val newProgress = (-totalDy / swipeThresholdPxState.value).coerceIn(0f, 1f)
                                     if (newProgress >= swipeArmFraction && sendSwipeProgress < swipeArmFraction) {
                                         swipeHaptics.performHapticFeedback(
                                             androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
@@ -992,14 +1091,14 @@ internal fun ChatInputArea(
                                 sendSwipeProgress = 0f
                             }
                         }
-                        // Drag ended (finger up or pointer cancel).
-                        val hasText = inputText.isNotBlank()
+                        // Drag ended (finger up or pointer cancel). One shared
+                        // eligibility predicate: swiped up with something to
+                        // send → send (or enqueue during streaming); swiped up
+                        // with NOTHING to send and no focus → pop the keyboard.
                         val swipedUp = claimed && totalDy < 0 &&
                             kotlin.math.abs(totalDy) > kotlin.math.abs(totalDx)
-                        if (swipedUp && hasText) {
-                            val attachmentsCount = viewModel.attachments.value.size
-                            val canSendNow = hasText || attachmentsCount > 0
-                            if (sendSwipeProgress >= swipeArmFraction && canSendNow) {
+                        if (swipedUp && canSwipeSendNow()) {
+                            if (sendSwipeProgress >= swipeArmFraction) {
                                 // T-drag-send-queue: route through the
                                 // shared send-or-enqueue handler so a
                                 // drag-to-send during streaming enqueues
@@ -1010,7 +1109,7 @@ internal fun ChatInputArea(
                                 performSendOrEnqueue()
                             }
                             sendSwipeProgress = 0f
-                        } else if (swipedUp && !hasText && !inputFocused) {
+                        } else if (swipedUp && !canSwipeSendNow() && !inputFocused) {
                             // Empty input + collapsed keyboard -> bring
                             // up the keyboard. If the keyboard is
                             // already open, do nothing so a stray drag
@@ -1248,12 +1347,15 @@ internal fun ChatInputArea(
                                                     android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
                                                 )
                                             }
-                                            try {
-                                                context.startActivity(intent)
-                                            } catch (_: android.content.ActivityNotFoundException) {
+                                            // [deep-audit-1049 B-03] Shared launcher instead of a
+                                            // bare startActivity: the intent carries no
+                                            // NEW_TASK (a chooser would not have inherited one
+                                            // either), and the failure toast used to be a
+                                            // hard-coded English sentence.
+                                            ExternalIntent.start(context, intent) {
                                                 android.widget.Toast.makeText(
                                                     context,
-                                                    "No app available to open this attachment.",
+                                                    context.getString(R.string.filepreview_no_app),
                                                     android.widget.Toast.LENGTH_SHORT,
                                                 ).show()
                                             }
@@ -1323,16 +1425,14 @@ internal fun ChatInputArea(
                         // re-inject text after the send cleared the composer
                         // (ghost input → double send), and take the send text
                         // from the field's live value — never the snapshot.
-                        imeBurstJob?.cancel()
-                        imeBurstJob = null
-                        imeBurstBuffer = null
+                        cancelPendingImeBurst()
                         val effectiveInput = inputFieldValue.text
                         if (effectiveInput.isBlank() && attachments.isEmpty()) return@handler false
                         // Intercept slash commands so "/compact" et al.
                         // run locally instead of being sent as a chat
                         // turn. Mirrors iOS performSend().
                         if (viewModel.tryExecuteInputAsSlashCommand(effectiveInput)) {
-                            viewModel.setInputText("")
+                            clearComposerInput()
                             keyboardController?.hide()
                             focusManager.clearFocus()
                             return@handler true
@@ -1348,7 +1448,7 @@ internal fun ChatInputArea(
                         // [P2-scroll-user-send] snapshot BEFORE sendMessage
                         // (insert pushes index 0 → 1; must not read after).
                         val wasScrolledIntoHistory = !isNearBottom.value
-                        viewModel.setInputText("")
+                        clearComposerInput()
                         keyboardController?.hide()
                         focusManager.clearFocus()
                         viewModel.sendMessage(toSend)
@@ -1399,28 +1499,31 @@ internal fun ChatInputArea(
                             // send. Guarded to a single added newline so a
                             // paste containing newlines is NOT swallowed —
                             // those increase the count by >1 and fall through
-                            // to the normal multi-line edit. Hardware-keyboard
-                            // Enter / Shift+Enter still go through onKeyEvent
-                            // below (Shift+Enter inserts a newline there and
-                            // never reaches the send path).
-                            if (sendOnEnter && !showMentionMenu) {
-                                val oldText = inputFieldValue.text
-                                val newText = tfv.text
-                                val addedNewline = newText.length == oldText.length + 1 &&
-                                    newText.count { it == '\n' } == oldText.count { it == '\n' } + 1
-                                if (addedNewline) {
-                                    val caret = tfv.selection.end
-                                    // The inserted char sits just before the
-                                    // caret; confirm it is the newline so we
-                                    // don't misfire on an unrelated 1-char edit
-                                    // that happens to keep newline parity.
-                                    if (caret in 1..newText.length &&
-                                        newText[caret - 1] == '\n'
-                                    ) {
-                                        performEnterSend()
-                                        return@BasicTextField
-                                    }
-                                }
+                            // to the normal multi-line edit. Hardware
+                            // Shift+Enter is the exception: `onKeyEvent` below
+                            // deliberately lets it through so Compose inserts a
+                            // newline, and that insertion is byte-identical to
+                            // the soft-IME shape caught here — so the key
+                            // handler flags it and this block stands down
+                            // ([meta-audit-1028 C3/F-03]; before, Shift+Enter
+                            // sent the message instead of breaking the line).
+                            // A single pasted '\n' is still indistinguishable
+                            // from a soft Enter and still sends (see report §6).
+                            val previousFieldText = inputFieldValue.text
+                            val hardwareShiftEnterNewline = shiftEnterNewlinePending
+                            // Consume unconditionally: one key event, at most
+                            // one insertion. A flag that outlived its insertion
+                            // would swallow the next genuine soft Enter.
+                            shiftEnterNewlinePending = false
+                            if (sendOnEnter && !showMentionMenu && !hardwareShiftEnterNewline &&
+                                isEnterSendEdit(
+                                    oldText = previousFieldText,
+                                    newText = tfv.text,
+                                    caretEnd = tfv.selection.end,
+                                )
+                            ) {
+                                performEnterSend()
+                                return@BasicTextField
                             }
                             inputFieldValue = tfv
                             // [Txxx-android-composer-caret] The IME's
@@ -1429,7 +1532,14 @@ internal fun ChatInputArea(
                             // LaunchedEffect can fall back to it instead of
                             // an already-stale inputFieldValue.selection.
                             lastTrueCaretEnd = tfv.selection.end.coerceAtLeast(0)
-                            if (inputText != tfv.text) {
+                            // [meta-audit-1028 C3/F-05] `|| imeBurstBuffer != null`:
+                            // while a burst is buffered the VM string is stale,
+                            // so "text equals the VM copy" is NOT "nothing
+                            // changed" — the user may have just cut / undone the
+                            // paste back to that very string, and this branch is
+                            // the only place that drops the buffered snapshot
+                            // (and the ViewModel's pending copy) on the way out.
+                            if (inputText != tfv.text || imeBurstBuffer != null) {
                                 // [fix/voice-crash-observability tail] IME
                                 // voice dictation drives onValueChange with
                                 // high-frequency, large text bursts. Each
@@ -1445,9 +1555,25 @@ internal fun ChatInputArea(
                                 // Ordinary typing (<=8 chars) and deletes
                                 // go through immediately — instant feedback
                                 // is preserved.
-                                if (shouldDebounceImeBurst(inputText, tfv.text)) {
+                                //
+                                // [meta-audit-1028 C3/F-05] The delta is
+                                // measured against the PREVIOUS FIELD TEXT, not
+                                // `inputText`. The field is the authority and
+                                // is never more than one edit behind; the VM
+                                // string can be a whole burst behind, so after
+                                // a debounced paste every single-char edit kept
+                                // seeing `new - stale > 8` and was debounced
+                                // again — one 150 ms stall per keystroke.
+                                if (shouldDebounceImeBurst(previousFieldText, tfv.text)) {
                                     imeBurstBuffer = tfv.text
                                     imeBurstCaret = tfv.selection.end
+                                    // [dv25-B08] Publish the pending snapshot to the
+                                    // ViewModel: the field's live text is the newest
+                                    // copy of what the user typed, and for 150 ms it
+                                    // exists ONLY here. `promoteDraftIfNeeded` (the
+                                    // "New Chat" path) reads it so a dictated tail is
+                                    // not promoted as the pre-burst string.
+                                    viewModel.publishPendingComposerText(tfv.text)
                                     imeBurstJob?.cancel()
                                     imeBurstJob = coroutineScope.launch {
                                         delay(150)
@@ -1465,6 +1591,12 @@ internal fun ChatInputArea(
                                         // snapshot would overwrite them.
                                         imeBurstJob = null
                                         imeBurstBuffer = null
+                                        // [dv25-B08] The pending snapshot is spent:
+                                        // whatever the field commits next is the
+                                        // authoritative text, so the ViewModel's
+                                        // pending copy must not outlive its flush
+                                        // (the `fix/ttfb-thinktag-composer` lesson).
+                                        viewModel.publishPendingComposerText(null)
                                         if (flushed != null &&
                                             shouldCommitImeBurst(flushed, inputText, inputFieldValue.text)
                                         ) {
@@ -1486,7 +1618,17 @@ internal fun ChatInputArea(
                                         }
                                     }
                                 } else {
+                                    // [meta-audit-1028 C3/F-05] A concrete edit
+                                    // supersedes any buffered burst: its
+                                    // snapshot is older than what the user just
+                                    // typed, and its 150 ms flush would either
+                                    // be rejected later or (worse) publish a
+                                    // zombie pending copy that `New Chat` reads.
+                                    cancelPendingImeBurst()
                                     viewModel.setInputText(tfv.text)
+                                    // [dv25-B08] No burst pending any more — the
+                                    // committed string IS the newest copy.
+                                    viewModel.publishPendingComposerText(null)
                                     viewModel.updateSlashMenuState(tfv.text)
                                     viewModel.updateMentionMenuState(
                                         text = tfv.text,
@@ -1494,6 +1636,12 @@ internal fun ChatInputArea(
                                     )
                                 }
                             } else {
+                                // [meta-audit-1028 C3/F-05] Reached only with no
+                                // burst buffered (see the guard above), so the
+                                // cancel is a no-op there — kept as the funnel's
+                                // terminal state assertion: "no edit path exits
+                                // with a live burst job or a pending VM copy".
+                                cancelPendingImeBurst()
                                 // Text unchanged, caret may have moved: the @-mention
                                 // token/filter must still re-scan on a pure selection change
                                 // (the only case that doesn't go through the branches above).
@@ -1531,10 +1679,15 @@ internal fun ChatInputArea(
                                                 currentCaret = inputFieldValue.selection.end,
                                             )
                                             if (result != null) {
+                                                // [fix/dv23-b3] Same as the tap path: a pending burst
+                                                // flush would overwrite the completed mention with the
+                                                // pre-completion snapshot.
+                                                cancelPendingImeBurst()
                                                 val (newText, newCaret) = result
                                                 // [fix/setinputtext-caret-intent] Explicit caret intent,
-                                                // same as the tap path — single-writer through LaunchedEffect.
-                                                viewModel.setInputText(newText, caretOverride = newCaret)
+                                                // same as the tap path — single writer is the funnel
+                                                // ([deep-audit-1049 B-06]).
+                                                commitComposerBody(newText, newCaret)
                                                 return@onKeyEvent true
                                             }
                                             // Menu open but no candidates → fall
@@ -1561,7 +1714,22 @@ internal fun ChatInputArea(
                                     sendOnEnter
                                 ) {
                                     performEnterSend()
-                                } else false
+                                } else {
+                                    // [meta-audit-1028 C3/F-03] Shift+Enter is
+                                    // "newline", not "send", whatever the
+                                    // Return-Key preference says. Returning
+                                    // false lets Compose insert the `\n`, and
+                                    // the flag tells the soft-IME intercept in
+                                    // `onValueChange` that this newline is the
+                                    // user's line break, not an IME Enter.
+                                    if (event.type == KeyEventType.KeyDown &&
+                                        event.key == Key.Enter &&
+                                        event.isShiftPressed
+                                    ) {
+                                        shiftEnterNewlinePending = true
+                                    }
+                                    false
+                                }
                             },
                         textStyle = mergedTextStyle,
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
@@ -1674,7 +1842,7 @@ internal fun ChatInputArea(
                             color = ChatColors.inputBg,
                             modifier = Modifier.clickable {
                                 viewModel.cancelEdit()
-                                viewModel.setInputText("")
+                                clearComposerInput()
                             },
                         ) {
                             Text(
@@ -1806,20 +1974,27 @@ internal fun ChatInputArea(
                     // voice panel, read-replies TTS) removed here.
 
                     // Right: 3-state Send / Enqueue / Stop button (mirrors iOS sendButton).
-                    //   • streaming + hasText  → SEND (routes through viewModel.sendMessage,
+                    //   • streaming + content → SEND (routes through viewModel.sendMessage,
                     //     which dispatches to enqueuePrompt since _isStreaming is true).
                     //     Visual feedback for the queued prompt comes from the dashed
                     //     bubble that ChatViewModel.enqueuePrompt appends to the message
                     //     list — no extra button badge needed (matches iOS).
-                    //   • streaming + !hasText → STOP (cancel current run).
-                    //   • !streaming           → SEND (full color when hasText, dimmed
+                    //   • streaming + !content → STOP (cancel current run).
+                    //   • !streaming           → SEND (full color when content, dimmed
                     //     when empty; same as before).
                     // T180: an attachments-only send (no caption) is a
                     // valid message — mirrors iOS where !attachments.isEmpty
                     // satisfies the composer's send guard. Without this an
                     // image-only "look at this" send is impossible.
-                    val hasText = inputText.isNotBlank()
-                    val hasContent = hasText || attachments.isNotEmpty()
+                    // [fix/dv19-b1] Content comes from the shared eligibility
+                    // predicate (the field's own TextFieldValue + attachments), the
+                    // same read the swipe gesture uses. The old
+                    // `inputText.isNotBlank()` read the 150 ms-debounced VM string,
+                    // so inside a dictation/paste burst the button rendered a red
+                    // STOP over a live stream (a tap then called cancelStream and
+                    // killed the run the user meant to enqueue) and the idle Send
+                    // stayed dimmed over a composer the user could see was full.
+                    val hasContent = canSwipeSendNow()
                     val showStop = isStreaming && !hasContent
                     if (showStop) {
                         Box(
@@ -1900,13 +2075,20 @@ internal fun ChatInputArea(
                 chatRepository = chatRepository,
                 onDismiss = { showMoveSheet = false },
                 onSelect = { targetId ->
+                    // [fix/dv19-b1] Stash the field's LIVE text (the VM string can
+                    // still be a 150 ms burst behind, i.e. exactly empty right
+                    // after dictation) and drop the pending flush: the job is
+                    // launched on ChatScreen's scope, so it outlives this composer
+                    // and would commit the snapshot into the session the user just
+                    // left (inputText is per-ViewModel) after the move cleared it.
+                    cancelPendingImeBurst()
                     ChatViewModelStore.stashPendingTransfer(
                         ChatViewModelStore.PendingTransfer(
-                            inputText = inputText,
+                            inputText = inputFieldValue.text,
                             attachments = viewModel.attachments.value,
                         ),
                     )
-                    viewModel.setInputText("")
+                    clearComposerInput()
                     viewModel.clearAttachments()
                     viewModel.clearShareInjectedFlag()
                     showMoveSheet = false
@@ -1915,4 +2097,104 @@ internal fun ChatInputArea(
             )
         }
 
+}
+
+/**
+ * [dv22-B4] Async payload of the slash menu. [commands] is the batched IO
+ * result; [loaded] is false only before the FIRST load for the current keys
+ * (initial value / closed menu) — it drives the loading placeholder, never
+ * the empty-vs-populated distinction (an empty `commands` with `loaded == true`
+ * simply renders no popup, exactly like the old synchronous shape).
+ */
+private data class SlashMenuPayload(
+    val commands: List<SlashCommand> = emptyList(),
+    val loaded: Boolean = false,
+)
+
+/**
+ * [dv22-B4] First-load placeholder for the async slash menu: the same locked
+ * frame the list uses ([SLASH_PICKER_FIXED_HEIGHT], 4 rows) with one subdued
+ * "Loading…" row, so the popup's geometry never changes when the data lands.
+ */
+@Composable
+private fun SlashMenuLoadingPanel() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            // T240: same thin visible border as the list panel (see the list
+            // Box below) so the placeholder IS the menu frame.
+            .shadow(elevation = 3.dp, shape = RoundedCornerShape(10.dp))
+            .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
+            .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
+            .height(SLASH_PICKER_FIXED_HEIGHT),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = stringResource(R.string.common_loading),
+            color = ChatColors.secondaryText,
+            fontSize = 12.sp,
+        )
+    }
+}
+
+/**
+ * [deep-audit-1049 B-06] Where the caret lands after a funnel rewrite.
+ *
+ * `null` means "this outlet has no caret intent" — the slash and `@` sites that
+ * just replace the body keep the user's true caret (`lastTrueCaretEnd`, the
+ * authoritative value maintained by `onValueChange`, NOT the possibly-lagging
+ * `TextFieldValue.selection`). Both shapes are clamped to the new text, because
+ * a shift-delete during the 150 ms burst can leave the remembered caret past the
+ * end of the replacement and `TextRange` would throw.
+ *
+ * Pure and top-level so the arithmetic is pinned on the JVM; the funnel itself
+ * needs a composition (`BasicTextField` + a ViewModel).
+ */
+internal fun composerCommitCaret(caret: Int?, lastTrueCaretEnd: Int, length: Int): Int {
+    val wanted = caret ?: lastTrueCaretEnd
+    if (length <= 0) return 0
+    return wanted.coerceIn(0, length)
+}
+
+/**
+ * [meta-audit-1028 C3/F-01] How the body funnel resolves the caret: an explicit
+ * caller caret wins, then the ViewModel's one-shot intent
+ * (`_pendingCaret`, parked by the slash flows and the mention insert), then the
+ * user's true caret.
+ *
+ * The middle term is the one that used to be missing. `composerCommitCaret`
+ * alone cannot see it, and the intent's only other reader (the
+ * `LaunchedEffect(inputText)` mirror) is skipped precisely when the funnel runs,
+ * because the funnel writes the field copy too. Pure so the precedence is
+ * pinned on the JVM: the funnel itself calls `viewModel.consumePendingCaret()`,
+ * which needs a composition.
+ */
+internal fun composerFunnelCaret(
+    caret: Int?,
+    pendingCaret: Int?,
+    lastTrueCaretEnd: Int,
+    length: Int,
+): Int = composerCommitCaret(caret ?: pendingCaret, lastTrueCaretEnd, length)
+
+/**
+ * [meta-audit-1028 C3/F-03] Does this `onValueChange` look like a soft-keyboard
+ * Enter (→ send) rather than an ordinary edit?
+ *
+ * Multi-line composers report Enter as a single inserted `'\n'` (the IME never
+ * fires `KeyboardActions.onSend`), so that is the whole signal: exactly one
+ * character added, exactly one newline more, and the newline sitting before the
+ * caret. A paste with line breaks adds more than one newline and falls through
+ * to the normal multi-line edit.
+ *
+ * The shape cannot separate "IME Enter" from "hardware Shift+Enter" — Compose
+ * inserts the same `'\n'` for both — so that discrimination lives one level up
+ * (the `shiftEnterNewlinePending` flag the key handler raises). A clipboard
+ * paste of a lone newline is likewise indistinguishable from a soft Enter and
+ * still sends; see the fix report's residual section.
+ */
+internal fun isEnterSendEdit(oldText: String, newText: String, caretEnd: Int): Boolean {
+    if (newText.length != oldText.length + 1) return false
+    if (newText.count { it == '\n' } != oldText.count { it == '\n' } + 1) return false
+    return caretEnd in 1..newText.length && newText[caretEnd - 1] == '\n'
 }

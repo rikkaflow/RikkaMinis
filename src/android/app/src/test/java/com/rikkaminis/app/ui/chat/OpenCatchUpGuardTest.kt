@@ -95,4 +95,73 @@ class OpenCatchUpGuardTest {
         if (decide(userEngaged = engaged, canScrollForward = true)) rolls++
         assertEquals(1, rolls)
     }
+
+    // ── [FIX-R4-Q F-12] wiring: the two jump-away entry points must mark ──
+
+    @Test
+    fun fabUpTapAndFocusJumpMarkTheUserEngagedBeforeScrollingAway() {
+        // [FIX-R4-Q F-12] Both entry points scroll AWAY from the bottom while
+        // the open-catchup window may still be armed (<2.5s after opening the
+        // session — e.g. a search-result tap into the same session). Without
+        // the marking the collector rolls the viewport straight back to the
+        // bottom and the jump the user asked for is cancelled.
+        val src = readChatScreen()
+        assertMarkedBefore(src, "tracedScrollToItem(\"FAB-UP\"")
+        assertMarkedBefore(src, "tracedScrollToItem(\"FOCUS-MESSAGE\"")
+    }
+
+    /** `openCatchUpUserEngaged = true` must appear on the same code path that
+     *  leads to the jump call, BEFORE it.
+     *
+     *  [R5-C4] The original form was a 1200-char proximity window — a heuristic,
+     *  not the contract. The R5-C4 fix legitimately inserts work between the
+     *  marking and the FAB-UP scroll (1224 chars) and turned the proxy red on a
+     *  change that satisfies the contract. A plain "nearest marking anywhere
+     *  before the marker" rewrite was tried first and proved toothless: deleting
+     *  the FAB-UP marking left the Resume-banner marking 230 lines earlier
+     *  satisfying it. What the contract actually says is "the marking is in the
+     *  block that does the scrolling", so the pin is now INDENT-SCOPED: walk up
+     *  from the scroll line to the first line with a smaller indent (the lambda
+     *  that owns the call), and require a marking inside that window with no
+     *  other `tracedScrollToItem(` in it. Immune to prose growth, still red when
+     *  the marking moves to a different code path. */
+    private fun assertMarkedBefore(src: String, marker: String) {
+        val at = src.indexOf(marker)
+        assertTrue("marker not found: $marker", at >= 0)
+        val lines = src.lines()
+        val scrollLine = src.substring(0, at).count { it == '\n' }
+        val indent = lines[scrollLine].takeWhile { it == ' ' }.length
+        var i = scrollLine - 1
+        var markingFound = false
+        var otherScrolls = 0
+        while (i >= 0) {
+            val line = lines[i]
+            if (line.isNotBlank() && line.takeWhile { it == ' ' }.length < indent) break
+            if (line.contains("openCatchUpUserEngaged = true")) markingFound = true
+            if (line.contains("tracedScrollToItem(")) otherScrolls++
+            i--
+        }
+        assertTrue(
+            "engagement marking missing from the scrolling block of $marker",
+            markingFound,
+        )
+        assertEquals(
+            "another programmatic scroll precedes $marker in the same block",
+            0,
+            otherScrolls,
+        )
+    }
+
+    private fun readChatScreen(): String {
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir") ?: error("user.dir unset"))
+        while (dir != null) {
+            val f = java.io.File(
+                dir,
+                "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt",
+            )
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException("ChatScreen.kt not found from user.dir=${System.getProperty("user.dir")}")
+    }
 }

@@ -121,10 +121,24 @@ fun ChatHistoryDrawer(
     // findable even while its title is still pending (or after title
     // generation failed), and message-less draft rows (the current unsent
     // chat, ghost rows from /memory or /thinking toggles) stay hidden.
+    //
+    // [dv24-b3] …nor may it depend on the row having `messages` rows yet. A
+    // session whose body is known only through `last_message` (a promoted
+    // draft — see `promoteDraftIfNeeded` — or a turn whose first assistant row
+    // is not durable yet, [T-android-session-last-message-live-tool-call]) has
+    // content the user typed and must be reachable. The ghost-row guard stays
+    // exact: those rows are created by a settings toggle, carry no preview and
+    // no message, so they fail all three terms.
     val messageCounts by chatRepository.observeMessageCountsPerSession()
         .collectAsState(initial = emptyMap())
     val visibleSessions = remember(sessions, messageCounts) {
-        sessions.filter { it.pinnedAt != null || (messageCounts[it.id] ?: 0) > 0 }
+        sessions.filter { session ->
+            isDrawerRowVisible(
+                pinnedAt = session.pinnedAt,
+                messageCount = messageCounts[session.id] ?: 0,
+                lastMessage = session.lastMessage,
+            )
+        }
     }
     val grouped = remember(visibleSessions) { groupSessionsByDate(visibleSessions) }
 
@@ -407,14 +421,36 @@ private const val TAG = "ChatHistoryDrawer"
 
 private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) {
     drawerIoScope.launch {
-        // [fix/audit-0917-b9] release()/clear() used to run only AFTER
-        // deleteSession returned; an exception there (IO error, row already
-        // gone) skipped them, leaking the ChatViewModel and a stale badge for
-        // a session that no longer exists. finally keeps the cleanup
-        // unconditional. ChatViewModelStore.release touches Compose state and
-        // must run on Main — hop back like ChatViewModel.deleteSession does.
+        // [dv27-B4 / deep-audit-1047 B-06] The sequence lives in
+        // `sessionDeletePlan()` (release → delete → clear) and is executed, not
+        // re-stated here. Releasing FIRST kills the producer before the tree it
+        // produces into is removed: the resident ChatViewModel's streamJob and
+        // its BrowserTabPool otherwise keep writing `minis-sessions/<id>/…` /
+        // `browser_tabs/<id>.json` back into the just-deleted directory, and
+        // the cancelled stream's own `finally` re-publishes an overlay excerpt
+        // / badge AFTER the clear below — a deleted session that lights up
+        // again. ChatMutationMethods.delete (headless entry) cancels first for
+        // the exact same reason.
+        //
+        // [fix/audit-0917-b9] The cleanup stays UNCONDITIONAL: any throw from a
+        // step (IO error, row already gone) is logged and the finally replays
+        // the two idempotent steps, so the VM and the badge are still cleared
+        // for a session that no longer exists. ChatViewModelStore.release
+        // touches Compose state and must run on Main — hop back like
+        // ChatViewModel.deleteSession does.
         try {
-            chatRepository.deleteSession(id)
+            for (step in sessionDeletePlan()) {
+                when (step) {
+                    SessionDeleteStep.RELEASE_VIEW_MODEL ->
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            ChatViewModelStore.release(id)
+                        }
+                    SessionDeleteStep.DELETE_ROW ->
+                        chatRepository.deleteSession(id)
+                    SessionDeleteStep.CLEAR_BADGE ->
+                        com.rikkaminis.app.service.SessionBadgeStore.clear(id)
+                }
+            }
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "deleteSession($id) failed — releasing resources anyway", t)
         } finally {
@@ -423,6 +459,14 @@ private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) 
             }
             com.rikkaminis.app.service.SessionBadgeStore.clear(id)
         }
+        // [deep-audit-1048 B-05] `deleteSession` reclaims the session's on-disk
+        // tree (minis-sessions/<id>: workspace / attachments / offloads /
+        // browser) and the Storage page caches a process-lifetime snapshot that
+        // sizes exactly those directories — so without this the deleted
+        // session's bytes stayed in the totals for the life of the process.
+        // Unconditional on purpose: the reclamation can be partial (read-only
+        // mount, IO error) and the cached numbers are stale either way.
+        com.rikkaminis.app.ui.settings.invalidateStorageSnapshot()
     }
 }
 
@@ -597,3 +641,31 @@ private fun DrawerSessionRow(
         }
     }
 }
+
+/**
+ * [dv24-b3] Which `sessions` rows the history drawer renders.
+ *
+ * Three independent reasons a row has content worth showing, in the order the
+ * user would recognise them:
+ *  - pinned: an explicit "keep this at hand" from the user;
+ *  - has messages: the ordinary case;
+ *  - has a preview: the body exists even though no `messages` row does yet
+ *    (a promoted draft — see `promoteDraftIfNeeded` — or a turn whose first
+ *    assistant row is not durable, `T-android-session-last-message-live-tool-call`).
+ *
+ * A row with none of the three is a ghost: the empty chat the user abandoned,
+ * or one materialised by a `/memory` / `/thinking` toggle. Those stay hidden —
+ * that is the `P0-1-drawer-title-visibility` contract, and it is why the
+ * preview term tests BLANKNESS rather than merely "the column is non-null": a
+ * whitespace-only preview carries no content either, and `isNullOrBlank` keeps
+ * such a legacy row in the ghost bucket.
+ *
+ * Pure on purpose: the drawer is a @Composable (not JVM-testable), so the
+ * decision lives here where `PromoteDraftVisibilityTest` can pin all four
+ * cases — including the two ghost-row regressions.
+ */
+internal fun isDrawerRowVisible(
+    pinnedAt: Long?,
+    messageCount: Int,
+    lastMessage: String?,
+): Boolean = pinnedAt != null || messageCount > 0 || !lastMessage.isNullOrBlank()

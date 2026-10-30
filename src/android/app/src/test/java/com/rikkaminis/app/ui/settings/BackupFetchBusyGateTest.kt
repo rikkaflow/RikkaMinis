@@ -1,0 +1,274 @@
+package com.rikkaminis.app.ui.settings
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * [fix/dv20-b4-backup-busy] deep-audit-1040 B-08.
+ *
+ * `BackupSettingsScreen`'s fetch-to-local path (`onFetch`, reached when the
+ * auto-backup remote list is opened for an entry) pulls a full payload into
+ * memory and then writes + rotates `filesDir/backup-autos` — the same
+ * directory the nightly run, the SAF export and every restore touch. It used
+ * to raise only the dialog-local `autoRemoteLoading`, so dismissing the dialog
+ * mid-flight (its OK button and the back gesture are never gated) left
+ * "Run Now" / "Restore" / "Export" clickable and let two full payloads land on
+ * that directory at once. Its post-fetch `openAutoRemoteList()` also ran
+ * unconditionally, re-arming the spinner from a scope that a torn-down screen
+ * had already cancelled.
+ *
+ * The screen is Compose-only (not JVM-instantiable: it needs a real `Context`,
+ * a WebDAV client and the auto-backup directory), so the contract is pinned by
+ * source-shape assertions — the same approach `SharedCacheExportPruneTest` and
+ * `SkillFileViewerSaveShapeTest` use for their screens.
+ *
+ * Expected values are hardcoded literals (never derived from the code under
+ * test) so a mutation of the production code cannot masquerade as PASS.
+ */
+class BackupFetchBusyGateTest {
+
+    private val screen: String by lazy {
+        readRepoFile("app/src/main/java/com/rikkaminis/app/ui/settings/BackupSettingsScreen.kt")
+    }
+
+    /** Comment-stripped source: every assertion below is about CODE, and the
+     *  handler's own prose mentions `openAutoRemoteList()` (in the ordering
+     *  note), so a raw `indexOf` would anchor on the comment instead of the
+     *  call. The scan gate strips comments for the same reason. */
+    private val code: String by lazy { withoutComments(screen) }
+
+    /** The `onFetch = { entry -> … }` handler region, located by brace matching
+     *  (the handler is a lambda argument, so a line-based anchor would drift on
+     *  any reformat). The candidate carrying the post-fetch list refresh wins. */
+    private val handler: String by lazy { fetchHandlerRegion(code) }
+
+    // -- ① the handler region is still locatable (fail-closed anchor) --
+
+    @Test
+    fun fetchHandler_regionIsLocated() {
+        val anchor = screen.indexOf("onFetch")
+        assertTrue("onFetch handler anchor disappeared from the screen", anchor >= 0)
+        val braceBalanced = handler.isNotEmpty() && handler.count { it == '{' } == handler.count { it == '}' }
+        assertTrue("onFetch handler region must be brace-balanced, got: ${handler.take(80)}", braceBalanced)
+    }
+
+    // -- ② the fetch path claims the shared busy gate --
+
+    @Test
+    fun fetchHandler_claimsTheSharedBusyGate() {
+        assertEquals(
+            "fetch-to-local must raise the shared operationBusy gate exactly once",
+            1,
+            handler.split("operationBusy = true").size - 1,
+        )
+    }
+
+    // -- ③ and releases it on the exit path, not just the happy path --
+
+    @Test
+    fun fetchHandler_releasesTheGateInsideFinally() {
+        val finallyIdx = handler.indexOf("finally")
+        assertTrue("fetch-to-local must release the shared gate on its exit path (no `finally`)", finallyIdx >= 0)
+        val finallyBlock = bracedRegion(handler, finallyIdx)
+        assertEquals(
+            "the shared gate must be lowered exactly once inside `finally`",
+            1,
+            finallyBlock.split("operationBusy = false").size - 1,
+        )
+    }
+
+    // -- ④ the tail refresh is liveness-guarded --
+
+    @Test
+    fun postFetchRefresh_isLivenessGuarded() {
+        val refreshIdx = handler.indexOf("openAutoRemoteList(")
+        assertTrue("the post-fetch refresh anchor disappeared", refreshIdx >= 0)
+        val window = handler.substring(maxOf(0, refreshIdx - 200), refreshIdx)
+        assertTrue(
+            "the post-fetch openAutoRemoteList() must be liveness-guarded (isActive / ensureActive())",
+            window.contains("isActive") || window.contains("ensureActive("),
+        )
+    }
+
+    // -- ⑤ a cancelled fetch must not be reported as a failure --
+
+    @Test
+    fun cancellation_isRethrownNotSwallowed() {
+        assertTrue(
+            "a screen-gone cancellation must be rethrown, not folded into the error path",
+            handler.contains("catch (t: CancellationException)") && handler.contains("throw t"),
+        )
+    }
+
+    // -- ⑥ radius: only this path gained a gate (whole-file literals) --
+
+    @Test
+    fun onlyTheFetchPathGainedAGateSite() {
+        // [meta-audit-1028 D4 F-02] 7 → 8: the restore-payload claim helper
+        // (`val claimRestorePayload`) is the single `operationBusy = true` site shared by
+        // every restore that builds a payload before it can call restoreWithSnapshot
+        // (WebDAV manual + auto, local snapshot, SAF import). One site, four entries — the
+        // alternative (claiming inside each handler) is what the count is protecting
+        // against. The contract behind the bump is pinned by RestorePayloadBusyGateTest
+        // (claim-before-payload per entry, preClaimed handoff, release on failure).
+        // 8 → 9 was the external-mirror "sync now" row; 9 → 8 again on
+        // 2026-10-29 [silent-mirror]: that row is gone (the mirror runs
+        // silently, its status row is passive). The only mirror action left is
+        // the status row's retry, which is a bounded text write and
+        // deliberately does NOT claim the gate — it reads `operationBusy` to
+        // stay disabled while a restore/fetch holds it, which is the ordering
+        // that matters (no 70 MB payload is built by a mirror sync).
+        assertEquals(
+            "exactly one new operationBusy = true site (the fetch path + the shared " +
+                "restore-payload claim helper)",
+            8,
+            code.split("operationBusy = true").size - 1,
+        )
+        // 10 = the pre-[FIX-P1A] baseline. The 11th site is the restore path's
+        // snapshot-failure abort (added by FIX-P1A / RT-S3: a failed snapshot
+        // used to leave the gate up forever while the import ran on; the abort
+        // branch lowers it before returning). It is NOT a free release — ⑦
+        // below pins that the branch really returns instead of falling through
+        // to the import, so the count cannot be bumped without the contract.
+        // [meta-audit-1028 D4 F-02] Still 11, and that is the interesting number: the
+        // release side did not grow. `releaseRestorePayload` is a single site (+1) and it
+        // is paid for by the `.minisbak` Plain handoff (-1), which no longer drops the
+        // gate before restoreWithSnapshot re-acquires it (see [preClaimed]). A new release
+        // site appearing here means someone lowered the gate by hand instead of through
+        // the helper.
+        // 12 → 11 follows the true-count above: the mirror row's paired release
+        // left with its claim. The mirror retry has no release site because it
+        // has no claim — a release site appearing here without a claim above
+        // means someone lowered another path's gate by hand.
+        assertEquals(
+            "exactly one new operationBusy = false site (the fetch path's finally), " +
+                "plus the restore snapshot-abort branch (pinned by snapshotFailure_abortsBeforeImport)",
+            11,
+            code.split("operationBusy = false").size - 1,
+        )
+    }
+
+    // -- ⑦ a failed pre-restore snapshot aborts the restore (FIX-P1A / RT-S3) --
+
+    @Test
+    fun snapshotFailure_abortsBeforeImport() {
+        val snapshotIdx = code.indexOf("writeSnapshotStreaming(")
+        val importIdx = code.indexOf("ConfigBackup.import(")
+        assertTrue("the pre-restore snapshot anchor disappeared", snapshotIdx >= 0)
+        assertTrue("the restore's import anchor disappeared", importIdx >= 0)
+        assertTrue(
+            "the safety snapshot must be taken BEFORE the import overwrites the config",
+            snapshotIdx < importIdx,
+        )
+        assertTrue(
+            "the snapshot coroutine must be labelled so its failure branch can return",
+            code.contains("launch snapshotBeforeRestore@{"),
+        )
+        val failedIdx = code.indexOf("backup_snapshot_failed")
+        assertTrue("the snapshot failure branch anchor disappeared", failedIdx >= 0)
+        val catchIdx = code.indexOf("catch (t: Throwable)", snapshotIdx)
+        assertTrue("the snapshot write must have its own catch", catchIdx in snapshotIdx until importIdx)
+        val branch = bracedRegion(code, catchIdx)
+        assertTrue(
+            "a failed snapshot must report through the existing error dialog",
+            branch.contains("errorMessage ="),
+        )
+        assertTrue(
+            "a failed snapshot must lower the shared busy gate before returning",
+            branch.contains("operationBusy = false"),
+        )
+        assertTrue(
+            "a failed snapshot must NOT fall through into the import",
+            branch.contains("return@snapshotBeforeRestore"),
+        )
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    private fun fetchHandlerRegion(src: String): String {
+        var from = 0
+        while (true) {
+            val i = src.indexOf("onFetch", from)
+            if (i < 0) return ""
+            val region = bracedRegion(src, i)
+            if (region.contains("openAutoRemoteList(")) return region
+            from = i + "onFetch".length
+        }
+    }
+
+    /** Substring from [marker] through the brace that closes the first block
+     *  opened after it. */
+    private fun bracedRegion(src: String, marker: Int): String {
+        val open = src.indexOf('{', marker)
+        assertTrue("no block opened at/after offset $marker", open >= 0)
+        var depth = 0
+        for (i in open until src.length) {
+            when (src[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return src.substring(open, i + 1)
+                }
+            }
+        }
+        throw AssertionError("unbalanced block opened at offset $open")
+    }
+
+    /** Comment-stripped source (string-literal aware), mirroring the scan
+     *  gate's `strip_comments`: every assertion below is about CODE, and the
+     *  handler's own prose mentions `openAutoRemoteList()` (in the ordering
+     *  note), so a raw `indexOf` would anchor on the comment instead of the
+     *  call. */
+    private fun withoutComments(src: String): String {
+        val out = StringBuilder()
+        var i = 0
+        while (i < src.length) {
+            val c = src[i]
+            when {
+                c == '/' && i + 1 < src.length && src[i + 1] == '/' -> {
+                    val nl = src.indexOf('\n', i)
+                    i = if (nl < 0) src.length else nl
+                }
+                c == '/' && i + 1 < src.length && src[i + 1] == '*' -> {
+                    val end = src.indexOf("*/", i + 2)
+                    i = if (end < 0) src.length else end + 2
+                }
+                c == '"' -> {
+                    out.append(c)
+                    i++
+                    while (i < src.length) {
+                        if (src[i] == '\\' && i + 1 < src.length) {
+                            out.append(src, i, i + 2)
+                            i += 2
+                            continue
+                        }
+                        out.append(src[i])
+                        if (src[i] == '"') {
+                            i++
+                            break
+                        }
+                        i++
+                    }
+                }
+                else -> {
+                    out.append(c)
+                    i++
+                }
+            }
+        }
+        return out.toString()
+    }
+
+    private fun readRepoFile(relative: String): String {
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir") ?: error("user.dir unset"))
+        while (dir != null) {
+            val f = java.io.File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException(
+            "$relative not found from user.dir=${System.getProperty("user.dir")}",
+        )
+    }
+}

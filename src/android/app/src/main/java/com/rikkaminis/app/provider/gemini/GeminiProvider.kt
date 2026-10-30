@@ -5,6 +5,8 @@ import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.LLMError
 import com.rikkaminis.app.data.model.parseRetryAfterMs
+import com.rikkaminis.app.provider.LegacyMediaPlan
+import com.rikkaminis.app.provider.sseDataPayload
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
@@ -44,13 +46,26 @@ import com.rikkaminis.app.provider.causeChainSummary
 import com.rikkaminis.app.provider.failOnSilentEmptyCompletion
 import com.rikkaminis.app.provider.asConsumerSideCancellation
 import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.StreamCancelBridge
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.visionPlaceholder
+import com.rikkaminis.app.provider.nonStreamCeilingCutLogLine
+import com.rikkaminis.app.provider.nonStreamOutputCeilingCut
 
 class GeminiProvider(
     private val apiKey: String,
     override var model: LLMModel = LLMModel.gemini25Flash,
-    private val basePath: String = "https://generativelanguage.googleapis.com/v1beta",
+    private val basePath: String = GeminiBasePath.DEFAULT_BASE,
+    /**
+     * [T-provider-custom-user-agent / deep-audit-1019 ISSUE-04] Per-provider
+     * User-Agent override. Both request builders used to hard-code
+     * `applyUserAgentOverride(null)` and this class had no parameter for it, so
+     * a UA the user set on a Gemini instance was unreachable. null/blank →
+     * MinisUserAgent.DEFAULT (the helper's fallback), non-blank → replaces the
+     * outbound User-Agent. Defaulted so every existing call site compiles
+     * unchanged.
+     */
+    private val customUserAgent: String? = null,
 ) : LLMProvider {
     override val name = "Google"
     override var instanceContext: com.rikkaminis.app.data.model.ProviderInstance? = null
@@ -59,21 +74,16 @@ class GeminiProvider(
     override val supportsPrefill: Boolean get() = true
 
     /**
-     * [FIX-1 / F-194] The request path is built as
-     * `$basePath/models/<id>:generateContent`, so a base that already carries an
-     * API-version segment produces `.../v1/v1beta/models/...` = 404. The models
-     * LIST api has always collapsed this (GeminiModelsApi:29 strips
-     * `/v1beta` and `/v1` with a comment saying exactly that relays do paste
-     * either), but the request side never did — so a user who pasted a working
-     * relay base into the models field got a green model list and a 404 on
-     * every message. Same normalization, applied where the URL is actually
-     * assembled.
+     * [FIX-1 / F-194; corrected by deep-audit-1016 ISSUE-01] The request path is built as
+     * `$basePath/models/<id>:generateContent`, so the base needs exactly one API-version
+     * segment and nothing more. FIX-1 stripped `/v1beta` / `/v1` (relays paste either) but
+     * never restored one, which turned "some relay bases 404" into "every base 404s" —
+     * measured 404 on the versionless path, 400 on `/v1beta/models/...`.
+     *
+     * The rule now lives in one place ([GeminiBasePath]) because two copies of it drifting
+     * apart is what produced the month-long split shape: model list 200, chat 404.
      */
-    private fun normalizedBasePath(): String {
-        var p = basePath
-        while (p.endsWith("/")) p = p.dropLast(1)
-        return p.removeSuffix("/v1beta").removeSuffix("/v1")
-    }
+    private fun normalizedBasePath(): String = GeminiBasePath.normalize(basePath)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -104,8 +114,10 @@ class GeminiProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] Brand the outbound UA so server logs
             // can trace the request back to the Minis build. Gemini has no
-            // SDK-specific UA requirement, so the helper's default kicks in.
-            .applyUserAgentOverride(null)
+            // SDK-specific UA requirement, so the helper's default kicks in
+            // when no override is set ([deep-audit-1019 ISSUE-04]: this used
+            // to be a hard-coded `null`, which also masked the user's value).
+            .applyUserAgentOverride(customUserAgent)
             .build()
 
         // [fix/audit-s4m1] response closed via .use{} on all paths.
@@ -121,10 +133,48 @@ class GeminiProvider(
             }
 
             val json = JSONObject(responseBody)
+            // [R5-E2 E-C-02②] A 2xx status is not the same thing as a successful
+            // generateContent: Google itself answers `200 {"error":{…}}` on some
+            // relay/edge shapes, and a blocked prompt comes back as
+            // `{"promptFeedback":{…}}` with NO candidates. Both used to fall
+            // through extractText (which returns "" for a missing array) into
+            // `finishReason ?: "end_turn"`, i.e. an EMPTY ANSWER REPORTED AS A
+            // CLEAN end_turn — the caller persisted a fabricated empty turn and
+            // never retried. The verdict below is pure and unit-tested
+            // (GeminiNonStreamingVerdictTest); see geminiGenerateContentVerdict
+            // for why "no candidates" throws instead of returning a
+            // `finishReason = "error"` response.
+            when (val verdict = geminiGenerateContentVerdict(json)) {
+                GeminiGenerateContentVerdict.Ok -> Unit
+                is GeminiGenerateContentVerdict.HttpError ->
+                    // Same mapping the streaming arm uses for an inline error
+                    // frame (geminiStreamErrorStatus + mapHttpError), so a rate
+                    // limit is RateLimited and a revoked key is InvalidApiKey on
+                    // both paths instead of two different classifications.
+                    throw mapHttpError(verdict.status, responseBody)
+                is GeminiGenerateContentVerdict.EmptyCandidates ->
+                    throw LLMError.ProviderError(verdict.describe())
+            }
             val text = extractText(json)
             val finishReason = extractFinishReason(json)
             val usage = extractUsage(json)
             val mediaAttachments = extractInlineMedia(json)
+            // Unchanged: a response that DOES carry a candidate but no
+            // finishReason (notably a pure functionCall turn, where text is
+            // legitimately empty) still defaults to end_turn.
+            //
+            // [FIX-FW-NONSTREAM C2] `finishReason = MAX_TOKENS` is normalised to
+            // `max_tokens` by extractFinishReason and then carried through
+            // untouched — no signal anywhere that the answer is a truncated
+            // prefix. Not an exception (the same max_tokens would hit the same
+            // ceiling on retry); one structured log line instead. See
+            // nonStreamOutputCeilingCut for why nothing new is thrown here.
+            if (nonStreamOutputCeilingCut(finishReason)) {
+                android.util.Log.w(
+                    name,
+                    nonStreamCeilingCutLogLine(name, finishReason, text.length),
+                )
+            }
             LLMResponse(text, finishReason ?: "end_turn", usage, mediaAttachments)
         }
     }
@@ -156,8 +206,9 @@ class GeminiProvider(
             .url(url)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] same intent as the non-streaming
-            // branch above — brand outbound requests with Minis/<version>.
-            .applyUserAgentOverride(null)
+            // branch above — brand outbound requests with Minis/<version>
+            // unless the instance carries an override ([deep-audit-1019 ISSUE-04]).
+            .applyUserAgentOverride(customUserAgent)
             .build()
 
         val call = client.newCall(request)
@@ -176,6 +227,31 @@ class GeminiProvider(
                 call.cancel()
             }
         }
+        // [fix/audit2-cancelbridge-1015, placement corrected by audit3 F-05]
+        // Cancellation bridge, registered BEFORE the first blocking call —
+        // which is `call.execute()` immediately below, then `reader.readLine()`
+        // in the loop. The position is load-bearing, not stylistic: `execute()`
+        // itself blocks while the connection is established and the response
+        // headers are awaited, and a blocking socket read is NOT interruptible
+        // by coroutine cancellation. With the bridge registered AFTER
+        // `execute()` (where audit2 first put it) a user cancel landing in that
+        // connect/header window had no handler to reach, so the coroutine ran
+        // on until the headers arrived or the TTFB watchdog
+        // (StreamTimeouts.TTFB_TIMEOUT_MS) fired. Measured: with the bridge
+        // after execute a cancel during a silent connect window is still parked
+        // in the socket read past the 10s probe bound; with it before, the call
+        // is torn down in milliseconds (see the connect-window arm of
+        // ProviderCancelBridgeAnthropicGeminiTest).
+        //
+        // Without any bridge at all, a cancel during the body read leaves this
+        // coroutine parked until the upstream speaks or the generation
+        // readTimeout (30 min, FirstChunkTimeoutPolicy) fires — measured against
+        // a silently wedged server: the outer job, the inner job, a wrapping
+        // coroutineScope and a withTimeoutOrNull each still ran the full budget,
+        // socket still open. OpenAIProvider registers it in exactly this spot.
+        // See [com.rikkaminis.app.provider.StreamCancelBridge] for the three
+        // semantics and the OpenAI arm's numbers.
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         val response = try {
             call.execute()
         } catch (e: IOException) {
@@ -219,15 +295,44 @@ class GeminiProvider(
             // content present → truncated) from a genuinely empty EOF (left to
             // failOnSilentEmptyCompletion).
             var contentChars = 0
+            // [deep-audit-1019 ISSUE-04] Gemini's streamGenerateContent hands
+            // each functionCall over WHOLE in a single SSE chunk (there is no
+            // Anthropic-style input_json_delta stream), so the counterpart of
+            // AnthropicProvider's `toolChars` is the call payload itself: a
+            // pure-tool turn that is cut after the calls but before any
+            // finishReason must still trip the truncated-Finished below instead
+            // of looking like a clean end_turn with an incomplete tool set.
+            var toolChars = 0
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 val l = line ?: continue
-                if (!l.startsWith("data: ")) continue
+                // [r3-b08 F-13] `data:{…}` (no space) is legal SSE and relays do
+                // emit it; the strict `data: ` prefix dropped every frame.
+                val payload = sseDataPayload(l)?.trim() ?: continue
+                if (payload.isEmpty()) continue
                 firstDataArrived.set(true)
                 firstDataWatchdog.cancel()
-                val payload = l.removePrefix("data: ")
 
                 val json = try { JSONObject(payload) } catch (_: Exception) { continue }
+
+                // [r3-b08 F-03] A 200 stream can carry the failure IN the body:
+                // Gemini/its relays send `data: {"error":{"code":429,…}}`. With
+                // no branch for it, the frame fell through `optJSONArray
+                // ("candidates")` and the loop ended at EOF — which the EOF
+                // guard (correctly, for a cut stream) re-signalled as truncated,
+                // so a rate limit became an EOF-continuation retry of a request
+                // the server had already refused. Mirrors the two siblings that
+                // already do this: AnthropicProvider's `"error"` event arm
+                // ([FIX-1 / F-195]) and OpenAIProvider's inline-error branch.
+                json.optJSONObject("error")?.let { err ->
+                    throw mapHttpError(
+                        geminiStreamErrorStatus(
+                            code = err.optInt("code", 0),
+                            googleStatus = err.optString("status", ""),
+                        ),
+                        payload,
+                    )
+                }
 
                 if (!started) {
                     send(LLMStreamChunk.Started)
@@ -259,6 +364,12 @@ class GeminiProvider(
                     // stable name-indexed id so the engine's per-turn dedupe
                     // (dedupeToolStartId) can collapse repeats.
                     val toolId = "gemini_${System.nanoTime()}"
+                    // [deep-audit-1019 ISSUE-04] Count the call payload as stream
+                    // activity (name + serialized args — the args JSON text, not
+                    // the JSONObject key count) so a tool-only turn that never
+                    // saw a finishReason is classified as truncated rather than
+                    // clean.
+                    toolChars += toolCallActivityChars(fcName, fcArgs.toString())
                     send(LLMStreamChunk.ToolUseStart(toolId, fcName))
                     send(LLMStreamChunk.ToolCallComplete(toolId, fcName, fcArgs))
                 }
@@ -270,6 +381,11 @@ class GeminiProvider(
                 // (:94) — the SSE loop previously only read text/thinking
                 // parts, silently dropping media bytes on streaming turns.
                 extractInlineMedia(json).forEach { media ->
+                    // [deep-audit-1019 ISSUE-04] Inline media is streamed output
+                    // content too (audit report's companion fix): count its bytes
+                    // into the activity counter so a media-only turn cut before
+                    // finishReason is not reclassified as a clean end_turn.
+                    contentChars += media.data.size
                     send(LLMStreamChunk.MediaAttachment(media))
                 }
 
@@ -288,17 +404,29 @@ class GeminiProvider(
             // signal truncated so the turnTruncated retry path owns it. A fully
             // empty EOF (contentChars == 0) is left to failOnSilentEmptyCompletion
             // and is not flagged here.
-            if (lastFinishReason == null && contentChars > 0) {
-                send(LLMStreamChunk.Finished(null, truncated = true))
-            } else {
-                send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
-            }
+            //
+            // [deep-audit-1045 A-02] "Left to failOnSilentEmptyCompletion" only
+            // holds if we stop INVENTING a stop reason on the way out: that
+            // operator decides by `Finished.stopReason != null` (LLMProvider.kt
+            // :239), so the old `?: "end_turn"` on a fully empty EOF made it
+            // read as a clean finish and no TransientError was ever raised.
+            // The terminal decision now lives in [geminiEofTerminal], which
+            // passes an absent finishReason through as null.
+            val terminal = geminiEofTerminal(lastFinishReason, contentChars, toolChars)
+            send(LLMStreamChunk.Finished(terminal.stopReason, truncated = terminal.truncated))
         } catch (e: Exception) {
             // [F-177] same defect as OpenAIProvider: a cause-less
             // CancellationException here means the consumer asked us to stop
             // (user tapped stop), not that the stream broke. Classifying it as
             // a stream error made a cancel look like a provider failure.
             val consumerCancel = e.asConsumerSideCancellation()
+                // [fix/audit2-cancelbridge-1015] The bridge closes the socket, so
+                // this catch sees `SocketException: Socket closed` — which says
+                // the socket closed, not *why*. Re-ask the bridge for the reason
+                // (the same second door OpenAIProvider uses), so a user cancel
+                // keeps landing in the INFO branch below instead of being logged
+                // as a stream error.
+                ?: cancelBridge.consumerCancellationCause?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "GeminiProvider",
@@ -311,7 +439,11 @@ class GeminiProvider(
         } finally {
             reader.close()
             response.close()
+            // The body left the read loop under its own power: a later scope
+            // cancellation is teardown, not "this stream was cancelled".
+            cancelBridge.markStreamCompleted()
         }
+        cancelBridge.dispose()
         channel.close()
         awaitClose()
         // [fix/provider-stream-flowon] Same starvation as OpenAIProvider: the
@@ -322,6 +454,39 @@ class GeminiProvider(
         // relocates only the producer + awaitClose to the IO pool; awaitClose
         // here is empty, so nothing thread-sensitive moves.
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * [R5-E2 E-F-06] Emit one turn's images as Gemini `inlineData` parts (or a
+     * text placeholder when the model has no vision input — [§27a]).
+     *
+     * Extracted so the two carriers (the turn's structured `contentParts` and
+     * the request/message-level `imageParts` lists) go through ONE assembly:
+     * the shape that produced this defect was two mutually exclusive branches,
+     * each with its own copy of the image assembly, so whichever branch a turn
+     * landed in decided which images the wire saw.
+     */
+    private fun appendImageParts(
+        parts: JSONArray,
+        images: List<LLMMessage.ImagePart>,
+        supportsImages: Boolean,
+    ) {
+        for (part in images) {
+            val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
+            if (visionText != null) {
+                // [§27a] Non-vision model — text placeholder, mirrors the
+                // contentParts branch above.
+                parts.put(JSONObject().put("text", visionText))
+            } else {
+                // T5-L1: same backstop as the contentParts branch above.
+                val safeBytes = ImageBudget.compressUnderBudget(part.data)
+                val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
+                val inlineData = JSONObject()
+                inlineData.put("mimeType", safeMime)
+                inlineData.put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
+                parts.put(JSONObject().put("inlineData", inlineData))
+            }
+        }
+    }
 
     private fun buildRequestBody(
         messages: List<LLMMessage>,
@@ -434,25 +599,45 @@ class GeminiProvider(
                         }
                     }
                 }
+                // [R5-E2 E-F-06] The image carriers are NOT the content/else
+                // branch selector. Before this, a turn whose `contentParts` was
+                // non-empty (structured text, tool blocks — the normal shape
+                // since T132) read NEITHER the request-level `imageParts` (the
+                // list `sendMessage`/`streamMessage` take for "this turn's
+                // images") NOR `msg.imageParts`, so the entire image payload of
+                // such a turn was silently dropped on the wire.
+                //
+                // The guard is what keeps the live chat path byte-identical: a
+                // chat turn already carries its images as `ImageData` parts of
+                // this same `contentParts` (and the SAME arrays again in
+                // `msg.imageParts`), so with an inline image present, appending
+                // either carrier would send every attachment twice. Only a turn
+                // that has NO inlined ImageData needs the other carriers.
+                val extraImages = geminiTurnExtraImages(
+                    isLastUserTurn = index == lastUserIndex,
+                    requestImages = imageParts,
+                    messageImages = msg.imageParts,
+                    inlineImageCount = msg.contentParts.count { it is AgentContentPart.ImageData },
+                )
+                if (extraImages.isNotEmpty()) {
+                    appendImageParts(parts, extraImages, supportsImages)
+                }
             } else {
                 // Legacy: plain text with optional images
-                if (index == lastUserIndex && imageParts.isNotEmpty()) {
-                    for (part in imageParts) {
-                        val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
-                        if (visionText != null) {
-                            // [§27a] Non-vision model — text placeholder, mirrors
-                            // the contentParts branch above.
-                            parts.put(JSONObject().put("text", visionText))
-                        } else {
-                            // T5-L1: same backstop as the contentParts branch above.
-                            val safeBytes = ImageBudget.compressUnderBudget(part.data)
-                            val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
-                            val inlineData = JSONObject()
-                            inlineData.put("mimeType", safeMime)
-                            inlineData.put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
-                            parts.put(JSONObject().put("inlineData", inlineData))
-                        }
-                    }
+                // [deep-audit-1047 A-03] `msg.imageParts` is a per-message carrier the
+                // payload predicate already weighs (`hasWirePayload`), so it needs a
+                // serializer here too. The request-level list keeps its contract
+                // (last user turn only); the message's own parts stay on its own turn.
+                // No producer feeds this in production today, so every live path is
+                // byte-identical to before.
+                val legacyImages = (if (index == lastUserIndex) imageParts else emptyList()) + msg.imageParts
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = index == lastUserIndex,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0) {
+                    appendImageParts(parts, legacyImages, supportsImages)
                 }
                 val legacyText = msg.content.ifEmpty { " " }
                 parts.put(JSONObject().put("text", legacyText))
@@ -677,4 +862,210 @@ class GeminiProvider(
         if (error is java.io.IOException) return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
     }
+
+    /**
+     * [deep-audit-1019 ISSUE-04] Stream-activity size of one Gemini functionCall:
+     * the tool name plus its args JSON text. Mirrors AnthropicProvider's `toolChars`
+     * intent (tool input counts as stream activity) adapted to Gemini's shape,
+     * where each call arrives whole in a single SSE chunk instead of as an
+     * input_json_delta stream.
+     */
+    private fun toolCallActivityChars(name: String, argsJson: String): Int =
+        name.length + argsJson.length
+}
+
+/**
+ * [deep-audit-1019 ISSUE-04] Pure verdict for Gemini's SSE EOF path: the loop
+ * exited without any finishReason but the stream DID deliver output — text /
+ * thinking / media bytes ([contentChars]) or whole functionCall payloads
+ * ([toolChars], AnthropicProvider's `toolChars` counterpart). That is a
+ * mid-stream cut, so the turn must be re-signalled as truncated instead of
+ * falling through to a clean `Finished("end_turn")`.
+ *
+ * A fully empty EOF (both counters 0) stays FALSE here: that is the
+ * "silent empty completion" case owned by failOnSilentEmptyCompletion, and
+ * flagging it here would double-handle it. A clear finishReason always
+ * wins (FALSE) even when tool calls were delivered.
+ *
+ * Extracted as a top-level pure function so the boundary table is directly
+ * unit-testable (see GeminiEofTruncatedDecisionTest) instead of being buried
+ * in the SSE loop.
+ */
+internal fun shouldFlagEofTruncated(
+    lastFinishReason: String?,
+    contentChars: Int,
+    toolChars: Int,
+): Boolean = lastFinishReason == null && (contentChars > 0 || toolChars > 0)
+
+/**
+ * [deep-audit-1045 A-02] The terminal chunk Gemini's SSE loop emits once the
+ * stream reaches EOF, as a pure decision over the same three inputs as
+ * [shouldFlagEofTruncated].
+ *
+ * Why this exists: the loop's `else` arm used to send
+ * `Finished(lastFinishReason ?: "end_turn")`. On a FULLY EMPTY EOF
+ * (contentChars == 0 && toolChars == 0) `lastFinishReason` is null, so the
+ * arm synthesized a stop reason — and `failOnSilentEmptyCompletion`
+ * (LLMProvider.kt:239) treats `Finished` with a non-null stopReason as
+ * "the server finished cleanly". A relay that drops the SSE body therefore
+ * produced an empty assistant turn that looked like a legitimate end_turn:
+ * the KDoc above `shouldFlagEofTruncated` promises that case is "left to
+ * failOnSilentEmptyCompletion", and the fabricated stop reason is exactly
+ * what made that promise unenforceable.
+ *
+ * Table (hand-pinned in GeminiEofTerminalDecisionTest):
+ *  - no finishReason + any stream activity → truncated, no stop reason (the
+ *    turnTruncated retry path owns it — same shape as before);
+ *  - no finishReason + no activity       → NOT truncated, NO stop reason, so
+ *    failOnSilentEmptyCompletion raises TransientError (retryable) instead of
+ *    a silent empty success;
+ *  - a real finishReason                 → pass it through verbatim, never
+ *    truncated (even when tool calls were delivered).
+ *
+ * Deliberately NOT expressed as a change to [shouldFlagEofTruncated]: that
+ * verdict has other consumers (the media-only / tool-only truncation rules)
+ * and widening it would reclassify a fully empty EOF as "truncated" as well,
+ * which would double-handle the case with a retry the empty-stream operator
+ * already owns.
+ */
+internal data class GeminiEofTerminal(
+    val stopReason: String?,
+    val truncated: Boolean,
+)
+
+internal fun geminiEofTerminal(
+    lastFinishReason: String?,
+    contentChars: Int,
+    toolChars: Int,
+): GeminiEofTerminal =
+    if (shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)) {
+        GeminiEofTerminal(stopReason = null, truncated = true)
+    } else {
+        GeminiEofTerminal(stopReason = lastFinishReason, truncated = false)
+    }
+
+/**
+ * [r3-b08 F-03] HTTP status to use for a Google-style error body
+ * (`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED",…}}`).
+ *
+ * `code` is already the HTTP status in Google's error model, so it is used
+ * verbatim whenever it is a plausible status. `status` is the fallback for the
+ * relays that keep the enum but drop/zero the code — that enum is what decides
+ * whether the stream error becomes a retryable RateLimited, a fatal
+ * InvalidApiKey, or a generic ProviderError in [GeminiProvider.mapHttpError].
+ *
+ * Pure + top-level so the table is unit-testable (see GeminiStreamErrorStatusTest)
+ * without a network stack.
+ */
+internal fun geminiStreamErrorStatus(code: Int, googleStatus: String): Int {
+    if (code in 400..599) return code
+    return when (googleStatus.trim().uppercase()) {
+        "INVALID_ARGUMENT" -> 400
+        "FAILED_PRECONDITION" -> 400
+        "OUT_OF_RANGE" -> 400
+        "UNAUTHENTICATED" -> 401
+        "PERMISSION_DENIED" -> 403
+        "NOT_FOUND" -> 404
+        "RESOURCE_EXHAUSTED" -> 429
+        "DEADLINE_EXCEEDED" -> 504
+        "INTERNAL" -> 500
+        "UNAVAILABLE" -> 503
+        "ABORTED" -> 503
+        else -> 500
+    }
+}
+
+/**
+ * [R5-E2 E-F-06] Which image parts belong to a turn whose `contentParts` are
+ * non-empty, i.e. the branch that previously emitted no images at all.
+ *
+ * Returns EMPTY when the turn already carries its images inline as
+ * [AgentContentPart.ImageData] parts: those are the same bytes (chat builds
+ * both carriers from one `prepared.imageParts` list), so appending the
+ * parallel carriers would double every attachment in the request. Otherwise
+ * the set is exactly the one the legacy branch uses — the request-level list
+ * on the LAST user turn only (`sendMessage`'s documented contract), plus the
+ * message's own parts on its own turn.
+ *
+ * Pure + top-level so the carrier table is unit-testable
+ * (see GeminiNonStreamingVerdictTest) instead of hidden in the serializer.
+ * Shared with the legacy branch's assembly (`GeminiProvider.appendImageParts`)
+ * so the two branches cannot drift into two wire shapes again.
+ */
+internal fun geminiTurnExtraImages(
+    isLastUserTurn: Boolean,
+    requestImages: List<LLMMessage.ImagePart>,
+    messageImages: List<LLMMessage.ImagePart>,
+    inlineImageCount: Int,
+): List<LLMMessage.ImagePart> {
+    if (inlineImageCount > 0) return emptyList()
+    if (requestImages.isEmpty() && messageImages.isEmpty()) return emptyList()
+    val out = ArrayList<LLMMessage.ImagePart>(requestImages.size + messageImages.size)
+    if (isLastUserTurn) out.addAll(requestImages)
+    out.addAll(messageImages)
+    return out
+}
+
+/**
+ * [R5-E2 E-C-02②] Verdict for a NON-STREAMING `generateContent` body that came
+ * back with a 2xx status.
+ *
+ * Gemini (and relays in front of it) can answer 200 with the failure inside the
+ * body — `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED",…}}` — exactly the
+ * shape the streaming arm already intercepts ([geminiStreamErrorStatus] +
+ * `mapHttpError`). The non-streaming arm read it as an empty candidate list and
+ * returned `LLMResponse("", "end_turn")`, i.e. a fabricated successful empty
+ * answer over a rate limit or a revoked key.
+ *
+ * ## Why "no candidates" THROWS instead of returning `finishReason = "error"`
+ *
+ * The callers cannot express the difference any other way:
+ *  • nothing in the app gives an `"error"` stop reason any meaning — the only
+ *    stop reason ever compared against a literal is `"length"`
+ *    (`compactSummaryIsTruncated`), while `text` stays empty, so an "error"
+ *    response would still be persisted as an assistant answer that says
+ *    nothing, which is the very symptom being fixed;
+ *  • throwing is the ONE classification path callers already treat as a
+ *    failure (typed [LLMError] → error card + retry), and the streaming arm
+ *    reaches the same place by throwing (`mapHttpError` on an inline error
+ *    frame, `failOnSilentEmptyCompletion` on a fully empty stream).
+ *
+ * A response that DOES carry a candidate is left alone: a pure `functionCall`
+ * turn with empty text, or a candidate that only carries `finishReason:
+ * "SAFETY"`, are legitimate responses whose meaning downstream already owns.
+ */
+internal sealed class GeminiGenerateContentVerdict {
+    /** A candidate is present — parse it the way this arm always has. */
+    data object Ok : GeminiGenerateContentVerdict()
+
+    /** The body carries an error object; [status] is its HTTP class. */
+    data class HttpError(val status: Int) : GeminiGenerateContentVerdict()
+
+    /** No candidate at all: blocked prompt, relay truncation, empty body. */
+    data class EmptyCandidates(val blockReason: String?) : GeminiGenerateContentVerdict() {
+        fun describe(): String = buildString {
+            append("Gemini returned no candidates")
+            if (!blockReason.isNullOrEmpty()) append(" (blocked: $blockReason)")
+            append(" — refusing to report an empty answer as a completed turn")
+        }
+    }
+}
+
+internal fun geminiGenerateContentVerdict(json: JSONObject): GeminiGenerateContentVerdict {
+    json.optJSONObject("error")?.let { err ->
+        return GeminiGenerateContentVerdict.HttpError(
+            geminiStreamErrorStatus(
+                code = err.optInt("code", 0),
+                googleStatus = err.optString("status", ""),
+            ),
+        )
+    }
+    val candidates = json.optJSONArray("candidates")
+    if (candidates == null || candidates.length() == 0) {
+        val blockReason = json.optJSONObject("promptFeedback")
+            ?.safeOptString("blockReason", "")
+            ?.ifEmpty { null }
+        return GeminiGenerateContentVerdict.EmptyCandidates(blockReason)
+    }
+    return GeminiGenerateContentVerdict.Ok
 }

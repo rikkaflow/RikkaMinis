@@ -383,26 +383,210 @@ lang: "auto"
     }
 
     /**
-     * Read + parse the current SOUL.md. Returns null when the file is
-     * missing or unreadable; an empty body parses to default-meta with
-     * empty body and callers may treat that as "fall back to default".
+     * Distinct outcomes of reading SOUL.md.
+     *
+     * [load] collapses every failure to `null`. That is the right shape for
+     * its call sites (`?: default`), but it loses the difference between the
+     * two worlds that matter to a *write*:
+     *
+     *  - **Missing** — falling back to the default content is correct, the
+     *    next save legitimately creates the file.
+     *  - **Unreadable** — a SOUL.md is on disk and its bytes cannot be
+     *    decoded. Falling back to default and then saving overwrites the
+     *    user's persona with the app default (P0 F-4 / world W3: a chmod, a
+     *    truncated write, an external editor swapping the file mid-save).
+     *
+     * Exposed read-only so logs, diagnostics and tests can tell the two apart
+     * without changing [load]'s signature (zero call-site churn).
      */
-    fun load(context: Context): SoulFile? {
-        val file = fileLocation(context)
-        if (!file.exists()) return null
+    sealed class ReadState {
+        /** No SOUL.md on disk — the default content is the correct answer. */
+        object Missing : ReadState()
+
+        /** Bytes read and parsed. */
+        data class Loaded(val file: SoulFile) : ReadState()
+
+        /** The path exists but its bytes could not be read. */
+        data class Unreadable(val message: String) : ReadState()
+    }
+
+    /**
+     * What the pre-overwrite backup did. Returned (not just logged) so the JVM
+     * tests assert the branch that ran instead of asserting on log text.
+     */
+    internal enum class BackupOutcome {
+        /** No SOUL.md on disk — nothing to lose. */
+        Missing,
+
+        /** Disk already holds the exact bytes about to be written. */
+        Identical,
+
+        /** Previous bytes copied to `SOUL.md.recovered-<stamp>`. */
+        Written,
+
+        /**
+         * [1028B-2 / backlog L9089] The bytes could not be read, so there was
+         * nothing to *copy* — but the file itself was moved (`renameTo`) to
+         * `SOUL.md.recovered-<stamp>` before the new content landed.
+         *
+         * Why this is a separate branch instead of another `Unreadable`: a
+         * rename needs only a writable **directory**, not read permission on
+         * the file. That is exactly the W3 world the copy path cannot cover
+         * (chmod / EIO / a foreign editor swapping the inode under us), and
+         * the one where the old persona used to disappear with nothing but an
+         * ERROR line. Renaming is therefore strictly more protective than
+         * copying here, at zero extra read cost.
+         */
+        Renamed,
+
+        /**
+         * Read failed **and** the rename-aside failed too (read-only parent,
+         * EACCES on the directory, filesystem refusing the rename). The save
+         * still proceeds — nothing here may turn a Save into a failure — but
+         * this is logged at ERROR because the previous content is now
+         * genuinely gone.
+         */
+        RenameFailed,
+
+        /**
+         * The path exists but is not a regular file (a directory, a FIFO, a
+         * dangling link). Deliberately NOT moved aside: those are not persona
+         * bytes, and a non-file squatting on the `SOUL.md.recovered-*`
+         * namespace would never be collected by [pruneBackups] (it filters on
+         * `isFile`). Distinct from [RenameFailed] so tests can tell "we chose
+         * not to" from "we tried and could not".
+         */
+        NotARegularFile,
+
+        /** Larger than [MAX_BACKUP_BYTES] — not copied; the save proceeds. */
+        TooLarge,
+
+        /** The copy failed (disk full, permissions) — the save proceeds. */
+        Failed,
+    }
+
+    /** Backup siblings kept on disk; older ones are pruned per new backup. */
+    private const val RECOVERED_KEEP = 3
+    private const val RECOVERED_INFIX = ".recovered-"
+
+    /**
+     * Ceiling on what may be copied into a backup. The documented body cap is
+     * [CHINESE_CHAR_LIMIT] (1600 chars), so a SOUL.md above 1 MiB is already a
+     * foreign or corrupted file — and copying it three times over is how a
+     * "protect the user's data" guard ends up filling the disk in exactly the
+     * situation it exists for. Also bounds the read: the bytes are never pulled
+     * into memory when the length is already over the cap.
+     */
+    private const val MAX_BACKUP_BYTES = 1L * 1024 * 1024
+
+    /**
+     * Read + parse [target] without collapsing "missing" into "unreadable".
+     * Context-free so the JVM tests run this exact body on a real filesystem.
+     */
+    fun loadFrom(target: File): ReadState {
+        if (!target.exists()) return ReadState.Missing
         return try {
-            SoulMDParser.parse(file.readText())
+            ReadState.Loaded(SoulMDParser.parse(target.readText()))
         } catch (t: Throwable) {
             AppLogger.warning(TAG, "SOUL.md load failed: ${t.message}")
-            null
+            ReadState.Unreadable(t.message ?: t.javaClass.simpleName)
         }
     }
 
-    /** Atomic write through a `.tmp` sibling, then rename. */
+    /**
+     * Read + parse the current SOUL.md. Returns null when the file is
+     * missing or unreadable; an empty body parses to default-meta with
+     * empty body and callers may treat that as "fall back to default".
+     *
+     * Behaviour is unchanged on purpose (5 write points in
+     * [com.rikkaminis.app.config.ConfigBuiltins] plus the Settings screen
+     * depend on the `null` shape). The body now delegates to [loadFrom] so
+     * the two can never disagree about what "unreadable" means.
+     */
+    fun load(context: Context): SoulFile? =
+        (loadFrom(fileLocation(context)) as? ReadState.Loaded)?.file
+
+    /** Same question as [load], answered with the reason instead of `null`. */
+    fun readState(context: Context): ReadState = loadFrom(fileLocation(context))
+
+    /**
+     * Atomic write through a `.tmp` sibling, then rename.
+     *
+     * Overwrite guard (P0 F-4): before the rename, the bytes currently on disk
+     * are copied to a `SOUL.md.recovered-<epochMillis>` sibling when — and
+     * only when — they differ from what is about to be written. See
+     * [backupBeforeOverwrite] for why the trigger is a content comparison
+     * rather than "am I falling back to the default right now".
+     */
     fun save(context: Context, file: SoulFile) {
-        val target = fileLocation(context)
+        saveTo(fileLocation(context), file)
+        _cachedMetadata.value = file.metadata
+        // [da1028-B / ISSUE-04] Signal for UI surfaces that hold an editable
+        // copy of what is on disk. `cachedMetadata` cannot serve as that
+        // signal: StateFlow de-duplicates equal values, so a body-only rewrite
+        // (the common `minis-config set soul.body …`) leaves the metadata
+        // identical and never emits. A monotonic counter emits on every write
+        // regardless of what changed.
+        _writeVersion.value += 1
+    }
+
+    /**
+     * The write itself, Context-free: `.tmp` sibling + rename, preceded by
+     * [backupBeforeOverwrite]. [save] adds the in-process cache/version
+     * bookkeeping on top; this function is the seam that lets a JVM test run
+     * the production bytes on a real filesystem.
+     *
+     * [clock] and [readExisting] are injectable ONLY so the tests can (a) pin
+     * backup timestamps and (b) simulate a read that throws without needing a
+     * permission bit (the test runner is root, so `chmod 000` is still
+     * readable). Production call sites take both defaults.
+     */
+    fun saveTo(
+        target: File,
+        file: SoulFile,
+        clock: () -> Long = System::currentTimeMillis,
+        readExisting: (File) -> ByteArray? = { f -> if (f.isFile) f.readBytes() else null },
+    ) {
+        saveRawTo(target, SoulMDParser.serialize(file), clock, readExisting)
+    }
+
+    /**
+     * [1028B-2 / backlog L9096] The write itself for **already-serialized**
+     * text: pre-overwrite backup, then an atomic `.tmp` + rename.
+     *
+     * Exists because SOUL.md has a second write surface that does not own a
+     * [SoulFile] — `MemoryRepository.saveFile(name, content)` receives the raw
+     * editor text (the chat memory sheet and Settings → Memory both splice a
+     * window back into the full text and hand it over verbatim). Routing that
+     * through [saveTo] would silently re-serialize it: frontmatter keys
+     * reordered, `emoji:` dropped, a trailing newline forced. Same protection,
+     * different text semantics — so the protection lives here, below the
+     * parser, and the caller keeps its byte-exact contract.
+     *
+     * Context-free on purpose: `MemoryRepository` holds only the memory
+     * directory, and the two UI surfaces already call
+     * [SoulStore.refreshCache] after saving (a gate pins that pairing).
+     */
+    internal fun saveRawTo(
+        target: File,
+        text: String,
+        clock: () -> Long = System::currentTimeMillis,
+        readExisting: (File) -> ByteArray? = { f -> if (f.isFile) f.readBytes() else null },
+    ) {
         target.parentFile?.mkdirs()
-        val text = SoulMDParser.serialize(file)
+        // Backup first: the rename below is atomic, but it is atomic over the
+        // *new* bytes — without this copy the previous content is gone the
+        // instant rename succeeds.
+        backupBeforeOverwrite(target, text, clock, readExisting)
+        writeAtomically(target, text)
+    }
+
+    /**
+     * `.tmp` sibling + rename. Split out so [saveTo] (parsed) and [saveRawTo]
+     * (verbatim) share one write path — a second copy of this block is how the
+     * `.tmp` cleanup fix below would get lost on the next edit.
+     */
+    private fun writeAtomically(target: File, text: String) {
         val tmp = File(target.parentFile, "${target.name}.tmp")
         // [audit-0917] Delete the temp file if the write itself fails. The old
         // code only cleaned up on a rename failure, so a throwing writeText
@@ -421,7 +605,161 @@ lang: "auto"
             target.writeText(text)
             tmp.delete()
         }
-        _cachedMetadata.value = file.metadata
+    }
+
+    /**
+     * Protect what is currently in [target] before it is overwritten: copy the
+     * bytes to a `SOUL.md.recovered-<stamp>` sibling — or, when the bytes
+     * cannot be read at all, move the file itself aside (see [renameAside]).
+     * Best effort by design: nothing here may turn a user's Save into a
+     * failure.
+     *
+     * The two halves answer two different failures. Copy protects "readable but
+     * about to be replaced by a fallback"; rename protects "present but we are
+     * not allowed to read it", which the copy path can never cover because it
+     * needs the very permission that is broken.
+     *
+     * **Why a content comparison instead of "is this write falling back to the
+     * default?"** — [saveTo]'s callers cannot tell us that. The fallback lives
+     * in `ConfigBuiltins.loadCurrent()` / `SoulSettingsScreen`
+     * (`load(context) ?: parse(DEFAULT_CONTENT)`), and threading a "this file
+     * is a fallback" flag through them means touching five writers that
+     * otherwise need no change. Comparing bytes is locally decidable, applies
+     * to every overwrite path (including ones added later), and costs one extra
+     * file of a few KB per *real* edit — capped at [RECOVERED_KEEP] files.
+     *
+     * Byte-for-byte copy, not read-text → write-text: a file the parser accepts
+     * but whose encoding we would round-trip differently must still be
+     * recoverable verbatim.
+     */
+    internal fun backupBeforeOverwrite(
+        target: File,
+        newText: String,
+        clock: () -> Long = System::currentTimeMillis,
+        readExisting: (File) -> ByteArray? = { f -> if (f.isFile) f.readBytes() else null },
+    ): BackupOutcome {
+        if (!target.exists()) return BackupOutcome.Missing
+
+        // Length first, read second: a foreign 200 MB file must not be pulled
+        // into memory just to be judged too big to copy.
+        if (target.isFile && target.length() > MAX_BACKUP_BYTES) {
+            AppLogger.warning(
+                TAG,
+                "SOUL.md at ${target.absolutePath} is ${target.length()} bytes " +
+                    "(over the $MAX_BACKUP_BYTES-byte backup cap) — overwriting without a " +
+                    "backup. The previous content is not recoverable from this device.",
+            )
+            return BackupOutcome.TooLarge
+        }
+
+        val existing = try {
+            readExisting(target)
+        } catch (t: Throwable) {
+            // Present but unreadable — the W3 "permission-broken" half. The
+            // [1028B-2 / backlog L9089] answer: COPY needs read permission,
+            // but RENAME only needs a writable directory. Move the file aside
+            // verbatim (no bytes are ever read, so chmod / EIO cannot stop
+            // it) and let the save recreate the path with the new content.
+            // If even the rename fails there is nothing left to do that does
+            // not risk the save itself — say so loudly and move on.
+            return renameAside(target, clock(), "unreadable (${t.message})")
+        }
+        if (existing == null) {
+            // Path exists but is not a regular file (a directory, a FIFO, a
+            // broken link): no persona bytes to protect, and moving a
+            // non-file into the `SOUL.md.recovered-*` namespace would put
+            // something [pruneBackups] (isFile filter) never collects next
+            // to real backups. Leave it; the save below will fail on its own
+            // if the path really cannot be replaced, with a filesystem error
+            // that names the true cause.
+            AppLogger.error(
+                TAG,
+                "SOUL.md at ${target.absolutePath} exists but is not a regular file " +
+                    "— not renaming it aside; the save proceeds against it as-is.",
+            )
+            return BackupOutcome.NotARegularFile
+        }
+        if (String(existing, Charsets.UTF_8) == newText) return BackupOutcome.Identical
+
+        return try {
+            nextBackupFile(target, clock()).writeBytes(existing)
+            pruneBackups(target)
+            BackupOutcome.Written
+        } catch (t: Throwable) {
+            AppLogger.warning(
+                TAG,
+                "SOUL.md backup failed (${t.message}) — continuing with the save",
+            )
+            BackupOutcome.Failed
+        }
+    }
+
+    /**
+     * [1028B-2 / backlog L9089] Move the unreadable file aside instead of
+     * copying it. Rename is the only operation in this file that preserves a
+     * file we are not allowed to read: it touches the directory entry, never
+     * the bytes, so `chmod 000` / EIO / an inode swapped by a foreign editor
+     * all still leave the user's persona recoverable verbatim.
+     *
+     * Both exits are explicit and both are audible — the save itself is never
+     * blocked (the copy path's contract: "nothing here may turn a Save into a
+     * failure"), but the caller can tell the two apart without parsing logs.
+     */
+    private fun renameAside(target: File, stamp: Long, reason: String): BackupOutcome {
+        val recovered = nextBackupFile(target, stamp)
+        if (target.renameTo(recovered)) {
+            AppLogger.warning(
+                TAG,
+                "SOUL.md at ${target.absolutePath} could not be read ($reason) — moved " +
+                    "aside to ${recovered.name} before overwriting. The previous content " +
+                    "is unchanged on this device (it may still need a chmod to open).",
+            )
+            pruneBackups(target)
+            return BackupOutcome.Renamed
+        }
+        AppLogger.error(
+            TAG,
+            "SOUL.md at ${target.absolutePath} could not be read ($reason) and could not " +
+                "be moved aside either — overwriting it without a backup. The previous " +
+                "content is not recoverable from this device.",
+        )
+        return BackupOutcome.RenameFailed
+    }
+
+    /**
+     * `SOUL.md.recovered-<epochMillis>` next to [target]. Two saves inside the
+     * same millisecond would otherwise collide and silently lose the first
+     * backup, so the stamp is bumped until the name is free (names stay
+     * lexicographically ordered, which [pruneBackups] relies on as a
+     * tie-break).
+     */
+    private fun nextBackupFile(target: File, stamp: Long): File {
+        val dir = target.parentFile ?: target.absoluteFile.parentFile ?: target.absoluteFile
+        var name = "${target.name}$RECOVERED_INFIX$stamp"
+        var bump = stamp
+        var candidate = File(dir, name)
+        while (candidate.exists()) {
+            bump += 1
+            name = "${target.name}$RECOVERED_INFIX$bump"
+            candidate = File(dir, name)
+        }
+        return candidate
+    }
+
+    /** Keep the [RECOVERED_KEEP] newest backups, delete the rest. */
+    private fun pruneBackups(target: File) {
+        val dir = target.parentFile ?: return
+        val prefix = target.name + RECOVERED_INFIX
+        val backups = dir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(prefix) }
+            ?: return
+        if (backups.size <= RECOVERED_KEEP) return
+        backups
+            // mtime is the documented order; the name carries a monotonic
+            // stamp, so it breaks same-millisecond ties.
+            .sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
+            .dropLast(RECOVERED_KEEP)
+            .forEach { runCatching { it.delete() } }
     }
 
     /**
@@ -434,6 +772,23 @@ lang: "auto"
     val cachedMetadata: StateFlow<SoulMetadata> = _cachedMetadata.asStateFlow()
 
     /**
+     * [da1028-B / ISSUE-04] Monotonic counter bumped on every rewrite of
+     * SOUL.md. Settings → Soul keys its load on this so an external write
+     * (minis-config behind the confirm sheet, a backup-restore, the chat
+     * memory sheet's SOUL.md editor) re-seeds the editors instead of leaving
+     * the screen on the values it read at open time — the user's next Save
+     * would otherwise write that stale snapshot straight back over the
+     * external change (the 1026-A / 1027-E silent-rollback family).
+     *
+     * Bumped from [save] *and* [refreshCache]: the latter is the documented
+     * entry point for "the file was rewritten outside [save]" (the chat
+     * memory sheet calls it right after its raw `saveFile`), so a rewrite
+     * that notifies the metadata cache must notify this too.
+     */
+    private val _writeVersion = MutableStateFlow(0L)
+    val writeVersion: StateFlow<Long> = _writeVersion.asStateFlow()
+
+    /**
      * Re-read SOUL.md into [cachedMetadata]. Call once at app launch
      * (after [ensureExists]) and any time the file is rewritten outside
      * of [save] (currently only the Settings UI uses save()).
@@ -441,6 +796,7 @@ lang: "auto"
     fun refreshCache(context: Context) {
         val parsed = load(context)
         _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value += 1
     }
 }
 
