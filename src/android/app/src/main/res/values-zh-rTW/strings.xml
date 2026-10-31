@@ -1698,4 +1698,13 @@
     <string name="mirror_diag_failed">上次同步失敗</string>
     <string name="mirror_diag_unavailable">沒有可用的儲存目標</string>
     <string name="mirror_retry">重試</string>
+    <!-- [feat/paste-fold-marker] Long-paste folding: chip, preview, send guard. -->
+    <string name="paste_chip_desc">已摺疊的貼上內容 #%1$d，%2$d 字元。點擊預覽。</string>
+    <string name="paste_preview_title">貼上內容 %1$s</string>
+    <string name="paste_folded_summary">已摺疊 %1$d 字</string>
+    <string name="paste_unresolved_notice">草稿中含有無法展開的貼上標記（%1$s），傳送已停用。刪除該標記後即可傳送。</string>
+    <string name="notif_storage_budget_channel_name">儲存空間預算</string>
+    <string name="notif_storage_budget_channel_description">當本應用程式自身的資料（沙箱 shell、工作階段、媒體）超出預算時提醒。</string>
+    <string name="notif_storage_budget_title">本應用程式佔用較多儲存空間</string>
+    <string name="notif_storage_budget_body">本應用程式已使用 %1$s（預算 %2$s）。點按查看空間被什麼佔用。</string>
 </resources>
