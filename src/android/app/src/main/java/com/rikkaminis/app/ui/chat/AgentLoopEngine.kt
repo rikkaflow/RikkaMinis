@@ -3,6 +3,8 @@ package com.rikkaminis.app.ui.chat
 import com.rikkaminis.app.agent.Level
 import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.AgentToolDefinition
+import com.rikkaminis.app.guard.GuardVerdict
+import com.rikkaminis.app.guard.ToolLoopScope
 import com.rikkaminis.app.provider.ToolJsonRepair
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.tools.ToolConcurrencyPolicy
@@ -736,6 +738,12 @@ internal class AgentLoopEngine(
         fallbackStrategy: com.rikkaminis.app.data.model.FallbackStrategy = com.rikkaminis.app.data.model.FallbackStrategy.default,
     ) {
         AppLogger.info(TAG_STREAM, "runAgentLoop ENTER provider=${provider.javaClass.simpleName} historySize=${host.agentHistory.size}")
+        // [dv1101-review F-04] Key the loop guard on the session THIS loop belongs to,
+        // captured once at entry. Reading host.activeSessionId at each tool call keyed a
+        // background loop's ladders under whichever session the UI happened to show —
+        // with two concurrent loops (SessionConcurrencyManager allows 2) that is one
+        // shared live value, so the two runs would write into the same ladders.
+        val guardSessionId = host.activeSessionId
         // T9: start a fresh trace for this run. The file is captured once so
         // every event of the run lands in the same JSONL file; the loop's
         // per-turn / per-tool hooks below append to it.
@@ -4078,7 +4086,19 @@ internal class AgentLoopEngine(
                         val callBlocks = ParallelToolBatchBlocks.forkForCall(baseline)
                         Triple(p.id, callBlocks, async {
                             val execStart = System.currentTimeMillis()
-                            val r = host.executeTool(p.name, p.argsStr, p.id, callBlocks, loopState.assistantId, loopState.accumulatedText)
+                            // [feat/tool-loop-guard] Same guarded dispatch as the sequential
+                            // branch (this one is only reached by parallel-safe reads, so a
+                            // refusal here can only come from a stopped session).
+                            val guardVerdict = ToolLoopScope.beforeCall(guardSessionId, p.name, p.argsStr)
+                            val r = if (guardVerdict is GuardVerdict.Refuse) {
+                                ToolLoopScope.refusal(p.name, guardVerdict.reason)
+                            } else {
+                                ToolLoopScope.afterCall(
+                                    guardSessionId, p.name, p.argsStr,
+                                    host.executeTool(p.name, p.argsStr, p.id, callBlocks, loopState.assistantId, loopState.accumulatedText),
+                                    guardVerdict,
+                                )
+                            }
                             execMsById[p.id] = System.currentTimeMillis() - execStart
                             r
                         })
@@ -4149,7 +4169,21 @@ internal class AgentLoopEngine(
                         }
                     }
                     val execStart = System.currentTimeMillis()
-                    resultsById[p.id] = host.executeTool(p.name, p.argsStr, p.id, loopState.allToolBlocks, loopState.assistantId, loopState.accumulatedText)
+                    // [feat/tool-loop-guard] Guarded dispatch. The verdict is taken BEFORE the
+                    // call: Refuse means the tool never runs and the model gets a `loop_guard`
+                    // error carrying the reason; Wait/ProceedWithNotice mean "run it, then show
+                    // the notice with the result". The decoration is a second write of the same
+                    // slot (not a wrapper around the call) because the dispatch line below is
+                    // pinned verbatim by the loop shape gate.
+                    val guardVerdict = ToolLoopScope.beforeCall(guardSessionId, p.name, p.argsStr)
+                    if (guardVerdict is GuardVerdict.Refuse) {
+                        resultsById[p.id] = ToolLoopScope.refusal(p.name, guardVerdict.reason)
+                    } else {
+                        resultsById[p.id] = host.executeTool(p.name, p.argsStr, p.id, loopState.allToolBlocks, loopState.assistantId, loopState.accumulatedText)
+                        resultsById[p.id] = ToolLoopScope.afterCall(
+                            guardSessionId, p.name, p.argsStr, resultsById[p.id]!!, guardVerdict,
+                        )
+                    }
                     execMsById[p.id] = System.currentTimeMillis() - execStart
                 }
             }

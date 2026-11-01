@@ -18,6 +18,7 @@ import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.tools.AgentTraceRecorder
+import com.rikkaminis.app.tools.AppGuideTool
 import com.rikkaminis.app.tools.FileEditTool
 import com.rikkaminis.app.tools.FileReadTool
 import com.rikkaminis.app.tools.FileWriteTool
@@ -340,6 +341,10 @@ internal suspend fun ChatViewModel.executeTool(
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
             "memory_rollup" -> executeMemoryRollupTool()
+            // [knowledge-pack] app_guide: built-in app UI guides (page
+            // structure / entries / traps / login pages). Read-only lookup
+            // over bundled assets — never touches the sandbox or the network.
+            AppGuideTool.NAME -> AppGuideTool.execute(argsJson, context)
             // [U10] conversation_history: reads THIS session's persisted
             // transcript (session id comes from the ViewModel, never from
             // arguments) so turns dropped by compaction are still reachable.
@@ -679,6 +684,10 @@ internal suspend fun ChatViewModel.executeSubagentTool(
     "memory_write" -> executeMemoryWriteTool(argsJson)
     "memory_get" -> executeMemoryGetTool(argsJson)
     "memory_rollup" -> executeMemoryRollupTool()
+    // [knowledge-pack] Same arm as the main dispatch: a skill that leaves
+    // allowedTools null gets app_guide in its schema, so a missing arm here
+    // would answer "Unknown or forbidden tool" for a tool it advertised.
+    AppGuideTool.NAME -> AppGuideTool.execute(argsJson, context)
     // Subagents run inside the same session, so the same transcript is fair
     // game (read-only, redacted). Kept in sync with the main dispatch switch —
     // a missing arm here is silent: the tool would work in the main loop and
@@ -1400,6 +1409,9 @@ Sandbox persistence layers (know them before diagnosing "environment lost"):
 - `/tmp` = survives across sessions, but a full rootfs rebuild wipes it. pip-installed packages (`pip install`) and manually extracted binaries (e.g. a downloaded compiler zip) are NOT auto-restored — after a rebuild they must be reinstalled.
 - A workspace that is empty in a NEW session is the PER-SESSION DESIGN, not evidence of a reset. Before attributing any missing tool/file to a "sandbox reset", verify with file timestamps: `ls -la /etc/apk/world` (old mtime = rootfs not rebuilt) and `ls -lt /tmp | head` (files predating today = rootfs not rebuilt). Only a full rootfs rebuild wipes `/tmp` and pip packages; app updates or app restarts do NOT.
 - The app keeps a durable event log at host-side `filesDir/logs/rootfs-events.log` (visible in sandbox as `/var/minis/logs/rootfs-events.log`) recording installs, auto-repair resets, and apk-world restores — check it first when investigating environment changes.
+
+Host status snapshot (read-only, refreshed every 30 s):
+- `/run/minis-host-status.json` in the sandbox carries the host's live state as JSON (battery, storage, network type, doze/interactive, uptime) — read it with `cat` before guessing why a long job behaves differently on battery, in doze, or on a metered connection. Fields the host could not read are `null`, never a made-up default. It is written by the app process, not by the sandbox: a rootfs rebuild does not need to recreate it.
 
 Guest /tmp lifecycle (automatic, and it bites):
 - `/tmp` inside the sandbox is RAM-backed (tmpfs), so a sweeper prunes aged entries — it runs only while no shell is busy. Defaults: entries older than 60 min may be deleted, checked every 60 s; both are user-tunable (`runtime.guestTmpMaxAgeMin` / `runtime.guestTmpSweepIntervalSec`, also in Settings → Runtime Limits → Sandbox lifecycle).
