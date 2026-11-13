@@ -621,10 +621,10 @@
     <string name="model_entry_display_name">표시 이름</string>
     <string name="model_entry_max_output_tokens">최대 출력 토큰</string>
     <string name="model_entry_provider">AI 공급자</string>
-    <string name="model_entry_visibility">표시 여부</string>
-    <string name="model_entry_hidden_models_won_t_appear_in_the_model_">숨겨진 모델은 모델 선택기에 표시되지 않습니다.</string>
-    <string name="model_entry_hidden">숨김</string>
-    <string name="model_entry_restores_the_provider_reported_display_n">제공업체가 보고한 표시 이름과 토큰 한도를 복원하고 모델을 다시 표시합니다.</string>
+    <string name="model_entry_selection">선택</string>
+    <string name="model_entry_unselect">선택에서 제거</string>
+    <string name="model_entry_unselect_footer">이 모델을 선택한 모델 목록에서 제거합니다. 제공자의 모델 목록에서 다시 추가할 수 있습니다.</string>
+    <string name="model_entry_restores_the_provider_reported_display_n">제공자가 보고한 표시 이름과 토큰 한도를 복원합니다.</string>
     <string name="model_entry_reset_to_default">기본값으로 재설정</string>
     <!-- T210: ModelEntryDetailScreen sections (iOS parity). -->
     <string name="modeldetail_identity_footer_custom">사용자 지정 모델입니다. 모델 ID를 편집할 수 있습니다.</string>
@@ -1712,4 +1712,11 @@
     <string name="notif_storage_budget_channel_description">이 앱 자체 데이터(샌드박스 셸, 세션, 미디어)가 예산을 초과하면 알려줍니다.</string>
     <string name="notif_storage_budget_title">이 앱이 저장공간을 많이 사용하고 있습니다</string>
     <string name="notif_storage_budget_body">이 앱이 %1$s 사용 중입니다(예산 %2$s). 탭하여 무엇이 공간을 차지하는지 확인하세요.</string>
+    <string name="provider_detail_refresh_catalog_result">새로 고침 — 원격 %1$d개, 선택됨 %2$d개.</string>
+    <string name="provider_detail_remote_catalog_count">원격 카탈로그: %1$d</string>
+    <string name="provider_detail_remote_catalog_unfetched">가져오지 않음</string>
+    <string name="manage_models_select_all_count">모두 선택 (%1$d)</string>
+    <string name="manage_models_deselect_all">선택 해제</string>
+    <string name="manage_models_remote_section_header">제공자에서 사용 가능 (%1$d)</string>
+    <string name="manage_models_error_prefix">새로 고침 실패: %1$s</string>
 </resources>

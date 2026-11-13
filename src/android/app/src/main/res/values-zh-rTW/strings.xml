@@ -262,10 +262,10 @@
     <string name="model_entry_display_name">顯示名稱</string>
     <string name="model_entry_max_output_tokens">最大輸出 Token 數</string>
     <string name="model_entry_provider">AI 服務商</string>
-    <string name="model_entry_visibility">可見性</string>
-    <string name="model_entry_hidden_models_won_t_appear_in_the_model_">隱藏的模型不會出現在模型選擇器中。</string>
-    <string name="model_entry_hidden">隱藏</string>
-    <string name="model_entry_restores_the_provider_reported_display_n">還原供應商回報的顯示名稱和 token 上限,並取消模型隱藏。</string>
+    <string name="model_entry_selection">選擇</string>
+    <string name="model_entry_unselect">從選擇中移除</string>
+    <string name="model_entry_unselect_footer">將此模型從已選模型中移除。可從服務商的模型清單重新加入。</string>
+    <string name="model_entry_restores_the_provider_reported_display_n">還原服務商回報的顯示名稱與 Token 上限。</string>
     <string name="model_entry_reset_to_default">恢復默認</string>
     <!-- T210: ModelEntryDetailScreen sections (iOS parity). -->
     <string name="modeldetail_identity_footer_custom">這是自定義模型。可以編輯模型 ID。</string>
@@ -1713,4 +1713,11 @@
     <string name="notif_storage_budget_channel_description">當本應用程式自身的資料（沙箱 shell、工作階段、媒體）超出預算時提醒。</string>
     <string name="notif_storage_budget_title">本應用程式佔用較多儲存空間</string>
     <string name="notif_storage_budget_body">本應用程式已使用 %1$s（預算 %2$s）。點按查看空間被什麼佔用。</string>
+    <string name="provider_detail_refresh_catalog_result">已重新整理 — 遠端 %1$d 個模型，已選 %2$d 個。</string>
+    <string name="provider_detail_remote_catalog_count">遠端目錄：%1$d</string>
+    <string name="provider_detail_remote_catalog_unfetched">尚未取得</string>
+    <string name="manage_models_select_all_count">全選（%1$d）</string>
+    <string name="manage_models_deselect_all">取消全選</string>
+    <string name="manage_models_remote_section_header">服務商提供的模型（%1$d）</string>
+    <string name="manage_models_error_prefix">重新整理失敗：%1$s</string>
 </resources>

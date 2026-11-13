@@ -151,6 +151,16 @@ object OpenAIModelsApi {
                     }
 
                     val displayName = obj.optString("name", id)
+                    // [gateway-context-1112] The endpoint's OWN capability
+                    // metadata — context window, output cap, display name and
+                    // the four `supports_*` flags. The parser used to read
+                    // only `id` / `name` / `architecture`, so a gateway that
+                    // advertises a 960K window had that number dropped on the
+                    // floor and the app fell back to the models.dev registry
+                    // and then to an id-shape guess (the 128K the user saw).
+                    // The endpoint's own number is the most trustworthy source
+                    // there is, so it is captured here at the boundary.
+                    val endpointMeta = parseOpenAIModelEndpointMetadata(obj)
                     // Third-party gateways (vLLM, OpenRouter-compat proxies) often
                     // report per-model modalities under `architecture.{input,output}_modalities`
                     // the same way OpenRouter does — pick them up so vision/audio
@@ -179,11 +189,24 @@ object OpenAIModelsApi {
                     parsed.add(
                         LLMModel(
                             id = id,
-                            displayName = displayName,
+                            // [gateway-context-1112] Prefer the endpoint's own
+                            // display name; fall back to the id (the previous
+                            // behaviour) when the endpoint reports none.
+                            displayName = endpointMeta.displayName ?: displayName,
                             provider = resolveProviderName(isCustomBase, providerName),
+                            contextWindow = endpointMeta.contextWindow,
+                            maxOutputTokens = endpointMeta.maxOutputTokens,
                             inputModalities = inputModalities,
                             outputModalities = outputModalities,
-                            supportsReasoning = if (knownReasoning) true else null,
+                            // [gateway-context-1112] The endpoint's own flag
+                            // wins only when it says TRUE — see
+                            // `resolveSupportsReasoning` for why a `false` is
+                            // not authoritative (the local gateway reports
+                            // false for every model).
+                            supportsReasoning = resolveSupportsReasoning(
+                                endpointFlag = endpointMeta.supportsReasoning,
+                                knownReasoningFamily = knownReasoning,
+                            ),
                         )
                     )
                 }
@@ -246,14 +269,14 @@ object OpenAIModelsApi {
      * A null [providerName] returns the SAME list instance — no copy, so the
      * unnamed (legacy) path is byte-for-byte what it was.
      *
-     * ponytail: cache rows are only relabelled, never re-enriched — capability
-     *   numbers baked in by the old blind scan survive until the TTL lapses.
-     *   | ceiling: a user who fetched the Kimi list before this fix sees
-     *   wrong context/effort numbers for at most 48h (forceRefresh re-fetches
-     *   immediately and the live path enriches with the right key now).
-     *   | upgrade trigger: a report that a Kimi model's context window / effort
-     *   ladder disagrees with models.dev while its provider field is right —
-     *   then the cache path needs `ModelsDevApi.enrichModels` too.
+     * [model-defaults-1112] The rows are only RE-LABELLED here — the
+     * capability enrichment (`ModelsDevApi.enrichModels`) is applied by the
+     * CALLER, on both the live and the cache path (see `fetchModels`), so
+     * this helper stays a pure rename. (The previous ponytail note here
+     * claimed the cache path never re-enriched and named the fix as a
+     * future upgrade trigger — that trigger fired on 2026-11-12 and the
+     * enrichment landed in `fetchModels`; the note was left describing the
+     * pre-fix world.)
      */
     private fun List<LLMModel>.withProviderName(
         isCustomBase: Boolean,
