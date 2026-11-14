@@ -673,6 +673,13 @@ object ConfigBackup {
             val obj = try {
                 JSONObject(json)
             } catch (t: Throwable) {
+                // [RC-U03] A provider that could not be serialized IS a
+                // partially failed export — it used to be dropped here with only
+                // this log line, while readFailures (the channel both manual
+                // export paths surface as "this backup may be incomplete")
+                // counted only per-field failures. The user's restore then
+                // simply lacked a provider, with nothing having said so.
+                readFailures++
                 Log.w(TAG, "export: unparseable provider ${instance.id}: ${t.message}")
                 continue
             }
@@ -912,6 +919,12 @@ object ConfigBackup {
                     // before importFromContent re-parses. "" when the source
                     // had none — the import side treats it as absent.
                     entry.put("frontmatter", skill.frontmatter)
+                    // [RC-U03] A skill that fell back to SKILL.md-only lost its
+                    // bundled scripts/references — a partially failed export,
+                    // so it must reach the same "may be incomplete" channel the
+                    // per-field failures use instead of stopping at this log
+                    // line. (An oversized archive is included: same loss.)
+                    readFailures++
                     Log.w(
                         TAG,
                         "export: ${if (zipBytes == null) "no archive" else "archive too large (${zipBytes.size} bytes)"} " +
@@ -1390,38 +1403,22 @@ object ConfigBackup {
                             if (oldEid.isNotEmpty()) entryIdMap[oldEid] = newEid
                         }
                     } else {
-                        val instancesBefore = providerRepo.instances.map { it.id }.toSet()
-                        resolvedLabel = providerRepo.importInstanceJSON(obj.toString())
-                        if (resolvedLabel != null) {
-                            // Identify the instance importInstanceJSON just
-                            // created (the one id that wasn't present before)
-                            // and pair its entries to the source uuids
-                            // positionally — orderedEntryIds mirrors the export
-                            // ordering exactly.
-                            val newId = providerRepo.instances
-                                .map { it.id }
-                                .firstOrNull { it !in instancesBefore }
-                            if (newId != null && srcEntryIds.isNotEmpty()) {
-                                val newEntryIds = orderedEntryIds(providerRepo, newId)
-                                val n = minOf(srcEntryIds.size, newEntryIds.size)
-                                for (k in 0 until n) {
-                                    val oldEid = srcEntryIds[k]
-                                    if (oldEid.isNotEmpty()) entryIdMap[oldEid] = newEntryIds[k]
-                                }
-                                if (srcEntryIds.size != newEntryIds.size) {
-                                    // Non-fatal: model set differs from when the
-                                    // backup was taken (a model was
-                                    // hidden/added since). Groups referencing
-                                    // the unmapped entries will report them.
-                                    Log.w(
-                                        TAG,
-                                        "import: provider \"$resolvedLabel\" entry count " +
-                                            "${srcEntryIds.size}→${newEntryIds.size}; " +
-                                            "some group members may not remap"
-                                    )
-                                }
-                            }
-                        }
+                        // [INCR-1113 F-02] The append path fills the id map
+                        // itself, pairing each restored row with the backup's
+                        // `_entryIds` by its ORIGINAL `models[]` index. The
+                        // positional derivation this replaces (`orderedEntryIds`
+                        // vs `_entryIds`, index by index) was wrong whenever the
+                        // parse dropped a row: a pre-split backup carries hidden
+                        // catalog rows that the selection-only rule filters out,
+                        // so the restored list was shorter than `_entryIds` and
+                        // every pairing after the first dropped row pointed at
+                        // the wrong entry — model group members, agent-loop
+                        // bindings and the compact pin landed on the wrong model
+                        // or dangled.
+                        resolvedLabel = providerRepo.importInstanceJSON(
+                            obj.toString(),
+                            entryIdMapOut = entryIdMap,
+                        )
                     }
                     if (resolvedLabel == null) {
                         skipped.add("provider \"$label\": import rejected")

@@ -108,18 +108,17 @@ internal fun decideConfigSource(
  * @param liveMirror `prefs.getString("config", null)` AFTER the commit — pass the
  *   read-back value, never the intended one, or the whole point is lost.
  * @return the hash to store, or null when there is no mirror to name (null makes
- *   the next load take the re-import branch rather than trust a hash that names
- *   nothing).
+ *   the next load take the DB branch instead of trusting a hash that names
+ *   nothing — the mirror may simply not exist yet, e.g. a degraded prefs store
+ *   or a first save whose commit was rejected).
  */
 internal fun decideSyncHash(
     intendedMirror: String,
     liveMirror: String?,
 ): String? = when {
-    // The committed value is what we asked for (or prefs reports nothing yet —
-    // a SharedPreferences that lies about a successful commit is not something
-    // we can defend against here; hash the intended string and let the load
-    // path's re-import branch arbitrate).
-    liveMirror == null -> hashJsonMirror(intendedMirror)
+    // Nothing landed in prefs: there is no mirror for this hash to name, so the
+    // token is deleted rather than pointed at a string that never existed.
+    liveMirror == null -> null
     else -> hashJsonMirror(liveMirror)
 }
 
@@ -294,4 +293,51 @@ internal fun decideEntryRename(
         )
     }
     return EntryRenameDecision(allowed = true, oldKey = existingUuid, newKey = newKey)
+}
+
+// --- [INCR-1113 F-02] Backup `_entryIds` → restored entry-id pairing. ---
+// Extracted from ProviderRepository so the pairing rule is JVM-testable
+// without an Android runtime (the repository class itself is not).
+
+/**
+ * [INCR-1113 F-02] The backup layer's `_entryIds` annotation, in `models[]`
+ * order. Empty when the payload carries none (a single-provider share, or a
+ * backup taken before the annotation existed) — the caller then maps nothing,
+ * exactly as before.
+ */
+internal fun readSrcEntryIds(dict: JSONObject): List<String> =
+    dict.optJSONArray("_entryIds")
+        ?.let { arr -> (0 until arr.length()).map { arr.optString(it) } }
+        ?: emptyList()
+
+/**
+ * [INCR-1113 F-02] Pair the backup's `_entryIds` with the ids the import
+ * actually produced, by each row's ORIGINAL `models[]` index.
+ *
+ * This is the whole point of carrying the source index through the parse: rows
+ * the selection-only rule drops (`isHidden && !isCustom` catalog copies from a
+ * pre-split backup) are ABSENT from [sourceIndexes], and pairing by position
+ * in that shorter list shifted every later mapping by the number of dropped
+ * rows — model group members, agent-loop bindings and the compact pin then
+ * pointed at the wrong entry or dangled.
+ *
+ * A dropped row simply contributes NO mapping (its group references take the
+ * existing "unmapped" warning path), which is the honest answer: that entry
+ * does not exist on this install.
+ *
+ * Out-of-range indexes are ignored rather than clamped: an index the payload
+ * does not describe cannot be mapped to anything.
+ */
+internal fun pairEntryIdsById(
+    srcEntryIds: List<String>,
+    sourceIndexes: List<Int>,
+    resolvedIds: List<String>,
+): Map<String, String> {
+    val map = HashMap<String, String>(sourceIndexes.size)
+    sourceIndexes.forEachIndexed { position, sourceIndex ->
+        val srcId = srcEntryIds.getOrNull(sourceIndex) ?: return@forEachIndexed
+        val newId = resolvedIds.getOrNull(position) ?: return@forEachIndexed
+        if (srcId.isNotEmpty() && newId.isNotEmpty()) map[srcId] = newId
+    }
+    return map
 }

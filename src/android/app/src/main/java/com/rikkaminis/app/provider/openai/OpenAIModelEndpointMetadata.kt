@@ -1,5 +1,6 @@
 package com.rikkaminis.app.provider.openai
 
+import com.rikkaminis.app.provider.safeOptString
 import org.json.JSONObject
 
 /**
@@ -81,8 +82,22 @@ internal fun parseOpenAIModelEndpointMetadata(obj: JSONObject): OpenAIModelEndpo
         // read as one.
         obj.optJSONObject("top_provider")?.optInt("max_completion_tokens") ?: 0,
     )
-    val displayName = obj.optString("name").takeIf { it.isNotBlank() }
-        ?: obj.optString("display_name").takeIf { it.isNotBlank() }
+    // [R8-B B-F04 后半] On Android, `optString(key)` returns the LITERAL "null"
+    // when the key exists with a JSON null value (it only returns "" for a missing
+    // key), so `{"name":null,"display_name":"Hy4"}` used to answer "null" —
+    // `isNotBlank()` is true for that string, the `?:` fallback never fired, and
+    // the model picker showed a model literally named "null".
+    //
+    // Reuses [safeOptString], the repo's single answer to this platform quirk
+    // (JsonExt.kt), rather than minting a second reader: absence and explicit null
+    // both come back as "" and fall through to `display_name`.
+    //
+    // NOTE for the test: the Maven `org.json` used by JVM unit tests does NOT
+    // reproduce the quirk (measured: `optString` on a JSON null returns ""), so
+    // behaviour alone cannot pin this fix — the shape assertion in
+    // OpenAIEndpointMetadataDisplayNameTest is the discriminator.
+    val displayName = obj.safeOptString("name").takeIf { it.isNotBlank() }
+        ?: obj.safeOptString("display_name").takeIf { it.isNotBlank() }
 
     return OpenAIModelEndpointMetadata(
         contextWindow = contextWindow,
@@ -96,6 +111,45 @@ internal fun parseOpenAIModelEndpointMetadata(obj: JSONObject): OpenAIModelEndpo
         supportsVision = obj.optBooleanOrNull("supports_vision"),
         supportsAudio = obj.optBooleanOrNull("supports_audio"),
     )
+}
+
+/**
+ * [INCR-1113 F-06] Fold the endpoint's capability FLAGS into the modality
+ * list it declared.
+ *
+ * `parseOpenAIModelEndpointMetadata` reads `supports_vision` / `supports_audio`
+ * and — until this function existed — nothing consumed them: the flags were
+ * parsed and dropped, so a gateway that says `supports_vision: true` without
+ * publishing `architecture.input_modalities` (the common shape) still left the
+ * model text-only in the app. The `supports_*` flags ARE the endpoint's own
+ * statement, so they are exactly as authoritative as the modality array — the
+ * contract this family is about is "the endpoint's own word beats a registry
+ * default and a shape guess", and a flag is the endpoint's word.
+ *
+ * Rules:
+ *  - `null` (the endpoint did not report the flag) changes nothing — silence
+ *    is not a denial, same as everywhere else in this family;
+ *  - `false` changes nothing either: the local gateway writes booleans
+ *    unconditionally, so a false is not a reliable "cannot" (the same reading
+ *    [resolveSupportsReasoning] applies to the reasoning flag);
+ *  - `true` ADDS the modality; an absent list starts from `["text"]` so the
+ *    result is never a capabilities-only list that drops text.
+ *
+ * Pure function — no JSON, no Android — so the rule is JVM-testable.
+ */
+internal fun mergeDeclaredModalities(
+    declared: List<String>?,
+    declaresVision: Boolean?,
+    declaresAudio: Boolean?,
+): List<String>? {
+    val add = ArrayList<String>(2)
+    if (declaresVision == true) add.add("image")
+    if (declaresAudio == true) add.add("audio")
+    if (add.isEmpty()) return declared
+    val base = declared ?: listOf("text")
+    val missing = add.filter { it !in base }
+    if (missing.isEmpty()) return declared
+    return base + missing
 }
 
 /**

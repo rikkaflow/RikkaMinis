@@ -19,6 +19,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,8 +61,10 @@ import java.io.File
  * explicit user opt-in per session view.
  */
 
-internal const val LARGE_MESSAGE_THRESHOLD_CHARS = 32_000
-internal const val LARGE_MESSAGE_PREVIEW_CHARS = 8_000
+// [fix/user-msg-fold-1114] `LARGE_MESSAGE_THRESHOLD_CHARS` /
+// `LARGE_MESSAGE_PREVIEW_CHARS` moved to MessageFoldPolicy.kt so the fold policy
+// (both families) is plain Kotlin that a JVM test can compile in isolation.
+// Same package — the references below resolve unchanged.
 
 /**
  * [T-android-streaming-regex-hang] Above this live-buffer size, an actively
@@ -79,14 +82,22 @@ internal const val STREAM_DEGRADE_CHARS = 8_000
  * Streaming content always renders inline (guard is bypassed) to avoid the
  * threshold flicker described above.
  */
-internal fun shouldCollapse(content: String, isStreaming: Boolean): Boolean =
-    !isStreaming && content.length > LARGE_MESSAGE_THRESHOLD_CHARS
+internal fun shouldCollapse(
+    content: String,
+    isStreaming: Boolean,
+    thresholdChars: Int = LARGE_MESSAGE_THRESHOLD_CHARS,
+): Boolean = shouldCollapseMessage(
+    contentLength = content.length,
+    isStreaming = isStreaming,
+    thresholdChars = thresholdChars,
+)
 
 @Composable
 internal fun LargeContentBadge(
     content: String,
     stableKey: String,
     onExpand: () -> Unit,
+    previewChars: Int = LARGE_MESSAGE_PREVIEW_CHARS,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -108,9 +119,11 @@ internal fun LargeContentBadge(
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        // Preview lines — plain Text, not markdown. Capped at LARGE_MESSAGE_PREVIEW_CHARS.
-        val preview = remember(content) {
-            content.take(LARGE_MESSAGE_PREVIEW_CHARS) + if (content.length > LARGE_MESSAGE_PREVIEW_CHARS) "…" else ""
+        // Preview lines — plain Text, not markdown. Capped at [previewChars]
+        // (the assistant default is 8K; USER bubbles pass a much shorter one —
+        // see MessageFoldPolicy.kt).
+        val preview = remember(content, previewChars) {
+            content.take(previewChars) + if (content.length > previewChars) "…" else ""
         }
         Text(
             text = preview,
@@ -199,6 +212,12 @@ internal fun LargeContentBadge(
  * @param stableKey   Used to scope the expand-state to a particular block. The
  *                    caller supplies messageId+blockId so two large messages
  *                    don't share expand-state across recompositions.
+ * @param collapseThresholdChars  Frozen bodies longer than this fold behind the
+ *                    badge. Defaults to [LARGE_MESSAGE_THRESHOLD_CHARS] (the
+ *                    assistant render-cost floor); USER bubbles pass
+ *                    [USER_MESSAGE_COLLAPSE_THRESHOLD_CHARS] so an ordinary
+ *                    long paste is readable as "folded", not as a wall of text.
+ * @param previewChars  How many leading chars the folded badge shows.
  * @param renderer    The actual body composable; called when content is small
  *                    or after user explicitly expands.
  */
@@ -207,6 +226,8 @@ internal fun LargeContentGuard(
     content: String,
     isStreaming: Boolean,
     stableKey: String,
+    collapseThresholdChars: Int = LARGE_MESSAGE_THRESHOLD_CHARS,
+    previewChars: Int = LARGE_MESSAGE_PREVIEW_CHARS,
     renderer: @Composable () -> Unit,
 ) {
     // [T-android-streaming-regex-hang] Proactive streaming degrade. While a
@@ -245,35 +266,58 @@ internal fun LargeContentGuard(
             // [T-android-content-perf-diag] Log the degrade with a structural
             // fingerprint (once per ~2K growth) so a hang report shows exactly
             // what shape the tail had. Only summarize the tail window we scan.
-            remember(content.length / 2000) {
+            //
+            // LaunchedEffect, not `remember(key) { ...; Unit }`: the log is a
+            // side effect, and remember's lambda runs during composition (main
+            // thread, inside the frame budget), whereas an effect runs after
+            // composition commits. Same "once per key" semantics — the key
+            // change disposes the old effect and starts a new one — but the
+            // content summary no longer competes with layout for the frame.
+            // (Lint: RememberReturnType flagged the old shape.)
+            LaunchedEffect(content.length / 2000) {
                 val s = com.rikkaminis.app.diagnostics.ContentDiag.summarize(content)
                 AppLogger.info(
                     "Perf",
                     "[Perf][ContentDiag] stream-degrade key=$stableKey breaker=$breakerActive " +
                         "threshold=$STREAM_DEGRADE_CHARS ${s.asLogFields()}",
                 )
-                Unit
             }
             DegradedStreamingTail(content)
             return
         }
     }
-    if (!shouldCollapse(content, isStreaming)) {
+    if (!shouldCollapse(content, isStreaming, collapseThresholdChars)) {
         // [T-android-content-perf-diag] Stream-end swap: a block that streamed
         // degraded now renders full markdown ONCE. Log its shape so we know what
         // the deferred render is about to parse (the thing the degrade was
         // protecting against). The actual off-main markdown parse cost is logged
         // separately by MarkdownParseCaches ([Perf][ColdParse] / [JankDiag] slow
         // markdown parse). Fires once via the wasDegraded latch.
+        // [incr1113 F-08] The latch is cleared INSIDE the effect, never in the
+        // composition body.
+        //
+        // Writing `wasDegraded.value = false` during composition invalidates
+        // this scope immediately, so the very next recomposition reads `false`,
+        // the `if` is no longer taken, and the `LaunchedEffect` declared by the
+        // previous pass is disposed before it ever runs its body — the log could
+        // simply never appear, and no test would notice (it is a diagnostic).
+        // It also deferred the log behind `renderer()` below, which is the
+        // opposite of what a swap-cost measurement wants.
+        //
+        // Reading the latch in the condition and writing it in the effect keeps
+        // composition read-only. The effect is keyed on the same
+        // (stableKey, content.length) pair the old shape used, and a key change
+        // disposes the old effect, so the "once per key" property is unchanged;
+        // the `if` guard only means an effect is not registered at all for a
+        // block that never degraded.
         if (!isStreaming && wasDegraded.value) {
-            wasDegraded.value = false
-            remember(stableKey, content.length) {
+            LaunchedEffect(stableKey, content.length) {
+                wasDegraded.value = false
                 val s = com.rikkaminis.app.diagnostics.ContentDiag.summarize(content)
                 AppLogger.info(
                     "Perf",
                     "[Perf][ContentDiag] stream-end-swap key=$stableKey ${s.asLogFields()}",
                 )
-                Unit
             }
         }
         // [T-android-content-perf-diag] Register this body as the currently-
@@ -298,13 +342,15 @@ internal fun LargeContentGuard(
 
     var expanded by rememberSaveable(stableKey) { mutableStateOf(false) }
 
-    // Diagnostic — emitted on first composition per large block.
-    remember(stableKey) {
+    // Diagnostic — emitted once per large block.
+    // LaunchedEffect, not `remember(stableKey) { ...; Unit }`: same key
+    // semantics, but the log happens after composition instead of inside it.
+    // (Lint: RememberReturnType flagged the old shape.)
+    LaunchedEffect(stableKey) {
         AppLogger.info(
             "LargeContentGuard",
-            "collapse key=$stableKey chars=${content.length} threshold=$LARGE_MESSAGE_THRESHOLD_CHARS",
+            "collapse key=$stableKey chars=${content.length} threshold=$collapseThresholdChars",
         )
-        Unit
     }
 
     if (expanded) {
@@ -314,6 +360,7 @@ internal fun LargeContentGuard(
             content = content,
             stableKey = stableKey,
             onExpand = { expanded = true },
+            previewChars = previewChars,
         )
     }
 }

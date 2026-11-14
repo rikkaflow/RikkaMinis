@@ -3966,34 +3966,35 @@ fun ChatScreen(
                                     )
                                 }
                             }
-                            is FlatChatItem.AssistantThinking -> {
-                                // T300: hide Deep Thinking block when the user
-                                // currently has thinking turned off — even if
-                                // a forced-reasoning model (e.g. xAI Grok 4.x
-                                // via OpenRouter) still streams reasoning_-
-                                // content. Snapshot on the message wins so
-                                // toggling the level after a turn finishes
-                                // doesn't retro-hide an already-visible block;
-                                // legacy DB-restored messages (snapshot=null)
-                                // follow the chat's current level.
-                                val effectiveLevel = item.messageThinkingLevel
-                                    ?: viewModel.thinkingLevel.value
-                                if (effectiveLevel.isEnabled) {
-                                    // [T-android-thinking-auto-collapse] Use
-                                    // `isLastBlockOverall` (not `isLast` =
-                                    // last-thinking-only) so the block flips
-                                    // to !isStreaming the moment a sibling
-                                    // text/tool_use arrives — that's the
-                                    // edge ThinkingBlock's LaunchedEffect
-                                    // hooks for auto-collapse, matching iOS
-                                    // ThinkingBlockView semantics.
-                                    ThinkingBlock(
-                                        block = item.block,
-                                        isStreaming = item.isLastBlockOverall && item.messageIsStreaming,
-                                        isLast = item.isLast,
-                                    )
-                                }
-                            }
+                            // [incr1113 F-08] NO-OP, and deliberately so.
+                            //
+                            // This branch used to render a thinking block for a
+                            // legacy per-block row. Nothing constructs that row
+                            // any more: the ONLY constructor of the row is
+                            // `LegacyFlatChatBuilder` (one site), and that file
+                            // is runtime-dead (the aggregate collect early-returns
+                            // before it, `buildFlatChatItems` has zero callers
+                            // outside the frozen legacy package, and
+                            // `AGGREGATE_MESSAGE_ITEMS` — the switch that used
+                            // to pick between the pipelines — was deleted in
+                            // [audit-0920]). So the branch was unreachable, and
+                            // the thinking-level read that lint flagged
+                            // (`viewModel.thinkingLevel.value` inside an item)
+                            // was fixing a dead path while hoisting a
+                            // `collectAsState` to the top of ChatScreen: every
+                            // level change recomposed the whole screen and every
+                            // item closure.
+                            //
+                            // The live path is `AssistantMessageItem` →
+                            // `AssistantMessageView`, which resolves the level
+                            // itself from `message.thinkingLevel`.
+                            //
+                            // Kept as an explicit arm rather than deleted: the
+                            // `when` is exhaustive over the sealed `FlatChatItem`,
+                            // and an `else` would let a NEW subtype render nothing
+                            // silently. If the legacy pipeline is ever revived,
+                            // this is the one place that has to be re-filled.
+                            is FlatChatItem.AssistantThinking -> Unit
                             is FlatChatItem.AssistantToolRunGroup -> ToolCallRunGroup(
                                 group = item,
                                 onRetry = if (item.isLastCancelled && !isStreaming && !canResume) ({ safeMutate { viewModel.retryLast() } }) else null,
