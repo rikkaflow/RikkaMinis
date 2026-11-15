@@ -541,11 +541,16 @@ internal fun ChatInputArea(
         // `sendMessage` (the funnel the debug RPC and the headless runner also
         // use) finds plain text and returns it unchanged. The move-to-session
         // path below has always worked this way.
-        val expandedToSend = viewModel.expandPastedText(toSend)
+        // [fix/fold-paste-split-1114] Take the SPLIT, not just the text: the
+        // offset is what lets the bubble keep the user's own words outside the
+        // fold. It must be read here — `clearComposerInput` drops the buffer,
+        // and with it the only record of where the block began.
+        val expanded = viewModel.expandPastedTextWithSplit(toSend)
+        val expandedToSend = expanded.text
         clearComposerInput()
         keyboardController?.hide()
         focusManager.clearFocus()
-        viewModel.sendMessage(expandedToSend)
+        viewModel.sendMessage(expandedToSend, expanded.pasteStart)
         noteSendForInputModePref()
         // [P2-scroll-user-send] The send re-engages follow ONLY if the user was
         // already at the bottom (wasScrolledIntoHistory==false) — sending does
@@ -581,8 +586,13 @@ internal fun ChatInputArea(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = 16.dp)
-                .padding(top = 2.dp, bottom = 8.dp),
+                // [composer-arc-1114] These two insets are not free numbers any
+                // more: the message list overlaps the composer by
+                // ComposerArcOverlap and clips itself with the inverse of this
+                // card's arc, so they have to come from the shared constants —
+                // a literal here would silently misalign the notch.
+                .padding(horizontal = ComposerCardHorizontalInset)
+                .padding(top = ComposerCardTopInset, bottom = 8.dp),
         ) {
             // T13 banner moved INSIDE the LazyColumn so it renders at the
             // visual end of the message list (mirrors iOS — see the
@@ -1195,7 +1205,9 @@ internal fun ChatInputArea(
                 modifier = Modifier
                     .fillMaxWidth()
                     .drawBehind {
-                        val radiusPx = 20.dp.toPx()
+                        // [composer-arc-1114] Shared with the list's arc clip —
+                        // see ComposerArcOcclusion.kt.
+                        val radiusPx = ComposerCardCornerRadius.toPx()
                         val canvas = drawContext.canvas.nativeCanvas
                         // Pass 1: symmetric ambient halo — small blur, low alpha.
                         shadowPaint.setShadowLayer(
@@ -1568,11 +1580,14 @@ internal fun ChatInputArea(
                         // [fix/paste-send-order-1114] Same contract as the
                         // button/swipe funnel: expand while the buffer still
                         // holds the blocks, then clear (the clear drops them).
-                        val expandedToSend = viewModel.expandPastedText(toSend)
+                        // [fix/fold-paste-split-1114] Same split contract as
+                        // the button/swipe funnel above.
+                        val expanded = viewModel.expandPastedTextWithSplit(toSend)
+                        val expandedToSend = expanded.text
                         clearComposerInput()
                         keyboardController?.hide()
                         focusManager.clearFocus()
-                        viewModel.sendMessage(expandedToSend)
+                        viewModel.sendMessage(expandedToSend, expanded.pasteStart)
                         noteSendForInputModePref()
                         // [bottom-trigger] Re-engage follow only if the
                         // reader was anchored at the bottom (P2: must not

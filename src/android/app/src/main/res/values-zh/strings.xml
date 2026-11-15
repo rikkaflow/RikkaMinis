@@ -1183,6 +1183,7 @@
 
     <!-- T-android-gc-storm-issue17: 渲染端大消息折叠 -->
     <string name="chat_message_large_collapsed_title">内容较大（%1$s）</string>
+    <string name="chat_message_large_collapse">收起</string>
     <string name="chat_message_large_expand">点击展开</string>
     <string name="chat_message_large_export">导出为文件</string>
     <string name="chat_message_large_export_ok">已导出</string>
@@ -1205,11 +1206,6 @@
     <string name="crash_freq_save_failed">保存日志失败：%1$s</string>
     <string name="crash_freq_save_success">已保存到 %1$s</string>
 
-    <!-- T-android-app-icon-shortcuts: 长按应用图标的快捷操作（对齐 iOS QuickActionRouter）。 -->
-    <string name="shortcut_new_chat_short">新建对话</string>
-    <string name="shortcut_new_chat_long">新建对话</string>
-    <string name="shortcut_camera_chat_short">拍照对话</string>
-    <string name="shortcut_camera_chat_long">拍照对话</string>
     <string name="image_action_copy">复制</string>
     <string name="image_action_share">分享</string>
     <string name="image_action_save">保存</string>
@@ -1747,6 +1743,11 @@
     <string name="mirror_diag_failed">上次同步失败</string>
     <string name="mirror_diag_unavailable">没有可用的存储目标</string>
     <string name="mirror_retry">重试</string>
+    <!-- [mirror-filetarget-1114] The grant is gone: a retry cannot fix it. -->
+    <string name="mirror_diag_missing_grant">无法访问外部文件夹</string>
+    <string name="mirror_diag_missing_grant_sub">「所有文件访问权限」已关闭——副本在 %1$s 之后停止更新。</string>
+    <string name="mirror_diag_missing_grant_sub_never">「所有文件访问权限」已关闭——副本从未写入过。</string>
+    <string name="mirror_grant_action">授权</string>
     <!-- [feat/paste-fold-marker] Long-paste folding: chip, preview, send guard. -->
     <string name="paste_chip_desc">已折叠的粘贴内容 #%1$d，%2$d 字符。点击预览。</string>
     <string name="paste_preview_title">粘贴内容 %1$s</string>

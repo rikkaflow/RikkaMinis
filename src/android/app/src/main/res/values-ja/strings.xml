@@ -1487,6 +1487,7 @@
     <string name="image_budget_total_exceeded">画像サイズの合計が25MBを超えるため、以降の画像は削除されました</string>
     <string name="image_budget_request_elided">25MBの制限に収めるため、古い%1$d枚の画像をリクエストから省略しました</string>
     <string name="chat_message_large_collapsed_title">大きなコンテンツ（%1$s）</string>
+    <string name="chat_message_large_collapse">折りたたむ</string>
     <string name="chat_message_large_expand">タップして展開</string>
     <string name="chat_message_large_export">ファイルに書き出す</string>
     <string name="chat_message_large_export_ok">書き出しました</string>
@@ -1505,10 +1506,6 @@
     <string name="crash_freq_zip_failed">ログのパッケージ化に失敗しました: %1$s</string>
     <string name="crash_freq_save_failed">ログの保存に失敗しました: %1$s</string>
     <string name="crash_freq_save_success">ログを%1$sに保存しました</string>
-    <string name="shortcut_new_chat_short">新しいチャット</string>
-    <string name="shortcut_new_chat_long">新しいチャット</string>
-    <string name="shortcut_camera_chat_short">カメラでチャット</string>
-    <string name="shortcut_camera_chat_long">カメラでチャット</string>
     <string name="ok">OK</string>
     <string name="chat_load_older_messages">↑ 古いメッセージを読み込む</string>
     <!-- [feat/chat-tuning-panel] チャット調整 — 閲覧/スクロール/入力の調整項目。 -->
@@ -1718,6 +1715,11 @@
     <string name="mirror_diag_failed">前回の同期に失敗しました</string>
     <string name="mirror_diag_unavailable">利用可能なストレージがありません</string>
     <string name="mirror_retry">再試行</string>
+    <!-- [mirror-filetarget-1114] The grant is gone: a retry cannot fix it. -->
+    <string name="mirror_diag_missing_grant">外部フォルダーにアクセスできません</string>
+    <string name="mirror_diag_missing_grant_sub">「すべてのファイルへのアクセス」がオフです — コピーは %1$s 以降更新されていません。</string>
+    <string name="mirror_diag_missing_grant_sub_never">「すべてのファイルへのアクセス」がオフです — コピーは一度も書き込まれていません。</string>
+    <string name="mirror_grant_action">許可</string>
     <!-- [feat/paste-fold-marker] Long-paste folding: chip, preview, send guard. -->
     <string name="paste_chip_desc">折りたたまれた貼り付け #%1$d、%2$d 文字。タップでプレビュー。</string>
     <string name="paste_preview_title">貼り付けたテキスト %1$s</string>

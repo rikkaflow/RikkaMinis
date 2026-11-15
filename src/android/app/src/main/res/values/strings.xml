@@ -1383,6 +1383,7 @@
 
     <!-- T-android-gc-storm-issue17: render-side safe mode for large messages -->
     <string name="chat_message_large_collapsed_title">Large content (%1$s)</string>
+    <string name="chat_message_large_collapse">Collapse</string>
     <string name="chat_message_large_expand">Tap to expand</string>
     <string name="chat_message_large_export">Export to file</string>
     <string name="chat_message_large_export_ok">Exported</string>
@@ -1406,14 +1407,6 @@
     <string name="crash_freq_zip_failed">Failed to package logs: %1$s</string>
     <string name="crash_freq_save_failed">Failed to save logs: %1$s</string>
     <string name="crash_freq_save_success">Saved logs to %1$s</string>
-
-    <!-- T-android-app-icon-shortcuts: app-icon long-press quick actions
-         (mirrors iOS QuickActionRouter strings). shortLabel is shown in
-         the launcher popup; longLabel is read by TalkBack. -->
-    <string name="shortcut_new_chat_short">New Chat</string>
-    <string name="shortcut_new_chat_long">New Chat</string>
-    <string name="shortcut_camera_chat_short">Chat with Camera</string>
-    <string name="shortcut_camera_chat_long">Chat with Camera</string>
 
     <string name="ok">OK</string>
     <string name="image_action_copy">Copy</string>
@@ -1843,6 +1836,11 @@
     <string name="mirror_diag_failed">Last sync failed</string>
     <string name="mirror_diag_unavailable">No usable storage target</string>
     <string name="mirror_retry">Retry</string>
+    <!-- [mirror-filetarget-1114] The grant is gone: a retry cannot fix it. -->
+    <string name="mirror_diag_missing_grant">Cannot reach the external folder</string>
+    <string name="mirror_diag_missing_grant_sub">All files access is off — the copy stopped updating after %1$s.</string>
+    <string name="mirror_diag_missing_grant_sub_never">All files access is off — the copy has never been written.</string>
+    <string name="mirror_grant_action">Grant</string>
     <!-- [feat/paste-fold-marker] Long-paste folding: chip, preview, send guard. -->
     <string name="paste_chip_desc">Folded paste #%1$d, %2$d characters. Tap to preview.</string>
     <string name="paste_preview_title">Pasted text %1$s</string>
