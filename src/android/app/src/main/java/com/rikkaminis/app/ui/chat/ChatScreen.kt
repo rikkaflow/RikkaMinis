@@ -15,6 +15,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -121,6 +122,8 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -143,6 +146,12 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.onSizeChanged
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import com.rikkaminis.app.offload.OffloadPermissionManager
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
@@ -261,6 +270,33 @@ fun ChatScreen(
     // across forward navigation (file preview, env vars, etc.); see
     // ChatViewModel.listState for the why.
     val listState = viewModel.listState
+
+    // [composer-glass-1115] Single HazeState shared by the two ends of the
+    // frosted-glass composer: the message list records into it (hazeSource,
+    // on the LazyColumn) and the composer card samples it (hazeEffect, in
+    // ChatInputArea). One state, one source — a second source would make the
+    // blur pick up whatever else registered, and a second state would leave
+    // the card sampling nothing.
+    //
+    // The source is the list *inside* the composer-arc clip on purpose:
+    // hazeSource records the source node's own content (HazeSourceNode
+    // .record { drawContent }), and an ancestor's clip is applied when that
+    // layer is composited into the parent — so the card still blurs the
+    // message rows that the arc clip hides underneath it, while the clip keeps
+    // its old job of terminating content on the arc. Verified against the
+    // library source (haze 1.6.10), not assumed.
+    val hazeState = rememberHazeState()
+
+    // [composer-glass-1115] Measured height of the composer, in px → dp. The
+    // list needs it for two things that must move together:
+    //   1. how far it may draw underneath the composer (composerArcTail), and
+    //   2. the bottom content padding that keeps the last row resting where it
+    //      did before the viewport grew.
+    // Measuring beats a constant: the composer grows with a multi-line draft
+    // and with attachment chips, and a fixed estimate would either leave a
+    // visible band of un-blurred card or push the last row up too far.
+    var composerHeightPx by remember { mutableStateOf(0) }
+    val composerHeightDp = with(LocalDensity.current) { composerHeightPx.toDp() }
 
     // ─── T51: Share Injection + Move-to capsule ───────────────────────
     // Drain any pending share buffered by ShareCoordinator (cold start =
@@ -832,6 +868,80 @@ fun ChatScreen(
     // Chat Tuning); the default is the T128 value (32). The helper registers
     // its own minis_chat_tuning_prefs listener, so a knob change recomposes here.
     val tuning = rememberChatTuning(context)
+
+    // [composer-glass-1115] One read of the switch, used by all four places
+    // that must agree: the list's tail depth, whether the list is clipped at
+    // the card's arc, whether it records into the haze state, and the bottom
+    // clearance. They are read separately on purpose (a boolean, not a mode
+    // flag threaded through the layout) but MUST be the same boolean — a
+    // mismatch is either a dead effect (clip still on) or content bleeding
+    // past the card (tail still 22dp).
+    //
+    // Declared HERE, after `tuning`: reading it next to the other composer
+    // state (≈300 lines up) put it before `tuning` exists — a compile error the
+    // first CI run caught (`Unresolved reference 'tuning'`).
+    val composerGlassOn = tuning.composerGlassEnabled
+
+    // [composer-glass-1116] One clip outline, shared by both modes and
+    // remembered so `Modifier.clip` keeps its layer across recompositions.
+    // Its depth IS the tail depth: [ComposerArcOverlap] with the glass off, the
+    // measured composer height with it on. That pairing is the whole point —
+    // the outline is the inverse of exactly what the list drew past its
+    // viewport, so a mismatch cannot silently produce either a dead effect
+    // (clip deeper than the tail) or content bleeding around the card.
+    val composerArcClip = remember(composerGlassOn, composerHeightPx) {
+        when {
+            // OFF — the pre-glass arc band (22dp).
+            !composerGlassOn -> composerArcClipShape
+            // Glass ON, first frame: `onSizeChanged` has not reported yet, so
+            // the list was handed ZERO overlap and does not actually draw past
+            // its viewport. Clipping to any band here would cut 22dp off a
+            // viewport that does not overflow — clip nothing for that one frame
+            // and let the measured pass install the real outline.
+            composerHeightPx <= 0 -> RectangleShape
+            else -> composerGlassArcClipShape(composerHeightDp)
+        }
+    }
+
+    // [composer-glass-1115] Top-bar glass: same switch, same HazeState, same
+    // source as the composer card — the message list. Two things differ, both
+    // forced by the geometry:
+    //  • the bar extends the list UPWARDS (topBarTail) instead of downwards, so
+    //    rows can run underneath it; the top content padding grows by the same
+    //    amount, so no row actually moves;
+    //  • the glass only fades in once the list can scroll up. At the very top
+    //    there is nothing behind the bar to blur, and a translucent bar over an
+    //    empty strip reads as a rendering bug. rikkahub gates its top-bar
+    //    capsule the same way (`showCapsuleBackground = listScrolledUnderTopBar`).
+    var topBarHeightPx by remember { mutableStateOf(0) }
+    val topBarHeightDp = with(LocalDensity.current) { topBarHeightPx.toDp() }
+    val topBarScrolled by remember { derivedStateOf { listState.canScrollBackward } }
+    val topBarGlassAlpha by animateFloatAsState(
+        targetValue = if (composerGlassOn && topBarScrolled) 1f else 0f,
+        label = "topBarGlassAlpha",
+    )
+    // `ChatColors` is a @Composable getter (LocalChatPalette), and a remember{}
+    // calculation lambda is NOT composable — reading it inside is a compile
+    // error (the same one that bit the composer scrim in round 1). Hoisted.
+    val topBarGlassBase = ChatColors.background
+    val topBarGlassStyle = remember(
+        composerGlassOn,
+        tuning.composerGlassBlurDp,
+        tuning.composerGlassTintPct,
+        topBarGlassBase,
+    ) {
+        HazeStyle(
+            backgroundColor = topBarGlassBase,
+            tint = HazeTint(
+                topBarGlassBase.copy(
+                    alpha = ComposerGlass.topBarTintAlpha(tuning.composerGlassTintPct),
+                ),
+            ),
+            blurRadius = ComposerGlass.blurDp(tuning.composerGlassBlurDp).dp,
+            noiseFactor = 0f,
+            fallbackTint = HazeTint(topBarGlassBase),
+        )
+    }
     val nearBottomThresholdPx = with(LocalDensity.current) { tuning.scrollNearBottomDp.dp.toPx() }
     // T138 phase 2 v3: ground-truth bottom test via layoutInfo. If
     // LazyList currently renders the visual-bottom item (data-index 0
@@ -841,31 +951,52 @@ fun ChatScreen(
     // emission expands into N tool / text flat items, firstVisible
     // drifts by N in one frame (logcat showed jumps of 5+ on a
     // multi-tool turn). Anchor on the rendered set instead.
+    // [fix/follow-exit-inset-1116] The bottom verdict anchors to the VISIBLE
+    // bottom — the composer card's top edge — not to the layout viewport end.
+    // Under the arc/glass tail the viewport extends to the physical screen bottom
+    // while the last row legitimately rests `padding.bottom` above it, so a
+    // comparison against the raw viewport end said "not at bottom" AT the true
+    // bottom. That left the sentinel-visible arm as the only one that could ever
+    // answer yes; that arm ignores distance, and the sentinel enters the viewport
+    // a whole padding-height early, so leaving follow needed a full card height
+    // of scroll (field report 2026-11-16).
+    //
+    // The inset is READ FROM THE LIST, not recomputed here:
+    // `LazyListLayoutInfo.afterContentPadding` is the value Compose measured and
+    // applied, and `viewportEndOffset` is defined as
+    // `mainAxisAvailableSize + afterContentPadding` (LazyListMeasure.kt), i.e.
+    // the viewport end already includes it. Subtracting it yields the coordinate
+    // where content is actually allowed to end. Deriving the number from the
+    // layout call site instead would be a second source that silently drifts the
+    // next time the padding changes for a reason this file does not control.
     val isNearBottom = remember(listState, nearBottomThresholdPx) {
         derivedStateOf {
-            // [forward-stable] Forward list: "at bottom" ⇔ the bottom
-            // sentinel row is visible, or the last visible row's bottom edge
-            // reaches the viewport end. The sentinel is a 5dp spacer one past
-            // the last message row, so it is only measurable when the user
-            // really is at the bottom — and it cannot be fooled by a tall
-            // last item (the T173 failure mode of the old gap test).
+            // [forward-stable] Forward list: "at bottom" ⇔ the sentinel row (or,
+            // when it is off screen, the lowest visible row) sits within the
+            // threshold ABOVE the visual bottom. The sentinel is a 5dp spacer one
+            // past the last message row, so it cannot be fooled by a tall last
+            // item (the T173 failure mode of the old gap test).
+            //
+            // [fix/follow-exit-inset-1116] Two corrections to the pre-1116 arm:
+            //  1. the anchor is measured against the visible end, not the raw
+            //     viewport end;
+            //  2. "sentinel visible" is no longer an unconditional TRUE. With a
+            //     bottom content padding the sentinel enters the viewport one
+            //     padding-height before the true bottom, so visibility alone kept
+            //     follow engaged the whole way down.
             val info = listState.layoutInfo
             val total = info.totalItemsCount
             if (total == 0) return@derivedStateOf false
             val sentinelIdx = total - 1
             val sentinel = info.visibleItemsInfo.firstOrNull { it.index == sentinelIdx }
-            val result = if (sentinel != null) {
-                true
-            } else {
-                val viewportEnd = info.viewportEndOffset
-                val last = info.visibleItemsInfo.maxByOrNull { it.index }
-                // [B-03 deep-audit-1037] The threshold is now actually
-                // consumed: the old arm had no threshold term at all (the
-                // remember key was captured but never read inside this body),
-                // so the scrollNearBottomDp knob did nothing on this arm.
-                last != null &&
-                    isListAtBottom(last.offset, last.size, viewportEnd, nearBottomThresholdPx.toInt())
-            }
+            val anchor = sentinel ?: info.visibleItemsInfo.maxByOrNull { it.index }
+            val result = anchor != null && isListAtBottom(
+                lastVisibleOffsetPx = anchor.offset,
+                lastVisibleSizePx = anchor.size,
+                viewportEndOffsetPx = info.viewportEndOffset,
+                contentBottomInsetPx = info.afterContentPadding,
+                thresholdPx = nearBottomThresholdPx.toInt(),
+            )
             // T-android-jank-profile: was logging on every scroll frame (this
             // is a derivedStateOf body — it re-runs when any of
             // listState.layoutInfo / firstVisibleItemIndex /
@@ -1230,19 +1361,30 @@ fun ChatScreen(
                     // yanked back mid-read). The verdict now reads the same
                     // raw layoutInfo snapshot as isNearBottom — authoritative
                     // at drag-stop, unlike the cached derived state — through
-                    // the ONE shared bottom test (sentinel arm + threshold).
+                    // the ONE shared bottom test (visible-end distance with
+                    // the sentinel as anchor, [fix/follow-exit-inset-1116]).
                     val info = listState.layoutInfo
                     val stoppedTotal = info.totalItemsCount
                     val sentinel = if (stoppedTotal > 0) {
                         info.visibleItemsInfo.firstOrNull { it.index == stoppedTotal - 1 }
                     } else null
                     val last = info.visibleItemsInfo.maxByOrNull { it.index }
-                    val stoppedAtBottom = stoppedTotal > 0 && (
-                        sentinel != null ||
-                            (last != null && isListAtBottom(
-                                last.offset, last.size, info.viewportEndOffset, nearBottomThresholdPx.toInt(),
-                            ))
-                        )
+                    // [fix/follow-exit-inset-1116] Same rule as isNearBottom: the
+                    // verdict is a distance against the VISIBLE end (viewport end
+                    // minus the list's bottom content padding), and a visible
+                    // sentinel is only one of the two possible anchors — not an
+                    // automatic "at bottom". Without the inset the drag-stop could
+                    // never report "away" until the last row had been dragged a
+                    // whole card height past the viewport end, which is exactly
+                    // the "hard to stop following" complaint.
+                    val anchor = sentinel ?: last
+                    val stoppedAtBottom = stoppedTotal > 0 && anchor != null && isListAtBottom(
+                        lastVisibleOffsetPx = anchor.offset,
+                        lastVisibleSizePx = anchor.size,
+                        viewportEndOffsetPx = info.viewportEndOffset,
+                        contentBottomInsetPx = info.afterContentPadding,
+                        thresholdPx = nearBottomThresholdPx.toInt(),
+                    )
                     // [forward-stable] Drag end flips the mode: sentinel in
                     // view → follow; scrolled away → detach (nothing may yank).
                     // Maintains the mode for the explicit-intent consumer above.
@@ -2093,6 +2235,24 @@ fun ChatScreen(
             // scope so a title/model change recomposes only this lambda, not
             // the whole message list below.
             val topBarSessionTitle by viewModel.sessionTitle.collectAsState()
+            // [composer-glass-1115] Measured here because the list above needs
+            // the bar's real height (status-bar inset included) to know how far
+            // to extend upward. The glass layer is a sibling BEHIND the bar, so
+            // the bar itself can stay transparent; its alpha follows the scroll
+            // position (see topBarGlassAlpha).
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { topBarHeightPx = it.height },
+            ) {
+                if (composerGlassOn) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .graphicsLayer { alpha = topBarGlassAlpha }
+                            .hazeEffect(state = hazeState, style = topBarGlassStyle),
+                    )
+                }
             TopAppBar(
                 title = {
                     // RikkaHub-style LEFT-aligned nav title, sitting directly
@@ -2873,8 +3033,13 @@ fun ChatScreen(
                 },
                 windowInsets = WindowInsets.statusBars,
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = ChatColors.background.copy(alpha = 0.92f),
-                    scrolledContainerColor = ChatColors.background.copy(alpha = 0.92f),
+                    // [composer-glass-1115] Glass on -> the bar paints nothing of
+                    // its own; the haze layer behind it IS its surface. Off ->
+                    // the pre-existing 92% wash, byte for byte.
+                    containerColor = if (composerGlassOn) Color.Transparent
+                    else ChatColors.background.copy(alpha = 0.92f),
+                    scrolledContainerColor = if (composerGlassOn) Color.Transparent
+                    else ChatColors.background.copy(alpha = 0.92f),
                 ),
                 // [T-android-topbar-shrink] 76dp → 68dp. The earlier
                 // T-topbar-model-row-clip fix bumped 60dp → 76dp to give the
@@ -2891,6 +3056,7 @@ fun ChatScreen(
                 // Font sizes + lineHeights stay untouched per spec.
                 expandedHeight = 68.dp,
             )
+            } // [composer-glass-1115] end measuring Box around TopAppBar
         },
         // [T-error-no-permanent-scars] SnackbarHost is NOT registered here —
         // it's rendered inside the content Box aligned to the TOP (below the
@@ -3582,8 +3748,42 @@ fun ChatScreen(
                 // would drop them ComposerArcOverlap down under the card.
                 AlwaysStretchOverscrollBox(
                     modifier = Modifier
-                        .composerArcTail()
-                        .clip(composerArcClipShape),
+                        // [composer-glass-1115 / composer-glass-1116] The
+                        // extent still depends on the Chat Tuning switch, the
+                        // clip does not:
+                        //  • glass ON  — the list runs the WHOLE composer height
+                        //    underneath the card, because those rows are what the
+                        //    card blurs. The clip stays on with that depth as its
+                        //    band, so the rows are only ever seen *through* the
+                        //    card, never painted sharp beside or below it.
+                        //  • glass OFF — the original composer-arc-1114 shape:
+                        //    22dp of extra drawing room plus a clip that reveals
+                        //    only the two corner notches.
+                        // The blur is unaffected by the clip: haze records the
+                        // list's own subtree into a layer and the outline is
+                        // applied at composite time (see ComposerArcOcclusion).
+                        // [composer-glass-1115] Upward first (outermost): the
+                        // list has to reach the screen top before it can run
+                        // under the top bar. Its own content padding grows by
+                        // the same amount below.
+                        .topBarTail(if (composerGlassOn) topBarHeightDp else 0.dp)
+                        .composerArcTail(
+                            overlap = if (composerGlassOn) composerHeightDp else ComposerArcOverlap,
+                        )
+                        // [composer-glass-1116] The clip stays on in BOTH modes;
+                        // only its depth follows the tail (see composerArcClip).
+                        //
+                        // The original port dropped it under glass so the card
+                        // would have rows to blur. It does have them either way:
+                        // `Modifier.hazeSource` copies the list's own subtree
+                        // into a graphics layer and an ancestor clip is applied
+                        // later, when that layer is composited — so the card
+                        // still samples the rows this outline hides. What the
+                        // outline buys is the reverse: without it those rows are
+                        // painted straight through the card, and a 10 % tint
+                        // leaves sharp text visible under the glass while the
+                        // 16dp gutters either side of the card show it raw.
+                        .clip(composerArcClip),
                 ) { sharedEffect ->
                 // [render-churn-1] Tool-pill progress flow (LocalToolProgressById)
                 // provided ONCE with a stable reference — the flow instance
@@ -3596,6 +3796,14 @@ fun ChatScreen(
                 // grows at the BOTTOM, so the viewport anchor naturally stays
                 // put during streaming — no reverseLayout index-0 insertion
                 // churn, no need for an anchor-guard compensation loop.
+                // [fix/follow-exit-inset-1116] The bottom clearance, in dp. This is
+                // the only place it is written; the verdict does not mirror it — it
+                // reads the same number back from the list
+                // (`LayoutInfo.afterContentPadding`), so changing the padding here
+                // can never leave the verdict measuring a stale geometry.
+                val listBottomPaddingDp =
+                    (if (bottomReserve == 0.dp) 12.dp else bottomReserve) +
+                        if (composerGlassOn) composerHeightDp else ComposerArcOverlap
                 LazyColumn(
                     state = listState,
                     reverseLayout = false,
@@ -3614,17 +3822,25 @@ fun ChatScreen(
                     // breath under the title bar. Bottom padding and inter-
                     // message spacing are untouched.
                     contentPadding = PaddingValues(
-                        top = 4.dp,
-                        // [composer-arc-1114] The viewport is ComposerArcOverlap
-                        // taller than the space it occupies (it slides under the
-                        // composer), so the clearance has to grow by the same
-                        // amount to keep the last row exactly where it was.
-                        bottom = (if (bottomReserve == 0.dp) 12.dp else bottomReserve) +
-                            ComposerArcOverlap,
+                        top = 4.dp + if (composerGlassOn) topBarHeightDp else 0.dp,
+                        // [composer-glass-1115] With the effect on, the viewport
+                        // is the composer's full height taller than the space it
+                        // occupies (it slides under the card), so the clearance
+                        // grows by the same amount and the last row stays put.
+                        // With it off, the pre-existing arc band is the extent.
+                        // [fix/follow-exit-inset-1116] Same value the verdict
+                        // reads (computed once, above).
+                        bottom = listBottomPaddingDp,
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
+                        // [composer-glass-1115] Record the message rows so the
+                        // composer card can blur whatever sits behind it. Only
+                        // while the effect is ON: the recording is a per-frame
+                        // GraphicsLayer copy of the whole list, which is exactly
+                        // the cost a user who left the switch off should not pay.
+                        .then(if (composerGlassOn) Modifier.hazeSource(hazeState) else Modifier)
                         .onGloballyPositioned {
                             listRootCoords = it
                             if (perfFirstLayoutFired.compareAndSet(false, true)) {
@@ -4579,8 +4795,25 @@ fun ChatScreen(
             // StateFlow subscription lives INSIDE the composer leaf instead of
             // at ChatScreen scope — typing no longer re-executes the whole
             // message-list body (the long-session input jank root cause).
+            // [composer-glass-1115] The wrapper exists only to MEASURE: the list
+            // above needs the composer's height to know how far to draw under it
+            // (and to pad its bottom by the same amount). `onSizeChanged` fires
+            // after layout, one frame after the first composition — the list's
+            // tail and its bottom padding move together in that recomposition,
+            // so the last row does not shift.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { composerHeightPx = it.height },
+            ) {
             ChatInputArea(
                 viewModel = viewModel,
+                // [composer-glass-1115] Input-bar background effect (haze) +
+                // its two knobs from Settings → Appearance → Chat Tuning.
+                hazeState = hazeState,
+                composerGlassEnabled = composerGlassOn,
+                composerGlassBlurDp = tuning.composerGlassBlurDp,
+                composerGlassTintPct = tuning.composerGlassTintPct,
                 // [da1023-F] Active id, not the route arg: the composer's
                 // downstream consumers (MoveToSessionSheet's self-filter,
                 // attachment add) must follow the promoted session.
@@ -4611,6 +4844,7 @@ fun ChatScreen(
                 coroutineScope = coroutineScope,
                 inputFocusRequester = inputFocusRequester,
             )
+            } // end [composer-glass-1115] measuring wrapper
 
             // [T-context-exhausted-dialog] iOS 'Context Full' alert parity:
             // the context reached its capacity and the user tried to send.
@@ -5278,12 +5512,27 @@ private fun followEventLabel(event: FollowEvent): String = when (event) {
 /**
  * [B-03 deep-audit-1037] The ONE bottom verdict, shared by the derived
  * `isNearBottom` state and the `DragInteraction.Stop` handler. "At bottom" =
- * the last visible row's bottom edge sits within [thresholdPx] of the
- * viewport end. Callers add the sentinel arm on top (sentinel row visible ⇒
- * at bottom regardless of measurement) — the sentinel is a 5dp spacer one
- * past the last message row and is only measurable when the user really is
- * at the bottom, so it cannot be fooled by a tall last item (the T173
- * failure mode of the old gap test).
+ * the anchor row's bottom edge sits within [thresholdPx] of the VISIBLE end of
+ * the content area — `viewportEndOffsetPx - contentBottomInsetPx` — never past it.
+ *
+ * [fix/follow-exit-inset-1116] [contentBottomInsetPx] is `LayoutInfo.afterContentPadding`
+ * — the bottom content padding the list MEASURED and applied, read back from the
+ * list itself rather than recomputed by the caller. It has to be subtracted:
+ * `viewportEndOffset` is defined by Compose as `mainAxisAvailableSize +
+ * afterContentPadding` (LazyListMeasure.kt), so the raw viewport end sits one
+ * padding-height past the last legal content position — and under the composer
+ * arc/glass tail the viewport itself reaches the physical screen bottom while
+ * the last row legitimately rests that padding above it. Comparing against it
+ * read FALSE at the true bottom, which forced both callers onto the sentinel arm;
+ * the sentinel enters the viewport one padding-height early and that arm ignores
+ * distance, so leaving follow required a full card height of scroll.
+ * Callers with no padding pass 0.
+ *
+ * The sentinel is an ANCHOR for this distance test (preferred when it is on
+ * screen, because it is the true content end), not a verdict on its own: it is
+ * a 5dp spacer one past the last message row, so it cannot be fooled by a tall
+ * last item (the T173 failure mode of the old gap test), but its VISIBILITY says
+ * nothing about how far the reader has scrolled.
  *
  * Before this function the two callers each carried their own copy, and the
  * DragStop copy compared the viewport-TOP index (`firstVisibleItemIndex`)
@@ -5291,7 +5540,7 @@ private fun followEventLabel(event: FollowEvent): String = when (event) {
  * era that read FALSE at the true bottom (streaming stopped following) and
  * TRUE when a tall last item's top reached the viewport top (a reader got
  * yanked back). [LazyListItemInfo.size] is the FULL item height, so
- * "bottom edge within threshold of the viewport end" is scroll-depth aware.
+ * "bottom edge within threshold of the visible end" is scroll-depth aware.
  *
  * Pure: no Compose / Android dependencies, JVM-testable.
  */
@@ -5299,10 +5548,18 @@ internal fun isListAtBottom(
     lastVisibleOffsetPx: Int,
     lastVisibleSizePx: Int,
     viewportEndOffsetPx: Int,
+    contentBottomInsetPx: Int,
     thresholdPx: Int,
 ): Boolean {
+    // [fix/follow-exit-inset-1116] The visible end of the content area is the
+    // viewport end MINUS the list's bottom content padding. Under the composer
+    // arc/glass tail the list's viewport reaches the physical screen bottom while
+    // the last row legitimately rests `padding.bottom` above it, so the raw
+    // viewport end is NOT where content is allowed to end. Callers that own no
+    // padding pass 0, which reproduces the pre-1116 geometry exactly.
+    val visualEnd = viewportEndOffsetPx - contentBottomInsetPx.coerceAtLeast(0)
     val bottomEdge = lastVisibleOffsetPx + lastVisibleSizePx
-    val distance = viewportEndOffsetPx - bottomEdge
+    val distance = visualEnd - bottomEdge
     return distance >= 0 && distance <= thresholdPx
 }
 

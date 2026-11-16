@@ -1627,6 +1627,7 @@
     <string name="chat_tuning_entry">Chat Tuning</string>
     <string name="chat_tuning_entry_subtitle">Reading, scrolling and composer feel</string>
     <string name="chat_tuning_title">Chat Tuning</string>
+    <string name="settings_live_apply_hint">Every change on this page is applied and saved as soon as you make it — there is no Save button.</string>
     <string name="chat_tuning_section_reading">READING &amp; SCROLLING</string>
     <string name="chat_tuning_scroll_threshold">Bottom-stick threshold</string>
     <string name="chat_tuning_scroll_threshold_desc">How close to the bottom (dp) still counts as “at the bottom” — governs auto-follow stickiness and the jump-to-bottom button. Default 32.</string>
@@ -1645,9 +1646,15 @@
     <string name="chat_tuning_swipe_threshold">Swipe-up-to-send distance (dp)</string>
     <string name="chat_tuning_swipe_threshold_desc">How far you must swipe up inside the input to arm the send gesture. Default 120.</string>
     <string name="chat_tuning_composer_footer">Only the in-app composer is affected. The send button and the return-key behaviour are separate settings.</string>
-    <!-- [feat/chat-tuning-panel-b] Runtime Limits — context/memory & media/tool budget sections. -->
-    <string name="runtime_limits_section_context">Context &amp; memory</string>
-    <string name="runtime_limits_compact_tail">Auto-compact tail floor (tokens)</string>
+    <string name="chat_tuning_section_composer_glass">COMPOSER GLASS</string>
+    <string name="chat_tuning_glass_blur">Blur radius</string>
+    <string name="chat_tuning_glass_blur_desc">How far the backdrop smears. Rikkahub uses 12 dp for its blur preset and 16 dp for glass.</string>
+    <string name="chat_tuning_glass_tint">Glass density</string>
+    <string name="chat_tuning_glass_tint_desc">How much of the card colour covers the blur. 0% is pure blur, 100% is the card colour alone (a solid card).</string>
+    <string name="chat_tuning_glass_footer">The on/off switch is in Appearance → Chat appearance. With it off, these two numbers have no effect.</string>    <!-- [feat/chat-tuning-panel-b] Runtime Limits — context/memory & media/tool budget sections. -->
+    <string name="appearance_glass_title">Input bar and top bar</string>    <string name="runtime_limits_section_context">Context &amp; memory</string>
+    <string name="appearance_section_glass">Glass</string>
+    <string name="appearance_glass_footer">Applies to the input bar and the top bar. Blur radius and density are in Chat Tuning; below Android 12 the surfaces stay solid.</string>    <string name="runtime_limits_compact_tail">Auto-compact tail floor (tokens)</string>
     <string name="runtime_limits_compact_tail_desc">Auto-compaction never cuts below this many tail tokens — the newest conversation stays verbatim. Default 8000.</string>
     <string name="runtime_limits_compact_interval">Auto-compact interval (min)</string>
     <string name="runtime_limits_compact_interval_desc">Minimum minutes between auto-compactions of the same conversation. Default 5.</string>
@@ -1699,9 +1706,9 @@
     <string name="runtime_limits_heavy_gate">Sandbox: heavy gate wait</string>
     <string name="runtime_limits_heavy_gate_desc">How long a heavy command waits for the global heavy-command gate before reporting that another heavy command is still running.</string>
     <string name="runtime_limits_sandbox_footer">These windows protect the app from memory pressure. Defaults match the previously fixed values.</string>
-    <string name="runtime_limits_restore_confirm_body">Every knob on this page goes back to its shipped value in the editor. Nothing is written until you press Save.</string>
+    <string name="runtime_limits_restore_confirm_body">Every knob on this page goes back to its shipped value immediately. This cannot be undone.</string>
     <string name="runtime_limits_restore_confirm_title">Restore defaults?</string>
-    <string name="runtime_limits_restore_defaults_footer">Restoring only changes this page\'s unsaved values — press Save to apply them. Slider steps are unchanged: some defaults (such as the tmp sweep age) are not reachable by dragging once you have moved past them, which is why this row exists.</string>
+    <string name="runtime_limits_restore_defaults_footer">Restoring rewrites every knob on this page to its built-in default immediately — there is nothing left to save. Slider steps are unchanged: some defaults (such as the tmp sweep age) are not reachable by dragging once you have moved past them, which is why this row exists.</string>
     <string name="runtime_limits_restore_defaults_desc">Put every knob on this page back to its shipped value</string>
     <string name="runtime_limits_restore_defaults">Restore defaults</string>
     <string name="runtime_limits_section_reset">Reset</string>

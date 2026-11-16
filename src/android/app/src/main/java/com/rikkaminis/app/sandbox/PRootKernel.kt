@@ -139,6 +139,11 @@ object PRootKernel {
         // found` and read-only mount guards were gone until the app restarted.
         // The hook only re-arms the gate; the next `boot()` (command, terminal)
         // re-runs this whole body, which is idempotent by design.
+        rootfsManager.beforeRootfsWiped = {
+            ExecutionCoordinator.stopCurrentCommand()
+            TerminalSession.stopAll()
+            bootGate.invalidate()
+        }
         rootfsManager.afterRootfsReinstalled = {
             onRootfsReinstalled(context)
         }
@@ -561,6 +566,35 @@ object PRootKernel {
     }
 
     /**
+     * True when [linuxPath] IS a PRoot bind-mount target, or an ANCESTOR of one.
+     *
+     * [incr1116-A F-01] The file browser grew a delete button on directories
+     * this window, and `/var/minis/{workspace,attachments,offloads,browser,shared}`
+     * are exactly that: the guest paths PRoot binds a session directory onto.
+     * Deleting one from the host side removes the placeholder inside the rootfs,
+     * and PRoot silently SKIPS a bind whose target does not exist — so a single
+     * tap on the trash icon made the agent's `/var/minis/workspace` disappear
+     * from every session (the files are still on disk; the view is gone) until
+     * the directory is recreated.
+     *
+     * Ancestors are included for the same reason: `/var/minis` and `/var` are
+     * one tap away in the rootfs browser, and removing them takes the whole
+     * mount table with it. `"/"` therefore always answers true — there is no
+     * delete that is not also a mount removal.
+     *
+     * Only the live table is consulted ([bindMounts]): a mounted folder that is
+     * currently unmounted has no placeholder worth protecting, and
+     * [applyMountedFoldersSnapshot] recreates `/var/minis/mounts/<name>` on the
+     * next reconcile.
+     */
+    fun isLinuxPathMountPointOrAncestor(linuxPath: String): Boolean {
+        val normalized = normalizeLinuxPath(linuxPath) ?: return false
+        val exact = normalized.trimEnd('/')
+        if (exact.isEmpty()) return true
+        return bindMounts.keys.any { target -> target == exact || target.startsWith("$exact/") }
+    }
+
+    /**
      * Snapshot of mount roots for the @-mention index. Skips entries
      * whose tree URI doesn't resolve to a POSIX path on this device.
      */
@@ -907,7 +941,21 @@ object PRootKernel {
         val basePath = try { base.canonicalPath } catch (e: IOException) { return null }
         val resolvedPath = try { resolved.canonicalPath } catch (e: IOException) { return null }
         if (resolvedPath == basePath) return resolved
-        if (!resolvedPath.startsWith("$basePath${File.separator}")) return null
+        if (!resolvedPath.startsWith("$basePath${File.separator}")) {
+            // [incr1116-CD F-01] A faked hard link is a symlink whose target is
+            // the file's real inode inside `<rootfs>/.l2s-backing`, i.e. always
+            // outside the session/mount base. Reading THROUGH that link is what
+            // the guest does with the same name, so refusing it here made every
+            // hard-linked file unreadable to the host-side tools while the shell
+            // could still open it.
+            //
+            // Only the extension's own bookkeeping is admitted (one
+            // `.l2s-backing` segment + a `.l2s.` leaf): every other target
+            // outside the base stays refused, which is the escape this guard
+            // exists for. Both constants live in RootfsResetFiles.kt next to the
+            // directory the reset preserves, so the two cannot drift.
+            if (!isL2sBackingTarget(resolvedPath)) return null
+        }
         return resolved
     }
 
@@ -1450,6 +1498,65 @@ object PRootKernel {
         val tmpDir = File(context.cacheDir, "proot-tmp")
         tmpDir.mkdirs()
         return tmpDir
+    }
+
+    /**
+     * Host directory where link2symlink keeps the files behind faked hard
+     * links, passed to PRoot as `PROOT_L2S_DIR`.
+     *
+     * **It must live inside the guest rootfs.**  A faked hard link is a
+     * symbolic link whose content is the host path of its backing file;
+     * a guest can't reach a path outside its root, so with the directory
+     * next to the rootfs (`filesDir/l2s-backing`, the first attempt) every
+     * chain made by that build resolved to ENOENT -- measured on device
+     * 1.0.0+3125, 2026-11-15: `ln a b` returned 0, `stat` reported the
+     * emulated count, and both `a` and `b` could not be opened.  The
+     * upstream tests start PRoot with `-r /`, which puts any host
+     * directory inside the root, hence they never saw this.
+     *
+     * Without the variable every backing file lives next to the name it
+     * was faked from.  The chain owner -- the name the first `link(2)`
+     * was made from -- then owns the backing files of the whole chain, so
+     * any directory holding that name cannot be removed while another
+     * name of the same chain still exists: `rm -rf` visits that
+     * directory, its backing file is still referenced, and `rmdir(2)`
+     * reports "Directory not empty".  Tools that copy trees while
+     * preserving hard links (`cp -a`, `cp -al`, `git clone --local`) put
+     * the owner wherever their readdir order lands -- reproduced on the
+     * device, the owner inside a subdirectory: one `rm -rf` failed, a
+     * second pass succeeded.
+     *
+     * With the directory configured the backing files live outside every
+     * directory a tracee works in: guest directories hold only the
+     * symbolic links.  PRoot keeps working with chains an older build
+     * left next to their names -- `l2s_entry()` falls back to the plain
+     * path -- so nothing on an existing rootfs has to be migrated.
+     *
+     * Persistence: the directory must survive restarts (a wiped backing
+     * directory turns every existing faked hard link into a dangling
+     * symlink), hence the rootfs and not `cacheDir`/`/tmp`.
+     */
+    internal fun getL2sBackingDir(context: Context): File {
+        val dir = File(RootfsManager.getInstance(context).rootfsDir, L2S_BACKING_DIR_NAME)
+        dir.mkdirs()
+        // PRoot compares this path against the host paths it resolves
+        // itself, which are canonical.  `filesDir` goes through
+        // /data/user/0 -> /data/data here, so the literal path never
+        // matched and every chain broke: `ln a b` returned 0, `stat`
+        // reported the emulated count, and neither name could be opened
+        // (measured on device, 1.0.0+3126).  Resolving the directory
+        // makes the literal path canonical.
+        //
+        // The chains the two broken builds made stay broken (measured on
+        // device, 1.0.0+3128): their symbolic links were never written
+        // with a usable target, so only the backing files survive under
+        // the directory above -- those still hold the data, but which
+        // internal name belonged to which link is not recorded.
+        return try {
+            dir.canonicalFile
+        } catch (e: IOException) {
+            dir
+        }
     }
 }
 

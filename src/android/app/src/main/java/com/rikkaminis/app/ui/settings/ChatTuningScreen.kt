@@ -1,11 +1,8 @@
 package com.rikkaminis.app.ui.settings
 
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -19,7 +16,6 @@ import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.ChatTuningPrefs
 import com.rikkaminis.app.data.ChatTuningValues
-import com.rikkaminis.app.ui.components.MinisTextButton
 
 /**
  * [feat/chat-tuning-panel] Chat Tuning — the knobs that shape how the chat
@@ -34,7 +30,10 @@ import com.rikkaminis.app.ui.components.MinisTextButton
  *     per-row subtitles / section footers.
  *   - Defaults == the previously hard-coded literals, so an untouched
  *     install behaves identically to the pre-panel build.
- *   - All edits are local state; the single Save action persists in one shot.
+ *   - [live-apply-1116] Every knob persists the moment its slider is released
+ *     (single-key write, no Save, no draft buffer). The chat screen listens on
+ *     this prefs file through [rememberChatTuning], so a committed value is
+ *     live the next time the chat surface composes — no restart, no re-entry.
  */
 @Composable
 fun ChatTuningScreen(onBack: () -> Unit) {
@@ -47,13 +46,16 @@ fun ChatTuningScreen(onBack: () -> Unit) {
     var markdownLineHeightSp by remember { mutableStateOf(ChatTuningPrefs.markdownLineHeightSp(context)) }
     var inputMaxLines by remember { mutableStateOf(ChatTuningPrefs.inputMaxLines(context)) }
     var sendSwipeThresholdDp by remember { mutableStateOf(ChatTuningPrefs.sendSwipeThresholdDp(context)) }
+    var composerGlassBlurDp by remember { mutableStateOf(ChatTuningPrefs.composerGlassBlurDp(context)) }
+    var composerGlassTintPct by remember { mutableStateOf(ChatTuningPrefs.composerGlassTintPct(context)) }
 
     // [FIX-6 / F-241] Re-read the snapshots when the prefs file changes
     // OUTSIDE this screen (`minis-config set chat.*`, backup-restore, the
     // agent). Same rationale as AppearanceScreen's [T-backup-import-refresh]
-    // listener; without it Save would write back the values captured at open
-    // time. The `rememberChatTuning` helper below covers the chat screen's
-    // read path — this covers the panel's own edit buffer.
+    // listener. [live-apply-1116] With no Save left there is nothing to write
+    // back, so the listener's job is now purely display: an external write
+    // must land in this panel's buffer instead of being overwritten the next
+    // time the matching slider is touched.
     // [fix/dv22-b1-prefs-listener-filter] One arm per key: an external
     // single-key write must only overwrite the buffer for THAT key, never
     // clear the whole group of unsaved edits (dv22-B-01 family).
@@ -77,6 +79,10 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                         inputMaxLines = ChatTuningPrefs.inputMaxLines(context)
                     ChatTuningPrefs.KEY_SEND_SWIPE_THRESHOLD_DP ->
                         sendSwipeThresholdDp = ChatTuningPrefs.sendSwipeThresholdDp(context)
+                    ChatTuningPrefs.KEY_COMPOSER_GLASS_BLUR_DP ->
+                        composerGlassBlurDp = ChatTuningPrefs.composerGlassBlurDp(context)
+                    ChatTuningPrefs.KEY_COMPOSER_GLASS_TINT_PCT ->
+                        composerGlassTintPct = ChatTuningPrefs.composerGlassTintPct(context)
                 }
             }
         prefs.registerOnSharedPreferenceChangeListener(listener)
@@ -93,6 +99,10 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                 .padding(bottom = 24.dp),
         ) {
 
+            // [live-apply-1116] No Save action exists any more — say so where the
+            // user lands, not in a footer three sections down.
+            LimitsSectionFooter(stringResource(R.string.settings_live_apply_hint))
+
             // ── 1. Reading & scrolling ───────────────────────────────────
             LimitsSectionCard(title = stringResource(R.string.chat_tuning_section_reading)) {
                 LimitsSliderRow(
@@ -103,6 +113,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.SCROLL_NEAR_BOTTOM_MIN,
                     max = ChatTuningPrefs.SCROLL_NEAR_BOTTOM_MAX,
                     onCommit = { scrollNearBottomDp = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_SCROLL_NEAR_BOTTOM_DP, scrollNearBottomDp) },
                 )
                 LimitsSliderRow(
                     title = stringResource(R.string.chat_tuning_prewarm),
@@ -112,6 +123,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.PREWARM_ROW_LIMIT_MIN,
                     max = ChatTuningPrefs.PREWARM_ROW_LIMIT_MAX,
                     onCommit = { prewarmRowLimit = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_PREWARM_ROW_LIMIT, prewarmRowLimit) },
                 )
                 LimitsSliderRow(
                     title = stringResource(R.string.chat_tuning_code_preview),
@@ -121,6 +133,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.CODE_PREVIEW_LINES_MIN,
                     max = ChatTuningPrefs.CODE_PREVIEW_LINES_MAX,
                     onCommit = { codePreviewLines = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_CODE_PREVIEW_LINES, codePreviewLines) },
                 )
                 LimitsSliderRow(
                     title = stringResource(R.string.chat_tuning_table_preview),
@@ -130,6 +143,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.TABLE_PREVIEW_ROWS_MIN,
                     max = ChatTuningPrefs.TABLE_PREVIEW_ROWS_MAX,
                     onCommit = { tablePreviewRows = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_TABLE_PREVIEW_ROWS, tablePreviewRows) },
                 )
                 LimitsSliderRow(
                     title = stringResource(R.string.chat_tuning_line_height),
@@ -139,6 +153,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_MIN,
                     max = ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_MAX,
                     onCommit = { markdownLineHeightSp = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_MARKDOWN_LINE_HEIGHT_SP, markdownLineHeightSp) },
                     showDivider = false,
                 )
             }
@@ -154,6 +169,7 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.INPUT_MAX_LINES_MIN,
                     max = ChatTuningPrefs.INPUT_MAX_LINES_MAX,
                     onCommit = { inputMaxLines = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_INPUT_MAX_LINES, inputMaxLines) },
                 )
                 LimitsSliderRow(
                     title = stringResource(R.string.chat_tuning_swipe_threshold),
@@ -163,38 +179,46 @@ fun ChatTuningScreen(onBack: () -> Unit) {
                     min = ChatTuningPrefs.SEND_SWIPE_THRESHOLD_MIN,
                     max = ChatTuningPrefs.SEND_SWIPE_THRESHOLD_MAX,
                     onCommit = { sendSwipeThresholdDp = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_SEND_SWIPE_THRESHOLD_DP, sendSwipeThresholdDp) },
                     showDivider = false,
                 )
             }
             LimitsSectionFooter(stringResource(R.string.chat_tuning_composer_footer))
 
-            // ── Save ─────────────────────────────────────────────────────
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 16.dp),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                MinisTextButton(
-                    onClick = {
-                        ChatTuningPrefs.save(
-                            context,
-                            ChatTuningValues(
-                                scrollNearBottomDp = scrollNearBottomDp,
-                                prewarmRowLimit = prewarmRowLimit,
-                                codePreviewLines = codePreviewLines,
-                                tablePreviewRows = tablePreviewRows,
-                                markdownLineHeightSp = markdownLineHeightSp,
-                                inputMaxLines = inputMaxLines,
-                                sendSwipeThresholdDp = sendSwipeThresholdDp,
-                            ),
-                        )
-                        onBack()
-                    },
-                ) {
-                    Text(stringResource(R.string.common_save))
-                }
+            // ── 3. Composer background effect [composer-glass-1115] ──────
+            //
+            // rikkahub parity: their Settings → Display has a switch plus a
+            // Blur / Glass picker. We ship a switch plus the two numbers that
+            // actually exist in haze 1.x — the AGSL "glass" preset needs haze
+            // 2.x (Compose 1.12 / Kotlin 2.4), which this app cannot take yet.
+            // Both sliders stay visible while the master switch is off, greyed
+            // by their own value labels: a user should be able to see what
+            // they'd be tuning before turning it on.
+            LimitsSectionCard(title = stringResource(R.string.chat_tuning_section_composer_glass)) {
+                LimitsSliderRow(
+                    title = stringResource(R.string.chat_tuning_glass_blur),
+                    subtitle = stringResource(R.string.chat_tuning_glass_blur_desc),
+                    valueLabel = "$composerGlassBlurDp dp",
+                    value = composerGlassBlurDp,
+                    min = ChatTuningPrefs.COMPOSER_GLASS_BLUR_MIN,
+                    max = ChatTuningPrefs.COMPOSER_GLASS_BLUR_MAX,
+                    onCommit = { composerGlassBlurDp = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_COMPOSER_GLASS_BLUR_DP, composerGlassBlurDp) },
+                )
+                LimitsSliderRow(
+                    title = stringResource(R.string.chat_tuning_glass_tint),
+                    subtitle = stringResource(R.string.chat_tuning_glass_tint_desc),
+                    valueLabel = "$composerGlassTintPct%",
+                    value = composerGlassTintPct,
+                    min = ChatTuningPrefs.COMPOSER_GLASS_TINT_MIN,
+                    max = ChatTuningPrefs.COMPOSER_GLASS_TINT_MAX,
+                    onCommit = { composerGlassTintPct = it },
+                    onCommitFinished = { ChatTuningPrefs.setInt(context, ChatTuningPrefs.KEY_COMPOSER_GLASS_TINT_PCT, composerGlassTintPct) },
+                    showDivider = false,
+                )
             }
+            LimitsSectionFooter(stringResource(R.string.chat_tuning_glass_footer))
+
         }
     }
 }
@@ -204,8 +228,8 @@ fun ChatTuningScreen(onBack: () -> Unit) {
  * [ChatTuningPrefs.ALL_KEYS] changes in the chat-tuning prefs file. Call from the
  * chat screen; the returned values feed layout math (scroll threshold),
  * composition locals (markdown folds / line height) and the composer
- * parameters. One listener for all seven keys keeps ChatScreen's existing
- * per-key listener block from growing seven more `when` arms.
+ * parameters. One listener for all ten keys keeps ChatScreen's existing
+ * per-key listener block from growing ten more `when` arms.
  */
 @Composable
 internal fun rememberChatTuning(context: android.content.Context): ChatTuningValues {

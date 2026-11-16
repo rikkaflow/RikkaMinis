@@ -1540,6 +1540,7 @@
     <string name="chat_tuning_entry">聊天微调</string>
     <string name="chat_tuning_entry_subtitle">阅读、滚动与输入手感</string>
     <string name="chat_tuning_title">聊天微调</string>
+    <string name="settings_live_apply_hint">本页每一项调整都在改动时立即生效并保存，无需再点保存。</string>
     <string name="chat_tuning_section_reading">阅读与滚动</string>
     <string name="chat_tuning_scroll_threshold">触底判定阈值</string>
     <string name="chat_tuning_scroll_threshold_desc">距离底部多近（dp）仍算“在底部”——决定自动跟随的粘性与回到底部按钮的出现时机。默认 32。</string>
@@ -1558,9 +1559,15 @@
     <string name="chat_tuning_swipe_threshold">上滑发送距离（dp）</string>
     <string name="chat_tuning_swipe_threshold_desc">在输入框内上滑多远才触发发送手势。默认 120。</string>
     <string name="chat_tuning_composer_footer">仅影响应用内输入框；发送按钮与回车键行为是另外的设置项。</string>
-    <!-- [feat/chat-tuning-panel-b] 运行时限制 — 上下文/记忆 与 媒体/工具预算段。 -->
-    <string name="runtime_limits_section_context">上下文与记忆</string>
-    <string name="runtime_limits_compact_tail">自动压缩保留尾部 token</string>
+    <string name="chat_tuning_section_composer_glass">输入框玻璃</string>
+    <string name="chat_tuning_glass_blur">模糊半径</string>
+    <string name="chat_tuning_glass_blur_desc">背景被抹开的程度。rikkahub 的模糊预设是 12 dp，玻璃预设 16 dp。</string>
+    <string name="chat_tuning_glass_tint">玻璃浓度</string>
+    <string name="chat_tuning_glass_tint_desc">卡片底色覆盖模糊的多少。0% 是纯模糊，100% 只剩卡片底色（实心）。</string>
+    <string name="chat_tuning_glass_footer">开关在 外观 → 聊天外观。关掉时这两个数值不生效。</string>    <!-- [feat/chat-tuning-panel-b] 运行时限制 — 上下文/记忆 与 媒体/工具预算段。 -->
+    <string name="appearance_glass_title">输入栏与顶部标题栏</string>    <string name="runtime_limits_section_context">上下文与记忆</string>
+    <string name="appearance_section_glass">毛玻璃</string>
+    <string name="appearance_glass_footer">对输入栏和顶部标题栏生效。模糊半径与浓度在「聊天微调」里；Android 12 以下保持实心。</string>    <string name="runtime_limits_compact_tail">自动压缩保留尾部 token</string>
     <string name="runtime_limits_compact_tail_desc">自动压缩不会砍掉低于此数量的尾部 token——最新对话保持原样。默认 8000。</string>
     <string name="runtime_limits_compact_interval">自动压缩间隔（分钟）</string>
     <string name="runtime_limits_compact_interval_desc">同一会话两次自动压缩之间的最小分钟数。默认 5。</string>
@@ -1612,9 +1619,9 @@
     <string name="runtime_limits_heavy_gate">沙箱：重活闸门等待</string>
     <string name="runtime_limits_heavy_gate_desc">重活命令等待全局重活闸门的最长时间，超时则报告另一重活仍在运行。</string>
     <string name="runtime_limits_sandbox_footer">这些窗口用于防止内存压力，默认值与之前的固定值一致。</string>
-    <string name="runtime_limits_restore_confirm_body">本页所有参数在编辑器里回到出厂值。在你点保存之前不会写入任何内容。</string>
+    <string name="runtime_limits_restore_confirm_body">本页所有参数将立即恢复为出厂默认值，此操作无法撤销。</string>
     <string name="runtime_limits_restore_confirm_title">恢复默认？</string>
-    <string name="runtime_limits_restore_defaults_footer">恢复只改动本页尚未保存的数值，需要再点保存才会生效。滑块步长未变：部分默认值（如临时目录收割年龄）一旦拖过就再也拖不回来，这一行就是为此存在的。</string>
+    <string name="runtime_limits_restore_defaults_footer">恢复会立即把本页所有参数改回内置默认值，无需再保存。滑块步长未变：部分默认值（如临时目录收割年龄）一旦拖过就再也拖不回来，这一行就是为此存在的。</string>
     <string name="runtime_limits_restore_defaults_desc">把本页所有参数改回出厂值</string>
     <string name="runtime_limits_restore_defaults">恢复默认</string>
     <string name="runtime_limits_section_reset">重置</string>

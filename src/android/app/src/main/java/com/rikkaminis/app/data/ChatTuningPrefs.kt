@@ -71,6 +71,48 @@ object ChatTuningPrefs {
     const val SEND_SWIPE_THRESHOLD_MIN = 60
     const val SEND_SWIPE_THRESHOLD_MAX = 240
 
+    // ── 6. Composer background effect ([composer-glass-1115]) ────────────
+    //
+    // The rikkahub input-bar effect: the card stops painting itself and draws a
+    // blurred sample of the message rows scrolling behind it instead.
+    //
+    // Three knobs, not one, because the ONE thing the effect cannot do without
+    // is a legibility check on the actual device: a blur radius that reads as
+    // "frosted" in one theme can make the draft text swim in another. Shipping
+    // only a switch would have meant shipping our guess as the only setting.
+    //
+    // OFF by default — same call rikkahub makes (`enableBlurEffect = false`):
+    // the blur records the whole message list every frame, and a user who never
+    // asked for it pays that cost for a look they may not want.
+    //
+    // The switch lives in Settings → APPEARANCE (it is a look, not a tuning
+    // knob); only the two numbers live in Chat Tuning.
+
+    /** Master switch for the frosted-glass composer card. */
+    const val KEY_COMPOSER_GLASS_ENABLED = "chat_composer_glass_enabled"
+    const val COMPOSER_GLASS_ENABLED_DEFAULT = false
+
+    /**
+     * Backdrop blur radius, dp. Default 12 = rikkahub's Blur preset (its Glass
+     * preset is 16; we have no Glass arm — see ComposerGlass).
+     */
+    const val KEY_COMPOSER_GLASS_BLUR_DP = "chat_composer_glass_blur_dp"
+    const val COMPOSER_GLASS_BLUR_DEFAULT = 12
+    const val COMPOSER_GLASS_BLUR_MIN = 4
+    const val COMPOSER_GLASS_BLUR_MAX = 40
+
+    /**
+     * How much of the card colour covers the blur, in percent (0 = pure blur,
+     * 100 = only the card colour, i.e. a solid card).
+     * Default 30 = rikkahub's Glass tint (containerColor at alpha 0.3); its Blur
+     * arm has no tint at all, but haze 1.x needs an opaque base or the rows
+     * under the card show through as a double image.
+     */
+    const val KEY_COMPOSER_GLASS_TINT_PCT = "chat_composer_glass_tint_pct"
+    const val COMPOSER_GLASS_TINT_DEFAULT = 30
+    const val COMPOSER_GLASS_TINT_MIN = 0
+    const val COMPOSER_GLASS_TINT_MAX = 100
+
     /** Every key this object owns — the change-listener filter. */
     val ALL_KEYS: Set<String> = setOf(
         KEY_SCROLL_NEAR_BOTTOM_DP,
@@ -80,6 +122,9 @@ object ChatTuningPrefs {
         KEY_MARKDOWN_LINE_HEIGHT_SP,
         KEY_INPUT_MAX_LINES,
         KEY_SEND_SWIPE_THRESHOLD_DP,
+        KEY_COMPOSER_GLASS_ENABLED,
+        KEY_COMPOSER_GLASS_BLUR_DP,
+        KEY_COMPOSER_GLASS_TINT_PCT,
     )
 
     // ── readers (each clamps to its bounds, so a corrupt value can't
@@ -120,6 +165,19 @@ object ChatTuningPrefs {
         SEND_SWIPE_THRESHOLD_DEFAULT, SEND_SWIPE_THRESHOLD_MIN, SEND_SWIPE_THRESHOLD_MAX,
     )
 
+    fun composerGlassEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_COMPOSER_GLASS_ENABLED, COMPOSER_GLASS_ENABLED_DEFAULT)
+
+    fun composerGlassBlurDp(context: Context): Int = readClamped(
+        context, KEY_COMPOSER_GLASS_BLUR_DP,
+        COMPOSER_GLASS_BLUR_DEFAULT, COMPOSER_GLASS_BLUR_MIN, COMPOSER_GLASS_BLUR_MAX,
+    )
+
+    fun composerGlassTintPct(context: Context): Int = readClamped(
+        context, KEY_COMPOSER_GLASS_TINT_PCT,
+        COMPOSER_GLASS_TINT_DEFAULT, COMPOSER_GLASS_TINT_MIN, COMPOSER_GLASS_TINT_MAX,
+    )
+
     /** Snapshot of every knob — what the panel edits and the composer reads. */
     fun readAll(context: Context): ChatTuningValues = ChatTuningValues(
         scrollNearBottomDp = scrollNearBottomDp(context),
@@ -129,40 +187,25 @@ object ChatTuningPrefs {
         markdownLineHeightSp = markdownLineHeightSp(context),
         inputMaxLines = inputMaxLines(context),
         sendSwipeThresholdDp = sendSwipeThresholdDp(context),
+        composerGlassEnabled = composerGlassEnabled(context),
+        composerGlassBlurDp = composerGlassBlurDp(context),
+        composerGlassTintPct = composerGlassTintPct(context),
     )
 
-    /** One-shot persist used by the panel's Save action (clamps like the readers). */
-    fun save(context: Context, values: ChatTuningValues) {
-        prefs(context).edit()
-            .putInt(
-                KEY_SCROLL_NEAR_BOTTOM_DP,
-                values.scrollNearBottomDp.coerceIn(SCROLL_NEAR_BOTTOM_MIN, SCROLL_NEAR_BOTTOM_MAX),
-            )
-            .putInt(
-                KEY_PREWARM_ROW_LIMIT,
-                values.prewarmRowLimit.coerceIn(PREWARM_ROW_LIMIT_MIN, PREWARM_ROW_LIMIT_MAX),
-            )
-            .putInt(
-                KEY_CODE_PREVIEW_LINES,
-                values.codePreviewLines.coerceIn(CODE_PREVIEW_LINES_MIN, CODE_PREVIEW_LINES_MAX),
-            )
-            .putInt(
-                KEY_TABLE_PREVIEW_ROWS,
-                values.tablePreviewRows.coerceIn(TABLE_PREVIEW_ROWS_MIN, TABLE_PREVIEW_ROWS_MAX),
-            )
-            .putInt(
-                KEY_MARKDOWN_LINE_HEIGHT_SP,
-                values.markdownLineHeightSp.coerceIn(MARKDOWN_LINE_HEIGHT_MIN, MARKDOWN_LINE_HEIGHT_MAX),
-            )
-            .putInt(
-                KEY_INPUT_MAX_LINES,
-                values.inputMaxLines.coerceIn(INPUT_MAX_LINES_MIN, INPUT_MAX_LINES_MAX),
-            )
-            .putInt(
-                KEY_SEND_SWIPE_THRESHOLD_DP,
-                values.sendSwipeThresholdDp.coerceIn(SEND_SWIPE_THRESHOLD_MIN, SEND_SWIPE_THRESHOLD_MAX),
-            )
-            .apply()
+    /**
+     * [live-apply-1116] Single-key write for the live-apply panel: one slider
+     * commit persists exactly its own knob and nothing else. That is strictly
+     * safer than the batched all-ten-keys write this object used to expose —
+     * a stale edit buffer can no longer clobber a concurrent write to a
+     * DIFFERENT key (the batched path had to re-read every field at save time
+     * to stay honest).
+     *
+     * Range checking stays in the readers (each clamps on the way out), so a
+     * value outside its bounds — only reachable by a caller that bypassed the
+     * slider's own min/max — still cannot escape into layout math.
+     */
+    fun setInt(context: Context, key: String, value: Int) {
+        prefs(context).edit().putInt(key, value).apply()
     }
 
     private fun readClamped(context: Context, key: String, default: Int, min: Int, max: Int): Int =
@@ -189,4 +232,10 @@ data class ChatTuningValues(
     val markdownLineHeightSp: Int = ChatTuningPrefs.MARKDOWN_LINE_HEIGHT_DEFAULT,
     val inputMaxLines: Int = ChatTuningPrefs.INPUT_MAX_LINES_DEFAULT,
     val sendSwipeThresholdDp: Int = ChatTuningPrefs.SEND_SWIPE_THRESHOLD_DEFAULT,
+    // [composer-glass-1115] Defaults == the pre-glass build: OFF, and the two
+    // sliders parked on rikkahub's own values so enabling the switch alone
+    // reproduces their look.
+    val composerGlassEnabled: Boolean = ChatTuningPrefs.COMPOSER_GLASS_ENABLED_DEFAULT,
+    val composerGlassBlurDp: Int = ChatTuningPrefs.COMPOSER_GLASS_BLUR_DEFAULT,
+    val composerGlassTintPct: Int = ChatTuningPrefs.COMPOSER_GLASS_TINT_DEFAULT,
 )
