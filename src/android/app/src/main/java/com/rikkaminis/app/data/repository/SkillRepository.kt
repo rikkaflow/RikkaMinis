@@ -1,7 +1,6 @@
 package com.rikkaminis.app.data.repository
 
 import android.content.Context
-import com.rikkaminis.app.tools.SkillInfo
 import com.rikkaminis.app.tools.SubagentSkill
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
@@ -422,6 +421,69 @@ class SkillRepository(private val context: Context) {
                 .distinct()
                 .sorted()
         }
+
+        /**
+         * [W1118-D5 F-01] The Skill row for a SKILL.md discovered on disk that
+         * has no DB row yet (loadAll's auto-discover branch).
+         *
+         * Every field the parser produced has to land on the row. The pre-fix
+         * call site hand-built the `Skill(...)` and omitted `version`, so a
+         * skill whose frontmatter declared `version: 2.3.0` was listed — and
+         * written to the `skills` table — as the constructor default `"1.0.0"`
+         * for the rest of the process. That is the same "one more construction
+         * site" bug class as the four-layer field sync: the other three landing
+         * paths (importFromContent, rescanFromDisk, updateFromURL) all pass
+         * `version = parsed.version`.
+         *
+         * Takes the already-parsed value rather than the raw markdown because
+         * the parser is an instance method; loadAll parses once and hands both
+         * halves over.
+         */
+        internal fun skillFromDiscoveredMd(id: String, parsed: ParsedSkill, raw: String): Skill =
+            Skill(
+                id = id,
+                name = parsed.name,
+                description = parsed.description,
+                version = parsed.version,
+                importSource = ImportSource.SESSION,
+                body = parsed.body,
+                // parseSkillMd strips the frontmatter block from body, so a
+                // skill first discovered mid-session keeps frontmatter-only
+                // keys (`subagent`, `max_turns`, `allowed_tools`, …) only if
+                // the block travels here — mirrors the DB-row path's
+                // readSkillMdFrontmatter.
+                frontmatter = SubagentSkill.extractFrontmatterBlock(raw),
+            )
+
+        /**
+         * [W1118-D5 F-06] The in-memory row after a rename.
+         *
+         * [Skill.frontmatter] is the raw `---…---` block of the on-disk
+         * SKILL.md, and the rename rewrites the `name:` line inside it
+         * ([renameFrontmatterName]). Copying only `name` left the StateFlow
+         * row carrying the OLD `name:` block, so anything that hands a skill's
+         * frontmatter onwards without re-reading disk (export, writeSkillMd's
+         * merge base) kept resurrecting the previous name — [rescanFromDisk]
+         * and [update] both refresh the block, so this was the odd one out.
+         *
+         * [renamedDocument] is the rewritten document, or null when the rename
+         * had nothing to rewrite (no frontmatter / no `name:` line) — in that
+         * case the previous block is kept, matching the "leave the file
+         * untouched" contract of [renameFrontmatterName].
+         */
+        internal fun skillAfterRename(
+            current: Skill,
+            newName: String,
+            renamedDocument: String?,
+            now: Long,
+        ): Skill = current.copy(
+            name = newName,
+            frontmatter = renamedDocument
+                ?.let { SubagentSkill.extractFrontmatterBlock(it) }
+                ?.takeIf { it.isNotBlank() }
+                ?: current.frontmatter,
+            updatedAt = now,
+        )
     }
 
     private val httpClient = OkHttpClient.Builder()
@@ -465,27 +527,26 @@ class SkillRepository(private val context: Context) {
 
     data class Skill(
         val id: String = UUID.randomUUID().toString(),
-        override val name: String,
-        override val description: String = "",
+        val name: String,
+        val description: String = "",
         val version: String = "1.0.0",
         val importSource: ImportSource = ImportSource.FILE,
         val isEnabled: Boolean = true,
         val installedAt: Long = System.currentTimeMillis(),
         val updatedAt: Long = System.currentTimeMillis(),
-        override val body: String = "",
+        val body: String = "",
         /**
-         * [fix/subagent-frontmatter] Frontmatter block of the on-disk SKILL.md
-         * (`---` … `---` included). [body] is frontmatter-stripped by
-         * [parseSkillMd], so frontmatter-only fields — `subagent: true`,
-         * `max_turns`, `allowed_tools` — must ride on this field or
-         * SubagentSkill can never see them. Populated by [loadAll] from disk.
+         * Frontmatter block of the on-disk SKILL.md (`---` … `---` included).
+         * [body] is frontmatter-stripped by [parseSkillMd], so frontmatter-only
+         * keys (`subagent`, `max_turns`, `allowed_tools`, …) ride on this field
+         * through an edit/save round-trip. Populated by [loadAll] from disk.
          */
-        override val frontmatter: String = "",
+        val frontmatter: String = "",
         /** Original GitHub URL when importSource is URL (null otherwise). */
         val sourceURL: String? = null,
         /** Cumulative read count of this skill's SKILL.md; normalized to 0–100 after exceeding 1000. */
         val useCount: Double = 0.0,
-    ) : SkillInfo
+    )
 
     enum class UsageFrequency { NEVER, LOW, REGULAR, HIGH }
 
@@ -630,6 +691,11 @@ class SkillRepository(private val context: Context) {
     fun delete(id: String) {
         db.execSQL("DELETE FROM skills WHERE id=?", arrayOf(id))
         db.execSQL("DELETE FROM session_skill_overrides WHERE skill_id=?", arrayOf(id))
+        // [W1118-D5 F-07] Every write to session_skill_overrides must move the
+        // revision (the class KDoc says so) — consumers that only watch
+        // `sessionOverridesRevision` (the slash menu) otherwise keep the
+        // deleted skill's "allowed in this session" row in memory.
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
         val dir = File(skillsDir, id)
         dir.deleteRecursively()
         _skills.value = _skills.value.filter { it.id != id }
@@ -1552,6 +1618,7 @@ class SkillRepository(private val context: Context) {
         val trimmed = newName.trim()
         if (trimmed.isBlank()) return false
         val file = File(File(skillsDir, skillId), "SKILL.md")
+        var renamedDocument: String? = null
         if (file.exists()) {
             val original = file.readText()
             // [B14b] Only rewrite the `name:` line inside the frontmatter block —
@@ -1561,10 +1628,20 @@ class SkillRepository(private val context: Context) {
             // companion so JVM tests exercise the real code (same split as
             // [mergeFrontmatter]). null → file left untouched.
             renameFrontmatterName(original, trimmed)?.let { updated ->
-                if (updated != original) file.writeText(updated)
+                if (updated != original) {
+                    file.writeText(updated)
+                    // [W1118-D5 F-06] Keep the in-memory frontmatter block in
+                    // step with the document we just wrote.
+                    renamedDocument = updated
+                }
             }
         }
-        val refreshed = current.copy(name = trimmed, updatedAt = System.currentTimeMillis())
+        val refreshed = skillAfterRename(
+            current = current,
+            newName = trimmed,
+            renamedDocument = renamedDocument,
+            now = System.currentTimeMillis(),
+        )
         db.execSQL(
             "UPDATE skills SET name=?, updated_at=? WHERE id=?",
             arrayOf<Any>(refreshed.name, refreshed.updatedAt, skillId)
@@ -2243,10 +2320,9 @@ class SkillRepository(private val context: Context) {
             // parse feeds the metadata re-sync further down.
             val diskSkill = parseSkillMdOnDisk(id)
             val body = diskSkill?.body ?: ""
-            // [fix/subagent-frontmatter] Frontmatter-only fields (subagent:
-            // true, max_turns, allowed_tools) never reach `body` — parseSkillMd
-            // strips the block — so read it separately for consumers that
-            // re-inspect frontmatter (SubagentSkill.parseSubagentConfig).
+            // Frontmatter-only keys (subagent / max_turns / allowed_tools, …)
+            // never reach `body` — parseSkillMd strips the block — so read the
+            // block separately and carry it through an edit/save round-trip.
             val frontmatter = readSkillMdFrontmatter(id)
             val sourceUrlIdx = cursor.getColumnIndex("source_url")
             val useCountIdx = cursor.getColumnIndex("use_count")
@@ -2338,6 +2414,10 @@ class SkillRepository(private val context: Context) {
             db.execSQL("DELETE FROM session_skill_overrides WHERE skill_id=?", arrayOf(id))
         }
         if (staleIds.isNotEmpty()) {
+            // [W1118-D5 F-07] The prune above is the second writer of
+            // session_skill_overrides that skipped the revision, so a reload
+            // that dropped a stale skill left its per-session toggles cached.
+            _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
             // Remove pruned ids from the in-memory list; delete() would
             // re-trigger recursion into loadAll, so drop them directly.
             dbSkills.removeAll { it.id in staleIds }
@@ -2351,25 +2431,9 @@ class SkillRepository(private val context: Context) {
                 val raw = runCatching { skillMd.readText() }.getOrNull() ?: continue
                 val parsed = parseSkillMd(raw)
                 if (parsed != null) {
-                    val skill = Skill(
-                        id = dir.name,
-                        name = parsed.name,
-                        description = parsed.description,
-                        importSource = ImportSource.SESSION,
-                        body = parsed.body,
-                        // [fix/subagent-frontmatter-autodiscover] The Skill
-                        // created here used to default frontmatter to "" —
-                        // parseSkillMd strips the block from body — so a skill
-                        // first discovered mid-session (e.g. written by an
-                        // agent file_write with `subagent: true`) parsed as
-                        // isSubagent=false and EVERY spawn_agent on it failed
-                        // with "not a sub-agent skill" until the next full
-                        // loadAll (10-08 23:44 sweep: 7/7 spawn failures on a
-                        // skill whose file had the flag). Extract the block
-                        // from the same raw text the parse consumed — mirrors
-                        // the DB-row path above (readSkillMdFrontmatter).
-                        frontmatter = SubagentSkill.extractFrontmatterBlock(raw),
-                    )
+                    // [W1118-D5 F-01] One construction site, every parsed field
+                    // (the previous inline copy dropped `version`).
+                    val skill = skillFromDiscoveredMd(dir.name, parsed, raw)
                     insertDb(skill)
                     dbSkills.add(skill)
                     Log.i(TAG, "Auto-discovered skill: ${dir.name}")
@@ -2401,18 +2465,15 @@ class SkillRepository(private val context: Context) {
         // 3-key block. `parseSkillMd` only extracts name/description/version, so
         // the old rebuild silently dropped every frontmatter-only key —
         // `subagent: true`, `max_turns`, `allowed_tools` — on ANY landing
-        // (add / update / import-overwrite / bundled upgrade). Since
-        // SubagentSkill.parseSubagentConfig reads those keys off disk, one
-        // rename via the skills UI made the skill vanish from the spawn_agent
-        // list. Preserving the original block keeps unknown keys intact.
+        // (add / update / import-overwrite / bundled upgrade). Preserving the
+        // original block keeps unknown keys intact.
         val existing = runCatching { file.readText() }.getOrNull()
         // [fix/subagent-frontmatter-newskill] A brand-new skill (no on-disk
         // file yet) used to emit the canonical 3-key block, silently dropping
         // every frontmatter-only key (`subagent: true`, `max_turns`,
-        // `allowed_tools`) the caller carried — an import of a `subagent:
-        // true` SKILL.md via the skills editor landed WITHOUT the flag, so
-        // parseSubagentConfig read isSubagent=false until the source was
-        // re-imported. Seed the merge with the caller's frontmatter block:
+        // `allowed_tools`) the caller carried — an import of a SKILL.md with
+        // such keys via the skills editor landed WITHOUT them until the source
+        // was re-imported. Seed the merge with the caller's frontmatter block:
         // mergeFrontmatter swaps the three managed keys in place and carries
         // every other key verbatim.
         //

@@ -78,6 +78,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import com.rikkaminis.app.ui.chat.ChatViewModelStore.PendingTransfer
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -239,6 +240,21 @@ internal fun ChatInputArea(
     // their pending candidate back through onValueChange even after we
     // cleared inputText. Drop those late commits during a short window.
     var lastSendTimeMs by remember { mutableStateOf(0L) }
+    // [fix/composer-post-send-residue] The body the last composer clear removed,
+    // plus when it went. The T217-2 window above only covers commits that still
+    // carry a composing region (composition != null) inside 500 ms; a
+    // third-party IME that replays the whole body with composition == null (or
+    // after 500 ms) sailed straight through it, wrote the already-sent text back
+    // into the emptied field, and re-committed it to the ViewModel 150 ms later
+    // (which also re-filled the persisted draft slot). Record the cleared body
+    // here — `clearComposerInput` is the single funnel every clear entrance goes
+    // through — and let `isComposerClearResidue` decide whether an arriving edit
+    // is a replay of it.
+    var lastClearedText by remember { mutableStateOf<String?>(null) }
+    var lastClearedAtMs by remember { mutableStateOf(0L) }
+    // One-shot observability latch, same shape as `dictationSkipLogged`: proof
+    // from a real device that the replay guard fired, without per-event noise.
+    var clearResidueLogged by remember { mutableStateOf(false) }
     // [fix/voice-crash-observability tail] IME burst debounce state. Buffers
     // the latest large-increment edit and the job that flushes it 150 ms
     // after the last burst, so voice dictation's N-event bursts collapse to
@@ -288,8 +304,22 @@ internal fun ChatInputArea(
     // [voice-ime-1116] Clearing is a composer write too: it is recorded inside
     // the funnel below so the mirror effect never reads the emptied ViewModel
     // as an external intent (see [shouldMirrorComposerText]).
+    // [fix/composer-post-send-residue] Stamp WHAT the clear removed, so a late
+    // IME replay of that body can be told from a fresh keystroke (see
+    // `isComposerClearResidue`). Kept as its own lambda, declared before the
+    // funnel, because the funnel's shape test measures a bounded window from
+    // its declaration — a block of comments inside it pushes the existing
+    // resets out of range (the 406-character lesson).
+    val stampClearedBody: () -> Unit = {
+        val clearedBody = inputFieldValue.text
+        if (clearedBody.isNotEmpty()) {
+            lastClearedText = clearedBody
+            lastClearedAtMs = SystemClock.elapsedRealtime()
+        }
+    }
     val clearComposerInput: () -> Unit = {
         cancelPendingImeBurst()
+        stampClearedBody()
         selfWrite.text = ""
         viewModel.setInputText("")
         inputFieldValue = androidx.compose.ui.text.input.TextFieldValue("")
@@ -407,6 +437,12 @@ internal fun ChatInputArea(
                     )
                 }
                 ComposerCommand.Clear -> clearComposerInput()
+                // [incr1118 D2-F02] The cross-session transfer's folded blocks
+                // land in the chip row through the same intent channel as its
+                // text; the composer owns the buffer, the screen only asks.
+                is ComposerCommand.RestoreDraftPastes -> {
+                    viewModel.restoreDraftPastesAfterClear(command.pastes)
+                }
                 // [dv24/B-05] The two text intents: resolved HERE against the
                 // field's live text, then committed through the funnel above.
                 is ComposerCommand.ReplaceText -> commitComposerBody(
@@ -1239,7 +1275,36 @@ internal fun ChatInputArea(
             // free overlay primitive that doesn't need a Box wrapper,
             // and an in-flow Row at the top with Arrangement.End is the
             // cleanest equivalent.
-            val showMoveCapsule by viewModel.hasInjectedShareContent.collectAsState()
+            // [fix/move-to-capsule-empty-1116] Armed by a system share, but
+            // only shown while the draft still holds something to move. The
+            // raw flag kept the pill floating after the shared attachments
+            // were deleted or the text was cleared — an entry with no content
+            // behind it and no dismiss affordance. See [MoveToCapsuleGate].
+            val shareInjected by viewModel.hasInjectedShareContent.collectAsState()
+            val showMoveCapsule = MoveToCapsuleGate.shouldShow(
+                shareInjected = shareInjected,
+                draftText = inputFieldValue.text,
+                attachmentCount = attachments.size,
+            )
+            // [incr1117-B F-05] The arm must be SPENT, not merely hidden. Hiding
+            // is `shouldShow`'s job and it reads the draft, so emptying the
+            // share left the flag armed and any later typing brought the "Move
+            // to…" pill back over an unrelated draft (the pill then moved
+            // something the share had nothing to do with). `observeFrame` owns
+            // the timing half — it will not spend an arm before the injected
+            // text has actually landed, because the share drain appends through
+            // the composer command queue (see its KDoc).
+            var shareContentSeen by remember { mutableStateOf(false) }
+            LaunchedEffect(shareInjected, inputFieldValue.text, attachments.size) {
+                val frame = MoveToCapsuleGate.observeFrame(
+                    shareInjected = shareInjected,
+                    draftText = inputFieldValue.text,
+                    attachmentCount = attachments.size,
+                    sawContent = shareContentSeen,
+                )
+                shareContentSeen = frame.sawContent
+                if (frame.disarm) viewModel.clearShareInjectedFlag()
+            }
             // Mirrors iOS swipe-up-to-send: drag the input bar upward —
             // if it holds text, a floating send-arrow + "Release to send"
             // capsule track the finger; releasing past `swipeArmFraction`
@@ -1470,7 +1535,13 @@ internal fun ChatInputArea(
                                 }
                                 Spacer(Modifier.width(6.dp))
                                 Text(
-                                    "Move to…",
+                                    // [fix/move-to-capsule-empty-1116] Was a
+                                    // hard-coded English literal, so the pill
+                                    // showed the English label in a Chinese UI
+                                    // while every locale already shipped
+                                    // `move_to_sheet_title` for the sheet it
+                                    // opens.
+                                    stringResource(com.rikkaminis.app.R.string.move_to_sheet_title),
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
                                     color = ChatColors.secondaryText,
@@ -1773,6 +1844,39 @@ internal fun ChatInputArea(
                             if (tfv.composition != null && now - lastSendTimeMs < 500L && tfv.text.isNotEmpty()) {
                                 return@BasicTextField
                             }
+                            // [fix/composer-post-send-residue] Second guard,
+                            // content-based. The window above needs a composing
+                            // region; third-party IMEs (Sogou / iFlytek / Baidu /
+                            // voice engines) replay the WHOLE cleared body with
+                            // composition == null, or later than 500 ms. Dropping
+                            // it here keeps the composer empty AND keeps the
+                            // ViewModel + persisted draft slot clean — without
+                            // this the replay re-commits the already-sent text
+                            // 150 ms later and it survives a cold start.
+                            if (isComposerClearResidue(
+                                    incoming = tfv.text,
+                                    fieldText = inputFieldValue.text,
+                                    vmText = inputText,
+                                    clearedText = lastClearedText,
+                                    msSinceClear = now - lastClearedAtMs,
+                                )
+                            ) {
+                                if (!clearResidueLogged) {
+                                    clearResidueLogged = true
+                                    AppLogger.info(
+                                        "ComposerResidue",
+                                        "[fix/composer-post-send-residue] dropped a late IME replay of the cleared body " +
+                                            "(len=${tfv.text.length}, " +
+                                            "composition=${tfv.composition != null}, " +
+                                            "dt=${now - lastClearedAtMs}ms)",
+                                    )
+                                }
+                                return@BasicTextField
+                            }
+                            // An edit that is NOT a replay means the user took
+                            // the composer back; a stale stamp must never
+                            // swallow a later edit that happens to match.
+                            if (tfv.text.isNotEmpty()) lastClearedText = null
                             // [feat/paste-fold-marker] Fold a long paste into a
                             // `[Pasted#N]` marker BEFORE anything downstream
                             // reads the edit. Two properties depend on this
@@ -2175,8 +2279,26 @@ internal fun ChatInputArea(
                             shape = RoundedCornerShape(16.dp),
                             color = ChatColors.inputBg,
                             modifier = Modifier.clickable {
+                                // [incr1118 D1-F02] Leaving edit mode used to
+                                // run `cancelEdit()` (hands the draft's folded
+                                // pastes back) and THEN the composer's clear
+                                // funnel, which drops the paste buffer on
+                                // purpose (audit P1-C) — the chips died one
+                                // statement after they came back, while the
+                                // attachments survived.
+                                //
+                                // The funnel still has to run LAST on this path
+                                // (pinned by chat_ui_interaction_check's F4:
+                                // every composer exit routes through it, and it
+                                // is the one place that resets the field), so the
+                                // fix takes the chips first and puts them back
+                                // AFTER it — as detached rows, because the field
+                                // no longer holds their `[Pasted#N]` literals
+                                // (see [pastesAfterCancelEdit]).
+                                val draftPastes = viewModel.peekPreEditPastes()
                                 viewModel.cancelEdit()
                                 clearComposerInput()
+                                viewModel.restoreDraftPastesAfterClear(draftPastes)
                             },
                         ) {
                             Text(
@@ -2411,7 +2533,18 @@ internal fun ChatInputArea(
                 currentSessionId = sessionId,
                 chatRepository = chatRepository,
                 onDismiss = { showMoveSheet = false },
-                onSelect = { targetId ->
+                onSelect = moveTo@{ targetId ->
+                    // [fix/move-to-capsule-empty-1116] Nothing to move ⇒ no
+                    // move. This used to execute unconditionally, so an empty
+                    // draft still navigated the user to the target session and
+                    // the transfer drain there re-armed the capsule — the pill
+                    // followed the user instead of dismissing (real-device
+                    // log: `[MoveTo] draining transfer … text=0ch
+                    // attachments=0`).
+                    if (!MoveToCapsuleGate.canMove(inputFieldValue.text, viewModel.attachments.value.size)) {
+                        showMoveSheet = false
+                        return@moveTo
+                    }
                     // [fix/dv19-b1] Stash the field's LIVE text (the VM string can
                     // still be a 150 ms burst behind, i.e. exactly empty right
                     // after dictation) and drop the pending flush: the job is
@@ -2424,10 +2557,25 @@ internal fun ChatInputArea(
                     // target session with nothing to expand it (that session's
                     // guard would then refuse to send). The TEXT travels; the
                     // chips stay behind with the buffer they belong to.
+                    // [incr1118 D2-F02] The inline arm is fully covered by the
+                    // expansion above (every resolvable literal becomes text),
+                    // so what the buffer still holds are the blocks NOT in the
+                    // text — detached pastes and orphan rows. Leaving those
+                    // behind loses them for good: the clear below empties the
+                    // buffer, and the target session sends the instruction
+                    // without the report it was pasted for. They travel as
+                    // detached rows ([pastesCarriedByMove]).
+                    // [incr1118 D2-F02] `pastedTexts` is read against the
+                    // FIELD's text, not the expanded string: a literal still on
+                    // screen is carried BY the expansion, everything else
+                    // (detached paste / orphan row) has to travel as a chip.
+                    // Kept on the call so the clear funnel stays on this path
+                    // (chat_ui_interaction_check F4 measures the distance).
                     ChatViewModelStore.stashPendingTransfer(
-                        ChatViewModelStore.PendingTransfer(
+                        PendingTransfer(
                             inputText = viewModel.expandPastedText(inputFieldValue.text),
                             attachments = viewModel.attachments.value,
+                            carriedPastes = viewModel.pastesForMove(inputFieldValue.text),
                         ),
                     )
                     clearComposerInput()

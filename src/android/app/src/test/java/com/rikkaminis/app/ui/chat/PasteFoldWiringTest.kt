@@ -304,6 +304,90 @@ class PasteFoldWiringTest {
         )
     }
 
+    // ── 6: edit mode owns the composer [incr1117-B F-03] ─────────────────────
+
+    @Test
+    fun `entering edit mode replaces the draft's chips instead of stacking on them`() {
+        val body = blockAfter(viewModel, "fun editMessage(messageId: String)")
+        val decisionAt = body.indexOf("editPastesOnEnter(_pastedTexts.value, _preEditPastes.value)")
+        assertTrue(
+            "the entry decision must come from the pure helper — spelled inline it was " +
+                "unreachable for a JVM test, which is how the re-entry branch below shipped " +
+                "restoring the draft",
+            decisionAt >= 0,
+        )
+        val refoldAt = body.indexOf("stashPastedText(paste, inlineMarker = false)", decisionAt)
+        assertTrue("the edit still refolds the turn's own paste", refoldAt >= 0)
+        val window = body.substring(decisionAt, refoldAt)
+
+        assertTrue(
+            "the snapshot must be taken from / written back as the helper's value",
+            window.contains("_preEditPastes.value = entry.snapshot"),
+        )
+        assertTrue(
+            "the live row must take the helper's value (empty on entry, first or repeated) — " +
+                "`exactly one place computes it` is the whole point of the extraction",
+            window.contains("_pastedTexts.value = entry.live"),
+        )
+        // Negative control: the pre-fix shape — a hand-rolled branch that decides the
+        // live row from the snapshot — must fail the probe above.
+        assertFalse(
+            "negative control: a hand-rolled branch must not pass",
+            window
+                .replace("_pastedTexts.value = entry.live", "_pastedTexts.value = preEditPastes")
+                .contains("_pastedTexts.value = entry.live"),
+        )
+    }
+
+    // The rule itself, driven directly: `PastedText` and the decision are plain
+    // Kotlin, so the composer does not have to be composed to witness the
+    // content-pollution path.
+    @Test
+    fun `edit entry snapshots the draft once and never makes it live again`() {
+        val draft = listOf(PastedText(1, "draft", inlineMarker = false))
+        val first = editPastesOnEnter(current = draft, snapshot = null)
+        assertEquals("the draft is captured for cancelEdit()", draft, first.snapshot)
+        assertEquals("the composer must not keep the draft's chips", emptyList<PastedText>(), first.live)
+
+        // Editing message A refolded its own paste into the live row.
+        val liveWhileEditingA = first.live + PastedText(2, "paste of A", inlineMarker = false)
+        val second = editPastesOnEnter(current = liveWhileEditingA, snapshot = first.snapshot)
+        assertEquals("snapshot-once: A's refold must never become the draft", draft, second.snapshot)
+        assertEquals("re-entry must start empty, not from the draft", emptyList<PastedText>(), second.live)
+
+        // Message B refolds its own paste; `expandPastedTextWithSplit` consumes
+        // every detached block at send time.
+        val liveB = second.live + PastedText(3, "paste of B", inlineMarker = false)
+        val body = "prompt of B" + liveB.filter { !it.inlineMarker }.joinToString("") { "\n" + it.text }
+        assertFalse("the unsent draft paste must not reach history message B", body.contains("draft"))
+        assertTrue("the edited turn's own paste still travels", body.contains("paste of B"))
+        assertFalse("message A's chip must not survive the switch", body.contains("paste of A"))
+    }
+
+    @Test
+    fun `re-entering the same message does not duplicate its chip`() {
+        val first = editPastesOnEnter(current = emptyList(), snapshot = null)
+        val liveA = first.live + PastedText(2, "paste of A", inlineMarker = false)
+        val again = editPastesOnEnter(current = liveA, snapshot = first.snapshot)
+        val liveAgain = again.live + PastedText(2, "paste of A", inlineMarker = false)
+        assertEquals("exactly one chip for the turn's own paste", 1, liveAgain.size)
+    }
+
+    @Test
+    fun `leaving edit mode puts the draft's chips back`() {
+        val body = blockAfter(viewModel, "fun cancelEdit()")
+        // [incr1118 D1-F02] The pin moved from a spelling to the decision it
+        // guards: entering edit mode CLEARS the live row, so this path must
+        // return the snapshot — through `pastesAfterCancelEdit`, which only
+        // demotes an inline chip whose literal the field no longer holds
+        // (an inline row without its literal is a chip no send can expand).
+        assertTrue(
+            "cancelEdit must restore the snapshot in place of the turn's refolded chip — " +
+                "the cleared first entry is only safe because this path returns it",
+            body.contains("pastesAfterCancelEdit(") && body.contains("_pastedTexts.value ="),
+        )
+    }
+
     // ── chip row / preview ───────────────────────────────────────────────────
 
     @Test

@@ -20,7 +20,9 @@ import com.rikkaminis.app.ui.chat.decideSessionModelResolution
 import com.rikkaminis.app.ui.chat.restoreFromBinding
 import com.rikkaminis.app.ui.chat.selectEntry
 import com.rikkaminis.app.ui.chat.setThinkingLevel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -168,7 +170,16 @@ internal object HeadlessChatRunner {
      * automation we materialize it eagerly so subsequent reads can resolve
      * the id.
      */
-    suspend fun ensureSession(context: Context, modelId: String? = null): String =
+    suspend fun ensureSession(
+        context: Context,
+        modelId: String? = null,
+        // [rework/spawn-agent-as-real-session] Callers that already know what
+        // the session is for (a dispatched sub-agent) pass a title here. The
+        // auto-title generator only runs when the row still says "New Chat",
+        // so a title provided at creation suppresses it cleanly — writing the
+        // title AFTER the first turn instead races that generator and loses.
+        title: String? = null,
+    ): String =
         withContext(Dispatchers.IO) {
             val app = app(context)
             val resolvedModel = modelId
@@ -187,7 +198,7 @@ internal object HeadlessChatRunner {
                 ?.defaultThinkingLevel
             val s = app.chatRepository.createSession(
                 modelId = resolvedModel,
-                title = null,
+                title = title,
                 thinkingLevel = defaultThinking?.name,
             )
             // Mark source so the UI session list shows it came from RPC.
@@ -387,6 +398,14 @@ internal object HeadlessChatRunner {
      * `isStreaming` flips back to false (or `timeoutMs` elapses) and return
      * the concatenated text of the last assistant message; otherwise return
      * immediately with `responseText=null`.
+     *
+     * [INCR-1117 A-F04] CANCELLATION OF THE CALLER ENDS THIS TURN. The turn
+     * streams on the session's own `viewModelScope`, so dropping the wait alone
+     * used to leave it running tools and burning tokens after the user pressed
+     * stop on the dispatching turn (sub-agent: the child; RPC: the session this
+     * request opened). A timeout is deliberately NOT a cancellation: the turn
+     * may still be running and the caller gets the ordinary timeout envelope
+     * (`timedOut = true`, "may still be running").
      */
     suspend fun prompt(
         context: Context,
@@ -548,14 +567,32 @@ internal object HeadlessChatRunner {
         if (!started) {
             return@withContext droppedSendResult()
         }
-        val finished = withTimeoutOrNull(timeoutMs) {
-            // Skip the initial false (if we were called before sendMessage flipped true)
-            if (vm.isStreaming.value) {
-                // Wait for the next false transition.
-                vm.isStreaming.first { !it }
-            }
-            true
-        } ?: false
+        // [INCR-1117 A-F04] Stop means stop for the CHILD too. The turn below
+        // streams on its own viewModelScope, so a cancelled caller (user pressed
+        // stop on the dispatching turn; RPC connection went away) used to sail
+        // on — running tools and spending tokens for an answer nobody waits for.
+        // NonCancellable so the cancel itself is not cut short; then rethrow, so
+        // the caller still learns it was a stop (never reported as a failure).
+        // Timeout keeps the OLD semantics on purpose: a timed-out dispatch
+        // leaves the child running and says so in the envelope, because a
+        // timeout is "the answer is late", not "abandon the work".
+        // [WAVE-1118 D9-F01] Kept hand-written here on purpose: this is the
+        // reference implementation and SubagentBudgetGateTest pins its shape.
+        // The three entries below (retry / rerunFromToolBlock / compact) share
+        // the same rule through `abandoningWaitStopsRun`.
+        val finished = try {
+            withTimeoutOrNull(timeoutMs) {
+                // Skip the initial false (if we were called before sendMessage flipped true)
+                if (vm.isStreaming.value) {
+                    // Wait for the next false transition.
+                    vm.isStreaming.first { !it }
+                }
+                true
+            } ?: false
+        } catch (ce: CancellationException) {
+            withContext(NonCancellable) { runCatching { vm.cancelStream() } }
+            throw ce
+        }
 
         // Best-effort: read this turn's assistant text from the DB so we don't
         // depend on the in-memory UI list (which may not have flushed yet).
@@ -681,12 +718,16 @@ internal object HeadlessChatRunner {
                 retriedMessageId = targetMsgId,
             )
         }
-        val finished = withTimeoutOrNull(timeoutMs) {
-            if (vm.isStreaming.value) {
-                vm.isStreaming.first { !it }
-            }
-            true
-        } ?: false
+        // [WAVE-1118 D9-F01] Same rule as prompt(): a cancelled caller stops
+        // the retry's stream instead of leaving it running headless.
+        val finished = abandoningWaitStopsRun(vm::cancelStream) {
+            withTimeoutOrNull(timeoutMs) {
+                if (vm.isStreaming.value) {
+                    vm.isStreaming.first { !it }
+                }
+                true
+            } ?: false
+        }
         val msgs = app.chatRepository.loadMessages(sessionId)
         val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, priorAnswerIds)
         val answer = if (answerIdx >= 0) msgs[answerIdx] else null
@@ -809,10 +850,13 @@ internal object HeadlessChatRunner {
                 retriedMessageId = assistantMessageId,
             )
         }
-        val finished = withTimeoutOrNull(timeoutMs) {
-            if (vm.isStreaming.value) vm.isStreaming.first { !it }
-            true
-        } ?: false
+        // [WAVE-1118 D9-F01] Same rule as prompt() / retry().
+        val finished = abandoningWaitStopsRun(vm::cancelStream) {
+            withTimeoutOrNull(timeoutMs) {
+                if (vm.isStreaming.value) vm.isStreaming.first { !it }
+                true
+            } ?: false
+        }
         val msgs = app.chatRepository.loadMessages(sessionId)
         val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, priorAnswerIds)
         val answer = if (answerIdx >= 0) msgs[answerIdx] else null
@@ -939,10 +983,17 @@ internal object HeadlessChatRunner {
         // Wait for _isCompacting to flip true → false. If runCompactNow
         // early-returned (nothing to compact, no provider, etc.) it never
         // flipped true at all — give it a short grace window then bail.
-        val flippedOn = withContext(Dispatchers.Default) {
-            withTimeoutOrNull(2000L) {
-                if (!vm.isCompacting.value) vm.isCompacting.first { it }
-                true
+        // [WAVE-1118 D9-F01] Both waits of this entry are inside the same
+        // cancellation rule: `cancelStream()` is also what cancels `compactJob`
+        // (ChatViewModel.cancelStream → compactJob?.cancel()), so a cancelled
+        // caller must reach it here too — otherwise the compaction keeps
+        // spending the summary budget for a client that is gone.
+        val flippedOn = abandoningWaitStopsRun(vm::cancelStream) {
+            withContext(Dispatchers.Default) {
+                withTimeoutOrNull(2000L) {
+                    if (!vm.isCompacting.value) vm.isCompacting.first { it }
+                    true
+                }
             }
         }
         if (flippedOn != true) {
@@ -953,11 +1004,13 @@ internal object HeadlessChatRunner {
                 error = "compact_skipped_no_change",
             )
         }
-        val finished = withContext(Dispatchers.Default) {
-            withTimeoutOrNull(timeoutMs) {
-                vm.isCompacting.first { !it }
-                true
-            } ?: false
+        val finished = abandoningWaitStopsRun(vm::cancelStream) {
+            withContext(Dispatchers.Default) {
+                withTimeoutOrNull(timeoutMs) {
+                    vm.isCompacting.first { !it }
+                    true
+                } ?: false
+            }
         }
         val newSummary = vm.compactSummary.value
         // `Changed` alone is not enough: a successful compact that folds a range

@@ -321,6 +321,13 @@ fun ChatScreen(
         val sharedDir = withContext(Dispatchers.IO) {
             com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
         }
+        // [incr1117-B F-03] The arm must follow CONTENT, not the intent to share.
+        // `addAttachmentFromStagedShare` returns null when the staged file is gone
+        // or the byte copy failed, and a whitespace-only INLINE_TEXT appends
+        // nothing — arming on those left `sawContent` false forever, so the arm
+        // could never be spent and the "Move to…" pill popped up over the next
+        // unrelated draft. One item that really reached the composer is enough.
+        val landed = mutableSetOf<com.rikkaminis.app.share.PendingShare.Item>()
         for (item in pending.items) {
             when (item.kind) {
                 com.rikkaminis.app.share.PendingShare.Item.Kind.INLINE_TEXT -> {
@@ -335,11 +342,20 @@ fun ChatScreen(
                 }
                 com.rikkaminis.app.share.PendingShare.Item.Kind.ATTACHMENT -> {
                     // Suspend: copies the staged bytes on IO, adds the attachment on Main.
-                    viewModel.addAttachmentFromStagedShare(java.io.File(sharedDir, item.value))
+                    if (viewModel.addAttachmentFromStagedShare(java.io.File(sharedDir, item.value)) != null) {
+                        landed += item
+                    }
                 }
             }
         }
-        viewModel.markShareInjected()
+        if (shareDrainLanded(pending.items, landed::contains)) {
+            viewModel.markShareInjected()
+        } else {
+            com.rikkaminis.app.logging.AppLogger.info(
+                "ChatScreen",
+                "[Share] ${pending.items.size} item(s) landed nothing; capsule not armed",
+            )
+        }
         withContext(Dispatchers.IO) {
             com.rikkaminis.app.share.SharedShareStore.cleanSharedFiles(context)
         }
@@ -439,7 +455,24 @@ fun ChatScreen(
             viewModel.requestComposerCommand(ComposerCommand.AppendText(transfer.inputText, separator = "\n", trimExistingEnd = false, trailingSpace = false))
         }
         for (a in transfer.attachments) viewModel.addAttachment(a)
-        viewModel.markShareInjected()
+        // [incr1118 D2-F02] The blocks the source could not put in the text
+        // (detached pastes / orphan rows) come back as chips. Raised as an
+        // intent, not written here: the paste buffer belongs to the composer
+        // (PasteFoldWiringTest pins that this file never names it), and the
+        // composer is the only place that can mint an id free in THIS session
+        // and pick the one shape a send can still expand (detached).
+        if (transfer.carriedPastes.isNotEmpty()) {
+            viewModel.requestComposerCommand(ComposerCommand.RestoreDraftPastes(transfer.carriedPastes))
+        }
+        // [fix/move-to-capsule-empty-1116] Only a transfer that actually
+        // carried something re-arms the capsule. Unconditional marking meant an
+        // empty "move" (nothing stashed) landed here and lit the pill in the
+        // target session, so it followed the user around instead of expiring
+        // with the content. The source-side guard in ChatInputArea refuses the
+        // empty move; this is the same decision read from the other end.
+        if (MoveToCapsuleGate.canMove(transfer.inputText, transfer.attachments.size)) {
+            viewModel.markShareInjected()
+        }
     }
 
     val inputFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
@@ -4129,8 +4162,22 @@ fun ChatScreen(
                                 // wasn't enough — users still saw a tappable
                                 // Retry that silently no-op'd.
                                 onRetry = if (isStreaming) null else ({
-                                    coroutineScope.launch {
-                                        tracedScrollToItem("RETRY-FROM-MSG", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
+                                    // [incr1118 D1-F05] A retry starts a NEW
+                                    // stream. Jumping the viewport to the bottom
+                                    // without telling the follow reducer left a
+                                    // history reader in DETACHED: the jump
+                                    // scrolled once, then every token of the
+                                    // freshly started answer was ignored (the
+                                    // streaming collector only moves a follower)
+                                    // and the Down-FAB stayed on screen over a
+                                    // viewport that was already at the bottom.
+                                    // Same intent as Resume below it.
+                                    followState = dispatchFollow(sessionId, followState, FollowEvent.Retry, listState, isUserDragging, isStreaming)
+                                    // [incr1118 D1-F08] `safeBottomScrollIndex`
+                                    // is the one resolver: an unmeasured list
+                                    // (0 items) yields null instead of index 0.
+                                    safeBottomScrollIndex(listState.layoutInfo.totalItemsCount)?.let { idx ->
+                                        coroutineScope.launch { tracedScrollToItem("RETRY-FROM-MSG", idx, 0) }
                                     }
                                     safeMutate { viewModel.retryFromMessage(item.message.id) }
                                 }),
@@ -4149,8 +4196,10 @@ fun ChatScreen(
                                         // StateFlow write), and the live 150 ms IME burst then
                                         // committed its older snapshot straight over the edit.
                                         viewModel.requestComposerCommand(ComposerCommand.ReplaceText(prefill, caretOverride = prefill.length))
-                                        coroutineScope.launch {
-                                            tracedScrollToItem("EDIT-MSG", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
+                                        // [incr1118 D1-F08] shared index resolver:
+                                        // an unmeasured list yields null, not 0.
+                                        safeBottomScrollIndex(listState.layoutInfo.totalItemsCount)?.let { idx ->
+                                            coroutineScope.launch { tracedScrollToItem("EDIT-MSG", idx, 0) }
                                         }
                                         inputFocusRequester.requestFocus()
                                     }
@@ -4242,8 +4291,12 @@ fun ChatScreen(
                                 onRerunFromHere = if (!isStreaming) ({
                                     val anchorId = item.tools.firstOrNull()?.id
                                     if (anchorId != null) {
-                                        coroutineScope.launch {
-                                            tracedScrollToItem("RERUN-FROM-TOOLRUN", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
+                                        // [incr1118 D1-F05] Re-run = new stream →
+                                        // re-engage follow (see RETRY-FROM-MSG).
+                                        followState = dispatchFollow(sessionId, followState, FollowEvent.Retry, listState, isUserDragging, isStreaming)
+                                        // [incr1118 D1-F08] shared index resolver.
+                                        safeBottomScrollIndex(listState.layoutInfo.totalItemsCount)?.let { idx ->
+                                            coroutineScope.launch { tracedScrollToItem("RERUN-FROM-TOOLRUN", idx, 0) }
                                         }
                                         safeMutate { viewModel.rerunFromToolBlock(item.messageId, anchorId) }
                                     }
@@ -4279,7 +4332,13 @@ fun ChatScreen(
                                 error = item.error,
                                 errorDetail = item.errorDetail,
                                 onRetry = {
-                                    coroutineScope.launch { tracedScrollToItem("INLINE-RETRY-LAST", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0) }
+                                    // [incr1118 D1-F05] Inline error retry = new
+                                    // stream → re-engage follow.
+                                    followState = dispatchFollow(sessionId, followState, FollowEvent.Retry, listState, isUserDragging, isStreaming)
+                                    // [incr1118 D1-F08] shared index resolver.
+                                    safeBottomScrollIndex(listState.layoutInfo.totalItemsCount)?.let { idx ->
+                                        coroutineScope.launch { tracedScrollToItem("INLINE-RETRY-LAST", idx, 0) }
+                                    }
                                     safeMutate { viewModel.retryLast() }
                                 },
                             )
@@ -4360,8 +4419,12 @@ fun ChatScreen(
                                                     onRerunFromHere = if (!isStreaming) ({
                                                         val messageId = item.messageId
                                                         val blockId = block.id
-                                                        coroutineScope.launch {
-                                                            tracedScrollToItem("RERUN-FROM-AGG-TOOL", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
+                                                        // [incr1118 D1-F05] Re-run =
+                                                        // new stream → re-engage follow.
+                                                        followState = dispatchFollow(sessionId, followState, FollowEvent.Retry, listState, isUserDragging, isStreaming)
+                                                        // [incr1118 D1-F08] shared index resolver.
+                                                        safeBottomScrollIndex(listState.layoutInfo.totalItemsCount)?.let { idx ->
+                                                            coroutineScope.launch { tracedScrollToItem("RERUN-FROM-AGG-TOOL", idx, 0) }
                                                         }
                                                         safeMutate { viewModel.rerunFromToolBlock(messageId, blockId) }
                                                     }) else null,
@@ -5557,7 +5620,23 @@ internal fun isListAtBottom(
     // the last row legitimately rests `padding.bottom` above it, so the raw
     // viewport end is NOT where content is allowed to end. Callers that own no
     // padding pass 0, which reproduces the pre-1116 geometry exactly.
-    val visualEnd = viewportEndOffsetPx - contentBottomInsetPx.coerceAtLeast(0)
+    // [incr1117-B F-01] The visible end must never be NEGATIVE. When the viewport
+    // is shorter than the list's own bottom content padding (landscape / split
+    // screen + IME + a multi-line draft: the composer arc grows that padding
+    // past the list's height) the pre-fix expression computed `visualEnd < 0`,
+    // and every visible row has `bottomEdge >= 0`, so `distance` was negative
+    // for EVERY row: the verdict read false at the true bottom and stayed false,
+    // i.e. follow never re-engaged after a send.
+    //
+    // Clamping the ENDPOINT is deliberately not a geometry fix. The padding /
+    // tail mismatch itself is a registered P2 (backlog §INCR-1116
+    // "B F-09 极矮视口下 padding 与 tail 不一致" — the candidate fix is
+    // `BoxWithConstraints` sizing the tail from the real viewport). Here the
+    // rule stays "the tail row's bottom edge is within `thresholdPx` of the
+    // visible end": for a viewport that fits its padding the value is unchanged,
+    // and for an over-long padding it measures the overshoot instead of the
+    // void.
+    val visualEnd = (viewportEndOffsetPx - contentBottomInsetPx.coerceAtLeast(0)).coerceAtLeast(0)
     val bottomEdge = lastVisibleOffsetPx + lastVisibleSizePx
     val distance = visualEnd - bottomEdge
     return distance >= 0 && distance <= thresholdPx
