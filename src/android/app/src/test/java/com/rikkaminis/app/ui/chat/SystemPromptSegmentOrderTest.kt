@@ -98,6 +98,23 @@ class SystemPromptSegmentOrderTest {
         var inString = false
         while (i < src.length) {
             val c = src[i]
+            // [prompt-behaviour-layer-1118] Skip `"""…"""` whole: prompt prose
+            // inside those blocks may contain an unbalanced brace, and treating
+            // it as structure would end the block in the wrong place.
+            //
+            // [fix/prompt-authority-1118b B10] …but "skip to the next `"""`" was
+            // itself wrong in two ways, both of which flipped the state machine:
+            //  • a raw string may END with a quote (`"""…""""`), and the naive
+            //    scan stopped at the FIRST three quotes, leaving the fourth to be
+            //    read as the opening of an ordinary string literal;
+            //  • a `${…}` interpolation may contain its own raw string, whose
+            //    opener is not the end of the outer one.
+            // [scanRawString] implements Kotlin's actual rule (the terminator is
+            // the LAST three quotes of a run) and walks template expressions.
+            if (c == '"' && i + 2 < src.length && src[i + 1] == '"' && src[i + 2] == '"') {
+                i = rawStringEnd(src, i)
+                continue
+            }
             if (inString) {
                 if (c == '\\' && i + 1 < src.length) { i += 2; continue }
                 if (c == '"') inString = false
@@ -112,6 +129,71 @@ class SystemPromptSegmentOrderTest {
             i++
         }
         throw AssertionError("the brace block opened at $open never closes")
+    }
+
+    /**
+     * Offset just past the raw string literal that opens at [open].
+     *
+     * Kotlin's rule is not "the first `\"\"\"` ends it": a raw string may contain
+     * any run of quotes shorter than three, and a run of four or more ends the
+     * literal at its LAST three characters (the leading ones are content). A
+     * `${…}` template expression is real code and may hold its own raw string,
+     * so it is walked with brace/string nesting instead of being skipped.
+     *
+     * Getting either case wrong desynchronises the caller's state machine: the
+     * leftover `"` is read as the start of an ordinary literal, and every `{`
+     * until the next quote becomes invisible to [braceBlock].
+     */
+    private fun rawStringEnd(src: String, open: Int): Int {
+        var i = open + 3
+        while (i < src.length) {
+            when {
+                src[i] == '$' && i + 1 < src.length && src[i + 1] == '{' -> {
+                    i = skipTemplateExpression(src, i + 1)
+                }
+                src[i] == '"' -> {
+                    var run = 0
+                    while (i + run < src.length && src[i + run] == '"') run++
+                    // A run of 3+ ends the literal at its last three chars.
+                    if (run >= 3) return i + run
+                    i += run
+                }
+                else -> i++
+            }
+        }
+        throw AssertionError("the raw string opened at $open never closes")
+    }
+
+    /** Offset just past the `}` matching the `{` at [brace]. */
+    private fun skipTemplateExpression(src: String, brace: Int): Int {
+        var depth = 0
+        var i = brace
+        while (i < src.length) {
+            val c = src[i]
+            if (c == '"' && i + 2 < src.length && src[i + 1] == '"' && src[i + 2] == '"') {
+                i = rawStringEnd(src, i)
+                continue
+            }
+            if (c == '"' || c == '\'') {
+                val quote = c
+                i++
+                while (i < src.length && src[i] != quote) {
+                    if (src[i] == '\\' && i + 1 < src.length) i++
+                    i++
+                }
+                i++
+                continue
+            }
+            when (c) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return i + 1
+                }
+            }
+            i++
+        }
+        throw AssertionError("the template expression opened at $brace never closes")
     }
 
     /** The body of the named top-level `fun`, brace-matched. */
@@ -232,8 +314,7 @@ class SystemPromptSegmentOrderTest {
     }
 
     @Test
-    fun theVolatileTailKeepsItsRelativeOrder() {
-        val body = buildStringBody()
+    fun theVolatileTailKeepsItsRelativeOrder() {        val body = buildStringBody()
         // [incr1113 F-07] Same reasoning one region over: "both are below the
         // anchor" does not pin which comes first, and the daily fragment is the
         // one that moves on every memory_write — it must stay LAST so the hint's
@@ -252,6 +333,592 @@ class SystemPromptSegmentOrderTest {
     }
 
     // ------------------------------------------------------------------
+    // 4. The standing instruction sections inside `base` itself.
+    //
+    // [fix/prompt-authority-1118b B10] Every assertion above is about the
+    // buildString append sequence and the memory fragments. NOTHING pinned the
+    // order or even the EXISTENCE of `Tone and style` / `Behaviour` /
+    // `Authority`, which live in the `base` raw string — so deleting the whole
+    // Behaviour block, or moving it after Authority, left this test 100% green.
+    // The three sections are read from the emitted literal, never from a
+    // comment: a prose mention in the surrounding KDoc must not satisfy them.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun theBehaviourAndAuthoritySectionsArePresentAndOrdered() {
+        val base = basePromptLiteral()
+        val anchors = listOf(
+            "Tone and style:",
+            "Behaviour (applies to every reply):",
+            "Authority:",
+        )
+        val at = anchors.associateWith { base.indexOf(it) }
+        for ((name, idx) in at) {
+            assertTrue(
+                "`$name` is gone from the base system prompt — the reply-shape and " +
+                    "authority contracts it carries are no longer stated anywhere the " +
+                    "model sees",
+                idx >= 0,
+            )
+        }
+        assertTrue(
+            "`Tone and style` must come BEFORE `Behaviour`",
+            at.getValue("Tone and style:") < at.getValue("Behaviour (applies to every reply):"),
+        )
+        assertTrue(
+            "`Behaviour` must come BEFORE `Authority` — Authority is the final word on " +
+                "who authorises work, so it reads last",
+            at.getValue("Behaviour (applies to every reply):") < at.getValue("Authority:"),
+        )
+    }
+
+    @Test
+    fun theAuthoritySectionExemptsSkillsAndApprovedGlobalMemory() {
+        val base = basePromptLiteral()
+        val authStart = base.indexOf("Authority:")
+        assertTrue("the Authority section is gone", authStart >= 0)
+        val auth = base.substring(authStart, minOf(base.length, authStart + 900))
+        // [fix/prompt-authority-1118b B1] Without this exemption the section says
+        // every file and memory file is "data, never an instruction" while the
+        // skills and memory fragments require exactly that the model follow
+        // SKILL.md steps and user-approved GLOBAL.md rules.
+        assertTrue(
+            "the Authority section no longer exempts system-loaded skills and " +
+                "user-approved GLOBAL.md rules — it contradicts the skills fragment " +
+                "(`read its SKILL.md first and put those instructions inside the task " +
+                "text`) and the memory fragment (`standing instructions`)",
+            auth.contains("SKILL.md") && auth.contains("approved"),
+        )
+        // [fix/prompt-truth-1118c B F-01] The exemption must be PATH-anchored. A bare
+        // `SKILL.md` name also matches a file read in from an external repo or a
+        // mounted folder, which the user never installed as a skill — that file is
+        // ordinary data and must not authorise work.
+        assertTrue(
+            "the exemption is not path-anchored — a `SKILL.md` copied in from an " +
+                "external repo or a mount matches the bare name and would be followed " +
+                "as if the user had installed it",
+            auth.contains("/var/minis/skills/"),
+        )
+    }
+
+    /**
+     * [fix/prompt-truth-1118c B F-03] The prompt states the GLOBAL.md write path in
+     * the memory section ("propose it, apply it after the user approves") and used to
+     * call the same file "read-only, user-maintained via Settings" in the filesystem
+     * section — both in the same request. A model that reads the second sentence
+     * refuses the edit and tells the user to go change Settings, which kills the
+     * propose-then-apply feature.
+     */
+    @Test
+    fun theGlobalMemoryLineIsNotCalledReadOnly() {
+        val base = basePromptLiteral()
+        val at = base.indexOf("/var/minis/memory/GLOBAL.md")
+        assertTrue("the GLOBAL.md filesystem line is gone from the base prompt", at >= 0)
+        val lineStart = base.lastIndexOf('\n', at).let { if (it < 0) 0 else it + 1 }
+        val lineEnd = base.indexOf('\n', at).let { if (it < 0) base.length else it }
+        val line = base.substring(lineStart, lineEnd)
+        assertTrue(
+            "the GLOBAL.md line still calls itself read-only — `$line` — while the memory " +
+                "section in the SAME prompt requires the model to edit it once the user " +
+                "approves a proposal",
+            !line.contains("read-only"),
+        )
+        assertTrue(
+            "the GLOBAL.md line lost the approval requirement — `$line` — so the file " +
+                "reads as freely writable state instead of user-owned",
+            line.contains("approv", ignoreCase = true),
+        )
+    }
+
+    /**
+     * [fix/prompt-truth-1118c B F-03] …and the write path itself must stay. Deleting
+     * the contradiction by deleting the permission is the other way to make the two
+     * statements agree, and it would silently drop the feature the memory section
+     * was added for.
+     */
+    @Test
+    fun theGlobalMemoryWritePathIsStillStated() {
+        val sec = rawLiteralAfter("val memorySystemSection = if (memoryOn) {")
+        assertTrue(
+            "the memory section no longer says how to update GLOBAL.md (file_read then " +
+                "file_edit) — the propose-then-apply flow has no write path left",
+            sec.contains("To update it, use file_read first then file_edit"),
+        )
+    }
+
+    /**
+     * [fix/prompt-truth-1118c B F-02] The admission criteria live only in
+     * `memory-hygiene/SKILL.md`, which is loaded on demand. A pointer that says "run
+     * the idea past the criteria" without telling the model to READ the skill leaves
+     * an unread skill and a proposal that was never checked against the four tests.
+     */
+    @Test
+    fun theMemoryAdmissionCriteriaLineAsksForAnActualRead() {
+        val sec = rawLiteralAfter("val memorySystemSection = if (memoryOn) {")
+        val at = sec.indexOf("admission criteria")
+        assertTrue("the admission-criteria line is gone from the memory section", at >= 0)
+        val lineStart = sec.lastIndexOf('\n', at).let { if (it < 0) 0 else it + 1 }
+        val lineEnd = sec.indexOf('\n', at).let { if (it < 0) sec.length else it }
+        val line = sec.substring(lineStart, lineEnd)
+        assertTrue(
+            "the admission-criteria line does not ask the model to READ the skill — " +
+                "`$line` — the criteria are in an on-demand SKILL.md, so a bare " +
+                "reference leaves them unread in the very turn that needs them",
+            line.contains("read skill", ignoreCase = true),
+        )
+    }
+
+    /**
+     * [fix/prompt-memory-truth-1119 F-01] The system prompt was fixed on 11-18
+     * (`theGlobalMemoryLineIsNotCalledReadOnly`), but the SAME request also carries
+     * tool definitions, and both of them still ended with
+     * `GLOBAL.md is read-only (user-maintained via Settings).` — confirmed in the
+     * shipped dex of 1.0.0+3275. A model that trusts the tool schema over the prose
+     * refuses the edit and tells the user to go change Settings, which is exactly
+     * the feature the memory section was added for.
+     *
+     * Scoped to the memory_write DESCRIPTION literal, not to the file: AgentTools.kt
+     * legitimately mentions `read-only` in the browser and file tool descriptions.
+     */
+    @Test
+    fun theMemoryWriteToolDescriptionsDoNotCallGlobalMemoryReadOnly() {
+        val memoryTools = stripComments(
+            readRepoFile("src/main/java/com/rikkaminis/app/tools/MemoryTools.kt"),
+        )
+        val anthropic = quotedStringAfter(
+            memoryTools, "put(\"name\", \"memory_write\")", "put(\"description\", \"",
+        )
+        assertTrue(
+            "the memory_write tool description still calls GLOBAL.md read-only — " +
+                "`$anthropic` — while the system prompt in the SAME request tells the " +
+                "model to propose an edit and apply it once the user approves",
+            !anthropic.contains("read-only"),
+        )
+        assertTrue(
+            "the memory_write description lost the approval requirement — `$anthropic` — " +
+                "so GLOBAL.md reads as freely writable state instead of user-owned",
+            anthropic.contains("approve", ignoreCase = true),
+        )
+
+        val agentTools = stripComments(
+            readRepoFile("src/main/java/com/rikkaminis/app/tools/AgentTools.kt"),
+        )
+        val gemini = regionAfter(
+            agentTools, "private fun memoryWriteDefinition()", "parameters = mapOf(",
+        )
+        assertTrue(
+            "the Gemini-side memory_write description still calls GLOBAL.md read-only — " +
+                "`$gemini` — the two tool-definition formats drift apart and the " +
+                "contradiction comes back on whichever path ships",
+            !gemini.contains("read-only"),
+        )
+        assertTrue(
+            "the Gemini-side memory_write description lost the approval requirement — " +
+                "`$gemini`",
+            gemini.contains("approve", ignoreCase = true),
+        )
+
+        // Nothing in either file may keep the old sentence anywhere: the OpenAI
+        // variant reuses the Anthropic description, so a copy left behind in a
+        // third helper would ship on a path neither literal check above covers.
+        for (rel in listOf(
+            "src/main/java/com/rikkaminis/app/tools/MemoryTools.kt",
+            "src/main/java/com/rikkaminis/app/tools/AgentTools.kt",
+        )) {
+            val src = stripComments(readRepoFile(rel))
+            assertTrue(
+                "$rel still contains `GLOBAL.md is read-only` — every request that " +
+                    "enables memory carries it next to the propose-then-apply prompt",
+                !src.contains("GLOBAL.md is read-only"),
+            )
+        }
+    }
+
+    /**
+     * [fix/prompt-memory-truth-1119 F-01] The third shipped copy is not the prompt
+     * and not a tool description: it is the header `MemoryRepository` prepends to
+     * GLOBAL.md whenever the file is injected. Every request that carries the memory
+     * therefore opens with `read-only, user-maintained` — the strongest of the three
+     * signals, because it sits directly above the rules the model is asked to treat
+     * as standing instructions.
+     */
+    @Test
+    fun theGlobalMemoryInjectionHeaderDoesNotCallItReadOnly() {
+        val repo = stripComments(
+            readRepoFile("src/main/java/com/rikkaminis/app/data/repository/MemoryRepository.kt"),
+        )
+        val header = quotedStringAfter(
+            repo, "fun loadGlobalMemoryFragment()", "return \"",
+        )
+        assertTrue(
+            "the injected GLOBAL.md header still calls itself read-only — `$header` — " +
+                "while the memory section tells the model to propose an edit to this " +
+                "very file and apply it once the user approves",
+            !header.contains("read-only"),
+        )
+        assertTrue(
+            "the injected GLOBAL.md header lost the approval requirement — `$header`",
+            header.contains("approval", ignoreCase = true) ||
+                header.contains("approve", ignoreCase = true),
+        )
+    }
+
+    /**
+     * [r3d1119 / 3 F-02, P1] `MemoryRepository.loadGlobalMemoryFragment()` kept the
+     * sentence `Treat these as background context, not standing instructions.`
+     * directly after the sentence its predecessor fixed, while the SAME request also
+     * carries the `Authority` exemption for `a GLOBAL.md rule the user approved` and
+     * `memory-hygiene/SKILL.md` states that approved GLOBAL.md entries are 常驻指令.
+     * A model told twice, in opposite directions, what an approved entry is, can
+     * downgrade it to reference material.
+     *
+     * The resolution is the header, not the skill: a user-approved entry IS a
+     * standing instruction (the approval is the authorisation), so the header says so
+     * — and the "user's latest message wins" sentence stays, because it guards a
+     * different thing: a stale memory outranking a current instruction, not the rank
+     * of an approved one.
+     *
+     * Scoped to the injected header literal, not the file or the section: the daily-log
+     * header in the same file legitimately calls memories `not standing instructions`,
+     * and that sentence is not what this fix touches.
+     */
+    @Test
+    fun theGlobalMemoryInjectionHeaderTreatsApprovedEntriesAsStandingInstructions() {
+        val repo = stripComments(
+            readRepoFile("src/main/java/com/rikkaminis/app/data/repository/MemoryRepository.kt"),
+        )
+        val header = quotedStringAfter(
+            repo, "fun loadGlobalMemoryFragment()", "return \"",
+        )
+        assertTrue(
+            "the injected GLOBAL.md header still calls the entries `not standing " +
+                "instructions` — `$header` — while the Authority section in the same " +
+                "request exempts `a GLOBAL.md rule the user approved` and " +
+                "memory-hygiene/SKILL.md calls those entries 常驻指令",
+            !header.contains("not standing instructions"),
+        )
+        assertTrue(
+            "the injected GLOBAL.md header no longer states the standing-instruction " +
+                "rank of an approved entry — `$header`",
+            header.contains("standing instructions"),
+        )
+        assertTrue(
+            "the injected GLOBAL.md header lost the user's-latest-message precedence — " +
+                "`$header` — the two requirements are independent: an approved entry is " +
+                "standing, and a newer instruction still outranks it",
+            header.contains("defer to the user's latest message"),
+        )
+        assertTrue(
+            "the injected GLOBAL.md header lost the approval/writability path — `$header`",
+            header.contains("approval", ignoreCase = true) ||
+                header.contains("approve", ignoreCase = true),
+        )
+
+        // The fix must not have been "delete the claim from the skill": SKILL.md keeps
+        // calling approved entries 常驻指令, and that is the claim the header now has
+        // to be consistent with.
+        val skill = readRepoFile("src/main/assets/skills/memory-hygiene/SKILL.md")
+        assertTrue(
+            "SKILL.md no longer calls approved GLOBAL.md entries 常驻指令 — the " +
+                "contradiction was resolved by weakening the skill instead of the " +
+                "injected header",
+            skill.contains("常驻指令"),
+        )
+    }
+
+    /**
+     * [fix/prompt-memory-truth-1119 F-02] `memory-hygiene/SKILL.md` is exempted from
+     * the Authority section (`under /var/minis/skills/`), so what it says the agent
+     * may do without asking is followed. Its 淘汰 section used to say
+     * 「我主动做，不必等用户」and「从 GLOBAL 删掉」— a documented licence to silently
+     * delete the user's global memory, contradicting the same file's own rule that
+     * GLOBAL.md is 提议、不擅写 and the prompt's `apply it only after the user approves`.
+     *
+     * [r3d1119 / 3 F-01, P1] The earlier form of this test asserted whole-section
+     * substrings (`section.contains("提议")`), and the section TITLE is
+     * `## 淘汰（我主动提议，仍需用户批准）` — the title alone satisfied both
+     * content assertions, so deleting all four body rules, or rewording any of them
+     * into a silent-delete instruction, stayed green. The title line is stripped
+     * first and each list item is asserted on its own, so deleting or un-constraining
+     * any single rule turns this red.
+     */
+    @Test
+    fun theMemoryHygieneSkillCallsPruningAProposal() {
+        val skill = readRepoFile("src/main/assets/skills/memory-hygiene/SKILL.md")
+        val at = skill.indexOf("## 淘汰")
+        assertTrue(
+            "the 淘汰 section is gone from memory-hygiene/SKILL.md — the pruning rule " +
+                "the model is expected to follow has no home",
+            at >= 0,
+        )
+        val end = skill.indexOf("\n## ", at + 1).let { if (it < 0) skill.length else it }
+        val section = skill.substring(at, end)
+
+        // The heading is not evidence: strip the title line before any content
+        // assertion, so a title that mentions 提议/批准 cannot carry the rule.
+        val titleEnd = section.indexOf('\n')
+        val title = if (titleEnd < 0) section else section.substring(0, titleEnd)
+        val body = if (titleEnd < 0) "" else section.substring(titleEnd + 1)
+        assertTrue(
+            "the 淘汰 section lost the approval wording from its title — `$title`",
+            title.contains("提议") && title.contains("批准"),
+        )
+
+        val items = body.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("- ") }
+            .toList()
+        assertTrue(
+            "the 淘汰 section has no list item left — the heading is the only line, " +
+                "and a heading is not a pruning rule",
+            items.isNotEmpty(),
+        )
+        assertTrue(
+            "the 淘汰 section dropped a pruning rule — expected at least " +
+                "${PRUNING_RULE_MIN_ITEMS} documented rules, found ${items.size} (`$items`)",
+            items.size >= PRUNING_RULE_MIN_ITEMS,
+        )
+        for (item in items) {
+            assertTrue(
+                "pruning rule `$item` no longer asks the agent to make a PROPOSAL — " +
+                    "this file is Authority-exempt, so an unqualified edit instruction " +
+                    "is a licence to rewrite user memory silently",
+                item.contains("提议"),
+            )
+            assertTrue(
+                "pruning rule `$item` no longer requires the user's approval before " +
+                    "GLOBAL.md is edited — the old whole-section check was satisfied by " +
+                    "the heading and stayed green when the body rules were deleted",
+                item.contains("批准"),
+            )
+            assertTrue(
+                "pruning rule `$item` still licenses a silent delete — `直接删`, " +
+                    "`无需用户确认` or `不必等`",
+                !item.contains("直接删") && !item.contains("无需用户确认") &&
+                    !item.contains("不必等"),
+            )
+        }
+        // Section-wide, on top of the per-item checks: no silent-delete wording
+        // anywhere in the section. A negation cannot be satisfied by the heading.
+        assertTrue(
+            "the 淘汰 section still tells the agent to prune `不必等用户` — `$section`",
+            !section.contains("不必等用户"),
+        )
+    }
+
+    /**
+     * The `base` prompt literal, with comments stripped. Read through the same
+     * comment stripper as everything else so a KDoc mention of a section title
+     * cannot stand in for the section itself.
+     */
+    private fun basePromptLiteral(): String {
+        val src = stripComments(readRepoFile(promptRel))
+        val start = src.indexOf("val base = identitySection + \"\"\"")
+        assertTrue(
+            "the `base` prompt literal is gone from $promptRel — the sections it " +
+                "carries are no longer emitted at all",
+            start >= 0,
+        )
+        val open = src.indexOf("\"\"\"", start)
+        val end = rawStringEnd(src, open)
+        return src.substring(open + 3, end - 3)
+    }
+
+    // ------------------------------------------------------------------
+    // Scanner self-checks: the two matchers above run over a source file that
+    // is mostly `"""…"""` prompt prose. Prose legitimately contains double
+    // quotes and `//`, and a brace can be unbalanced inside it — both used to
+    // derail the matchers, which showed up as five ordering tests failing on a
+    // prompt-only edit (2026-11-18).
+
+    @Test
+    fun theCommentStripperLeavesRawPromptProseIntact() {
+        val triple = "\"\"\""
+        val src = buildString {
+            append("val before = 1\n")
+            append("val block = ").append(triple).append("\n")
+            append("prompt text with \"quoted words\" and // not a comment\n")
+            append("also /* not a block comment */ here\n")
+            append(triple).append("\n")
+            append("fun after() = 2\n")
+        }
+        val stripped = stripComments(src)
+        assertTrue(
+            "a `\"` inside a raw string must not end the string and swallow the rest of the file",
+            stripped.contains("fun after() = 2"),
+        )
+        assertTrue("text after `//` inside a raw string is prose, not a comment", stripped.contains("not a comment"))
+        assertTrue("a `/*` inside a raw string is prose", stripped.contains("not a block comment"))
+    }
+
+    @Test
+    fun theBraceMatcherIgnoresBracesInsideRawPromptProse() {
+        val triple = "\"\"\""
+        val src = buildString {
+            append("fun f() {\n")
+            append("val block = ").append(triple).append("\n")
+            append("prose with an unmatched { brace\n")
+            append(triple).append("\n")
+            append("val after = 1\n")
+            append("}\n")
+        }
+        val body = braceBlock(src, 0)
+        assertTrue(
+            "an unbalanced `{` inside prompt prose must not end the block early",
+            body.contains("val after = 1"),
+        )
+    }
+
+    /**
+     * [fix/prompt-authority-1118b B10] A raw string may END with a quote, written
+     * `"""prose""""`. The terminator is the LAST three quotes of the run, so the
+     * leading one is content. A scanner that stops at the first three leaves a
+     * stray `"`, reads it as the start of an ordinary literal, and then ignores
+     * every `{` until the next quote — the block ends in the wrong place.
+     */
+    @Test
+    fun theBraceMatcherSurvivesAQuoteTerminatedRawString() {
+        val triple = "\"\"\""
+        val src = buildString {
+            append("fun f() {\n")
+            append("val block = ").append(triple)
+            append("prose whose last char is a quote").append("\"\"\"\"\n")
+            append("val after = 1\n")
+            append("}\n")
+        }
+        val body = braceBlock(src, 0)
+        assertTrue(
+            "a `\"\"\"…\"\"\"\"` raw string must not desynchronise the brace matcher — " +
+                "the fourth quote is content, not the start of a new literal",
+            body.contains("val after = 1"),
+        )
+        assertTrue(
+            "the whole literal must be skipped, not just up to the first three quotes",
+            body.contains("\"\"\"\""),
+        )
+    }
+
+    /**
+     * [fix/prompt-authority-1118b B10] A `${…}` template expression is real code
+     * and may hold its own raw string. Skipping the outer literal blind to that
+     * means the inner opener looks like the outer terminator, and the rest of the
+     * file is read as prose — here the inner raw string holds an UNBALANCED brace,
+     * so a blind skip cannot even find the end of the outer block.
+     */
+    @Test
+    fun theBraceMatcherSurvivesARawStringInsideATemplateExpression() {
+        val triple = "\"\"\""
+        val src = buildString {
+            append("fun f() {\n")
+            append("val block = ").append(triple).append("head \${g(").append(triple)
+            append("x{y").append(triple).append(")}\n").append(triple).append("\n")
+            append("val after = 1\n")
+            append("}\n")
+        }
+        val body = braceBlock(src, 0)
+        assertTrue(
+            "a raw string nested inside ${'$'}{…} must not end the outer literal — the " +
+                "matcher has to walk the template expression as code",
+            body.contains("val after = 1"),
+        )
+    }
+
+    /**
+     * Same shapes, through the comment stripper.
+     *
+     * [fix/prompt-authority-1118b B10] The four-quote case is asserted on the
+     * COMMENT, not on "the tail survived": a stripper that desynchronises stops
+     * stripping, so the tail survives either way and the assertion would be
+     * blind (measured: it was).
+     */
+    @Test
+    fun theCommentStripperSurvivesQuoteTerminatedAndNestedRawStrings() {
+        val triple = "\"\"\""
+        val src = buildString {
+            append("val a = ").append(triple).append("ends with a quote").append("\"\"\"\" // gone\n")
+            append("val b = ").append(triple).append("nested \${h(").append(triple)
+            append("x").append(triple).append(")}\n").append(triple).append("\n")
+            append("fun after() = 2\n")
+        }
+        val stripped = stripComments(src)
+        assertTrue(
+            "a `//` comment right after a `\"\"\"…\"\"\"\"` literal must still be stripped — " +
+                "the stray fourth quote used to open an ordinary string and swallow it",
+            !stripped.contains("gone"),
+        )
+        assertTrue(
+            "code after a raw string containing ${'$'}{…(\"\"\"…\"\"\")} must survive too",
+            stripped.contains("fun after() = 2"),
+        )
+    }
+
+    /**
+     * The first `"""…"""` literal that opens after [anchor], with comments stripped.
+     *
+     * Same fail-closed shape as [basePromptLiteral]: read through the comment stripper
+     * so a KDoc mention cannot stand in for the emitted text, and reject a suspiciously
+     * short slice so a stale anchor surfaces as a failure instead of an empty string.
+     */
+    private fun rawLiteralAfter(anchor: String): String {
+        val src = stripComments(readRepoFile(promptRel))
+        val start = src.indexOf(anchor)
+        assertTrue("`$anchor` not found in $promptRel", start >= 0)
+        val open = src.indexOf("\"\"\"", start)
+        assertTrue("no raw string literal opens after `$anchor`", open >= 0)
+        val end = rawStringEnd(src, open)
+        val body = src.substring(open + 3, end - 3)
+        assertTrue(
+            "the literal after `$anchor` is only ${body.length} chars — the anchor or " +
+                "the matcher drifted, so assertions on it would be vacuous",
+            body.length > 500,
+        )
+        return body
+    }
+
+    /**
+     * [fix/prompt-memory-truth-1119] The content of the first `"…"` literal that
+     * opens right after `marker`, with `anchor` locating the region first. Comments
+     * are stripped by the caller so a KDoc copy of the sentence cannot satisfy an
+     * assertion. Fails closed when the anchor/delimiter is missing or the literal is
+     * implausibly short — a drifted anchor must surface as a failure, never as an
+     * empty string that trivially passes a `!contains(...)` check.
+     */
+    private fun quotedStringAfter(src: String, anchor: String, marker: String): String {
+        val at = src.indexOf(anchor)
+        assertTrue("`$anchor` not found — the tool/repository definition moved", at >= 0)
+        val m = src.indexOf(marker, at)
+        assertTrue("`$marker` not found after `$anchor`", m >= 0)
+        var i = m + marker.length
+        val sb = StringBuilder()
+        while (i < src.length && src[i] != '"') {
+            if (src[i] == '\\' && i + 1 < src.length) {
+                sb.append(src[i]); i++
+            }
+            sb.append(src[i]); i++
+        }
+        assertTrue("the literal after `$anchor` is unterminated", i < src.length)
+        assertTrue(
+            "the literal after `$anchor` is only ${sb.length} chars — the anchor or " +
+                "the delimiter drifted, so assertions on it would be vacuous",
+            sb.length > 80,
+        )
+        return sb.toString()
+    }
+
+    /** The source between [anchor] and the next [end] occurrence, fail-closed. */
+    private fun regionAfter(src: String, anchor: String, end: String): String {
+        val at = src.indexOf(anchor)
+        assertTrue("`$anchor` not found — the definition moved", at >= 0)
+        val e = src.indexOf(end, at)
+        assertTrue("`$end` not found after `$anchor`", e >= 0)
+        val body = src.substring(at, e)
+        assertTrue(
+            "the region after `$anchor` is only ${body.length} chars — the anchor or " +
+                "the terminator drifted, so assertions on it would be vacuous",
+            body.length > 200,
+        )
+        return body
+    }
 
     private fun readRepoFile(relative: String): String {
         var dir: java.io.File? = java.io.File(System.getProperty("user.dir") ?: error("user.dir unset"))
@@ -285,7 +952,24 @@ class SystemPromptSegmentOrderTest {
         while (i < n) {
             val c = src[i]
             val next = if (i + 1 < n) src[i + 1] else '\u0000'
+            val rawString = c == '"' && i + 2 < n && src[i + 1] == '"' && src[i + 2] == '"'
             when {
+                // [prompt-behaviour-layer-1118] Raw strings FIRST: the prompt
+                // blocks are `"""…"""` and their prose legitimately contains
+                // `"quoted words"` and `//`-looking text. The single-quote
+                // branch below used to end the "string" at the next `"`, which
+                // flipped the state machine and made everything after it look
+                // like a comment (5 ordering tests failed on a prompt edit).
+                rawString -> {
+                    // [fix/prompt-authority-1118b B10] Same terminator rule as
+                    // [rawStringEnd]: the LAST three quotes of a run, and
+                    // `${…}` walked as real code. Stopping at the first three
+                    // left a stray `"` that opened an ordinary literal and made
+                    // everything after it look like a comment (or vice versa).
+                    val end = rawStringEnd(src, i)
+                    out.append(src, i, end)
+                    i = end
+                }
                 c == '/' && next == '/' -> {
                     while (i < n && src[i] != '\n') i++
                 }
@@ -319,3 +1003,13 @@ class SystemPromptSegmentOrderTest {
         return out.toString()
     }
 }
+
+/**
+ * [r3d1119 / 3 F-01, P1] How many pruning rules `## 淘汰` in
+ * `memory-hygiene/SKILL.md` has to document: the rule that wrote a scanner gate or
+ * a test, the recurrence-upgrade rule, the cheaper-trigger move, and the merge rule.
+ * A top-level constant because `const val` is not allowed in a class body; the test
+ * uses it as a floor, so adding a fifth well-constrained rule stays green while
+ * deleting any one of the four turns the test red.
+ */
+private const val PRUNING_RULE_MIN_ITEMS = 4

@@ -2337,7 +2337,16 @@ class ChatViewModel(
                 providerRepository.config.value.modelEntries.find { it.id == id }
             }
             if (entry != null) {
-                return withLearnedCeiling(entry.effectiveMaxThinkingLevel, expectedModelId = entry.model.id)
+                // [fix/effort-truth-1119b] 4 F-01: the declaration must come from the SAME
+                // object the wire reads (`effectiveModel` enriches the base row first, then
+                // folds the overrides). `entry.model` alone never touches models.dev, so
+                // every built-in row would answer null here and the narrowing would silently
+                // do nothing.
+                return withLearnedCeiling(
+                    entry.effectiveMaxThinkingLevel,
+                    expectedModelId = entry.model.id,
+                    declaredEffortValues = ModelsDevApi.effectiveModel(entry).reasoningEffortValues,
+                )
             }
             // [deep-audit-1044 B-04] The no-entry fallback is reached by a
             // group-resolved turn and by any snapshot written before the
@@ -2348,7 +2357,14 @@ class ChatViewModel(
             // through the same live exit as the other readers — it enriches
             // the snapshot exactly like the entry branch does.
             val model = liveEffectiveModel() ?: return ThinkingLevel.XHIGH
-            return withLearnedCeiling(model.catalogMaxThinkingLevel, expectedModelId = model.id)
+            // [fix/effort-truth-1119b] 4 F-01: `liveEffectiveModel` already holds the
+            // enriched+overridden model, i.e. the same declaration the provider hands the
+            // wire — pass it straight through.
+            return withLearnedCeiling(
+                model.catalogMaxThinkingLevel,
+                expectedModelId = model.id,
+                declaredEffortValues = model.reasoningEffortValues,
+            )
         }
 
     /**
@@ -2362,12 +2378,26 @@ class ChatViewModel(
      * the reachable tiers and paints the orange up-arrow on the highest one
      * (`isClampedBy(requested, maxAvailable)`), with no new strings.
      *
-     * Scoped exactly like the wire: `host + model id` (the learner's key). A model
-     * group therefore degrades ONE member — switching to a member that has not been
-     * refused keeps its own ceiling, and the user's stored choice is never rewritten
-     * (only [com.rikkaminis.app.ui.chat.setThinkingLevel] persists, on an explicit tap).
+     * Scoped exactly like the wire: the endpoint scope + model id (the learner's key).
+     * A model group therefore degrades ONE member — switching to a member that has not
+     * been refused keeps its own ceiling, and the user's stored choice is never
+     * rewritten (only [com.rikkaminis.app.ui.chat.setThinkingLevel] persists, on an
+     * explicit tap). The scope — not the bare host — is what keeps two instances of
+     * one gateway on different ports / path prefixes from sharing a ceiling
+     * ([fix/effort-key-1119]).
+     *
+     * [fix/effort-truth-1119b] The learned set is narrowed by [declaredEffortValues]
+     * before it reaches `lowerCeiling` ([EffortTierLearner.learnedWithinOrNull]), which
+     * is the rule the wire already applies. Without it a CEILING-shaped answer — a
+     * ladder PREFIX that names tiers this model never declared — could RAISE the picker
+     * above the declaration, and the user's next request at that tier was the 400 the
+     * entry was learned from.
      */
-    private fun withLearnedCeiling(declared: ThinkingLevel, expectedModelId: String?): ThinkingLevel {
+    private fun withLearnedCeiling(
+        declared: ThinkingLevel,
+        expectedModelId: String?,
+        declaredEffortValues: List<String>?,
+    ): ThinkingLevel {
         val provider = currentProvider ?: return declared
         // The switch paths set `_activeEntryId` before `currentProvider`; until the
         // second assignment lands, this provider still fronts the PREVIOUS member.
@@ -2375,9 +2405,19 @@ class ChatViewModel(
         // member's downgrade appeared on every other member — so while the two disagree,
         // report the catalog ceiling and let `_providerGeneration` re-derive right after.
         if (expectedModelId != null && provider.model.id != expectedModelId) return declared
-        val host = provider.requestHost ?: return declared
-        val learned = EffortTierLearner.learned(host, expectedModelId ?: provider.model.id)
-            ?: return declared
+        val scope = provider.requestScope ?: return declared
+        // [fix/effort-truth-1119b] 4 F-01 — the other half of [fix/effort-key-1119] F-02.
+        // The wire narrows a CEILING-shaped learned set by the model's declaration
+        // (`OpenAIProvider` → `learnedWithin`); this read used the raw `learned()`, so a
+        // prefix naming tiers this model never declared still lifted the picker's ceiling
+        // to them and every request made at that tier came back 400. Same rule, one
+        // reader: `learnedWithinOrNull` returns null when nothing is learned, which is
+        // what keeps `?: return declared` (catalog ceiling untouched) byte-identical.
+        val learned = EffortTierLearner.learnedWithinOrNull(
+            scope,
+            expectedModelId ?: provider.model.id,
+            declaredEffortValues,
+        ) ?: return declared
         return ThinkingEffortLadder.lowerCeiling(declared, learned)
     }
 
@@ -4146,6 +4186,30 @@ class ChatViewModel(
     // AgentLoopHost.kt (the engine returns/consumes it); the VM keeps its own
     // alias-free references. The old private nested data class is gone.
 
+    /**
+     * [W1118-COMPOSER F-06] Hand the user's text back after a send is REFUSED.
+     *
+     * The send contract is "ChatInputArea clears the composer first, then calls
+     * sendMessage", so every refusal owes the text back. A bare `setInputText`
+     * restores only the ViewModel string and leaves the FIELD and the caret
+     * alone: the mirror then put the text back with the caret at index 0, and
+     * did nothing at all while an IME was dictating (the mirror is suppressed
+     * then), leaving the user with an empty box over a ViewModel that still held
+     * the message. Routing it through the composer's intent channel writes both
+     * copies AND lands the caret where it was when he sent.
+     *
+     * One shared function, not three copies: the three refusal branches are
+     * exactly the "multi-entry, one contract" surface that drifts, and the shape
+     * test that guards them measures a bounded window — a 15-line rationale at
+     * each call site pushes the statement out of that window and the arm fails
+     * for the wrong reason.
+     */
+    private fun restoreComposerAfterRefusal(text: String) {
+        requestComposerCommand(
+            ComposerCommand.ReplaceText(text = text, caretOverride = text.length),
+        )
+    }
+
     fun sendMessage(rawText: String, pasteStartIndex: Int? = null) {
         // [feat/paste-fold-marker] Folded pastes come back BEFORE anything else
         // reads the text: this function is the single funnel for the UI (send
@@ -4220,7 +4284,7 @@ class ChatViewModel(
                     text = context.getString(R.string.sysmsg_edit_wait_stream),
                     iconKind = "info",
                 )
-                setInputText(text)
+                restoreComposerAfterRefusal(text)
                 return
             }
             enqueuePrompt(text)
@@ -4261,7 +4325,7 @@ class ChatViewModel(
             // path). This branch returned bare, so a wall of text the user just
             // typed (or a paste it had already expanded) was dropped in
             // exchange for an inline "wait for compaction" notice.
-            setInputText(text)
+            restoreComposerAfterRefusal(text)
             return
         }
         // Context pressure check — warns at the needsCompact threshold but
@@ -4338,9 +4402,10 @@ class ChatViewModel(
         val initialProvider = currentProvider
         if (initialProvider == null) {
             _error.value = "No provider configured"
-            // [incr1118 D1-F04] Same contract as the compaction branch above:
-            // the composer was cleared by the caller, so the text goes back.
-            setInputText(text)
+            // [D1-F04 + W1118-COMPOSER F-06] The caller cleared the composer, so
+            // a refusal owes the text back — through the intent channel, so the
+            // FIELD and the caret come back too.
+            restoreComposerAfterRefusal(text)
             return
         }
         // [incr1118 D1-F04] Spent ONLY by a send that actually starts. It used
@@ -4939,15 +5004,29 @@ class ChatViewModel(
                             if (agentHistory.lastOrNull()?.role == LLMMessage.Role.ASSISTANT) {
                                 val reminder = CONTINUATION_REMINDER_TEXT
                                 val parts = listOf<AgentContentPart>(AgentContentPart.Text(reminder))
-                                val reminderRow = runCatching {
+                                // [FIX-DEFERRED-1119 F-21] `runCatching` also
+                                // catches the CancellationException a Stop
+                                // raises out of this suspend Room write, so a
+                                // cancelled resume kept running: it appended a
+                                // `user` turn to the in-memory history (with
+                                // `dbMessageId = null` — the row may never have
+                                // been written) and re-armed
+                                // SessionActivityTracker. attemptUnlessCancelled
+                                // reports a real failure and rethrows the
+                                // cancellation, so the enclosing
+                                // `catch (CancellationException)` unwinds the
+                                // turn instead of letting it continue.
+                                val reminderRow = attemptUnlessCancelled(
+                                    onFailure = {
+                                        AppLogger.warning(TAG, "resume: continue-reminder persist failed: ${it.message}")
+                                    },
+                                ) {
                                     chatRepository.appendMessage(
                                         activeSessionId,
                                         "user",
                                         """[{"type":"text","value":${escapeJson(reminder)}}]""",
                                     )
-                                }.onFailure {
-                                    AppLogger.warning(TAG, "resume: continue-reminder persist failed: ${it.message}")
-                                }.getOrNull()
+                                }
                                 agentHistory.add(
                                     LLMMessage(
                                         role = LLMMessage.Role.USER,
@@ -5668,5 +5747,44 @@ internal fun shareDrainLanded(
     when (item.kind) {
         com.rikkaminis.app.share.PendingShare.Item.Kind.INLINE_TEXT -> item.value.isNotBlank()
         com.rikkaminis.app.share.PendingShare.Item.Kind.ATTACHMENT -> attachmentLanded(item)
+    }
+}
+
+/**
+ * [FIX-DEFERRED-1119 F-21] Run one suspending step; report a real failure,
+ * rethrow a cancellation.
+ *
+ * `runCatching { suspendCall() }` is a cancellation trap: `runCatching` catches
+ * `Throwable`, so the `CancellationException` that a Stop raises out of a
+ * suspended Room write lands in `onFailure` and the coroutine keeps executing
+ * the statements that follow. On the resume path that meant the turn continued
+ * past the enclosing `catch (CancellationException)`: it appended a `user` turn
+ * to the in-memory history (with a null `dbMessageId`, because the row may
+ * never have been written) and re-armed `SessionActivityTracker` after the user
+ * had already stopped the run.
+ *
+ * The same species had already been repaired at least three times
+ * (`ChatModelRouting`, `AgentLoopEngine`, `ConversationHistoryTool`), so the
+ * rule lives in one expression here rather than as a fourth inline
+ * `is CancellationException` test: cancellation always wins, an ordinary
+ * failure is reported by the caller and answers null.
+ *
+ * Deliberately NOT reusing `Throwable.asConsumerSideCancellation()`: that
+ * predicate exists to tell a *stream teardown* from a *stream error* and keys on
+ * `cause == null`. A DB write's cancellation carries no such meaning — no
+ * failure can be persisted anyway, so every `CancellationException` is
+ * rethrown.
+ */
+internal suspend fun <T> attemptUnlessCancelled(
+    onFailure: (Exception) -> Unit,
+    block: suspend () -> T,
+): T? {
+    return try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        onFailure(e)
+        null
     }
 }

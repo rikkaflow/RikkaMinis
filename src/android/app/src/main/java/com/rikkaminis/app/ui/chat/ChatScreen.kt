@@ -2279,6 +2279,35 @@ fun ChatScreen(
                     .onSizeChanged { topBarHeightPx = it.height },
             ) {
                 if (composerGlassOn) {
+                    // [fix/topbar-occlusion-1118c] Opaque floor UNDER the glass,
+                    // alpha = TopBarGlassOcclusion.floorAlpha(...) — always 1f. The
+                    // glass samples the declared hazeSource (the message list), not
+                    // the pixels below it, so the floor can be opaque on its own:
+                    // under SrcOver an opaque floor leaves nothing of the bar raw,
+                    // and the glass still blurs the rows (see TopBarGlassOcclusion).
+                    //
+                    // Without it the two gates disagree for the first frames of a
+                    // chat open: `topBarTail` already lifts the list behind the bar
+                    // (it only reads the switch), while the glass layer is still at
+                    // alpha 0 (it reads `canScrollBackward`, which is false until
+                    // the list is measured and scrolled to the bottom — and
+                    // `animateFloatAsState` seeds itself with its target, so frame
+                    // one is genuinely alpha 0). A zero-alpha graphicsLayer draws
+                    // nothing and the bar container is transparent under the
+                    // switch, so the lifted rows are painted raw for the whole
+                    // spring-up: the reported "flash of what the bar was hiding".
+                    // The floor makes that window read as the ordinary opaque bar
+                    // and cross-fades into the glass — no layout change, so no row
+                    // jitter (animating `topBarTail` instead would move every row).
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .background(
+                                topBarGlassBase.copy(
+                                    alpha = TopBarGlassOcclusion.floorAlpha(topBarGlassAlpha),
+                                ),
+                            ),
+                    )
                     Box(
                         modifier = Modifier
                             .matchParentSize()
@@ -4952,6 +4981,15 @@ fun ChatScreen(
                                 onClick = {
                                     viewModel.dismissContextExhaustedDialog(restoreInput = false)
                                     viewModel.clearChat()
+                                    // [W1118-COMPOSER F-04] Same contract as the
+                                    // drawer's Clear Chat: the composer wipes
+                                    // itself through the three-write funnel. This
+                                    // entrance was the only one that skipped it,
+                                    // so a hardware keystroke or a late callback
+                                    // landing while the dialog was up survived a
+                                    // "Clear Chat" in `_inputText`, the persisted
+                                    // draft slot and `savedInputBeforeSlash`.
+                                    viewModel.requestComposerCommand(ComposerCommand.Clear)
                                 },
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                             ) {

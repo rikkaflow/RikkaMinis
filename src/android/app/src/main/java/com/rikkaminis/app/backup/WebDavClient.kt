@@ -134,17 +134,32 @@ class WebDavClient(
      * a public `http://` endpoint is REFUSED instead of guessed at, with the
      * reason in the message (surfaced to the user via WebDavException →
      * webDavErrorMessage's IOException branch).
+     *
+     * [fix/r2-backup-1119 F-22] Only strict IPv4 literals may match the private
+     * ranges. Numeric DNS labels (e.g. 10.example.com) are not private; never
+     * resolve domains here. localhost and IPv6 loopback are explicit exceptions.
      */
     internal fun isLoopbackOrPrivateHost(host: String): Boolean {
         val h = host.lowercase()
-        if (h == "localhost" || h.endsWith(".localhost") || h.startsWith("127.")) return true
-        if (h.startsWith("10.")) return true
-        if (h.startsWith("192.168.")) return true
-        // 172.16.0.0/12
-        if (h.startsWith("172.")) {
-            val second = h.removePrefix("172.").substringBefore('.').toIntOrNull()
-            if (second != null && second in 16..31) return true
+        if (h == "localhost" || h.endsWith(".localhost")) return true
+        // IPv6 loopback only; other IPv6 literals stay "not private".
+        if (h == "::1" || h == "[::1]") return true
+        val parts = h.split('.')
+        if (parts.size != 4) return false
+        val octets = IntArray(4)
+        for (i in 0 until 4) {
+            val part = parts[i]
+            if (part.isEmpty() || part.length > 3) return false
+            if (!part.all { c -> c in '0'..'9' }) return false
+            val v = part.toIntOrNull() ?: return false
+            if (v !in 0..255) return false
+            octets[i] = v
         }
+        if (octets[0] == 127) return true
+        if (octets[0] == 10) return true
+        if (octets[0] == 192 && octets[1] == 168) return true
+        // 172.16.0.0/12
+        if (octets[0] == 172 && octets[1] in 16..31) return true
         return false
     }
 
@@ -156,8 +171,8 @@ class WebDavClient(
             throw WebDavException(
                 "Refusing to send credentials over plain HTTP to ${base.host}: " +
                     "WebDAV uses HTTP Basic auth, so non-HTTPS servers are only allowed " +
-                    "for loopback or private hosts (localhost, 127.x, 10.x, 172.16-31.x, " +
-                    "192.168.x). Use an https:// server URL.",
+                    "for loopback or private hosts (localhost, or a private IPv4 literal: " +
+                    "127.x, 10.x, 172.16-31.x, 192.168.x). Use an https:// server URL.",
                 -1,
             )
         }
@@ -548,15 +563,19 @@ class WebDavClient(
                     when (name) {
                         "response" -> {
                             inResponse = true
-                            // [fix/composer-paste-lifecycle F-A-02] No reset
-                            // to `true` here. This line predated the
-                            // fail-closed declaration above and silently
-                            // cancelled it: a response with neither
-                            // `<propstat>` nor `<status>` (hand-rolled DAV
-                            // shims, S3 gateways) was read as "200 OK" again
-                            // — exactly the shape the declaration was
-                            // written to reject. Only an explicit
-                            // `<status>` (below) may set it.
+                            // [FULLSCAN-1119 A / F-23] This MUST reset to
+                            // false, and the comment here used to say the
+                            // opposite ("No reset to `true` here" — which
+                            // described a different variable). `statusOk` is
+                            // declared false once, before the loop, and only a
+                            // `<status>` element assigns it, so without this
+                            // line the SECOND response inherits the FIRST one's
+                            // verdict: a response carrying no `<status>` at all
+                            // was accepted as 200 whenever the response before
+                            // it had been. Fail-closed means "start each
+                            // response failed and let its own `<status>` arm
+                            // it", which is exactly what this assignment does.
+                            statusOk = false
                             href = null
                             displayName = null
                             contentLength = 0

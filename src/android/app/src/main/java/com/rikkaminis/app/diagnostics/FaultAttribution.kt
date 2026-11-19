@@ -16,7 +16,8 @@ package com.rikkaminis.app.diagnostics
  *
  * Signals (checked in priority order, first hit wins):
  *   - auth / quota vocabulary → credentials (fix keys / top up)
- *   - HTTP 4xx/5xx status vocabulary → service (endpoint alive, unhappy)
+ *   - HTTP 4xx/5xx status codes, matched as standalone three-digit tokens
+ *     (see [STATUS_CODE_PATTERN]) → service (endpoint alive, unhappy)
  *   - worker death / first-chunk budget vocabulary → service
  *     (the endpoint accepted the request and then went silent)
  *   - UnknownHost / connect / timeout / reset / TLS vocabulary → connection
@@ -61,8 +62,44 @@ object FaultAttribution {
         "ping",                                             // h2 ping liveness
     )
 
+    /**
+     * [F-03] HTTP status codes, matched as STANDALONE three-digit tokens.
+     *
+     * The codes used to sit in [SERVICE_PATTERNS] as space-prefixed strings
+     * (`" 500"`) matched with a bare `contains`. That fixes the boundary on
+     * the left and none on the right, so a duration in a connection-leg
+     * message read as a status code: `"connect timed out after 500 ms"`,
+     * `"waited 1500 ms"` and `"retry in 400 ms"` were all attributed to
+     * [Layer.SERVICE] — the user's own network/proxy failure reported as the
+     * relay's, which is the exact misdirection this module exists to prevent.
+     *
+     * The lookarounds restore the boundary without narrowing the real cases:
+     *  - `(?<![A-Za-z0-9._])` — a preceding letter, digit, dot or underscore means
+     *    these digits are part of a longer token (`1500`, `1.500`, and — the case the
+     *    first version missed — `X500Principal`, where a leading `X` was enough to make
+     *    a TLS failure read as an HTTP 500);
+     *  - `(?![A-Za-z0-9._])` — the same class on the right (`5000`, `500.5`, `500ms`);
+     *  - `(?!\s*<time unit>)` — digits followed by a duration unit are a duration, not
+     *    a status. The unit list is an EQUIVALENCE CLASS, not one more arm: `ms`,
+     *    `msec`, `milliseconds`, `s`, `sec`, `seconds`, `秒`, `毫秒`. The first version
+     *    only knew `ms`, so `"read timed out after 504 seconds"` still read as a 504
+     *    and `"connect timed out after 500 milliseconds"` as a 500 — both are the
+     *    user's own network leg.
+     * `=`, `:`, whitespace, quotes and the string edges all still qualify as
+     * boundaries, so `"HTTP 500"`, `"status=500"`, `"error code: 503"`,
+     * a bare code with surrounding spaces, and `"500 Internal Server Error"`
+     * keep matching — the `=` and `:` forms did NOT match the old
+     * space-prefixed substring.
+     */
+    private val STATUS_CODE_PATTERN = Regex(
+        "(?<![A-Za-z0-9._])(400|401|403|429|500|502|503|504)" +
+            "(?![A-Za-z0-9._])" +
+            "(?!\\s*(?:milliseconds|millisecond|millis|msec|ms|seconds|second|secs|sec|s)\\b)" +
+            "(?!\\s*(?:毫秒|秒))",
+    )
+
     private val SERVICE_PATTERNS = listOf(
-        "http 4", "http 5", " 400", " 401", " 403", " 429", " 500", " 502", " 503", " 504",
+        "http 4", "http 5",
         "bad request", "not found", "internal server", "bad gateway",
         "service unavailable", "overloaded", "rate limit", "expired",
         "first chunk timeout", "first_chunk", "no first chunk",
@@ -91,6 +128,14 @@ object FaultAttribution {
 
         if (CREDENTIAL_PATTERNS.any { raw.contains(it) }) {
             return Result(Layer.CREDENTIALS, "fault_layer_credentials")
+        }
+        // [F-03] Status codes are a TOKEN class, not a substring class — see
+        // [STATUS_CODE_PATTERN]. Checked with the service phrases (same layer,
+        // same verdict) and before the connection walk, so a millisecond count
+        // inside a connection-leg message cannot be read as a code on the way
+        // through to the connection vocabulary it belongs with.
+        if (STATUS_CODE_PATTERN.containsMatchIn(raw)) {
+            return Result(Layer.SERVICE, "fault_layer_service")
         }
         // [W1118-T6 R6 F-01] Service BEFORE connection: "first chunk timeout"
         // contains "timeout", so the old order shadowed every service phrase.

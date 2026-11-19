@@ -169,8 +169,18 @@ object GatewayEffortTruth {
      * The wire value for an ENABLED [level] on a gateway whose strict enum this object
      * describes. Precedence:
      *
-     *  1. [EffortTierLearner.learned] — the gateway said it out loud on a previous 400.
-     *     One-hand truth, freshest, and the only source that ever updates itself.
+     *  1. [EffortTierLearner.learnedWithinOrNull] — the gateway said it out loud on a
+     *     previous 400. A CEILING-shaped answer (the ladder PREFIX below a refused
+     *     `THINKING_LEVEL_*`) is narrowed by [declaredTiers] before it is used, exactly
+     *     like the two wire paths: the prefix names tiers this model never declared, and
+     *     handing it to `clampEffort` in place of the declaration puts one of those back
+     *     on the wire — the same 400 the entry was learned from ([fix/effort-truth-1119b],
+     *     the other half of [fix/effort-key-1119] F-02). An ENUM-shaped answer is
+     *     one-hand truth and is NOT narrowed.
+     *     The read is the `OrNull` variant on purpose: it must return null when nothing
+     *     is learned so that [tiersFor] stays reachable. The `?: declaredTiers` form of
+     *     [EffortTierLearner.learnedWithin] returns the declaration and would short-cut
+     *     the measured table — the second half of the same finding.
      *  2. [tiersFor] — the static measurement table (what we probed by hand).
      *  3. [declaredTiers] — the catalog's opinion, possibly under-declared.
      *  4. [fallbackTiersFor] — the conservative set for THIS gateway, never a value
@@ -182,14 +192,22 @@ object GatewayEffortTruth {
      *
      * Degrades DOWNWARD (clampEffort walks to the strongest tier at or below the request,
      * then to the weakest) so asking for a tier the enum lacks never fails the request.
+     *
+     * [host] selects the measured table (and is therefore still the bare host — the
+     * table is keyed by host), [scope] selects WHAT THE LEARNER READS: it is the
+     * endpoint the request goes to (`scheme://host[:port]/path`), so an instance on a
+     * different port or path prefix of the same host cannot inherit another's entry
+     * ([fix/effort-key-1119]). It defaults to [host] so a host-only caller keeps the
+     * legacy key shape.
      */
     fun resolveTier(
         host: String,
         modelId: String,
         level: ThinkingLevel,
         declaredTiers: List<String>?,
+        scope: String = host,
     ): String {
-        val tiers = EffortTierLearner.learned(host, modelId)
+        val tiers = EffortTierLearner.learnedWithinOrNull(scope, modelId, declaredTiers)
             ?: tiersFor(host, modelId)
             ?: declaredTiers?.takeIf { it.isNotEmpty() }
             ?: fallbackTiersFor(host)

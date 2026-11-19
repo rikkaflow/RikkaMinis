@@ -15,6 +15,7 @@ import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.model.acceptsImageInput
 import com.rikkaminis.app.data.model.ImageInputDecision
 import com.rikkaminis.app.data.model.imageInputDecision
+import com.rikkaminis.app.debug.LLMRequestLog
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderBoundary
 import com.rikkaminis.app.provider.TOOL_LOG_INPUT_STEP_CHARS
@@ -53,6 +54,7 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import okhttp3.EventListener
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -106,10 +108,16 @@ class OpenAIProvider constructor(
     override val name = "OpenAI"
     override var instanceContext: com.rikkaminis.app.data.model.ProviderInstance? = null
 
-    // [fix/thinking-level-ceiling-1118] Same host the effort learner keys its entries
-    // by (see the record/learned call sites below) — the UI reads it to lower the
-    // picker's ceiling to what the gateway has actually accepted.
-    override val requestHost: String? get() = basePath.toHttpUrlOrNull()?.host
+    // [fix/effort-key-1119] The normalized endpoint (`scheme://host[:port]/path`) the
+    // effort learner keys its entries by (see the record/learned call sites below) —
+    // the UI reads it to lower the picker's ceiling to what the gateway has actually
+    // accepted. Derived from basePath ONCE, so record/learned on the wire and the read
+    // in the picker ask the same question; deriving it from `HttpUrl.host` would drop
+    // the port and the path prefix and let two endpoints of one host share one entry.
+    override val requestScope: String? get() = effortScope ?: basePath.toHttpUrlOrNull()?.host
+
+    /** Normalized endpoint scope of [basePath], or null when it is not a URL we model. */
+    private val effortScope: String? get() = EffortTierLearner.scopeOf(basePath)
 
     /**
      * [T-android-thinking-rules-phase2] Owning provider-instance id, set by
@@ -428,6 +436,13 @@ class OpenAIProvider constructor(
         .eventListenerFactory { com.rikkaminis.app.network.ProviderHealthTraceListener(model.id, model.displayName) }
         .build()
 
+    // [F-09] The second hop may carry opaque, vendor-specific signing fields.
+    // Keep it out of the provider trace (URL and raw failure details) and out
+    // of the provider health counters, but keep the same pool and timeouts.
+    private val imageDownloadClient by lazy {
+        client.newBuilder().eventListener(EventListener.NONE).build()
+    }
+
     /** Detect OpenRouter base URL. */
     private val isOpenRouter: Boolean = basePath.contains("openrouter.ai")
 
@@ -719,7 +734,7 @@ class OpenAIProvider constructor(
                 } ?: false)
             com.rikkaminis.app.logging.AppLogger.info(
                 "OpenAIProvider",
-                "[T321] → REQ url=${request.url} model=${model.id} stream=${body.optBoolean("stream", false)} " +
+                "[T321] → REQ url=${LLMRequestLog.redactURL(request.url.toString())} model=${model.id} stream=${body.optBoolean("stream", false)} " +
                     "headerKeys=${request.headers.names()} authPresent=$authPresent " +
                     "messages=$msgsLen tools=$toolsLen temp=$temp maxTokens=$maxTok hasSystem=$hasSystem " +
                     "useResponsesAPI=${!usesChatCompletionsAPI} bodyLen=${bodyStr.length}"
@@ -829,7 +844,11 @@ class OpenAIProvider constructor(
             // No probe request, and a gateway changing its enum does not need a release
             // from us to be absorbed. Learning nothing is not an error: record() returns
             // null and throws nothing.
-            EffortTierLearner.record(request.url.host, bodyStr, errorBody)
+            // [fix/effort-key-1119] Keyed on the normalized ENDPOINT (scheme + host +
+            // port + path prefix), not on `request.url.host`: the host alone is what
+            // let two gateways on one host share one learned ceiling. Fall back to the
+            // request's host only when basePath is not a URL we could parse.
+            EffortTierLearner.record(effortScope ?: request.url.host, bodyStr, errorBody)
             throw mapHttpError(
                 response.code,
                 errorBody,
@@ -1340,7 +1359,7 @@ class OpenAIProvider constructor(
                         // [T-android-effort-self-learn] Same hook as the HTTP-400 path:
                         // some relays report the identical error inside a 200 stream, so
                         // the enum lands in the event instead of the status body.
-                        EffortTierLearner.record(request.url.host, bodyStr, event.toString())
+                        EffortTierLearner.record(effortScope ?: request.url.host, bodyStr, event.toString())
                         val err = mapHttpError(
                             openAiStreamErrorStatus(
                                 inlineError.optString("code", ""),
@@ -1517,10 +1536,11 @@ class OpenAIProvider constructor(
             // ChatViewModel.toolCalls empty: the agent loop sees no tool calls, exits,
             // and the UI hangs with the tool thumbnail spinning while the stop button
             // disappears (T247 root cause; same path hit by T237 DeepSeek truncation).
-            for ((itemId, acc) in responsesToolCalls) {
+            // The map key is only for lookup: when item.id was absent it is call_id.
+            for (acc in responsesToolCalls.values) {
                 if (acc.callId.isNotEmpty() && acc.name.isNotEmpty()) {
                     val args = try { JSONObject(acc.args.toString()) } catch (_: Exception) { JSONObject() }
-                    val combined = combineResponsesAPIIds(acc.callId, itemId)
+                    val combined = combineResponsesAPIIds(acc.callId, acc.itemId)
                     com.rikkaminis.app.logging.AppLogger.warning(
                         "OpenAIProvider",
                         "Stream ended mid-tool-call id=$combined name=${acc.name} argsLen=${acc.args.length} — flushing as ToolCallComplete (T248)",
@@ -1760,7 +1780,7 @@ class OpenAIProvider constructor(
 
         com.rikkaminis.app.logging.AppLogger.info(
             "OpenAIProvider",
-            "[ModelUseRoute] route=raw-passthrough method=$verb url=$url " +
+            "[ModelUseRoute] route=raw-passthrough method=$verb url=${LLMRequestLog.redactURL(url)} " +
                 "bodyKeys=[${bodyObject?.keys()?.asSequence()?.sorted()?.joinToString(",") ?: ""}] " +
                 "headerOverrides=[${headers.keys.sorted().joinToString(",")}]",
         )
@@ -1867,7 +1887,7 @@ class OpenAIProvider constructor(
 
             com.rikkaminis.app.logging.AppLogger.info(
                 "OpenAIProvider",
-                "[ModelUseRoute] → images/generations url=$url model=${model.id} n=$n " +
+                "[ModelUseRoute] → images/generations url=${LLMRequestLog.redactURL(url)} model=${model.id} n=$n " +
                     "size=$size quality=$quality respFormat=${if (triedWithoutFormat) "<none>" else "b64_json"}",
             )
 
@@ -1960,7 +1980,7 @@ class OpenAIProvider constructor(
                         // close() sat after bytes(), so an IOException there
                         // skipped it and leaked the connection instead of
                         // returning it to the pool.
-                        client.newCall(dlReq).execute().use { dlResp ->
+                        imageDownloadClient.newCall(dlReq).execute().use { dlResp ->
                             // [R5-E1 E-F-05] The SECOND hop carries its own
                             // status code and nothing was reading it: only the
                             // size ceiling and a non-empty body were checked, so
@@ -1974,13 +1994,11 @@ class OpenAIProvider constructor(
                             // anywhere: the classic M7 false success.
                             if (!GeneratedImageVerdict.downloadAccepted(dlResp.code)) {
                                 lastDownloadStatus = dlResp.code
-                                // The URL itself is NOT logged here: a generated-image
-                                // link is usually a signed object URL, and its query
-                                // carries the credential. Status + body prefix is what
-                                // identifies the failure; the item's index names which.
+                                // The error body can echo the signed URL or signing fields.
+                                // Only log the status and item index, never the body.
                                 com.rikkaminis.app.logging.AppLogger.warning(
                                     "OpenAIProvider",
-                                    "[ModelUseRoute] image download HTTP ${dlResp.code} skipped item=$i body=${dlResp.body?.string()?.take(200).orEmpty()}",
+                                    "[ModelUseRoute] image download HTTP ${dlResp.code} skipped item=$i",
                                 )
                                 // Same inline-lambda rule as the size arm below:
                                 // no `continue` here (Kotlin < 2.2 rejects it).
@@ -2036,9 +2054,13 @@ class OpenAIProvider constructor(
                             }
                         }
                     } catch (e: Exception) {
+                        // redactURL masks known query keys, but object-store signing
+                        // fields are vendor-specific. OkHttp's redact() keeps only
+                        // the origin; a parse failure must not print the raw input.
+                        val origin = urlStr.toHttpUrlOrNull()?.redact() ?: "<invalid URL>"
                         com.rikkaminis.app.logging.AppLogger.warning(
                             "OpenAIProvider",
-                            "[ModelUseRoute] failed to download image from $urlStr: ${e.message}",
+                            "[ModelUseRoute] failed to download image from $origin (item=$i, ${e.javaClass.simpleName})",
                         )
                     }
                 }
@@ -2798,6 +2820,11 @@ class OpenAIProvider constructor(
         // ceiling by LLMProvider.streamMessage/sendMessage — do NOT re-clamp.
         val lid = model.id.lowercase()
         val host = basePath.toHttpUrlOrNull()?.host ?: ""
+        // [fix/effort-key-1119] The learner's scope for THIS request. `host` above stays
+        // the bare host because the measured-gateway table is keyed by host; the effort
+        // learner needs the whole endpoint, or two instances on one host (different
+        // port / path prefix) would read each other's ceiling.
+        val scope = effortScope ?: host
 
         // [T-relay-host-adaptation] Host-precise adaptation table, absorbed from
         // RikkaHub's ChatCompletionsAPI `when(host)` switch. A relay is
@@ -2828,8 +2855,17 @@ class OpenAIProvider constructor(
             // the only source that ever updates itself. With nothing learned the
             // expression is byte-identical to `model.reasoningEffortValues`, so a host we
             // have never heard a complaint from keeps today's behaviour exactly.
-            declaredEffortValues = EffortTierLearner.learned(host, model.id)
-                ?: model.reasoningEffortValues,
+            //
+            // [fix/effort-key-1119] The ceiling is read through the endpoint scope, and
+            // a CEILING-shaped answer (a `THINKING_LEVEL_*` rejection, i.e. a ladder
+            // PREFIX) is NARROWED by the model's own declaration — on its own it can
+            // put a tier back on the wire that this model never declared. An ENUM-shaped
+            // answer (the gateway spelling out its legal set) is one-hand truth and is
+            // NOT narrowed: it being wider than the catalog is the whole reason the
+            // learner exists.
+            declaredEffortValues = EffortTierLearner.learnedWithin(
+                scope, model.id, model.reasoningEffortValues,
+            ),
             declaresNoEffortTiers = model.declaresNoEffortTiers == true,
             level = level,
             maxTokens = maxTokens,
@@ -2882,7 +2918,10 @@ class OpenAIProvider constructor(
             // then whatever the catalog declared, then that gateway's own fallback).
             body.put(
                 "reasoning_effort",
-                GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
+                // [fix/effort-key-1119] `host` still selects the measured table; the
+                // learner is read through the endpoint scope so it cannot inherit a
+                // ceiling written by another endpoint of the same host.
+                GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues, scope),
             )
             return echo
         }
@@ -2965,7 +3004,7 @@ class OpenAIProvider constructor(
                 // accepted for this host+model, when it ever refused a tier. Printed
                 // next to the declaration on purpose: when they disagree, this is the
                 // line that explains why the wire value is lower than the catalog's.
-                "learned=${EffortTierLearner.learned(host, model.id)?.joinToString("|") ?: "null"} " +
+                "learned=${EffortTierLearner.learned(scope, model.id)?.joinToString("|") ?: "null"} " +
                 "declaresNoEffort=${model.declaresNoEffortTiers == true} " +
                 "offEffort=${explicitOffEffort() ?: "null"} maxTokens=$maxTokens",
         )
@@ -3214,8 +3253,15 @@ class OpenAIProvider constructor(
             clampResponsesEffort(
                 effort = mapThinkingLevelToResponsesEffort(thinkingLevel),
                 modelId = model.id,
-                learnedEffortValues = EffortTierLearner.learned(
-                    basePath.toHttpUrlOrNull()?.host ?: "", model.id,
+                // [fix/effort-key-1119] Same scope the record sites write with: the
+                // normalized endpoint, falling back to the same bare host they fall
+                // back to — a read that asked for a different spelling than the write
+                // stored would silently throw the learning away. `learnedWithin` applies
+                // the F-02 narrowing (CEILING only) inside, so both wire paths share one
+                // rule instead of each deciding what to do with the two sets.
+                learnedEffortValues = EffortTierLearner.learnedWithin(
+                    effortScope ?: basePath.toHttpUrlOrNull()?.host ?: "", model.id,
+                    model.reasoningEffortValues,
                 ),
                 declaredEffortValues = model.reasoningEffortValues,
             )
@@ -3917,7 +3963,7 @@ internal fun chatCompletionsDeltaThinkingBlocks(delta: JSONObject?): List<String
  * [r3-b08 F-08] Tier resolution for the Responses API `reasoning.effort` field.
  *
  * The Chat-Completions builder resolves an effort string through
- * `EffortTierLearner.learned(host, model)` (a gateway's own enum, learned from a
+ * `EffortTierLearner.learned(scope, model)` (a gateway's own enum, learned from a
  * 400 body) and `model.reasoningEffortValues` (the catalog's declaration), then
  * snaps the requested tier with [ThinkingEffortLadder.clampEffort]. The
  * Responses builder did none of that: it applied only the MiMo/Agnes family
@@ -3931,6 +3977,13 @@ internal fun chatCompletionsDeltaThinkingBlocks(delta: JSONObject?): List<String
  *
  * `learned` outranks `declared`: a measured enum is one-hand truth, and with
  * nothing learned the expression is exactly `declared`.
+ *
+ * [fix/effort-key-1119] F-02's narrowing does NOT happen here: it depends on WHICH
+ * SHAPE was learned (a `THINKING_LEVEL_*` ceiling must be narrowed by the model's
+ * declaration; an enumerated `one of: …` set must not be), and only the caller holds
+ * that bit. `EffortTierLearner.learnedWithin` applies it, so the value arriving here
+ * is already the set that may go on the wire — narrowing it again would either be a
+ * no-op or, for an enumerated set, silently throw away the one-hand truth.
  *
  * Pure + top-level for direct JVM testing (see ResponsesEffortClampTest).
  */

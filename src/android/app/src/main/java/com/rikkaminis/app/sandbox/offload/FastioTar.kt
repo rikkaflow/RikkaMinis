@@ -483,6 +483,16 @@ internal class TarExtractOutcome : EntryBudget {
     var skippedSpecial = 0L
 
     /**
+     * [FULLSCAN-1119 R2 F-03] Declared payload bytes charged against
+     * [PayloadSizePolicy.MAX_FILE_BYTES] by the pre-write gate. Kept apart from [bytes]
+     * on purpose: [bytes] is user-facing ("how much did this archive yield"),
+     * this is the budget reading, and it also counts a member that was charged
+     * and then failed to land.
+     */
+    var declaredBytes = 0L
+
+
+    /**
      * [§6 F2] LNKTYPE members materialised by COPYING the already-unpacked
      * target (`Files.copy`) — the target file appears on disk, as an
      * independent regular file. A hard link cannot be created here anyway:
@@ -510,6 +520,49 @@ internal sealed class TarRefusal {
     data class BadHeader(val detail: String) : TarRefusal()
 }
 
+/** Member types whose payload tarExtract copies to disk. */
+internal fun tarWritesPayload(member: TarMember): Boolean =
+    member.type == '0' || member.type == '\u0000' || member.type == '7'
+
+/**
+ * [FULLSCAN-1119 R2 F-03] Charge one member's declared size against [maxBytes].
+ *
+ * Returns true when the archive is over budget — [out] already holds the
+ * reason, and the caller must refuse (validate) or stop (extract). The check
+ * is `used > max - size`, not `used + size > max`: the latter overflows to a
+ * negative number for a header that declares `Long.MAX_VALUE` and answers
+ * "fits" for a 10 GiB bomb.
+ */
+internal fun chargeExpandedBytes(out: TarExtractOutcome, size: Long, maxBytes: Long): Boolean {
+    val declared = size
+    require(size >= 0 && maxBytes >= 0) { "negative archive byte budget or size" }
+    if (declared > maxBytes || out.declaredBytes > maxBytes - declared) {
+        out.errors.add(
+            "archive expands past the byte budget: " +
+                "used=${out.declaredBytes} next=$declared max=$maxBytes",
+        )
+        return true
+    }
+    out.declaredBytes += declared
+    return false
+}
+
+/** Charge every payload and materialised hard-link copy, including link chains. */
+private fun chargeTarMember(out: TarExtractOutcome, member: TarMember, files: MutableMap<String, Long>, maxBytes: Long): Boolean {
+    if (chargeExpandedBytes(out, member.size, maxBytes)) return true
+    val name = tarNormalizeMember(member.name)?.joinToString("/")
+    when {
+        tarWritesPayload(member) -> if (name != null) files[name] = member.size
+        member.type == '1' -> {
+            val link = tarNormalizeMember(member.linkName)?.joinToString("/")
+            val copyBytes = files[link] ?: return false
+            if (chargeExpandedBytes(out, copyBytes, maxBytes)) return true
+            if (name != null) files[name] = copyBytes
+        }
+    }
+    return false
+}
+
 /** Where a validated member lands, and how. */
 internal data class TarTarget(val path: Path, val member: TarMember)
 
@@ -527,14 +580,24 @@ internal fun tarValidate(
     dest: Path,
     maxEntries: Long,
     out: TarExtractOutcome,
+    maxBytes: Long = PayloadSizePolicy.MAX_FILE_BYTES,
 ): Boolean {
-    val reader = TarReader(source)
+    val reader = TarReader(source, maxBytes)
     val declaredLinks = HashSet<String>()
+    val declaredFiles = HashMap<String, Long>()
     try {
         while (true) {
             val member = reader.next() ?: break
             if (charge(out, maxEntries)) {
                 out.errors.add("entry budget reached while validating; extraction would be partial")
+                return false
+            }
+            // [FULLSCAN-1119 R2 F-03] Charge the DECLARED size here, before a
+            // single payload byte is read: a 30 KB archive whose one member
+            // says 6 GiB is refused in one header parse instead of filling
+            // /data first. Payloads and materialised hard-link copies both
+            // spend the single shared byte ceiling.
+            if (chargeTarMember(out, member, declaredFiles, maxBytes)) {
                 return false
             }
             val refusal = tarEntryTarget(dest, member, declaredLinks)
@@ -568,9 +631,11 @@ internal fun tarExtract(
     force: Boolean,
     maxEntries: Long,
     out: TarExtractOutcome,
+    maxBytes: Long = PayloadSizePolicy.MAX_FILE_BYTES,
 ) {
-    val reader = TarReader(source)
+    val reader = TarReader(source, maxBytes)
     val declaredLinks = HashSet<String>()
+    val declaredFiles = HashMap<String, Long>()
     // [§6 F2] normalized member name -> the regular file actually written for
     // it, so an LNKTYPE member that follows can be materialised by copy.
     // Keyed by the NORMALIZED name: the link target is spelled the way the
@@ -582,6 +647,13 @@ internal fun tarExtract(
         while (true) {
             val member = reader.next() ?: break
             if (charge(out, maxEntries)) break
+
+            // [FULLSCAN-1119 R2 F-03] Same charge as tarValidate, enforced a
+            // second time so an archive that reaches extraction through any
+            // path (a future caller, a validate whose stream differed) still
+            // cannot write past the ceiling. Break, not `continue`: the next
+            // member is exactly as hostile.
+            if (chargeTarMember(out, member, declaredFiles, maxBytes)) break
 
             val refusal = tarEntryTarget(dest, member, declaredLinks)
             if (refusal != null) {
@@ -658,6 +730,8 @@ internal fun tarExtract(
                         if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(member.name)
                     }
                 }
+            } catch (e: TarPayloadBudgetExceeded) {
+                throw e
             } catch (e: Exception) {
                 out.errors.add("${member.name}: ${e.message}")
             }
@@ -898,12 +972,27 @@ internal fun permissionsOf(mode: Int): Set<PosixFilePermission> {
  * enforced by tracking how many bytes of the current member are outstanding,
  * so a caller that forgot to consume them cannot silently desynchronize.
  */
-internal class TarReader(private val source: InputStream) {
+internal class TarReader(
+    private val source: InputStream,
+    /**
+     * [FULLSCAN-1119 R2 F-03] Ceiling on ACTUAL payload bytes this reader may
+     * consume. The declared-size gate in [tarValidate]/[tarExtract] already
+     * refuses a bomb from its header alone; this one is the belt for a stream
+     * whose copy request exceeds its header, so "we stop at N bytes" is a property of the reader rather
+     * than of every caller's arithmetic.
+     */
+    private val maxPayloadBytes: Long = PayloadSizePolicy.MAX_FILE_BYTES,
+) {
     private var pendingData = 0L
+    private var declaredPayloadBytes = 0L
     private var longName: String? = null
     private var longLink: String? = null
     private var paxPath: String? = null
     private var paxLink: String? = null
+
+    /** Actual payload bytes consumed so far (copied and skipped alike). */
+    var consumedBytes = 0L
+        private set
 
     /** pax extension headers consumed so far (only path/linkpath are honoured). */
     var paxHeaders = 0L
@@ -920,6 +1009,10 @@ internal class TarReader(private val source: InputStream) {
                 continue
             }
             val member = parseHeader(block)
+            if (member.size > maxPayloadBytes || declaredPayloadBytes > maxPayloadBytes - member.size) {
+                throw TarPayloadBudgetExceeded("archive payload exceeded the byte budget: used=$declaredPayloadBytes next=${member.size} max=$maxPayloadBytes")
+            }
+            declaredPayloadBytes += member.size
             when (member.type) {
                 'L' -> {
                     longName = readText(member.size)
@@ -931,7 +1024,12 @@ internal class TarReader(private val source: InputStream) {
                 }
                 'x', 'g' -> {
                     paxHeaders++
-                    applyPax(readText(member.size))
+                    // [FULLSCAN-1119 F-14] UTF-8 calibration: the record length in
+                    // a pax header counts BYTES, so the parser must walk bytes.
+                    // Decoding first and then counting in chars is what swapped
+                    // CJK names for "????" (loop stopped early) or glued the next
+                    // record onto the path.
+                    applyPax(readRaw(member.size))
                     continue
                 }
                 else -> {
@@ -959,6 +1057,7 @@ internal class TarReader(private val source: InputStream) {
         while (left > 0) {
             val read = source.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
             if (read < 0) throw EOFException("archive truncated ${left} bytes into an entry")
+            chargePayload(read.toLong())
             sink.write(buffer, 0, read)
             left -= read
         }
@@ -968,9 +1067,31 @@ internal class TarReader(private val source: InputStream) {
 
     /** Consume the current member's payload without copying it. */
     fun skipData() {
-        skipBytes(pendingData)
+        var left = pendingData
+        val buffer = ByteArray(COPY_BUFFER)
+        while (left > 0) {
+            val read = source.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+            if (read < 0) throw EOFException("archive truncated ${left} bytes into an entry")
+            chargePayload(read.toLong())
+            left -= read
+        }
         skipPadding(pendingData)
         pendingData = 0
+    }
+
+    /**
+     * [FULLSCAN-1119 R2 F-03] Count actual payload bytes and refuse to read past
+     * the ceiling. Thrown (not returned) so every caller — copy, skip, and any
+     * future one — stops at the same boundary; both passes already turn an
+     * exception into a refusal with the message attached.
+     */
+    private fun chargePayload(additional: Long) {
+        if (additional > maxPayloadBytes || consumedBytes > maxPayloadBytes - additional) {
+            throw TarPayloadBudgetExceeded(
+                "archive payload exceeded the byte budget: read=${consumedBytes + additional} max=$maxPayloadBytes",
+            )
+        }
+        consumedBytes += additional
     }
 
     private fun requirePaused() {
@@ -990,18 +1111,24 @@ internal class TarReader(private val source: InputStream) {
         return block
     }
 
-    private fun readText(size: Long): String {
+    /** Read a metadata member's payload raw (size-checked, padding skipped). */
+    private fun readRaw(size: Long): ByteArray {
         if (size <= 0 || size > MAX_LONG_NAME_BYTES) throw EOFException("implausible long-name size $size")
         val bytes = ByteArray(size.toInt())
         var filled = 0
         while (filled < bytes.size) {
             val read = source.read(bytes, filled, bytes.size - filled)
             if (read < 0) throw EOFException("archive truncated in a long-name record")
+            chargePayload(read.toLong())
             filled += read
         }
         skipPadding(size)
-        return bytes.toString(StandardCharsets.UTF_8).trimEnd('\u0000')
+        return bytes
     }
+
+    /** GNU `L`/`K` payload: a NUL-terminated name, i.e. plain text. */
+    private fun readText(size: Long): String =
+        readRaw(size).toString(StandardCharsets.UTF_8).trimEnd('\u0000')
 
     private fun skipBytes(count: Long) {
         var left = count
@@ -1018,25 +1145,68 @@ internal class TarReader(private val source: InputStream) {
         if (pad > 0) skipBytes(pad)
     }
 
-    private fun applyPax(text: String) {
-        // Records are "LENGTH KEY=VALUE\n"; we honour only the two path
-        // overrides and ignore the rest (mtime/size/uid are advisory here).
+    /**
+     * Parse a pax extended-header payload (typeflag `x`/`g`).
+     *
+     * Record grammar (POSIX pax / GNU tar): `"<LEN> <KEY>=<VALUE>\n"` where
+     * `LEN` is the record's total length in **BYTES** — the decimal digits of
+     * `LEN` themselves, the separating space, `KEY`, `=`, `VALUE` and the
+     * trailing newline.
+     *
+     * [FULLSCAN-1119 F-14] The offsets below are byte offsets into [payload]
+     * and only the key/value slices are decoded as UTF-8. The previous version
+     * scanned a decoded `String` while advancing by the byte count, which is
+     * only correct while every byte is one char:
+     *   - a 139-byte `path=` record inside a 55-char header made
+     *     `cursor + length > text.length` stop the loop ⇒ the long CJK name was
+     *     DROPPED and the (truncated) ustar name was used instead;
+     *   - a shorter CJK path overshot the record end ⇒ the value swallowed the
+     *     following record (`中文.txt\n20 mtime=1700000000`).
+     * Both are covered by `OffloadBoundsTest` (pax UTF-8 cases).
+     */
+    private fun applyPax(payload: ByteArray) {
         var cursor = 0
-        while (cursor < text.length) {
-            val space = text.indexOf(' ', cursor)
+        while (cursor < payload.size) {
+            val space = indexOfByte(payload, PAX_SPACE, cursor)
             if (space < 0) break
-            val length = text.substring(cursor, space).toIntOrNull() ?: break
-            if (length <= 0 || cursor + length > text.length) break
-            val record = text.substring(space + 1, cursor + length).trimEnd('\n')
-            val eq = record.indexOf('=')
-            if (eq > 0) {
-                when (record.substring(0, eq)) {
-                    "path" -> paxPath = record.substring(eq + 1)
-                    "linkpath" -> paxLink = record.substring(eq + 1)
+            val length = parsePaxLength(payload, cursor, space) ?: break
+            // A record must fit inside this payload: `length` counts from
+            // [cursor] inclusive. (Also keeps the Int addition in range.)
+            if (length <= space - cursor + 1 || length > payload.size - cursor) break
+            val recordEnd = cursor + length
+            // The newline is part of LEN but not part of the value.
+            val bodyEnd = if (payload[recordEnd - 1] == PAX_NEWLINE) recordEnd - 1 else recordEnd
+            val eq = indexOfByte(payload, PAX_EQUALS, space + 1).takeIf { it in (space + 1) until bodyEnd }
+            if (eq != null) {
+                when (String(payload, space + 1, eq - space - 1, StandardCharsets.UTF_8)) {
+                    "path" -> paxPath = String(payload, eq + 1, bodyEnd - eq - 1, StandardCharsets.UTF_8)
+                    "linkpath" -> paxLink = String(payload, eq + 1, bodyEnd - eq - 1, StandardCharsets.UTF_8)
                 }
             }
-            cursor += length
+            cursor = recordEnd
         }
+    }
+
+    private fun indexOfByte(buf: ByteArray, target: Byte, from: Int): Int {
+        var i = from
+        while (i < buf.size) {
+            if (buf[i] == target) return i
+            i++
+        }
+        return -1
+    }
+
+    /** Decimal digits in `[from, until)`, or null when the field is not one. */
+    private fun parsePaxLength(buf: ByteArray, from: Int, until: Int): Int? {
+        if (until <= from) return null
+        var value = 0L
+        for (i in from until until) {
+            val c = buf[i].toInt() - '0'.code
+            if (c < 0 || c > 9) return null
+            value = value * 10 + c
+            if (value > Int.MAX_VALUE) return null
+        }
+        return value.toInt()
     }
 }
 
@@ -1279,6 +1449,9 @@ private const val PREFIX_LENGTH = 155
 
 private const val COPY_BUFFER = 64 * 1024
 
+/** [FULLSCAN-1119 R2 F-03] Raised by [TarReader] when actual payload bytes pass the ceiling. */
+internal class TarPayloadBudgetExceeded(message: String) : Exception(message)
+
 /** Names listed in `skipped_names`; the COUNT is always exact. */
 private const val MAX_REPORTED_SKIPS = 20
 
@@ -1290,3 +1463,8 @@ private const val MAX_REPORTED_SKIPS = 20
  * 升级触发: an archive that legitimately needs it fails with a clear error.
  */
 private const val MAX_LONG_NAME_BYTES = 1L * 1024 * 1024
+
+// [FULLSCAN-1119 F-14] pax record delimiters — parsed as bytes, never as chars.
+private val PAX_SPACE = ' '.code.toByte()
+private val PAX_EQUALS = '='.code.toByte()
+private val PAX_NEWLINE = '\n'.code.toByte()
