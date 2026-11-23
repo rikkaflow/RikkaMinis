@@ -310,7 +310,6 @@
     <string name="token_usage_context_window">Context Window</string>
     <string name="token_usage_context_window_group_limit"> (group limit %1$s)</string>
     <string name="token_usage_context_window_group_limit_applied"> (set by group limit %1$s)</string>
-    <string name="token_usage_context_window_group_unlimited"> (unlimited)</string>
     <string name="token_usage_context_window_heuristic_warning">Model does not report its real context window — this is an estimate. Correct it in the model details screen.</string>
     <string name="token_usage_max_output">Max Output</string>
     <string name="context_full_dialog_title">Context Full</string>
@@ -547,7 +546,7 @@
     <string name="env_var_add">Add</string>
     <string name="env_var_privacy_header">Privacy</string>
     <string name="env_var_privacy_toggle">Privacy Mode</string>
-    <string name="env_var_privacy_footer">When enabled, any environment variable value that appears in shell-execute output is replaced with a masked form (e.g. `sk-1********ajhks`) before reaching the model. Values shorter than 8 characters become all `*`. The user-visible output in chat is unchanged.</string>
+    <string name="env_var_privacy_footer">Privacy Mode hides known credentials and recognizable secret fields in tool results, restored history and summaries before sending them to the model. New diagnostic records and tool history are always redacted. Original files and images are unchanged; images and arbitrarily encoded secrets are not inspected. Edit non-secret fields locally instead of writing a redacted copy over an original file.</string>
     <string name="env_var_restart_terminal_note">Commands run by the assistant re-read these values every time, deletions included, so they need no restart. Time zone and proxy changes are pushed into open terminals; other variables are not. A program that is already running keeps the environment it started with.</string>
     <string name="env_var_restart_terminal_body">Variables are injected when a terminal session starts. An already-open terminal keeps its old environment — close and reopen it to apply changes.</string>
     <string name="env_var_restart_terminal_title">Terminal sessions</string>
@@ -983,7 +982,10 @@
     <string name="model_group_detail_thinking_auto">Auto</string>
     <string name="model_group_detail_limit_context_window">Limit Context Window</string>
     <string name="model_group_detail_max_context">Max Context</string>
-    <string name="model_group_detail_unlimited">Unlimited</string>
+    <string name="model_group_detail_custom_context">Custom</string>
+    <string name="model_group_detail_custom_context_title">Custom context limit</string>
+    <string name="model_group_detail_custom_context_input">Context limit (K tokens)</string>
+    <string name="model_group_detail_custom_context_range">Minimum 64,000 tokens</string>
     <string name="model_groups_model_groups">Model Groups</string>
     <string name="model_groups_new_group">New Group</string>
     <string name="model_groups_no_model_groups">No model groups</string>

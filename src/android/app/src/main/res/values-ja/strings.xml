@@ -159,7 +159,6 @@
     <string name="token_usage_context_window_group_limit">（グループ上限 %1$s）</string>
     <string name="token_usage_context_window_group_limit_applied">（グループ上限に基づく %1$s）</string>
     <string name="token_usage_context_window_heuristic_warning">モデルが実際のコンテキストウィンドウを報告していません。これは推測値です。モデル詳細画面で修正してください。</string>
-    <string name="token_usage_context_window_group_unlimited">（無制限）</string>
     <string name="token_usage_max_output">最大出力</string>
     <string name="context_full_dialog_title">コンテキスト上限</string>
     <string name="context_full_dialog_body">会話コンテキストが上限に達しました。続けるには新しいチャットを開始するか、チャットをクリアしてください。下書きは保存されています — キャンセルで復元します。</string>
@@ -227,7 +226,7 @@
     <string name="env_var_add">追加</string>
     <string name="env_var_privacy_header">プライバシー</string>
     <string name="env_var_privacy_toggle">プライバシーモード</string>
-    <string name="env_var_privacy_footer">有効にすると、shell-execute の出力に含まれる環境変数の値はモデルに渡される前にマスクされます（例: `sk-1********ajhks`）。8 文字未満の値はすべて `*` に置き換えられます。チャットに表示される出力は変更されません。</string>
+    <string name="env_var_privacy_footer">プライバシーモードでは、ツール結果、復元した履歴、要約をモデルに送る前に既知の認証情報と明確な機密フィールドを隠します。新しい診断記録とツール履歴は常にマスクされます。元のファイルと画像は変更しません。画像内や任意にエンコードされた秘密は検出しません。マスク済みコピーで元のファイルを上書きせず、機密でないフィールドだけを編集してください。</string>
     <string name="env_var_restart_terminal_note">アシスタントが実行するコマンドは毎回これらの値を読み直すため（削除も含む）、再起動は不要です。タイムゾーンとプロキシの変更は開いているターミナルに反映されますが、その他の変数は反映されません。すでに実行中のプログラムは起動時の環境を保持します。</string>
     <string name="env_var_restart_terminal_body">変数はターミナルセッションの開始時に注入されます。すでに開いているターミナルは古い環境を保持するため、閉じて開き直すと反映されます。</string>
     <string name="env_var_restart_terminal_title">ターミナルセッション</string>
@@ -1391,7 +1390,10 @@
     <string name="model_group_detail_thinking_ultra">ウルトラ</string>
     <string name="model_group_detail_limit_context_window">コンテキストウィンドウを制限</string>
     <string name="model_group_detail_max_context">最大コンテキスト</string>
-    <string name="model_group_detail_unlimited">無制限</string>
+    <string name="model_group_detail_custom_context">カスタム</string>
+    <string name="model_group_detail_custom_context_title">カスタムコンテキスト上限</string>
+    <string name="model_group_detail_custom_context_input">コンテキスト上限（K トークン）</string>
+    <string name="model_group_detail_custom_context_range">最低 64,000 トークン</string>
     <string name="add_provider_subtitle_openai">OpenAI と、DeepSeek、Moonshot、Groq などの互換サービスに対応</string>
     <string name="add_provider_subtitle_anthropic">ClaudeおよびAnthropicプロトコル互換サービスで動作します</string>
     <string name="add_provider_subtitle_gemini">GeminiシリーズおよびGoogle AI Studioで動作します</string>

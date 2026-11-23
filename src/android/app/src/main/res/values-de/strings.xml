@@ -159,7 +159,6 @@
     <string name="token_usage_context_window_group_limit"> (Gruppenlimit %1$s)</string>
     <string name="token_usage_context_window_group_limit_applied"> (per Gruppenlimit %1$s)</string>
     <string name="token_usage_context_window_heuristic_warning">Das Modell meldet sein echtes Kontextfenster nicht — dies ist ein Schätzwert. Korrigieren Sie ihn in den Modelldetails.</string>
-    <string name="token_usage_context_window_group_unlimited"> (unbegrenzt)</string>
     <string name="token_usage_max_output">Max. Ausgabe</string>
     <string name="context_full_dialog_title">Kontext voll</string>
     <string name="context_full_dialog_body">Der Gesprächskontext hat sein Limit erreicht. Starte einen neuen Chat oder leere den Chat, um fortzufahren. Ihr Entwurf ist gespeichert — Abbrechen stellt ihn wieder her.</string>
@@ -227,7 +226,7 @@
     <string name="env_var_add">Hinzufügen</string>
     <string name="env_var_privacy_header">Datenschutz</string>
     <string name="env_var_privacy_toggle">Datenschutzmodus</string>
-    <string name="env_var_privacy_footer">Wenn aktiviert, werden in der Ausgabe von shell-execute erkannte Werte von Umgebungsvariablen vor der Weitergabe an das Modell maskiert (z. B. `sk-1********ajhks`). Werte mit weniger als 8 Zeichen werden vollständig durch `*` ersetzt. Die für den Nutzer sichtbare Ausgabe im Chat bleibt unverändert.</string>
+    <string name="env_var_privacy_footer">Der Datenschutzmodus verbirgt bekannte Zugangsdaten und eindeutig sensible Felder in Werkzeugergebnissen, wiederhergestelltem Verlauf und Zusammenfassungen vor dem Versand an das Modell. Neue Diagnoseaufzeichnungen und der Werkzeugverlauf werden immer bereinigt. Originaldateien und Bilder bleiben unverändert; Bildinhalte und beliebig kodierte Geheimnisse werden nicht geprüft. Bearbeiten Sie einzelne nicht sensible Felder, statt eine bereinigte Kopie über die Originaldatei zu schreiben.</string>
     <string name="env_var_restart_terminal_note">Von der Assistenz ausgeführte Befehle lesen diese Werte jedes Mal neu, Löschungen eingeschlossen, ein Neustart ist dafür nicht nötig. Änderungen an Zeitzone und Proxy werden in offene Terminals übertragen, andere Variablen nicht. Ein bereits laufendes Programm behält die Umgebung, mit der es gestartet ist.</string>
     <string name="env_var_restart_terminal_body">Variablen werden beim Start einer Terminal-Sitzung injiziert. Ein bereits geöffnetes Terminal behält seine alte Umgebung — schließen und neu öffnen, um Änderungen zu übernehmen.</string>
     <string name="env_var_restart_terminal_title">Terminal-Sitzungen</string>
@@ -1384,7 +1383,10 @@
     <string name="model_group_detail_thinking_ultra">Ultra</string>
     <string name="model_group_detail_limit_context_window">Kontextfenster begrenzen</string>
     <string name="model_group_detail_max_context">Max. Kontext</string>
-    <string name="model_group_detail_unlimited">Unbegrenzt</string>
+    <string name="model_group_detail_custom_context">Benutzerdefiniert</string>
+    <string name="model_group_detail_custom_context_title">Benutzerdefiniertes Kontextlimit</string>
+    <string name="model_group_detail_custom_context_input">Kontextlimit (K-Tokens)</string>
+    <string name="model_group_detail_custom_context_range">Mindestens 64,000 Tokens</string>
     <string name="add_provider_subtitle_openai">OpenAI und kompatible Dienste wie DeepSeek, Moonshot und Groq</string>
     <string name="add_provider_subtitle_anthropic">Funktioniert mit Claude und Diensten, die das Anthropic-Protokoll unterstützen</string>
     <string name="add_provider_subtitle_gemini">Funktioniert mit der Gemini-Serie und Google AI Studio</string>
