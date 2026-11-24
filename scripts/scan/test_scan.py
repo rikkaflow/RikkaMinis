@@ -23,6 +23,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -2268,6 +2269,12 @@ def exec_gate_fixture(shape="good"):
     if shape == "no_settle":
         settle = "        Thread.sleep(1)\n"
 
+    terminate_tail = "        if (shell != null) postRecycleMemoryRecovery()\n"
+    if shape == "unguarded_terminate":
+        # G8 regression: a draft id that never had a shell still runs the two
+        # GC rounds inside the send shell, before the user row is persisted.
+        terminate_tail = "        postRecycleMemoryRecovery()\n"
+
     extra_acquire = ""
     if shape == "bare_acquire":
         # A raw blocking acquire reappearing in the command path.
@@ -2333,6 +2340,13 @@ def exec_gate_fixture(shape="good"):
         "\n    private fun postRecycleMemoryRecoveryNow() {\n"
         + settle +
         "    }\n"
+        "\n    fun sessionDidTerminate(sessionId: String) {\n"
+        "        val shell = shells.remove(sessionId)\n"
+        "        lastInjectedKeys.remove(sessionId)\n"
+        "        lastActiveMs.remove(sessionId)\n"
+        "        shell?.stop()\n"
+        + terminate_tail +
+        "    }\n"
         "}\n"
     )
     if shape == "missing_file":
@@ -2390,6 +2404,13 @@ def test_exec_gate():
     code, out = run_scanner("exec_gate_release_check.py", root)
     check("missing target file fails instead of passing silently",
           code == 1 and "anchor lost" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("unguarded_terminate"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("recycle on a shell-less terminate caught",
+          code == 1 and "session terminate recovery not guarded" in out,
+          f"exit={code}\n{out}")
     shutil.rmtree(root)
 
 
@@ -3831,6 +3852,10 @@ def test_surgery_1122_gates():
 
 TOOL_ARGS_LOG_GATES = [
     ("tool_args_log_redaction_check", "SELFTEST=PASS", (REPO_ROOT,)),
+    # [fix/session-load-redaction-cost-1123] The per-item credential re-read
+    # gate: its arms are the pre-fix loop shape, the hoisted fix, and the
+    # already-snapshot call that must NOT be flagged.
+    ("redaction_loop_snapshot_check", "SELFTEST=PASS", (REPO_ROOT,)),
 ]
 
 def test_tool_args_log_redaction_gate():
@@ -3846,10 +3871,43 @@ def test_tool_args_log_redaction_gate():
         # The negative arm: with the fixture's redactor removed the gate MUST
         # report a violation, otherwise the selftest could be passing on a gate
         # that never flags anything.
-        check("%s selftest caught the dirty fixture" % script,
-              "dirty fixture is caught" in out, out[-280:])
+        # Each gate names its dirty arm differently; the shared assertion is
+        # that SOME dirty fixture was caught (a gate that flags nothing would
+        # otherwise pass on the teeth marker alone).
+        check("%s selftest caught a dirty fixture" % script,
+              "dirty" in out and "caught" in out, out[-280:])
         rc, out = run_scanner(script + ".py", *real_args)
         check("%s real tree green" % script, rc == 0, out[-280:])
+
+def test_privacy_switch_scope_gate():
+    print("━━━ privacy-mode switch scope gate (selftest teeth + real tree) ━━━")
+    script = "privacy_switch_scope_check"
+    proc = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
+        capture_output=True, text=True,
+    )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    check("%s selftest has teeth" % script,
+          proc.returncode == 0 and "SELFTEST=PASS" in out, out[-280:])
+    # The gate prints `SELFTEST ARM FAILED: <arm>` for every mutation that did
+    # NOT turn the tree red — i.e. a dirty tree the gate failed to catch. A gate
+    # with no teeth reports arms here instead of PASS.
+    check("%s caught every dirty fixture" % script,
+          "SELFTEST ARM FAILED" not in out, out[-280:])
+    # The negative control that matters most: the real tree must be green with
+    # the gate's own arms covering each judged sink.
+    rc, out = run_scanner(script + ".py", ".")
+    check("%s real tree green" % script, rc == 0, out[-280:])
+    # Read the arm names back from the GATE's own source. A hand-written list
+    # here only proved the list matched itself: deleting a real selftest arm
+    # left every one of these checks green.
+    with open(os.path.join(SCRIPT_DIR, script + ".py"), encoding="utf-8") as gate_file:
+        gate_src = gate_file.read()
+    arm_names = re.findall(r'\("(P[0-9A-Za-z]+) [^"]*",\s*mutate\(', gate_src)
+    check("%s arms are readable" % script, len(arm_names) >= 8, repr(arm_names))
+    for tag in ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"):
+        check("%s selftest arm present for %s" % (script, tag), tag in arm_names, repr(arm_names))
+
 
 TEST_ORDER = (
     "test_four_way",
@@ -3907,6 +3965,7 @@ TEST_ORDER = (
     "test_scan_parallel_local_refusal",
     "test_surgery_1122_gates",
     "test_tool_args_log_redaction_gate",
+    "test_privacy_switch_scope_gate",
 )
 
 RESULT_TAG = "@@TEST_RESULT@@"

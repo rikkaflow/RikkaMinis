@@ -323,6 +323,10 @@ internal fun ChatViewModel.offloadContextIfNeeded(
     var offloadedCount = 0
     var freedTokens = 0
 
+    // [fix/session-load-redaction-cost-1123] ONE credential read for the whole
+    // offload pass: this loop walks every candidate part, and the single-shot
+    // call would decrypt every credential again for each one.
+    val offloadSnapshot = com.rikkaminis.app.data.EnvVarRedactor.snapshot()
     for (candidate in candidates) {
         if (currentTokens <= targetTokens) break
 
@@ -337,8 +341,16 @@ internal fun ChatViewModel.offloadContextIfNeeded(
         val newPart: AgentContentPart? = when (part) {
             is AgentContentPart.ToolResult -> {
                 if (part.content.length > 500) {
+                    // [feat/privacy-mode-toggle-1124] The offloaded file is a
+                    // durable artifact the agent re-reads later, so it follows
+                    // the user's Privacy Mode switch rather than always masking.
+                    val payload = if (com.rikkaminis.app.data.EnvVarPrivacyStore.isEnabled) {
+                        com.rikkaminis.app.data.EnvVarRedactor.redactWithSnapshot(part.content, offloadSnapshot, null).text
+                    } else {
+                        part.content
+                    }
                     linuxPath = ContextOffload.offloadContent(
-                        context, sid, com.rikkaminis.app.data.EnvVarRedactor.redactForDiagnostics(part.content).text,
+                        context, sid, payload,
                         toolId = part.id, toolName = part.name,
                     )
                 }

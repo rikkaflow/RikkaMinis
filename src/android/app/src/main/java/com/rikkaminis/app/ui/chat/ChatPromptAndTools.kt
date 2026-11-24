@@ -389,11 +389,21 @@ internal suspend fun ChatViewModel.executeTool(
     // `result` stays the executor's own bytes: the defect-registry match and
     // the T7 outcome flag must read what actually ran. `modelResult` is the
     // only copy handed to the model.
-    val diagView = com.rikkaminis.app.data.EnvVarRedactor.redactForDiagnostics(result.output)
-    val modelView = com.rikkaminis.app.data.EnvVarRedactor.redactForModel(result.output)
+    // [fix/replay-guard-cost-1123] Both projections decrypt every credential;
+    // share one snapshot instead of paying the decrypt twice per tool result.
+    val privacySnapshot = com.rikkaminis.app.data.EnvVarRedactor.snapshot()
+    val diagView = com.rikkaminis.app.data.EnvVarRedactor.redactWithSnapshot(result.output, privacySnapshot, null)
+    val modelView = com.rikkaminis.app.data.EnvVarRedactor.redactForModel(result.output, privacySnapshot)
     val modelResult = result.copy(
         output = modelView.text,
-        privacyRedacted = result.privacyRedacted || modelView.hits > 0 || diagView.hits > 0 || safeArgs != argsJson,
+        // [feat/privacy-mode-toggle-1124] This flag means "the MODEL-facing
+        // projection changed real tool bytes" (see ToolExecutionResult). The
+        // diagnostics projection and the args copy are redacted unconditionally
+        // — including with the switch OFF — so folding them in here made the
+        // flag true while the model had in fact read the real bytes. Any future
+        // consumer that keys replay eligibility off this flag would then drop a
+        // capsule that still matches the request the provider saw.
+        privacyRedacted = result.privacyRedacted || modelView.hits > 0,
     )
 
     // T9: record tool result event
@@ -437,9 +447,14 @@ internal suspend fun ChatViewModel.executeTool(
             // Keep the registry match on the executor bytes, then project the
             // decorated MODEL copy. The outcome flag still describes execution.
             return result.copy(output = result.output + defectHint).let { hinted ->
-                val view = com.rikkaminis.app.data.EnvVarRedactor.redactForModel(hinted.output)
+                // [fix/replay-guard-and-send-latency-1123] Reuse the snapshot
+                // this function already took: this branch decorated the same
+                // tool result and then paid a SECOND full credential decrypt.
+                // Bounded to this one call — the snapshot must not outlive the
+                // operation, so it is never hoisted above the executor.
+                val view = com.rikkaminis.app.data.EnvVarRedactor.redactForModel(hinted.output, privacySnapshot)
                 hinted.copy(output = view.text,
-                    privacyRedacted = hinted.privacyRedacted || view.hits > 0 || diagView.hits > 0 || safeArgs != argsJson)
+                    privacyRedacted = hinted.privacyRedacted || view.hits > 0)
             }
         }
     }

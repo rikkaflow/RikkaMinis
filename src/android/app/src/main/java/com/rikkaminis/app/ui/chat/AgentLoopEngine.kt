@@ -4806,12 +4806,17 @@ internal class AgentLoopEngine(
             }
 
             // ============================ Pass 3 ============================
+            // [fix/session-load-redaction-cost-1123] ONE credential read for the
+            // whole pass. Each single-shot redaction call decrypts every env var
+            // and every provider key, so a per-tool-result call multiplied the
+            // decrypt cost by the number of tool calls in the turn.
+            val pass3Snapshot = com.rikkaminis.app.data.EnvVarRedactor.snapshot()
             for (p in pending) {
                 val id = p.id
                 val name = p.name
                 val paramsMap = p.paramsMap
                 val result = resultsById[id]!!
-                android.util.Log.d("ToolChain[VM]", "[turn=$turn] host.executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${com.rikkaminis.app.data.EnvVarRedactor.redactForDiagnostics(result.output).text.take(200)}")
+                android.util.Log.d("ToolChain[VM]", "[turn=$turn] host.executeTool END name=$name success=${result.success} title=${result.toolTitle} outputLen=${result.output.length} output=${com.rikkaminis.app.data.EnvVarRedactor.redactWithSnapshot(result.output, pass3Snapshot, null).text.take(200)}")
 
                 // Record post-execution. WARNING text is appended to the tool
                 // result so the model sees it on its next turn. No block here —
@@ -4824,8 +4829,16 @@ internal class AgentLoopEngine(
                     errorMessage = errMsgForDetector,
                     toolCallId = id,
                 )
-                if (result.privacyRedacted) {
-                    transcriptRedactions[id] = com.rikkaminis.app.data.EnvVarRedactor.redactForDiagnostics(result.output).text
+                // [feat/privacy-mode-toggle-1124] Only a real model-facing
+                // redaction replaces the persisted payload. With Privacy Mode
+                // OFF the model already read the real bytes, so storing a
+                // diagnostics-redacted copy here would hand the NEXT turn a
+                // placeholder in place of the value it is about to reuse
+                // (device log 2026-11-24: `eval: line 892: [MINIS_REDACTED]:
+                // not found`). The SensitiveCommandPolicy entry above is a
+                // different rule and stays unconditional.
+                if (result.privacyRedacted && com.rikkaminis.app.data.EnvVarPrivacyStore.isEnabled) {
+                    transcriptRedactions[id] = com.rikkaminis.app.data.EnvVarRedactor.redactWithSnapshot(result.output, pass3Snapshot, null).text
                 }
                 val outputForLLM = if (postRecord.level == Level.WARNING && postRecord.message != null) {
                     AppLogger.debug("ChatViewModel",
