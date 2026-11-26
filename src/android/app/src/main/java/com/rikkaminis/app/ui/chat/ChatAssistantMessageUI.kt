@@ -11,11 +11,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -67,6 +63,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.key
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
@@ -75,6 +83,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.graphics.drawscope.withTransform
+import com.rikkaminis.app.ui.components.DecorativeSpinner
+import com.rikkaminis.app.ui.components.animationLayer
+import com.rikkaminis.app.ui.components.decorativePhase
+import com.rikkaminis.app.ui.components.rememberDecorativeTick
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.boundsInWindow
@@ -94,9 +109,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.ui.theme.ChatColors
@@ -229,7 +246,67 @@ internal fun AssistantMessageView(
     // yet; drives the TypingIndicator elapsed counter. Default 0 keeps every
     // other caller (previews, legacy paths) rendering the plain indicator.
     awaitingResponseSinceMs: Long = 0L,
+    // NOTE: there is deliberately no "is the user scrolling / browsing history"
+    // input here any more. It used to postpone the first automatic fold, which
+    // meant scrolling through an unfolded transcript opened every segment —
+    // the opposite of what it was meant to protect. Fold state now comes from
+    // the block list plus explicit taps only.
+    // The live preference is required: callers must not silently bypass OFF.
+    processFoldEnabled: Boolean,
+    // Bumped by the "back to newest" FAB. Closing the open segments is part of
+    // WHAT THAT BUTTON MEANS ("show me the newest thing"), not a second feature
+    // hung on it: the tap already moves the viewport by a screen or more, so the
+    // collapse costs nothing the reader can see.
+    collapseAllEpoch: Int = 0,
 ) {
+    // Fold state = the plan plus explicit taps, nothing else. The previous
+    // version also tracked "already auto-folded once" and wrote it only while
+    // the list was NOT being scrolled, so scrolling a transcript that had never
+    // been folded re-opened every segment — the message blew open exactly when
+    // the user was trying to read it. That bookkeeping is gone.
+    var foldChoices by rememberSaveable(message.id) { mutableStateOf(hashMapOf<String, Boolean>()) }
+    // The epoch `foldChoices` was recorded under. Saved with the choices so a
+    // restored row cannot resurrect a choice that a later "close everything"
+    // has already retired (both halves survive together or neither does).
+    var foldChoicesEpoch by rememberSaveable(message.id) { mutableStateOf(0) }
+    // Choices in force right now. A "close everything" (the back-to-newest FAB)
+    // bumps [collapseAllEpoch]; every choice recorded under an older epoch is
+    // retired — including rows that are not composed at that moment, which is
+    // the case this is here for: an effect inside a row never runs for the rows
+    // scrolled off screen, and those are exactly the ones the reader left open
+    // further up.
+    val activeChoices = ChatProcessFoldPlanner.liveChoices(foldChoices, foldChoicesEpoch, collapseAllEpoch)
+    // Record a tap under the CURRENT epoch, so it survives later composition
+    // and is retired only by a later "close everything".
+    fun writeChoices(next: Map<String, Boolean>) {
+        foldChoices = HashMap(next)
+        foldChoicesEpoch = collapseAllEpoch
+    }
+    val foldSegments = remember(message.toolBlocks, message.isStreaming, processFoldEnabled) {
+        ChatProcessFoldPlanner.plan(message.toolBlocks, message.isStreaming, processFoldEnabled)
+    }
+    fun segmentMode(segment: ChatProcessFoldPlanner.Segment): ChatProcessFoldPlanner.Mode =
+        ChatProcessFoldPlanner.mode(segment.key, activeChoices, segment.liveTail)
+    val segmentByIndex = buildMap {
+        foldSegments.forEach { segment -> segment.memberIndices.forEach { put(it, segment) } }
+    }
+
+    // ── [auto-fold] an OPEN segment is never closed by a scroll ──────────────
+    // There used to be a "fold it once it leaves the top of the viewport" rule
+    // here, driven by a zero-height probe. Two reasons it is gone:
+    //  1. It measured with `boundsInWindow()`, which returns Rect.Zero for a
+    //     zero-height node (AndroidX LayoutCoordinates.kt), so the segment's
+    //     bottom read as 0 and "has left the top" was true at all times. A
+    //     segment the reader opened folded itself one frame later — a manual
+    //     expand was impossible to keep, on every message but the live one.
+    //  2. Its only possible target was a FULL segment, i.e. exactly the one the
+    //     reader had just opened (a settled segment is COLLAPSED by default and
+    //     a running one shows TAIL). So the rule could only ever undo intent.
+    // Folding stays what the user asked for: a settled segment arrives
+    // collapsed, a tap opens or closes it, and the back-to-newest button closes
+    // what was left open — see `activeChoices` above for why that comparison,
+    // and not an effect, is what makes the button reach rows off screen.
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -269,13 +346,41 @@ internal fun AssistantMessageView(
         val hasAnyTextBlock = message.toolBlocks.any { it.kind == "text" }
         val lastTextBlockIndex = message.toolBlocks.indexOfLast { it.kind == "text" }
         message.toolBlocks.forEachIndexed { index, block ->
+            val segment = segmentByIndex[index]
+            if (segment != null) {
+                val mode = segmentMode(segment)
+                if (segment.range.first == index) {
+                    key("process:${message.id}:${segment.key}") {
+                        ChatProcessSummary(
+                            segment = segment,
+                            mode = mode,
+                            onToggle = {
+                                // A tap flips the CURRENT visual state. Closing a
+                                // running segment clears the explicit choice so the
+                                // tail comes back instead of freezing the row shut.
+                                val next = ChatProcessFoldPlanner.nextChoice(mode, segment.liveTail)
+                                writeChoices(
+                                    HashMap(activeChoices).apply {
+                                        if (next == null) remove(segment.key) else put(segment.key, next)
+                                    },
+                                )
+                            },
+                        )
+                    }
+                }
+                // COLLAPSED replaces the whole span with the row above; TAIL keeps
+                // only the newest steps; FULL keeps everything (the user opened it).
+                if (mode == ChatProcessFoldPlanner.Mode.COLLAPSED) return@forEachIndexed
+                if (mode == ChatProcessFoldPlanner.Mode.TAIL && index < segment.tailStart) {
+                    return@forEachIndexed
+                }
+            }
+            // Stable block scope, independent of added summaries and appended tokens.
+            key(message.id, block.id) {
             when (block.kind) {
                 "thinking" -> {
-                    // T300: same per-message thinking-level gate as the
-                    // FlatChatItem path. AssistantMessageView is currently
-                    // unreferenced (legacy pre-FlatChatItem code) but the
-                    // gate stays here so any future re-introduction
-                    // doesn't silently bring back the always-render bug.
+                    // The live aggregate path must use the same per-message thinking-level
+                    // gate as restored/legacy rows; never resurrect disabled reasoning.
                     val effectiveLevel = message.thinkingLevel
                         ?: com.rikkaminis.app.data.model.ThinkingLevel.MEDIUM
                     if (effectiveLevel.isEnabled) {
@@ -344,6 +449,7 @@ internal fun AssistantMessageView(
                     }
                 }
             }
+            }
         }
 
         // [fix/typing-band-live] The in-bubble typing indicator moved to the
@@ -379,6 +485,104 @@ internal fun AssistantMessageView(
             InlineErrorBanner(error = message.error, errorDetail = message.errorDetail, onRetry = onRetry)
         }
     }
+}
+
+/**
+ * The process row. Plain text on one line — no card, no pill, no background: a
+ * filled container around a line of meta text was itself part of what made the
+ * old row read as a placeholder instead of a record of what happened.
+ *
+ * The row is also the live progress line while a turn runs: its counts grow as
+ * calls finish, which is what keeps the transcript feeling active without any
+ * height animation (an assistant message is ONE LazyColumn item, so a height
+ * animation re-measures the whole row every frame — see ThinkingReadPlanner).
+ */
+@Composable
+private fun ChatProcessSummary(
+    segment: ChatProcessFoldPlanner.Segment,
+    mode: ChatProcessFoldPlanner.Mode,
+    onToggle: () -> Unit,
+) {
+    val expansionLabel = stringResource(
+        if (mode == ChatProcessFoldPlanner.Mode.COLLAPSED) {
+            R.string.chat_process_collapsed
+        } else {
+            R.string.chat_process_expanded
+        },
+    )
+    // Counts only: no title, no duration.
+    //  - The title came from the segment's own last reasoning (else the last
+    //    call's label) — the final second of a run that may hold eighty calls,
+    //    and usually a headless fragment ("按真实diff行号修正…"). It described
+    //    nothing the row's reader wanted.
+    //  - The duration was the SUM of per-call durations (parallel calls counted
+    //    twice, not wall time) and is not persisted with the tool_use part, so
+    //    it vanished on reload and the same segment changed shape across a
+    //    restart.
+    val toolsText = stringResource(
+        if (segment.allCallsSucceeded) R.string.chat_process_tools else R.string.chat_process_tool_calls,
+        segment.toolCount,
+    )
+    val failedText = if (segment.failedCount > 0) {
+        stringResource(R.string.chat_process_failed, segment.failedCount)
+    } else {
+        null
+    }
+    val cancelledText = if (segment.cancelledCount > 0) {
+        stringResource(R.string.chat_process_cancelled, segment.cancelledCount)
+    } else {
+        null
+    }
+    val deduplicatedText = if (segment.deduplicatedCount > 0) {
+        stringResource(R.string.chat_process_deduplicated, segment.deduplicatedCount)
+    } else {
+        null
+    }
+    val neutral = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth()
+            .semantics { stateDescription = expansionLabel }
+            .clickable(role = Role.Button, onClick = onToggle)
+            .padding(vertical = 6.dp),
+    ) {
+        Icon(
+            if (mode == ChatProcessFoldPlanner.Mode.COLLAPSED) {
+                Icons.Default.KeyboardArrowRight
+            } else {
+                Icons.Default.KeyboardArrowDown
+            },
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            modifier = Modifier.size(14.dp),
+        )
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = buildAnnotatedString {
+                withStyle(SpanStyle(color = neutral)) { append(toolsText) }
+                // Failures are the one detail worth colouring: a collapsed
+                // segment holding them must say so from the row alone. The rest
+                // stays neutral — a whole red line shouted for one bad call.
+                appendMetaPart(failedText, ToolErrorColor, neutral)
+                appendMetaPart(cancelledText, neutral, neutral)
+                appendMetaPart(deduplicatedText, neutral, neutral)
+            },
+            fontSize = 12.5.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** Appends " · <text>" to a summary row, or nothing when [text] is null. */
+private fun androidx.compose.ui.text.AnnotatedString.Builder.appendMetaPart(
+    text: String?,
+    color: Color,
+    neutral: Color,
+) {
+    if (text == null) return
+    withStyle(SpanStyle(color = neutral.copy(alpha = 0.7f))) { append(" · ") }
+    withStyle(SpanStyle(color = color)) { append(text) }
 }
 
 /**
@@ -673,24 +877,9 @@ internal fun ToolCallPill(
         else String.format("%.0fs", seconds)
     } else null
 
-    // T125: drop the spinner that used to replace the tool icon while
-    // running. iOS only animates a left→right shimmer sweep across the
-    // pill background and keeps the typed icon visible — the spinner
-    // both fought the icon for attention and looked stylistically off
-    // next to the iOS counterpart. The bottom FloatingToolStatusBar
-    // still shows a CircularProgressIndicator (that is the running-tool
-    // status surface, where a spinner reads correctly).
-    val shimmerTranslate = if (isRunning) {
-        val transition = rememberInfiniteTransition(label = "toolPillShimmer")
-        transition.animateFloat(
-            initialValue = -1f,
-            targetValue = 2f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 2800, easing = LinearEasing),
-            ),
-            label = "toolPillShimmerTranslate",
-        )
-    } else null
+    // Decorative tick is observed only by the sibling overlay's draw lambda.
+    // The typed icon, title, progress badge and actions remain in a static layer.
+    val shimmerTick = if (isRunning) rememberDecorativeTick() else null
 
     // [T-android-tool-bubble-longpress-menu] Long-press menu state, scoped
     // to this pill. The DropdownMenu is anchored to the pill via the Box
@@ -700,7 +889,7 @@ internal fun ToolCallPill(
     // Pill stretches up to the full row width so long titles can ellipsize
     // without pushing the duration out of view. Title takes the remaining
     // space via weight(1f), duration stays fixed-width (softWrap=false).
-    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).animateContentSize()) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
       Box(modifier = Modifier.weight(1f, fill = false)) {
         Row(
             modifier = Modifier
@@ -710,27 +899,6 @@ internal fun ToolCallPill(
                 )
                 .border(0.5.dp, ChatColors.toolBorder, CircleShape)
                 .clip(CircleShape)
-                .then(
-                    if (shimmerTranslate != null) {
-                        Modifier.drawWithContent {
-                            drawContent()
-                            val w = size.width
-                            val band = w * 0.6f
-                            val x = shimmerTranslate.value * w
-                            drawRect(
-                                brush = Brush.linearGradient(
-                                    colors = listOf(
-                                        Color.White.copy(alpha = 0f),
-                                        Color.White.copy(alpha = 0.18f),
-                                        Color.White.copy(alpha = 0f),
-                                    ),
-                                    start = Offset(x, 0f),
-                                    end = Offset(x + band, 0f),
-                                ),
-                            )
-                        }
-                    } else Modifier,
-                )
                 .combinedClickable(
                     onClick = { onOpenDetail(block.id) },
                     onLongClick = if (onRerunFromHere != null || onCopyDetails != null) {
@@ -811,6 +979,28 @@ internal fun ToolCallPill(
                 Spacer(modifier = Modifier.width(8.dp))
                 ToolStopButton(onStop = onStop)
             }
+        }
+        if (shimmerTick != null) {
+            // No pointer/semantics handlers: this sibling cannot intercept tool actions.
+            Box(
+                modifier = Modifier.matchParentSize()
+                    .animationLayer()
+                    .clip(CircleShape)
+                    .drawWithCache {
+                        val band = size.width * 0.6f
+                        val brush = Brush.linearGradient(
+                            colors = listOf(Color.Transparent, Color.White.copy(alpha = 0.18f), Color.Transparent),
+                            start = Offset.Zero,
+                            end = Offset(band, 0f),
+                        )
+                        onDrawBehind {
+                            val x = (decorativePhase(shimmerTick.value, 2800) * 3f - 1f) * size.width
+                            withTransform({ translate(left = x) }) {
+                                drawRect(brush = brush, size = Size(band, size.height))
+                            }
+                        }
+                    },
+            )
         }
         // [T-android-tool-bubble-longpress-menu] Long-press menu anchored to
         // the pill. Items mirror the user-bubble menu's style (MinisMenu +
@@ -948,7 +1138,7 @@ internal fun ToolCallRunGroup(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isRunning) {
-                    CircularProgressIndicator(
+                    DecorativeSpinner(
                         modifier = Modifier.size(13.dp),
                         color = groupAccent,
                         strokeWidth = 1.5.dp,
@@ -1057,7 +1247,11 @@ internal fun ToolCallRunGroup(
 // ─── Thinking Block (iOS: collapsible "Deep Thinking" section, blue tint) ────
 
 @Composable
-internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: Boolean = true) {
+internal fun ThinkingBlock(
+    block: AssistantBlock,
+    isStreaming: Boolean,
+    isLast: Boolean = true,
+) {
     // Per-block expand state, keyed by block.id so the user's manual toggle on
     // an earlier (finished) thinking block survives recomposition while a
     // later block is still streaming. The previous LaunchedEffect snapped
@@ -1078,13 +1272,12 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
     // a settings change lands on the next mounted row, not mid-stream.
     val showThinkingDuration = remember { thinkingDurationVisibleEnabled(context) }
     val showThinkingCharCount = remember { thinkingCharCountVisibleEnabled(context) }
-    var expanded by remember(block.id) { mutableStateOf(autoExpandThinking && isLast && isStreaming) }
-    var userTouched by remember(block.id) { mutableStateOf(false) }
-    LaunchedEffect(block.id, isStreaming) {
-        // One-shot auto-collapse when streaming for this block ends, but only
-        // if the user hasn't taken control of its state yet.
-        if (!isStreaming && !userTouched) expanded = false
-    }
+    // Null = automatic. A header tap or a drag away from the live tail can keep the body open.
+    var manualChoice by rememberSaveable(block.id) { mutableStateOf<Boolean?>(null) }
+    // Only a header OPEN starts a new reading position. A drag that keeps the body
+    // open must preserve the current position and be able to resume tail-follow.
+    var headerOpenGeneration by rememberSaveable(block.id) { mutableStateOf(0) }
+    val expanded = ThinkingReadPlanner.expanded(manualChoice, autoExpandThinking, isStreaming, isLast)
     val thinkingBlue = ChatColors.thinking
     val charCount = block.content.length
     // [T-thinking-header-toggles] Duration + char count are user-toggled; the
@@ -1097,24 +1290,25 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         durationMs = block.durationMs,
         charCount = charCount,
     )
-    // [T-thinking-render-perf-android] Compose `Text` measures/lays out the
-    // ENTIRE string even when only ~300dp is visible, so a 200k-char thinking
-    // block froze the UI (and a per-token recomposition re-measured all 200k
-    // each tick). Two tiers guard this:
-    //  • > HARD_CAP: the inline scroller can't render it at all — show a
-    //    "View full content" entry that opens a native TextView dialog
-    //    (Android TextView handles large text far better than Compose Text).
-    //  • otherwise: render only the last WINDOW chars (tail) — capping layout
-    //    cost to O(WINDOW) regardless of total length.
-    val thinkingWindowSize = 8000
-    val thinkingHardCap = 100_000
+    // Inline layout stays bounded to 8K/300dp. The >100K hard cap bypasses the
+    // inline Text altogether; all truncated stopped blocks offer the lazy full viewer.
+    val thinkingWindowSize = ThinkingReadPlanner.WINDOW_CHARS
+    val thinkingHardCap = ThinkingReadPlanner.INLINE_HARD_CAP
     val overHardCap = charCount > thinkingHardCap
     var showFullContent by remember(block.id) { mutableStateOf(false) }
+    // Viewer receives an explicit stable snapshot; appending tokens cannot resplit it.
+    var fullContentSnapshot by remember(block.id) { mutableStateOf("") }
+    val expansionLabel = stringResource(
+        if (expanded) R.string.chat_process_expanded else R.string.chat_process_collapsed,
+    )
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
+            .background(thinkingBlue.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+            .border(0.5.dp, thinkingBlue.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(12.dp))
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         // Header row — only the header reacts to taps. Mirrors iOS, where
@@ -1125,19 +1319,20 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable {
-                    userTouched = true
-                    // [T-thinking-render-perf-android] Over the hard cap the
-                    // inline scroller is bypassed entirely; tapping the header
-                    // opens the native full-content viewer instead of toggling
-                    // the (never-shown) inline expansion.
-                    if (overHardCap) showFullContent = true
-                    else expanded = !expanded
+                .semantics { stateDescription = expansionLabel }
+                .clickable(role = Role.Button) {
+                    if (overHardCap) {
+                        fullContentSnapshot = block.content
+                        showFullContent = true
+                    } else {
+                        if (!expanded) headerOpenGeneration++
+                        manualChoice = !expanded
+                    }
                 },
         ) {
             if (isStreaming && block.toolStatus != ToolBlockStatus.SUCCESS) {
                 // iOS: ProgressView().controlSize(.mini) while streaming
-                CircularProgressIndicator(
+                DecorativeSpinner(
                     modifier = Modifier.size(13.dp),
                     color = thinkingBlue,
                     strokeWidth = 1.5.dp,
@@ -1211,7 +1406,7 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
             } else {
                 Icon(
                     imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    contentDescription = expansionLabel,
                     tint = thinkingBlue.copy(alpha = 0.5f),
                     modifier = Modifier.size(14.dp),
                 )
@@ -1223,49 +1418,41 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         // block is streaming, manual drag at any time, and pause-on-user-scroll
         // so a user reading earlier reasoning isn't yanked back to the tail by
         // the next token.
+        // A fresh AnimatedVisibility node created with visible=true does NOT
+        // animate; with the node kept in composition and driven through a
+        // transition state, every tap runs the enter/exit animation instead of
+        // snapping open (the "sometimes it just jumps" report).
+        val thinkingBodyVisible = remember(block.id) {
+            MutableTransitionState(expanded && !overHardCap)
+        }
+        LaunchedEffect(expanded, overHardCap) {
+            thinkingBodyVisible.targetState = expanded && !overHardCap
+        }
         AnimatedVisibility(
-            visible = expanded && !overHardCap,
+            visibleState = thinkingBodyVisible,
             // Smooth height + fade on collapse/expand: without the animation
             // the block's height snaps to zero the instant streaming ends,
             // yanking the viewport (the "content suddenly jumps" feel).
             enter = expandVertically(
-                animationSpec = tween(durationMillis = 220),
-            ) + fadeIn(animationSpec = tween(durationMillis = 160)),
+                animationSpec = tween(durationMillis = ThinkingReadPlanner.EXPAND_MS),
+                expandFrom = Alignment.Top,
+            ) + fadeIn(animationSpec = tween(durationMillis = ThinkingReadPlanner.FADE_MS)),
             exit = shrinkVertically(
-                animationSpec = tween(durationMillis = 220),
-            ) + fadeOut(animationSpec = tween(durationMillis = 160)),
+                animationSpec = tween(durationMillis = ThinkingReadPlanner.EXPAND_MS),
+                shrinkTowards = Alignment.Top,
+            ) + fadeOut(animationSpec = tween(durationMillis = ThinkingReadPlanner.FADE_MS)),
         ) {
-            val scrollState = rememberScrollState()
-            // [T-android-thinking-inner-scroll] Pause auto-follow once the user
-            // scrolls away from the bottom; resume it when they return. iOS
-            // pulls the user back unconditionally — but that fights every
-            // touch on Compose's smaller pause-threshold scroller, so we
-            // honor the user's drag the way the outer chat list does.
-            var userScrolledAway by remember(block.id) { mutableStateOf(false) }
-            // [F-14 meta-audit-1028] Pausing the *scroll* wasn't enough: the
-            // window below is anchored to the tail, so on every token it
-            // dropped another slice from the head and re-based the whole
-            // string — the lines the reader was looking at slid up out of the
-            // viewport even though `scrollTo` was never called. Pin the head
-            // of the visible slice for as long as the pause lasts; release it
-            // (snap back to the live tail) the moment they return to the
-            // bottom, which the collector below already detects via gap <= 4.
-            var frozenWindowStart by remember(block.id) { mutableStateOf<Int?>(null) }
-            // [T-thinking-render-perf-android] Render only the tail window so
-            // Compose lays out at most `thinkingWindowSize` chars. Recompute
-            // cost is O(window), not O(total). The cut snaps to the next
-            // newline (within 200 chars) so we don't start mid-line.
+            // Compose otherwise reveals the bottom edge first, even at scroll offset 0.
+            // A new header-open key starts at 0 without a post-layout scroll. Reusing the
+            // key during drag/recomposition/restoration keeps the reader's scroll state.
+            val scrollState = key(headerOpenGeneration) { rememberScrollState() }
+            val isDragging by scrollState.interactionSource.collectIsDraggedAsState()
+            var readAnchor by remember(block.id, headerOpenGeneration) { mutableStateOf(ThinkingReadPlanner.Anchor()) }
+            // Keep the frozenWindowStart contract: a real drag pins the original source
+            // offset, not merely the scroller's pixel position, until the reader returns.
+            val frozenWindowStart = readAnchor.frozenWindowStart
             val tailWindowStart = remember(block.content) {
                 thinkingTailWindowStart(block.content, thinkingWindowSize)
-            }
-            LaunchedEffect(userScrolledAway, tailWindowStart) {
-                if (userScrolledAway) {
-                    // Capture at pause time — without this the head would keep
-                    // advancing on the very next token.
-                    if (frozenWindowStart == null) frozenWindowStart = tailWindowStart
-                } else if (frozenWindowStart != null) {
-                    frozenWindowStart = null
-                }
             }
             val isTruncated = charCount > thinkingWindowSize
             val displayContent = remember(block.content, tailWindowStart, frozenWindowStart) {
@@ -1276,55 +1463,35 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                     frozen = frozenWindowStart != null,
                 )
             }
-            LaunchedEffect(scrollState, block.id) {
-                snapshotFlow {
-                    Triple(
-                        scrollState.value,
-                        scrollState.maxValue,
-                        scrollState.isScrollInProgress,
+            val currentTailStart by rememberUpdatedState(tailWindowStart)
+            LaunchedEffect(scrollState, block.id, isDragging) {
+                snapshotFlow { scrollState.value to scrollState.maxValue }.collect { (value, max) ->
+                    val nextAnchor = ThinkingReadPlanner.updateAnchor(
+                        readAnchor, value, max, isDragging, currentTailStart,
                     )
-                }.collect { (v, max, dragging) ->
-                    // A nonzero gap from the bottom while the user is actively
-                    // dragging counts as "they took control". We don't flip
-                    // back until the gap closes — gives them room to scroll
-                    // up briefly without ping-ponging.
-                    val gap = (max - v).coerceAtLeast(0)
-                    when {
-                        dragging && gap > 4 -> userScrolledAway = true
-                        gap <= 4 -> userScrolledAway = false
-                    }
+                    readAnchor = nextAnchor
+                    if (manualChoice == null && nextAnchor.isReadingHistory) manualChoice = true
                 }
             }
-            // [F-1 sweep1013] `block` is a plain parameter, so the old
-            // snapshotFlow { block.content.length } registered no snapshot
-            // dependency and fired only once — the live tail froze after the
-            // first tick. rememberUpdatedState hands the closure a State whose
-            // .value tracks every recomposition, so content growth is
-            // observable again (same fix as StreamingMarkdownText f255; this
-            // is the second family occurrence).
+            // maxValue changes AFTER layout. Observe it as well as text length so an
+            // automatic live body follows a growing tail, pauses on drag and resumes
+            // when the reader returns to the bottom. An explicit reopen starts a read
+            // at the top and must not be pulled back down by the next token.
+            val followThinkingTail = isStreaming && expanded && headerOpenGeneration == 0
             val currentBlock by rememberUpdatedState(block)
-            LaunchedEffect(scrollState, block.id, isStreaming) {
-                if (!isStreaming) return@LaunchedEffect
-                snapshotFlow { currentBlock.content.length }
-                    .collect {
-                        if (userScrolledAway) return@collect
-                        // scrollTo (not animateScrollTo) — animating fights
-                        // back-to-back token ticks; iOS uses a 0.15s linear
-                        // animation, but Compose's animateScrollTo cancels
-                        // any in-flight scroll, so streaming bursts get
-                        // jankier than a direct snap.
-                        scrollState.scrollTo(scrollState.maxValue)
-                    }
+            val currentDragging by rememberUpdatedState(isDragging)
+            LaunchedEffect(scrollState, block.id, followThinkingTail) {
+                if (!followThinkingTail) return@LaunchedEffect
+                snapshotFlow {
+                    Triple(currentBlock.content.length, scrollState.maxValue, currentDragging to readAnchor.isReadingHistory)
+                }.collect {
+                    if (readAnchor.isReadingHistory || currentDragging) return@collect
+                    scrollState.scrollTo(scrollState.maxValue)
+                }
             }
             Column(
                 modifier = Modifier
                     .padding(top = 6.dp)
-                    // Expanded content keeps the tinted container (moved here
-                    // from the outer Column, which is now a plain one-line
-                    // header when collapsed — the lightweight form).
-                    .background(thinkingBlue.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
-                    .border(0.5.dp, thinkingBlue.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
-                    .clip(RoundedCornerShape(12.dp))
                     .heightIn(max = 300.dp)
                     .verticalScroll(scrollState),
             ) {
@@ -1347,29 +1514,49 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                     lineHeight = 19.sp,
                 )
             }
+            // Only inside the expanded body: a collapsed chip stays a single
+            // line, so the entry cannot widen or add a row to the idle block.
+            if (!isStreaming && isTruncated) {
+                Box(Modifier.fillMaxWidth()) {
+                Text(
+                    text = stringResource(R.string.thinking_view_full),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = thinkingBlue,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(role = Role.Button) {
+                            fullContentSnapshot = block.content
+                            showFullContent = true
+                        }
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+                }
+            }
         }
 
-        // [T-thinking-render-perf-android] Hard-cap full-content viewer. A
-        // native TextView (selectable, scrollable) renders arbitrarily large
-        // thinking text without the Compose `Text` measure freeze.
-        if (overHardCap && showFullContent) {
+        if (showFullContent) {
             ThinkingFullContentDialog(
-                content = block.content,
+                content = fullContentSnapshot,
                 onDismiss = { showFullContent = false },
             )
         }
     }
 }
 
-/**
- * [T-thinking-render-perf-android] Full-screen viewer for thinking content
- * that exceeds the inline hard cap. Wraps a native Android [android.widget.TextView]
- * (inside a scroller) — it lays out very large strings far more cheaply than
- * Compose `Text`, and stays selectable.
- */
+/** Full-content snapshot: split off-main once per explicit opening; lay out only visible chunks. */
 @Composable
 private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
     val textColor = MaterialTheme.colorScheme.onSurface
+    val snapshot = content
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var chunks by remember(content) { mutableStateOf<List<IntRange>?>(null) }
+    var copying by remember { mutableStateOf(false) }
+    LaunchedEffect(content) {
+        chunks = withContext(Dispatchers.Default) { ThinkingReadPlanner.chunks(content) }
+    }
     androidx.compose.ui.window.Dialog(
         onDismissRequest = onDismiss,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
@@ -1378,63 +1565,87 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
             Column(modifier = Modifier.fillMaxSize()) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Text(
                         text = stringResource(R.string.chat_deep_thinking),
                         fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = ChatColors.link,
+                        modifier = Modifier.weight(1f),
                     )
-                    Spacer(modifier = Modifier.weight(1f))
-                    MinisTextButton(onClick = onDismiss) {
-                        Text(text = stringResource(android.R.string.ok))
-                    }
+                    MinisTextButton(enabled = !copying, onClick = {
+                        scope.launch {
+                            copying = true
+                            try {
+                                copyThinkingFullContent(context, content)
+                                android.widget.Toast.makeText(
+                                    context,
+                                    if (ThinkingReadPlanner.canCopyAsText(content.length)) R.string.chat_process_copied
+                                    else R.string.chat_process_copied_file,
+                                    android.widget.Toast.LENGTH_LONG,
+                                ).show()
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                android.widget.Toast.makeText(context, R.string.chat_process_copy_failed, android.widget.Toast.LENGTH_LONG).show()
+                            } finally { copying = false }
+                        }
+                    }) { Text(stringResource(R.string.chat_process_copy_all)) }
+                    MinisTextButton(onClick = onDismiss) { Text(stringResource(android.R.string.ok)) }
                 }
-                androidx.compose.ui.viewinterop.AndroidView(
-                    factory = { ctx ->
-                        android.widget.ScrollView(ctx).apply {
-                            addView(
-                                android.widget.TextView(ctx).apply {
-                                    textSize = 13f
-                                    setTextColor(textColor.toArgb())
-                                    setTextIsSelectable(true)
-                                    setPadding(36, 24, 36, 48)
-                                    text = content
-                                }
+                val ranges = chunks
+                if (ranges == null) {
+                    DecorativeSpinner(color = textColor, modifier = Modifier.padding(24.dp).size(40.dp))
+                } else {
+                    LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        items(count = ranges.size, key = { ranges[it].first }) { index ->
+                            val range = ranges[index]
+                            // Shadow only inside the lazy row: sync compares at most 4K,
+                            // while Copy above always receives the COMPLETE dialog snapshot.
+                            val content = remember(snapshot, range) { snapshot.substring(range.first, range.last + 1) }
+                            androidx.compose.ui.viewinterop.AndroidView(
+                                factory = { ctx ->
+                                    android.widget.TextView(ctx).apply {
+                                        textSize = 13f
+                                        setTextColor(textColor.toArgb())
+                                        setTextIsSelectable(true)
+                                        // Layout padding in dp rather than raw device pixels.
+                                        val inset = (12 * resources.displayMetrics.density).toInt()
+                                        setPadding(inset, 0, inset, 0)
+                                        text = content
+                                    }
+                                },
+                                update = { textView ->
+                                    textView.setTextColor(textColor.toArgb())
+                                    if (shouldSyncFullContentText(textView.text, content)) {
+                                        textView.text = content
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
                             )
                         }
-                    },
-                    // [dv19-B02] The factory runs once, so a dialog opened
-                    // while the block was still streaming (or after a theme
-                    // flip) kept the text and colour it was born with. Sync
-                    // them here instead of keying the node on `content`: the
-                    // TextView holds >100k chars in this code path and
-                    // rebuilding it on every appended token would reset the
-                    // reader's scroll offset and text selection.
-                    update = { scrollView ->
-                        val textView = scrollView.getChildAt(0) as? android.widget.TextView
-                        if (textView != null) {
-                            textView.setTextColor(textColor.toArgb())
-                            // Setting the same text again forces a full
-                            // re-measure/re-layout of the whole buffer, and
-                            // this block re-runs on every recomposition. Only
-                            // write when it actually changed (TextView keeps
-                            // the exact CharSequence it was handed, so a
-                            // length check settles the common no-op case).
-                            if (shouldSyncFullContentText(textView.text, content)) {
-                                textView.text = content
-                            }
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                )
+                    }
+                }
             }
         }
+    }
+}
+
+/** A URI clipboard streams the complete UTF-8 file instead of sending MBs through Binder. */
+private suspend fun copyThinkingFullContent(context: android.content.Context, content: String) {
+    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+    val label = context.getString(R.string.chat_deep_thinking)
+    if (ThinkingReadPlanner.canCopyAsText(content.length)) {
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText(label, content))
+    } else {
+        val file = withContext(Dispatchers.IO) {
+            val dir = java.io.File(context.cacheDir, "large-messages").apply { mkdirs() }
+            runCatching { pruneExpiredLargeMessageFiles(dir, System.currentTimeMillis()) }
+            java.io.File(dir, "thinking-${java.util.UUID.randomUUID()}.txt").apply { writeText(content) }
+        }
+        val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        clipboard.setPrimaryClip(android.content.ClipData.newUri(context.contentResolver, label, uri))
     }
 }
 
@@ -1476,7 +1687,9 @@ internal fun thinkingTailWindowStart(content: String, windowSize: Int): Int {
     if (windowSize <= 0 || content.length <= windowSize) return 0
     val start = content.length - windowSize
     val nl = content.indexOf('\n', start)
-    return if (nl in start until start + THINKING_WINDOW_NEWLINE_SLACK) nl + 1 else start
+    val cut = if (nl in start until start + THINKING_WINDOW_NEWLINE_SLACK) nl + 1 else start
+    return if (cut > 0 && cut < content.length && Character.isLowSurrogate(content[cut]) &&
+        Character.isHighSurrogate(content[cut - 1])) cut + 1 else cut
 }
 
 /**
@@ -1499,8 +1712,13 @@ internal fun thinkingWindowSlice(
     frozen: Boolean = false,
 ): String {
     if (content.isEmpty()) return content
-    val from = start.coerceIn(0, content.length)
+    var from = start.coerceIn(0, content.length)
+    if (from > 0 && from < content.length && Character.isLowSurrogate(content[from]) &&
+        Character.isHighSurrogate(content[from - 1])) from++
     if (!frozen) return content.substring(from)
     val size = if (windowSize > 0) windowSize else content.length
-    return content.substring(from, minOf(content.length, from + size))
+    var end = minOf(content.length.toLong(), from.toLong() + size).toInt()
+    if (end > from && end < content.length && Character.isHighSurrogate(content[end - 1]) &&
+        Character.isLowSurrogate(content[end])) end--
+    return content.substring(from, end)
 }
